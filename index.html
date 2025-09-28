@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>XR + Desktop + Mobile Nav — NKN Mesh (event-driven pose + sessions)</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#111a; color:#eeea; font-family:monospace }
+    #hint { border-radius:2rem; position:fixed; top:1rem; left:1rem; font-size:.75rem; background:rgba(0,0,0,.5); padding:.5em 1em; pointer-events:none; z-index:10 }
+    #request, #geo, #menu { background:black; cursor:pointer; border:none; position:fixed; top:1rem; border-radius:2rem; width:4rem; height:4rem; display:flex; align-items:center; justify-content:center; z-index:11; padding:.5rem }
+    #geo{ right:1rem } #request{ right:5.5rem } #menu{ right:10rem }
+    #backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.35); backdrop-filter:blur(1px); display:none; z-index:19 }
+    #menuPane{ position:fixed; top:0; right:0; width:min(440px,92vw); height:100%; background:#0b0b0fcc; backdrop-filter:saturate(120%) blur(6px); border-left:1px solid #2228; z-index:20; display:none; padding:12px 12px 24px; overflow:auto }
+    #menuPane h2{ margin:12px 0 8px; font-size:16px }
+    .kv{ display:flex; align-items:center; gap:8px; background:#0008; border:1px solid #222; padding:6px 8px; border-radius:8px; margin:2px 0 }
+    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+    .tiny{ font-size:12px; color:#9aa0a6 }
+    .mono{ font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace }
+    .dot{ width:10px; height:10px; border-radius:50%; background:#444; border:1px solid #222 }
+    .ok{ background:#30cf6b } .warn{ background:#f7b500 } .err{ background:#e84d4d }
+    input[type=text]{ width:100%; background:#000; color:#eee; border:1px solid #333; border-radius:8px; padding:8px 10px }
+    .peer{ display:flex; gap:10px; align-items:flex-start; border:1px solid #222; background:#0a0a0a; border-radius:10px; padding:8px }
+    .peer .name{ font-family:ui-monospace, Menlo, Consolas, monospace }
+    .peer .meta{ font-size:12px; color:#9aa0a6 }
+    .peer .pose{ font-size:12px; color:#ccc; margin-top:2px }
+    #nuke{ margin-top:8px; width:100%; padding:14px 10px; cursor:pointer; border:6px solid #000; border-radius:18px; font-weight:900; text-transform:uppercase; color:#000;
+      background:repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px); box-shadow:0 3px 0 #000, inset 0 0 0 3px #ffd400; }
+    #nuke .big{ display:block; font-size:20px; letter-spacing:1px }
+    #nuke .sub{ display:block; font-size:12px; font-weight:700 }
+  </style>
+
+  <!-- NKN SDK (global window.nkn) -->
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+
+  <!-- three.js import map -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three"   : "https://cdn.jsdelivr.net/npm/three@0.177.0/build/three.module.min.js",
+        "VRButton": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/webxr/VRButton.js",
+        "XRControllerModelFactory": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/webxr/XRControllerModelFactory.js",
+        "PointerLockControls": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/controls/PointerLockControls.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hint">Click to lock • Arrows/WASD/Shift/run • Space/jump • Ctrl/crouch • Touch drag/look • Swipe↑ to jump • Scroll = 3rd→1st person</div>
+
+  <button id="menu" title="Menu" aria-label="Menu">
+    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
+      <path d="M4 6h16M4 12h16M4 18h16" stroke="#eee" stroke-width="2" stroke-linecap="round" />
+    </svg>
+  </button>
+  <button id="request" title="Enable Sensors" aria-label="Enable Sensors">
+    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
+      <path d="M12 18H12.01M9.2 21H14.8C15.9201 21 16.4802 21 16.908 20.782C17.2843 20.5903 17.5903 20.2843 17.782 19.908C18 19.4802 18 18.9201 18 17.8V6.2C18 5.0799 18 4.51984 17.782 4.09202C17.5903 3.71569 17.2843 3.40973 16.908 3.21799C16.4802 3 15.9201 3 14.8 3H9.2C8.0799 3 7.51984 3 7.09202 3.21799C6.71569 3.40973 6.40973 3.71569 6.21799 4.09202C6 4.51984 6 5.07989 6 6.2V17.8C6 18.9201 6 19.4802 6.21799 19.908C6.40973 20.2843 6.71569 20.5903 7.09202 20.782C7.51984 21 8.07989 21 9.2 21Z" stroke="#eee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  </button>
+  <button id="geo" title="Enable Geolocation" aria-label="Enable Geolocation">
+    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
+      <path d="M12 2C8.686 2 6 4.686 6 8c0 5.25 6 12 6 12s6-6.75 6-12c0-3.314-2.686-6-6-6Z" stroke="#eee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="12" cy="8" r="2.5" fill="#eee"/>
+    </svg>
+  </button>
+
+  <!-- Backdrop + slide-out menu -->
+  <div id="backdrop" aria-hidden="true"></div>
+  <aside id="menuPane" aria-label="NKN Mesh Menu">
+    <h2>NKN Mesh Status</h2>
+    <div class="row">
+      <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
+      <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
+    </div>
+    <div class="tiny" id="txtSigMeta">—</div>
+
+    <div style="margin-top:10px">
+      <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
+      <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
+    </div>
+
+    <h2 style="margin-top:14px">Signaller</h2>
+    <div class="tiny">Primary Signaller Public Key (64-hex override)</div>
+    <input id="hexSig" class="mono" placeholder="64-hex (blank = default)" spellcheck="false" />
+    <div class="tiny">Default: <code class="mono">8ad525942fc13bdf468a640a18716cbd91ba75d3bcb0ca198f73e9cd0cf34a88</code></div>
+
+    <h2 style="margin-top:14px">Pose TX</h2>
+    <div class="row">
+      <span class="kv">Hz: <b id="poseHz">0</b></span>
+      <span class="kv">Sent: <b id="poseSent">0</b></span>
+      <span class="kv">Dropped: <b id="poseDrop">0</b></span>
+      <span class="kv">Rate: <b id="poseRate">0.0</b> <span class="tiny">kbps</span></span>
+    </div>
+
+    <h2 style="margin-top:14px">Local Pose</h2>
+    <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
+    <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
+    <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+
+    <h2 style="margin-top:14px">Wallet</h2>
+    <button id="nuke" title="Hard reset identity & caches">
+      <span class="big">⚠️ CAUTION ⚠️</span>
+      <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
+    </button>
+    <div class="tiny" style="margin-top:6px">Generates a new NKN seed and clears caches. You will appear as a new peer.</div>
+
+    <h2 style="margin-top:14px">Peers</h2>
+    <div class="tiny" id="peerSummary">—</div>
+    <div id="peerList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px"></div>
+  </aside>
+
+  <!-- Entry points -->
+  <script type="module" src="./js/app.js"></script>
+  <script type="module" src="./js/persist.js"></script>
+</body>
+</html>
