@@ -20,6 +20,8 @@ import { MiniMap } from './minimap.js';
 const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 const RAD = THREE.MathUtils.degToRad;
 const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
+const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
+const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
 
 class App {
   constructor() {
@@ -51,6 +53,15 @@ class App {
     this._locationSource = 'unknown';
     this._locationState = null;
     this._lastAutoLocation = null;
+    this._compassYawOffset = 0;
+    this._compassYawConfidence = 0;
+    this._compassLastUpdate = 0;
+    this._compassEnabled = true;
+    this._gpsLockEnabled = true;
+    const storedGpsLock = this._loadGpsLockPref();
+    if (storedGpsLock != null) this._gpsLockEnabled = storedGpsLock;
+    const storedCompass = this._loadCompassPref();
+    if (storedCompass != null) this._compassEnabled = storedCompass;
 
     document.addEventListener('gps-updated', (ev) => this._handleGpsUpdate(ev.detail));
 
@@ -148,12 +159,55 @@ class App {
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
 
+    const compassDial = this._createCompassDial();
+    this._compassDialMount = compassDial?.mount ?? null;
+    this._compassDial = compassDial?.dial ?? null;
+    this._compassReadoutSprite = compassDial?.readout ?? null;
+    this._compassReadoutValue = null;
+
     const manualLatInput = document.getElementById('miniMapLat');
     const manualLonInput = document.getElementById('miniMapLon');
     const manualApplyBtn = document.getElementById('miniMapApply');
 
     this._manualLatInput = manualLatInput;
     this._manualLonInput = manualLonInput;
+
+    if (ui.gpsLockToggle) {
+      const gpsToggle = ui.gpsLockToggle;
+      gpsToggle.checked = this._gpsLockEnabled;
+      gpsToggle.disabled = !('geolocation' in navigator);
+      gpsToggle.addEventListener('change', () => {
+        this._gpsLockEnabled = !!gpsToggle.checked;
+        this._storeGpsLockPref(this._gpsLockEnabled);
+        if (!this._gpsLockEnabled && this._mobileNav) {
+          this._mobileNav.active = false;
+          this._mobileNav.initialized = false;
+          this._mobileNav.velocity?.set?.(0, 0, 0);
+          this._compassYawOffset = 0;
+          this._compassYawConfidence = 0;
+          this._compassLastUpdate = 0;
+        }
+        if (this._gpsLockEnabled && this._lastAutoLocation) {
+          this._handleGpsUpdate({ ...this._lastAutoLocation, force: true });
+        }
+      });
+    }
+
+    if (ui.yawAssistToggle) {
+      const yawBtn = ui.yawAssistToggle;
+      const updateYawText = () => {
+        yawBtn.textContent = `Yaw Corr: ${this._compassEnabled ? 'On' : 'Off'}`;
+      };
+      updateYawText();
+      yawBtn.addEventListener('click', () => {
+        this._compassEnabled = !this._compassEnabled;
+        this._storeCompassPref(this._compassEnabled);
+        this._compassYawOffset = 0;
+        this._compassYawConfidence = 0;
+        this._compassLastUpdate = 0;
+        updateYawText();
+      });
+    }
 
     this.miniMap = new MiniMap({
       canvas: document.getElementById('miniMapCanvas'),
@@ -222,17 +276,34 @@ class App {
     const { lat, lon } = detail;
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
+    const source = detail.source || 'unknown';
+
     if (detail.incremental && isMobile && this._mobileNav) {
-      this._updateMobileNavFromGps(detail);
+      if (this._gpsLockEnabled) {
+        this._updateMobileNavFromGps(detail);
+      } else {
+        this._mobileNav.active = false;
+        this._mobileNav.initialized = false;
+        this._mobileNav.velocity?.set?.(0, 0, 0);
+        if (source !== 'manual') {
+          this._lastAutoLocation = { lat, lon, source };
+          this._locationState = { lat, lon };
+        }
+      }
       return;
     }
 
-    const source = detail.source || 'unknown';
     const rank = this._locationRank?.[source] ?? this._locationRank.unknown;
     const currentRank = this._locationRank?.[this._locationSource] ?? this._locationRank.unknown;
     const force = detail.force === true;
 
-    if (!force && rank < currentRank) return;
+    if (!force && rank < currentRank) {
+      if (source !== 'manual') {
+        this._lastAutoLocation = { lat, lon, source };
+        this._locationState = { lat, lon };
+      }
+      return;
+    }
 
     if (!force && rank === currentRank && this._locationState) {
       const deltaLat = Math.abs(lat - this._locationState.lat);
@@ -241,10 +312,25 @@ class App {
       if (sameCoords && source !== 'manual') return;
     }
 
+    const shouldLock = this._gpsLockEnabled || source === 'manual';
+
+    if (!shouldLock && source !== 'manual') {
+      this._locationSource = source;
+      this._locationState = { lat, lon };
+      this._lastAutoLocation = { lat, lon, source };
+      this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
+      this.miniMap?.forceRedraw?.();
+      return;
+    }
+
     this._applyLocation({ lat, lon, source, detail });
 
     if (isMobile && this._mobileNav && source !== 'manual') {
-      this._updateMobileNavFromGps({ ...detail, lat, lon, incremental: false });
+      if (this._gpsLockEnabled) {
+        this._updateMobileNavFromGps({ ...detail, lat, lon, incremental: false });
+      } else {
+        this._mobileNav.active = false;
+      }
     }
   }
 
@@ -258,7 +344,8 @@ class App {
     this.hexGridMgr?.setOrigin(lat, lon);
     this.buildings?.setOrigin(lat, lon);
 
-    if (detail.recenter !== false) {
+    const allowRecenter = detail.recenter !== false && (this._gpsLockEnabled || source === 'manual');
+    if (allowRecenter) {
       this._resetPlayerPosition();
     }
 
@@ -269,6 +356,9 @@ class App {
         this._mobileNav.initialized = false;
         this._mobileNav.velocity?.set?.(0, 0, 0);
       }
+      this._compassYawOffset = 0;
+      this._compassYawConfidence = 0;
+      this._compassLastUpdate = 0;
     } else if (!detail.preserveManual) {
       this._clearManualLocation();
     }
@@ -310,6 +400,38 @@ class App {
     return null;
   }
 
+  _storeGpsLockPref(enabled) {
+    try {
+      localStorage.setItem(GPS_LOCK_KEY, enabled ? '1' : '0');
+    } catch { /* ignore quota */ }
+  }
+
+  _loadGpsLockPref() {
+    try {
+      const raw = localStorage.getItem(GPS_LOCK_KEY);
+      if (raw == null) return null;
+      return raw === '1';
+    } catch {
+      return null;
+    }
+  }
+
+  _storeCompassPref(enabled) {
+    try {
+      localStorage.setItem(COMPASS_YAW_KEY, enabled ? '1' : '0');
+    } catch { /* ignore quota */ }
+  }
+
+  _loadCompassPref() {
+    try {
+      const raw = localStorage.getItem(COMPASS_YAW_KEY);
+      if (raw == null) return null;
+      return raw === '1';
+    } catch {
+      return null;
+    }
+  }
+
   _initMobileTracking() {
     if (!('geolocation' in navigator)) return;
     try {
@@ -344,6 +466,13 @@ class App {
   _updateMobileNavFromGps(detail = {}) {
     if (!this._mobileNav || !this.hexGridMgr?.origin) return;
 
+    if (!this._gpsLockEnabled) {
+      this._mobileNav.active = false;
+      this._mobileNav.initialized = false;
+      this._mobileNav.velocity?.set?.(0, 0, 0);
+      return;
+    }
+
     const nav = this._mobileNav;
     const { lat, lon } = detail;
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
@@ -356,14 +485,21 @@ class App {
     const dtGps = nav.initialized ? Math.max(0.016, (now - nav.lastGpsTs) / 1000) : 0;
     nav.lastGpsTs = now;
 
+    let deltaWorld = null;
+    if (nav.initialized) {
+      deltaWorld = {
+        dx: world.x - nav.positionWorld.x,
+        dz: world.z - nav.positionWorld.z,
+      };
+    }
+
     if (!nav.initialized) {
       nav.positionWorld.set(world.x, 0, world.z);
       nav.predictedWorld.copy(nav.positionWorld);
       nav.velocity.set(0, 0, 0);
       nav.initialized = true;
     } else {
-      const dx = world.x - nav.positionWorld.x;
-      const dz = world.z - nav.positionWorld.z;
+      const { dx = 0, dz = 0 } = deltaWorld || {};
       if (dtGps > 0) {
         const blend = 0.4;
         const targetVx = dx / dtGps;
@@ -378,7 +514,8 @@ class App {
     nav.active = true;
     nav.lastLatLon = { lat, lon };
     nav.speed = Number.isFinite(detail.speed) ? detail.speed : (nav.speed * 0.9);
-    if (Number.isFinite(detail.heading)) nav.headingRad = THREE.MathUtils.degToRad(detail.heading);
+    const headingRadFromDetail = Number.isFinite(detail.heading) ? THREE.MathUtils.degToRad(detail.heading) : null;
+    if (Number.isFinite(headingRadFromDetail)) nav.headingRad = headingRadFromDetail;
     if (!Number.isFinite(nav.headingRad)) {
       const yawInfo = this.sensors.getYawPitch?.();
       if (yawInfo?.ready) nav.headingRad = yawInfo.yaw;
@@ -394,6 +531,12 @@ class App {
     nav.lastPredictTs = now;
     nav.accuracy = detail.accuracy ?? nav.accuracy;
 
+    this._updateCompassCorrection({
+      headingRad: headingRadFromDetail,
+      deltaWorld,
+      speed: Number.isFinite(nav.speed) ? nav.speed : null,
+    });
+
     this._locationState = { lat, lon };
     if (detail.source) this._locationSource = detail.source;
     if (detail.source !== 'manual') this._lastAutoLocation = { lat, lon, source: detail.source };
@@ -402,7 +545,7 @@ class App {
   }
 
   _updateMobileAutopilot(dt) {
-    if (!isMobile || !this._mobileNav || !this._mobileNav.active) return;
+    if (!isMobile || !this._mobileNav || !this._mobileNav.active || !this._gpsLockEnabled) return;
     if (this._locationSource === 'manual') return;
     const nav = this._mobileNav;
     if (!nav.initialized) return;
@@ -448,11 +591,11 @@ class App {
     const yawInfo = this.sensors.getYawPitch?.();
     if (yawInfo?.ready) {
       this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = yawInfo.yaw;
+      this._tmpEuler.y = this._wrapAngle(yawInfo.yaw + this._getCompassYawOffset());
       dolly.quaternion.setFromEuler(this._tmpEuler);
     } else if (Number.isFinite(nav.headingRad)) {
       this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = nav.headingRad;
+      this._tmpEuler.y = this._wrapAngle(nav.headingRad + this._getCompassYawOffset());
       dolly.quaternion.setFromEuler(this._tmpEuler);
     }
 
@@ -463,6 +606,194 @@ class App {
   }
 
   /* ---------- Helpers ---------- */
+
+  _createCompassDial() {
+    if (!this.sceneMgr?.camera) return null;
+    const mount = new THREE.Group();
+    mount.name = 'compass-dial-mount';
+    mount.position.set(0, -0.85, -0.65);
+    mount.rotation.x = THREE.MathUtils.degToRad(-28);
+    mount.renderOrder = 999;
+
+    const dial = new THREE.Group();
+    dial.name = 'compass-dial';
+    dial.renderOrder = 999;
+    mount.add(dial);
+
+    const radius = 1.2;
+    const lineOpacity = 0.15;
+    const majorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
+    const mediumMat = new THREE.MeshBasicMaterial({ color: 0xb8c4ff, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
+    const minorMat = new THREE.MeshBasicMaterial({ color: 0x6f758c, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
+
+    for (let deg = 0; deg < 360; deg += 5) {
+      const rad = THREE.MathUtils.degToRad(deg);
+      const isMajor = deg % 30 === 0;
+      const isMedium = !isMajor && deg % 10 === 0;
+      const height = isMajor ? 0.25 : (isMedium ? 0.175 : 0.11);
+      const width = isMajor ? 0.02 : 0.012;
+      const mat = isMajor ? majorMat : (isMedium ? mediumMat : minorMat);
+      const line = new THREE.Mesh(new THREE.BoxGeometry(width, height, 0.008), mat);
+      line.position.set(Math.sin(rad) * radius, height / 2, -Math.cos(rad) * radius);
+      line.lookAt(0, height / 2, 0);
+      line.renderOrder = 999;
+      dial.add(line);
+
+      if (isMajor) {
+        const label = this._makeCompassLabel(`${deg}`, { color: '#9dc7ff', size: 0.1, fontSize: 70, weight: '500' });
+        label.position.set(Math.sin(rad) * (radius + 0.1), height + 0.04, -Math.cos(rad) * (radius + 0.1));
+        label.renderOrder = 1000;
+        dial.add(label);
+      }
+    }
+
+    const cardinals = [
+      { text: 'N', deg: 0 },
+      { text: 'E', deg: 90 },
+      { text: 'S', deg: 180 },
+      { text: 'W', deg: 270 },
+    ];
+    for (const { text, deg } of cardinals) {
+      const rad = THREE.MathUtils.degToRad(deg);
+      const label = this._makeCompassLabel(text, { color: '#ffffff', size: 0.18, fontSize: 96, weight: '700' });
+      label.position.set(Math.sin(rad) * (radius + 0.18), 0.38, -Math.cos(rad) * (radius + 0.18));
+      label.renderOrder = 1000;
+      dial.add(label);
+    }
+
+    const readout = this._makeCompassLabel('000°', { color: '#ffe082', size: 0.05, fontSize: 50, weight: '600' });
+    readout.position.set(0, 0.45, 0);
+    readout.renderOrder = 1000;
+    dial.add(readout);
+
+    this.sceneMgr.camera.add(mount);
+
+    return { mount, dial, readout };
+  }
+
+  _makeCompassLabel(text, { color = '#fff', size = 0.08, fontSize = 32, weight = '600' } = {}) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const padding = fontSize * 0.45;
+    ctx.font = `${weight} ${fontSize}px sans-serif`;
+    const metrics = ctx.measureText(text);
+    canvas.width = Math.ceil(metrics.width + padding * 2);
+    canvas.height = Math.ceil(fontSize + padding * 2);
+    ctx.font = `${weight} ${fontSize}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    texture.generateMipmaps = false;
+    texture.needsUpdate = true;
+
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false });
+    const sprite = new THREE.Sprite(material);
+    const aspect = canvas.width / canvas.height;
+    sprite.scale.set(size * aspect, size, 1);
+    sprite.userData = {
+      canvas,
+      ctx,
+      texture,
+      color,
+      font: `${weight} ${fontSize}px sans-serif`,
+      padding,
+      size,
+      baseHeight: canvas.height,
+    };
+    sprite.userData.updateText = (value) => {
+      const { canvas, ctx, texture, color, font, padding, size, baseHeight } = sprite.userData;
+      ctx.font = font;
+      const metrics = ctx.measureText(value);
+      const desiredWidth = Math.ceil(metrics.width + padding * 2);
+      const desiredHeight = baseHeight;
+      if (canvas.width !== desiredWidth || canvas.height !== desiredHeight) {
+        canvas.width = desiredWidth;
+        canvas.height = desiredHeight;
+      }
+      ctx.font = font;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = color;
+      ctx.fillText(value, canvas.width / 2, canvas.height / 2);
+      texture.needsUpdate = true;
+      const aspect = canvas.width / canvas.height;
+      sprite.scale.set(size * aspect, size, 1);
+    };
+    return sprite;
+  }
+
+  _wrapAngle(rad) {
+    if (!Number.isFinite(rad)) return 0;
+    return Math.atan2(Math.sin(rad), Math.cos(rad));
+  }
+
+  _getCompassYawOffset() {
+    if (!this._gpsLockEnabled || !this._compassEnabled || this._compassYawConfidence <= 0) return 0;
+    return this._compassYawOffset;
+  }
+
+  _updateCompassCorrection({ headingRad = null, deltaWorld = null, speed = null }) {
+    if (!this._gpsLockEnabled || !this._compassEnabled) return;
+    const yawInfo = this.sensors.getYawPitch?.();
+    if (!yawInfo?.ready) return;
+    const sensorYaw = yawInfo.yaw;
+    if (!Number.isFinite(sensorYaw)) return;
+
+    let targetYaw = Number.isFinite(headingRad) ? headingRad : null;
+
+    if (!Number.isFinite(targetYaw) && deltaWorld) {
+      const { dx = 0, dz = 0 } = deltaWorld;
+      const distSq = dx * dx + dz * dz;
+      if (distSq > 0.09) {
+        targetYaw = Math.atan2(dx, -dz);
+      }
+    }
+
+    if (!Number.isFinite(targetYaw)) return;
+
+    const diff = this._wrapAngle(targetYaw - sensorYaw);
+    if (this._compassYawConfidence <= 0) {
+      this._compassYawOffset = diff;
+    } else {
+      const delta = this._wrapAngle(diff - this._compassYawOffset);
+      const weight = Number.isFinite(speed)
+        ? THREE.MathUtils.clamp(Math.abs(speed) / 5, 0.08, 0.3)
+        : 0.12;
+      this._compassYawOffset = this._wrapAngle(this._compassYawOffset + delta * weight);
+    }
+
+    this._compassYawConfidence = Math.min(1, this._compassYawConfidence + 0.2);
+    const now = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now();
+    this._compassLastUpdate = now;
+  }
+
+  _updateCompassDial() {
+    if (!this._compassDial) return;
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return;
+
+    const forward = this._headingWorld.copy(this._headingBasis).applyQuaternion(dolly.quaternion);
+    const headingRad = Math.atan2(forward.x, -forward.z);
+    this._compassDial.rotation.set(0, headingRad, 0);
+
+    if (this._compassReadoutSprite?.userData?.updateText) {
+      const headingDeg = (THREE.MathUtils.radToDeg(headingRad) + 360) % 360;
+      const rounded = Math.round(headingDeg);
+      if (this._compassReadoutValue == null || Math.abs(this._compassReadoutValue - rounded) >= 1) {
+        this._compassReadoutValue = rounded;
+        const padded = `${rounded.toString().padStart(3, '0')}°`;
+        this._compassReadoutSprite.userData.updateText(padded);
+      }
+    }
+  }
 
   // Old, proven mapping: (beta, alpha, -gamma) YXZ then align device frame by Rx(-90°).
   _deviceQuatForFPV(orient) {
@@ -529,6 +860,19 @@ class App {
       this.buildings?.updateQoS?.({ fps: this._perf.smoothedFps, target: this._perf.targetFps });
       this._perf.accum = 0;
     }
+
+    if (this._compassYawConfidence > 0) {
+      const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      const ageSec = Math.max(0, (nowMs - this._compassLastUpdate) / 1000);
+      if (ageSec > 1.5) {
+        this._compassYawConfidence = Math.max(0, this._compassYawConfidence - dt * 0.5);
+        if (this._compassYawConfidence < 0.01) {
+          this._compassYawConfidence = 0;
+          this._compassYawOffset = 0;
+        }
+      }
+    }
+
     const { dolly, camera, renderer } = this.sceneMgr;
     const xrOn = renderer.xr.isPresenting;
 
@@ -543,6 +887,12 @@ class App {
       if (this._mobileFPVOn && this.sensors?.orient?.ready) {
         // MOBILE FPV: direct 1:1 mapping from device → dolly. Camera inherits (no extra pitch writes).
         const q = this._deviceQuatForFPV(this.sensors.orient);
+        const yawOffset = this._getCompassYawOffset();
+        if (yawOffset) {
+          this._tmpEuler.setFromQuaternion(q, 'YXZ');
+          this._tmpEuler.y = this._wrapAngle(this._tmpEuler.y + yawOffset);
+          q.setFromEuler(this._tmpEuler);
+        }
         dolly.quaternion.copy(q);
         // Enforce camera local zero so it precisely inherits dolly rotation
         camera.rotation.set(0, 0, 0);
@@ -600,6 +950,8 @@ class App {
     if (this._mobileNav?.active) {
       this._updateMobileAutopilot(dt);
     }
+
+    this._updateCompassDial();
 
     this.hexGridMgr.update(dolly.position);
     this.buildings?.update(dt);

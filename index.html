@@ -24,7 +24,7 @@
     #nuke{ margin-top:8px; width:100%; padding:14px 10px; cursor:pointer; border:6px solid #000; border-radius:18px; font-weight:900; text-transform:uppercase; color:#000;
       background:repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px); box-shadow:0 3px 0 #000, inset 0 0 0 3px #ffd400; }
     #nuke .big{ display:block; font-size:20px; letter-spacing:1px }
-    #nuke .sub{ display:block; font-size:12px; font-weight:700 }
+    #nuke .sub{font-size:20px; font-weight:bold; text-shadow:2px 2px 0px #f7b500,2px -2px 0px #f7b500,-2px 2px 0px #f7b500, -2px -2px 0px #f7b500;display:block; font-size:12px; font-weight:700 }
     #miniMapCanvas{ filter:saturate(0)hue-rotate(180deg)invert(0.9)contrast(1.2); background:#111; }
     .mini-map-controls{ display:flex; gap:8px }
     .mini-map-controls button{ flex:1; border:1px solid #333; background:#111; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
@@ -33,6 +33,10 @@
     .mini-map-manual input{ flex:1 1 120px }
     .mini-map-manual button{ flex:1 1 110px; border:1px solid #333; background:#181818; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
     .mini-map-manual button:hover{ background:#232323 }
+    .toggle-row{ display:flex; align-items:flex-start; gap:10px; background:#0008; border:1px solid #222; border-radius:10px; padding:10px 12px; cursor:pointer }
+    .toggle-row input[type=checkbox]{ width:18px; height:18px; accent-color:#4da3ff; margin-top:2px }
+    .toggle-text{ display:flex; flex-direction:column; gap:4px }
+    .toggle-title{ font-size:14px; letter-spacing:0.04em; text-transform:uppercase; color:#fafafa; }
     #perfHud{ position:fixed; top:1rem; right:1rem; display:flex; flex-direction:column; gap:4px; align-items:flex-end; background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px 14px; font-size:12px; color:#e6e9f0; z-index:12; pointer-events:auto; cursor:pointer; min-width:120px; transition:background 0.2s ease; }
     #perfHud:hover{ background:rgba(0,0,0,0.7); }
     #perfHud:focus-visible{ outline:2px solid #7fd5ff; outline-offset:3px; }
@@ -115,6 +119,7 @@
         <div class="mini-map-controls">
           <button id="miniMapRecenter" type="button">Follow: On</button>
           <button id="miniMapSet" type="button">Set Loc</button>
+          <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
         </div>
         <div class="mini-map-manual">
           <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
@@ -122,6 +127,13 @@
           <button id="miniMapApply" type="button">Apply Manual</button>
         </div>
         <div id="miniMapStatus" class="tiny">Determining location…</div>
+        <label class="toggle-row" for="gpsLockToggle">
+          <input id="gpsLockToggle" type="checkbox" checked />
+          <span class="toggle-text">
+            <span class="toggle-title">Lock world to GPS</span>
+            <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling geolocation.</span>
+          </span>
+        </label>
       </div>
     </section>
 
@@ -145,7 +157,6 @@
     <section class="modal-section">
       <div class="section-title">Wallet</div>
       <button id="nuke" title="Hard reset identity & caches">
-        <span class="big">⚠️ CAUTION ⚠️</span>
         <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
       </button>
       <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>

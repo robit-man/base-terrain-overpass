@@ -28,6 +28,8 @@ const nukeBtn = document.getElementById('nuke');
 const hudFps = document.getElementById('hudFps');
 const hudQos = document.getElementById('hudQos');
 const perfHud = document.getElementById('perfHud');
+const gpsLockToggle = document.getElementById('gpsLockToggle');
+const yawAssistToggle = document.getElementById('yawAssistToggle');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 
 function openMenu() {
@@ -69,5 +71,6 @@ export const ui = {
   peerSummary, peerList,
   hexSig, nukeBtn,
   hudFps, hudQos,
+  gpsLockToggle, yawAssistToggle,
   openMenu, closeMenu
 };
