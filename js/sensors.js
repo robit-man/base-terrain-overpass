@@ -34,9 +34,16 @@ export class Sensors {
     this._q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -PI/2 around X
     this._eulerIn = new THREE.Euler();   // for beta/alpha/gamma → quaternion
     this._eulerOut = new THREE.Euler();  // to read yaw/pitch (YXZ)
+    this._orientationQuat = new THREE.Quaternion();
+    this._accelRaw = new THREE.Vector3();
+    this._accelWorld = new THREE.Vector3();
+
+    this.motion = { ax: 0, ay: 0, az: 0, ready: false, timestamp: 0 };
+    this._motionListening = false;
 
     // Bind handler once
     this._onDO = this._onDO.bind(this);
+    this._onDM = this._onDM.bind(this);
 
     // Button wiring
     if (this.btn) this.btn.addEventListener('click', () => this.enable(), { once: true });
@@ -60,7 +67,17 @@ export class Sensors {
       }
     } catch { /* ignore permission errors */ }
 
+    try {
+      if (typeof DeviceMotionEvent?.requestPermission === 'function') {
+        await DeviceMotionEvent.requestPermission();
+      }
+    } catch { /* ignore permission errors */ }
+
     window.addEventListener('deviceorientation', this._onDO, true);
+    if (!this._motionListening) {
+      window.addEventListener('devicemotion', this._onDM, true);
+      this._motionListening = true;
+    }
     this.enabled = true;
 
     // Tell listeners (e.g., ChaseCam) to calibrate to current camera orbit
@@ -121,6 +138,36 @@ export class Sensors {
     // Apply calibration offsets to produce final camera-facing angles
     this.yaw   = this._measYaw   + this._yawOff;
     this.pitch = this._measPitch + this._pitchOff;
+    this._orientationQuat.copy(q);
+  }
+
+  getAcceleration() {
+    return this.motion;
+  }
+
+  _onDM(e) {
+    const src = e.acceleration || e.accelerationIncludingGravity;
+    if (!src) return;
+
+    const ax = src.x ?? 0;
+    const ay = src.y ?? 0;
+    const az = src.z ?? 0;
+
+    this._accelRaw.set(ax, ay, az);
+
+    if (!e.acceleration && e.accelerationIncludingGravity) {
+      // crude gravity compensation when only accelerationIncludingGravity is available
+      this._accelRaw.y -= 9.81;
+    }
+
+    const worldVec = this._accelWorld.copy(this._accelRaw);
+    worldVec.applyQuaternion(this._orientationQuat);
+
+    this.motion.ax = worldVec.x;
+    this.motion.ay = worldVec.y;
+    this.motion.az = worldVec.z;
+    this.motion.ready = true;
+    this.motion.timestamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
   }
 }
 

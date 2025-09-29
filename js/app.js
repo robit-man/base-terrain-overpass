@@ -5,7 +5,7 @@ import { Sensors, GeoButton } from './sensors.js';
 import { Input } from './input.js';
 import { AudioEngine } from './audio.js';
 import { TileManager } from './tiles.js';
-import { ipLocate } from './geolocate.js';
+import { ipLocate, latLonToWorld, worldToLatLon } from './geolocate.js';
 import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
@@ -64,6 +64,24 @@ class App {
     // Motion / physics shim (jump, crouch, mobile drag, eye height)
     this.move = new Locomotion(this.sceneMgr, this.input, this.sensors.orient);
     this.clock = new THREE.Clock();
+    this._perf = { targetFps: 60, smoothedFps: 60, accum: 0 };
+    this._geoWatchId = null;
+    this._mobileNav = isMobile ? {
+      active: false,
+      initialized: false,
+      positionWorld: new THREE.Vector3(),
+      predictedWorld: new THREE.Vector3(),
+      velocity: new THREE.Vector3(),
+      headingRad: 0,
+      speed: 0,
+      accuracy: Infinity,
+      lastGpsTs: 0,
+      lastLatLon: null
+    } : null;
+
+    if (isMobile && 'geolocation' in navigator) {
+      this._initMobileTracking();
+    }
 
     // UI poller
     this._uiTimer = setInterval(() => this._updateLocalPoseUI(), 200);
@@ -126,6 +144,7 @@ class App {
     this._tmpVec2 = new THREE.Vector3();
     this._tmpVec3 = new THREE.Vector3();
     this._tmpVec4 = new THREE.Vector3();
+    this._tmpEuler = new THREE.Euler();
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
 
@@ -203,6 +222,11 @@ class App {
     const { lat, lon } = detail;
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
+    if (detail.incremental && isMobile && this._mobileNav) {
+      this._updateMobileNavFromGps(detail);
+      return;
+    }
+
     const source = detail.source || 'unknown';
     const rank = this._locationRank?.[source] ?? this._locationRank.unknown;
     const currentRank = this._locationRank?.[this._locationSource] ?? this._locationRank.unknown;
@@ -218,6 +242,10 @@ class App {
     }
 
     this._applyLocation({ lat, lon, source, detail });
+
+    if (isMobile && this._mobileNav && source !== 'manual') {
+      this._updateMobileNavFromGps({ ...detail, lat, lon, incremental: false });
+    }
   }
 
   _applyLocation({ lat, lon, source, detail = {} }) {
@@ -236,6 +264,11 @@ class App {
 
     if (source === 'manual') {
       if (!detail.persisted) this._storeManualLocation(lat, lon);
+      if (this._mobileNav) {
+        this._mobileNav.active = false;
+        this._mobileNav.initialized = false;
+        this._mobileNav.velocity?.set?.(0, 0, 0);
+      }
     } else if (!detail.preserveManual) {
       this._clearManualLocation();
     }
@@ -275,6 +308,158 @@ class App {
       if (Number.isFinite(parsed?.lat) && Number.isFinite(parsed?.lon)) return parsed;
     } catch { /* ignore */ }
     return null;
+  }
+
+  _initMobileTracking() {
+    if (!('geolocation' in navigator)) return;
+    try {
+      this._geoWatchId = navigator.geolocation.watchPosition(
+        (pos) => this._handleGeoWatch(pos),
+        (err) => console.warn('[geo] watch failed', err?.message || err),
+        { enableHighAccuracy: true, maximumAge: 500, timeout: 10000 }
+      );
+    } catch (err) {
+      console.warn('[geo] watch error', err);
+    }
+  }
+
+  _handleGeoWatch(position) {
+    if (!position || !position.coords) return;
+    const { latitude, longitude, accuracy, speed, heading } = position.coords;
+    const detail = {
+      lat: latitude,
+      lon: longitude,
+      accuracy,
+      speed: Number.isFinite(speed) ? speed : undefined,
+      heading: Number.isFinite(heading) ? heading : undefined,
+      timestamp: position.timestamp,
+      source: 'device',
+      recenter: false,
+      preserveManual: true,
+      incremental: !!(this._mobileNav && this._mobileNav.initialized)
+    };
+    this._handleGpsUpdate(detail);
+  }
+
+  _updateMobileNavFromGps(detail = {}) {
+    if (!this._mobileNav || !this.hexGridMgr?.origin) return;
+
+    const nav = this._mobileNav;
+    const { lat, lon } = detail;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    const origin = this.hexGridMgr.origin;
+    const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+    if (!world) return;
+
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const dtGps = nav.initialized ? Math.max(0.016, (now - nav.lastGpsTs) / 1000) : 0;
+    nav.lastGpsTs = now;
+
+    if (!nav.initialized) {
+      nav.positionWorld.set(world.x, 0, world.z);
+      nav.predictedWorld.copy(nav.positionWorld);
+      nav.velocity.set(0, 0, 0);
+      nav.initialized = true;
+    } else {
+      const dx = world.x - nav.positionWorld.x;
+      const dz = world.z - nav.positionWorld.z;
+      if (dtGps > 0) {
+        const blend = 0.4;
+        const targetVx = dx / dtGps;
+        const targetVz = dz / dtGps;
+        nav.velocity.x = nav.velocity.x * (1 - blend) + targetVx * blend;
+        nav.velocity.z = nav.velocity.z * (1 - blend) + targetVz * blend;
+      }
+      nav.positionWorld.set(world.x, 0, world.z);
+      nav.predictedWorld.copy(nav.positionWorld);
+    }
+
+    nav.active = true;
+    nav.lastLatLon = { lat, lon };
+    nav.speed = Number.isFinite(detail.speed) ? detail.speed : (nav.speed * 0.9);
+    if (Number.isFinite(detail.heading)) nav.headingRad = THREE.MathUtils.degToRad(detail.heading);
+    if (!Number.isFinite(nav.headingRad)) {
+      const yawInfo = this.sensors.getYawPitch?.();
+      if (yawInfo?.ready) nav.headingRad = yawInfo.yaw;
+    }
+    if (Number.isFinite(nav.speed) && Number.isFinite(nav.headingRad)) {
+      const vx = nav.speed * Math.sin(nav.headingRad);
+      const vz = -nav.speed * Math.cos(nav.headingRad);
+      nav.velocity.x = nav.velocity.x * 0.6 + vx * 0.4;
+      nav.velocity.z = nav.velocity.z * 0.6 + vz * 0.4;
+    }
+    nav.velocity.x = THREE.MathUtils.clamp(nav.velocity.x, -30, 30);
+    nav.velocity.z = THREE.MathUtils.clamp(nav.velocity.z, -30, 30);
+    nav.lastPredictTs = now;
+    nav.accuracy = detail.accuracy ?? nav.accuracy;
+
+    this._locationState = { lat, lon };
+    if (detail.source) this._locationSource = detail.source;
+    if (detail.source !== 'manual') this._lastAutoLocation = { lat, lon, source: detail.source };
+
+    this.miniMap?.notifyLocationChange?.({ lat, lon, source: detail.source || this._locationSource });
+  }
+
+  _updateMobileAutopilot(dt) {
+    if (!isMobile || !this._mobileNav || !this._mobileNav.active) return;
+    if (this._locationSource === 'manual') return;
+    const nav = this._mobileNav;
+    if (!nav.initialized) return;
+
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const elapsed = Math.max(0, (now - (nav.lastPredictTs || now)) / 1000);
+    nav.lastPredictTs = now;
+
+    const motion = this.sensors.getAcceleration?.();
+    if (motion?.ready) {
+      nav.velocity.x += motion.ax * elapsed;
+      nav.velocity.z += motion.az * elapsed;
+      nav.velocity.x *= 0.95;
+      nav.velocity.z *= 0.95;
+    } else {
+      nav.velocity.x *= 0.98;
+      nav.velocity.z *= 0.98;
+    }
+
+    if (Number.isFinite(nav.speed) && Number.isFinite(nav.headingRad)) {
+      const vx = nav.speed * Math.sin(nav.headingRad);
+      const vz = -nav.speed * Math.cos(nav.headingRad);
+      nav.velocity.x = nav.velocity.x * 0.85 + vx * 0.15;
+      nav.velocity.z = nav.velocity.z * 0.85 + vz * 0.15;
+    }
+
+    if (!Number.isFinite(nav.velocity.x) || !Number.isFinite(nav.velocity.z)) {
+      nav.velocity.set(0, 0, 0);
+    }
+
+    nav.velocity.x = THREE.MathUtils.clamp(nav.velocity.x, -30, 30);
+    nav.velocity.z = THREE.MathUtils.clamp(nav.velocity.z, -30, 30);
+
+    nav.predictedWorld.x += nav.velocity.x * elapsed;
+    nav.predictedWorld.z += nav.velocity.z * elapsed;
+    nav.predictedWorld.x = THREE.MathUtils.damp(nav.predictedWorld.x, nav.positionWorld.x, 0.5, elapsed);
+    nav.predictedWorld.z = THREE.MathUtils.damp(nav.predictedWorld.z, nav.positionWorld.z, 0.5, elapsed);
+
+    const dolly = this.sceneMgr.dolly;
+    dolly.position.x = THREE.MathUtils.damp(dolly.position.x, nav.predictedWorld.x, 6, elapsed);
+    dolly.position.z = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
+
+    const yawInfo = this.sensors.getYawPitch?.();
+    if (yawInfo?.ready) {
+      this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
+      this._tmpEuler.y = yawInfo.yaw;
+      dolly.quaternion.setFromEuler(this._tmpEuler);
+    } else if (Number.isFinite(nav.headingRad)) {
+      this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
+      this._tmpEuler.y = nav.headingRad;
+      dolly.quaternion.setFromEuler(this._tmpEuler);
+    }
+
+    if (this.hexGridMgr?.origin) {
+      const fused = worldToLatLon(dolly.position.x, dolly.position.z, this.hexGridMgr.origin.lat, this.hexGridMgr.origin.lon);
+      if (fused) nav.fusedLatLon = fused;
+    }
   }
 
   /* ---------- Helpers ---------- */
@@ -335,6 +520,15 @@ class App {
   /* ---------- Main loop ---------- */
   _tick() {
     const dt = this.clock.getDelta();
+    const fpsSample = dt > 0.5 ? this._perf.targetFps : (dt > 1e-4 ? 1 / dt : this._perf.targetFps);
+    const alpha = 0.1;
+    this._perf.smoothedFps = this._perf.smoothedFps * (1 - alpha) + fpsSample * alpha;
+    this._perf.accum += dt;
+    if (this._perf.accum >= 0.3) {
+      if (ui.hudFps) ui.hudFps.textContent = Math.round(this._perf.smoothedFps);
+      this.buildings?.updateQoS?.({ fps: this._perf.smoothedFps, target: this._perf.targetFps });
+      this._perf.accum = 0;
+    }
     const { dolly, camera, renderer } = this.sceneMgr;
     const xrOn = renderer.xr.isPresenting;
 
@@ -402,6 +596,10 @@ class App {
     finalPos.y = groundY + eyeHeight;
 
     dolly.position.copy(finalPos);
+
+    if (this._mobileNav?.active) {
+      this._updateMobileAutopilot(dt);
+    }
 
     this.hexGridMgr.update(dolly.position);
     this.buildings?.update(dt);

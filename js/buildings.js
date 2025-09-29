@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { metresPerDegree } from './geolocate.js';
+import { ui } from './ui.js';
 
 const FEATURES = {
   BUILDINGS: true,
@@ -18,6 +19,7 @@ const BUILD_FRAME_BUDGET_MS = 2.0; // ms budget to spend per frame on feature bu
 const BUILD_IDLE_BUDGET_MS = 8.0; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 1.0; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 1.5; // ms per frame allotted to resnap tiles
+const TARGET_FPS = 60;
 
 function averagePoint(flat) {
   let sx = 0;
@@ -196,6 +198,19 @@ export class BuildingManager {
     this._pickMaterial.depthTest = false;
 
     this._cachePrefix = `${CACHE_PREFIX}:${this.tileSize}:`;
+
+    // QoS / performance state (auto-tuned via updateQoS)
+    this._qosLevel = 'high';
+    this._smoothedFps = TARGET_FPS;
+    this._frameBudgetMs = BUILD_FRAME_BUDGET_MS;
+    this._idleBudgetMs = BUILD_IDLE_BUDGET_MS;
+    this._mergeBudgetMs = MERGE_BUDGET_MS;
+    this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
+    this._resnapInterval = RESNAP_INTERVAL;
+    this._tileUpdateInterval = 0; // seconds — 0 = every frame
+    this._tileUpdateTimer = 0;
+    this._resnapTimer = 0;
+    this._qosTargetFps = TARGET_FPS;
   }
 
   setPhysicsEngine(physics) {
@@ -299,6 +314,72 @@ export class BuildingManager {
       building.pick.updateMatrixWorld(true);
     }
   }
+
+  updateQoS({ fps, target = TARGET_FPS } = {}) {
+    if (!Number.isFinite(fps) || fps <= 0) return;
+    if (!Number.isFinite(target) || target <= 0) target = TARGET_FPS;
+
+    const alpha = 0.12;
+    this._smoothedFps = this._smoothedFps * (1 - alpha) + fps * alpha;
+    this._qosTargetFps = target;
+
+    const ratio = this._smoothedFps / target;
+    let desiredLevel = 'high';
+    if (ratio < 0.7) desiredLevel = 'low';
+    else if (ratio < 0.92) desiredLevel = 'medium';
+
+    if (desiredLevel !== this._qosLevel) this._applyQoSLevel(desiredLevel);
+  }
+
+  _applyQoSLevel(level) {
+    this._qosLevel = level;
+
+    let frameBudget, idleBudget, mergeBudget, resnapBudget, resnapInterval, tileInterval;
+    if (level === 'high') {
+      frameBudget = BUILD_FRAME_BUDGET_MS;
+      idleBudget = BUILD_IDLE_BUDGET_MS;
+      mergeBudget = MERGE_BUDGET_MS;
+      resnapBudget = RESNAP_FRAME_BUDGET_MS;
+      resnapInterval = RESNAP_INTERVAL;
+      tileInterval = 0;
+    } else if (level === 'medium') {
+      frameBudget = Math.max(0.9, BUILD_FRAME_BUDGET_MS * 0.55);
+      idleBudget = Math.max(3.5, BUILD_IDLE_BUDGET_MS * 0.5);
+      mergeBudget = Math.max(3, MERGE_BUDGET_MS * 0.6);
+      resnapBudget = Math.max(0.6, RESNAP_FRAME_BUDGET_MS * 0.55);
+      resnapInterval = RESNAP_INTERVAL * 1.8;
+      tileInterval = 0.25;
+    } else {
+      frameBudget = Math.max(0.55, BUILD_FRAME_BUDGET_MS * 0.3);
+      idleBudget = Math.max(2.2, BUILD_IDLE_BUDGET_MS * 0.3);
+      mergeBudget = Math.max(2, MERGE_BUDGET_MS * 0.35);
+      resnapBudget = Math.max(0.4, RESNAP_FRAME_BUDGET_MS * 0.35);
+      resnapInterval = RESNAP_INTERVAL * 3.2;
+      tileInterval = 0.45;
+    }
+
+    this._frameBudgetMs = frameBudget;
+    this._idleBudgetMs = idleBudget;
+    this._mergeBudgetMs = mergeBudget;
+    this._resnapFrameBudgetMs = resnapBudget;
+    this._resnapInterval = resnapInterval;
+    this._tileUpdateInterval = tileInterval;
+    this._tileUpdateTimer = 0;
+
+    if (typeof console !== 'undefined' && console.log) {
+      console.log(
+        `[Buildings][QoS] level=${level} fps≈${this._smoothedFps.toFixed(1)} budgets frame=${this._frameBudgetMs.toFixed(2)}ms idle=${this._idleBudgetMs.toFixed(2)}ms merge=${this._mergeBudgetMs.toFixed(2)}ms resnap=${this._resnapFrameBudgetMs.toFixed(2)}ms interval=${this._resnapInterval.toFixed(2)}s`
+      );
+    }
+
+    const qosText = `QoS: ${level} · frame ${this._frameBudgetMs.toFixed(1)}ms · merge ${this._mergeBudgetMs.toFixed(1)}ms`;
+    if (ui.hudQos) {
+      ui.hudQos.textContent = qosText;
+      ui.hudQos.classList.remove('flash');
+      void ui.hudQos.offsetWidth;
+      ui.hudQos.classList.add('flash');
+    }
+  }
   // ——————————————————————————————————————————————————————————
 
   setOrigin(lat, lon) {
@@ -328,16 +409,25 @@ export class BuildingManager {
   update(dt = 0) {
     if (!this._hasOrigin || !this.camera) return;
 
-    this._updateTiles();
-    this._drainBuildQueue(BUILD_FRAME_BUDGET_MS);
+    if (this._tileUpdateInterval <= 0) {
+      this._updateTiles();
+    } else {
+      this._tileUpdateTimer += dt;
+      if (this._tileUpdateTimer >= this._tileUpdateInterval) {
+        this._tileUpdateTimer = 0;
+        this._updateTiles();
+      }
+    }
+
+    this._drainBuildQueue(this._frameBudgetMs);
     this._processMergeQueue();
 
-    this._resnapTimer = (this._resnapTimer || 0) + dt;
-    if (this._resnapTimer > RESNAP_INTERVAL) {
+    this._resnapTimer += dt;
+    if (this._resnapTimer > this._resnapInterval) {
       this._resnapTimer = 0;
       this._queueResnapSweep();
     }
-    this._drainResnapQueue(RESNAP_FRAME_BUDGET_MS);
+    this._drainResnapQueue(this._resnapFrameBudgetMs);
 
     this._waterTime += dt;
     for (const mat of this._waterMaterials) mat.uniforms.uTime.value = this._waterTime;
@@ -650,7 +740,7 @@ export class BuildingManager {
     this._buildTickScheduled = true;
     const run = (deadline) => {
       this._buildTickScheduled = false;
-      this._drainBuildQueue(BUILD_IDLE_BUDGET_MS, deadline);
+      this._drainBuildQueue(this._idleBudgetMs, deadline);
       if (this._activeBuildJob || this._buildQueue.length) this._scheduleBuildTick();
     };
     if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
@@ -660,8 +750,11 @@ export class BuildingManager {
     }
   }
 
-  _drainBuildQueue(budgetMs = BUILD_FRAME_BUDGET_MS, deadline) {
+  _drainBuildQueue(budgetMs, deadline) {
     if (!this._activeBuildJob && !this._buildQueue.length) return;
+
+    const frameBudget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : this._frameBudgetMs;
+    if (frameBudget <= 0) return;
 
     const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
       ? performance.now()
@@ -669,7 +762,7 @@ export class BuildingManager {
     const start = now();
     const hasDeadline = deadline && typeof deadline.timeRemaining === 'function';
     const timeRemaining = () => {
-      const budgetLeft = budgetMs - (now() - start);
+      const budgetLeft = frameBudget - (now() - start);
       const idleLeft = hasDeadline ? deadline.timeRemaining() : Infinity;
       return Math.min(budgetLeft, idleLeft);
     };
@@ -838,7 +931,7 @@ export class BuildingManager {
       if (!b.render) continue;
       b.render.updateMatrixWorld(true);
       const elapsed = performance.now() - start;
-      if (elapsed > MERGE_BUDGET_MS) break;
+      if (elapsed > this._mergeBudgetMs) break;
       if (deadline && typeof deadline.timeRemaining === 'function' && deadline.timeRemaining() < 1) break;
     }
 
@@ -1171,8 +1264,13 @@ export class BuildingManager {
     this._resnapIndex = 0;
   }
 
-  _drainResnapQueue(budgetMs = RESNAP_FRAME_BUDGET_MS) {
+  _drainResnapQueue(budgetMs) {
     if (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length) return;
+
+    const effectiveBudget = Number.isFinite(budgetMs) && budgetMs > 0
+      ? budgetMs
+      : this._resnapFrameBudgetMs;
+    if (effectiveBudget <= 0) return;
 
     const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
       ? performance.now()
@@ -1181,7 +1279,7 @@ export class BuildingManager {
 
     while (this._resnapIndex < this._resnapQueue.length) {
       const elapsed = now() - start;
-      if (elapsed > budgetMs) break;
+      if (elapsed > effectiveBudget) break;
 
       const tileKey = this._resnapQueue[this._resnapIndex++];
       const state = this._tileStates.get(tileKey);

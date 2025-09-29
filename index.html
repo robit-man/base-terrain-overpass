@@ -5,11 +5,10 @@
   <title>XR + Desktop + Mobile Nav — NKN Mesh (event-driven pose + sessions)</title>
   <style>
     html, body { margin:0; height:100%; overflow:hidden; background:#111a; color:#eeea; font-family:monospace }
+    body.modal-open{ overflow:hidden; }
     #hint { border-radius:2rem; position:fixed; top:1rem; left:1rem; font-size:.75rem; background:rgba(0,0,0,.5); padding:.5em 1em; pointer-events:none; z-index:10 }
-    #request, #geo, #menu { background:black; cursor:pointer; border:none; position:fixed; top:1rem; border-radius:2rem; width:4rem; height:4rem; display:flex; align-items:center; justify-content:center; z-index:11; padding:.5rem }
-    #geo{ right:1rem } #request{ right:5.5rem } #menu{ right:10rem }
     #backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.35); backdrop-filter:blur(1px); display:none; z-index:19 }
-    #menuPane{ position:fixed; top:0; right:0; width:min(440px,92vw); height:100%; background:#0b0b0fcc; backdrop-filter:saturate(120%) blur(6px); border-left:1px solid #2228; z-index:20; display:none; padding:12px 12px 24px; overflow:auto }
+    #menuPane{ position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:min(520px,92vw); max-height:92vh; background:#0b0b0fcc; backdrop-filter:saturate(120%) blur(12px); border:1px solid rgba(255,255,255,0.08); border-radius:18px; z-index:20; display:none; padding:24px 24px 32px; overflow:auto }
     #menuPane h2{ margin:12px 0 8px; font-size:16px }
     .kv{ display:flex; align-items:center; gap:8px; background:#0008; border:1px solid #222; padding:6px 8px; border-radius:8px; margin:2px 0 }
     .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
@@ -26,8 +25,7 @@
       background:repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px); box-shadow:0 3px 0 #000, inset 0 0 0 3px #ffd400; }
     #nuke .big{ display:block; font-size:20px; letter-spacing:1px }
     #nuke .sub{ display:block; font-size:12px; font-weight:700 }
-    #miniMapBlock{ display:flex; flex-direction:column; gap:8px; background:#0006; border:1px solid #222; padding:10px; border-radius:12px }
-    #miniMapCanvas{ filter:saturate(0)hue-rotate(180deg)invert(0.9)contrast(1.2);width:100%; max-width:260px; aspect-ratio:1; border-radius:10px; background:#111; border:1px solid #333; display:block }
+    #miniMapCanvas{ filter:saturate(0)hue-rotate(180deg)invert(0.9)contrast(1.2); background:#111; }
     .mini-map-controls{ display:flex; gap:8px }
     .mini-map-controls button{ flex:1; border:1px solid #333; background:#111; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
     .mini-map-controls button:hover{ background:#1d1d1d }
@@ -35,6 +33,26 @@
     .mini-map-manual input{ flex:1 1 120px }
     .mini-map-manual button{ flex:1 1 110px; border:1px solid #333; background:#181818; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
     .mini-map-manual button:hover{ background:#232323 }
+    #perfHud{ position:fixed; top:1rem; right:1rem; display:flex; flex-direction:column; gap:4px; align-items:flex-end; background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px 14px; font-size:12px; color:#e6e9f0; z-index:12; pointer-events:auto; cursor:pointer; min-width:120px; transition:background 0.2s ease; }
+    #perfHud:hover{ background:rgba(0,0,0,0.7); }
+    #perfHud:focus-visible{ outline:2px solid #7fd5ff; outline-offset:3px; }
+    #perfHud .hud-fps{ font-size:14px; font-weight:600; letter-spacing:0.04em; }
+    #perfHud .hud-qos{ font-size:12px; opacity:0.85; }
+    #perfHud .hud-qos.flash{ animation: hudFlash 0.8s ease-out; }
+    @keyframes hudFlash { from { color:#7fd5ff; } to { color:inherit; } }
+    #miniMapDock{ position:fixed; top:1rem; left:1rem; background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px; z-index:11; display:flex; flex-direction:column; align-items:center; gap:6px; backdrop-filter:blur(6px); }
+    #miniMapDock canvas{ width:180px; height:180px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); display:block; }
+    #miniMapControls{ display:flex; flex-direction:column; gap:10px; background:rgba(0,0,0,0.45); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:12px; }
+    #miniMapControls .mini-map-controls button,
+    #miniMapControls .mini-map-manual button{ background:#171717; }
+    .modal-section{ margin-bottom:18px; display:flex; flex-direction:column; gap:10px; }
+    .modal-section .section-title{ font-size:16px; font-weight:600; letter-spacing:0.04em; text-transform:uppercase; color:#fafafa; opacity:0.9; }
+    .button-row{ display:flex; gap:8px; flex-wrap:wrap; }
+    .button-row button{ flex:1 1 140px; border:1px solid #333; background:#111; color:#eee; padding:10px 12px; border-radius:10px; cursor:pointer; font-family:inherit; font-size:13px; letter-spacing:0.03em; text-transform:uppercase; transition:background 0.2s ease, transform 0.2s ease; }
+    .button-row button:hover{ background:#1d1d1d; transform:translateY(-1px); }
+    .modal-note{ font-size:12px; color:#9aa0a6; }
+    .modal-header{ display:flex; flex-direction:column; gap:4px; margin-bottom:18px; }
+    .modal-header h2{ margin:0; font-size:18px; font-weight:700; letter-spacing:0.05em; text-transform:uppercase; }
   </style>
 
   <!-- NKN SDK (global window.nkn) -->
@@ -56,82 +74,89 @@
 </head>
 <body>
   <div id="hint">Click to lock • Arrows/WASD/Shift/run • Space/jump • Ctrl/crouch • Touch drag/look • Swipe↑ to jump • Scroll = 3rd→1st person</div>
+  <div id="perfHud" aria-live="polite" aria-expanded="false" role="button" tabindex="0" title="Open control center">
+    <span class="hud-fps">FPS: <span id="hudFps">60</span></span>
+    <span class="hud-qos" id="hudQos">QoS: high</span>
+  </div>
+  <div id="miniMapDock">
+    <canvas id="miniMapCanvas" width="220" height="220" aria-label="Mini map preview"></canvas>
+  </div>
 
-  <button id="menu" title="Menu" aria-label="Menu">
-    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
-      <path d="M4 6h16M4 12h16M4 18h16" stroke="#eee" stroke-width="2" stroke-linecap="round" />
-    </svg>
-  </button>
-  <button id="request" title="Enable Sensors" aria-label="Enable Sensors">
-    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
-      <path d="M12 18H12.01M9.2 21H14.8C15.9201 21 16.4802 21 16.908 20.782C17.2843 20.5903 17.5903 20.2843 17.782 19.908C18 19.4802 18 18.9201 18 17.8V6.2C18 5.0799 18 4.51984 17.782 4.09202C17.5903 3.71569 17.2843 3.40973 16.908 3.21799C16.4802 3 15.9201 3 14.8 3H9.2C8.0799 3 7.51984 3 7.09202 3.21799C6.71569 3.40973 6.40973 3.71569 6.21799 4.09202C6 4.51984 6 5.07989 6 6.2V17.8C6 18.9201 6 19.4802 6.21799 19.908C6.40973 20.2843 6.71569 20.5903 7.09202 20.782C7.51984 21 8.07989 21 9.2 21Z" stroke="#eee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    </svg>
-  </button>
-  <button id="geo" title="Enable Geolocation" aria-label="Enable Geolocation">
-    <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="none">
-      <path d="M12 2C8.686 2 6 4.686 6 8c0 5.25 6 12 6 12s6-6.75 6-12c0-3.314-2.686-6-6-6Z" stroke="#eee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      <circle cx="12" cy="8" r="2.5" fill="#eee"/>
-    </svg>
-  </button>
-
-  <!-- Backdrop + slide-out menu -->
+  <!-- Modal overlay -->
   <div id="backdrop" aria-hidden="true"></div>
-  <aside id="menuPane" aria-label="NKN Mesh Menu">
-    <h2>NKN Mesh Status</h2>
-    <div class="row">
-      <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
-      <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
+  <aside id="menuPane" aria-label="World Control Center">
+    <div class="modal-header">
+      <h2>World Control Center</h2>
+      <p class="modal-note">Tap outside this panel to close. Unlock permissions for smoother tracking.</p>
     </div>
-    <div class="tiny" id="txtSigMeta">—</div>
 
-    <div style="margin-top:10px">
+    <section class="modal-section">
+      <div class="section-title">Network Status</div>
+      <div class="row">
+        <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
+        <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
+      </div>
+      <div class="tiny" id="txtSigMeta">—</div>
       <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
       <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
-    </div>
+    </section>
 
-    <h2 style="margin-top:14px">Location</h2>
-    <div id="miniMapBlock">
-      <canvas id="miniMapCanvas" width="220" height="220" aria-label="Mini map preview"></canvas>
-      <div class="mini-map-controls">
-        <button id="miniMapRecenter" type="button">Follow: On</button>
-        <button id="miniMapSet" type="button">Set Loc</button>
+    <section class="modal-section">
+      <div class="section-title">Permissions</div>
+      <div class="button-row">
+        <button id="request" type="button">Enable Sensors</button>
+        <button id="geo" type="button">Enable Geolocation</button>
       </div>
-      <div class="mini-map-manual">
-        <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
-        <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
-        <button id="miniMapApply" type="button">Apply Manual</button>
+      <p class="modal-note">Sensors align orientation while geolocation streams your live position.</p>
+    </section>
+
+    <section class="modal-section">
+      <div class="section-title">Location</div>
+      <div id="miniMapControls">
+        <div class="mini-map-controls">
+          <button id="miniMapRecenter" type="button">Follow: On</button>
+          <button id="miniMapSet" type="button">Set Loc</button>
+        </div>
+        <div class="mini-map-manual">
+          <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
+          <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
+          <button id="miniMapApply" type="button">Apply Manual</button>
+        </div>
+        <div id="miniMapStatus" class="tiny">Determining location…</div>
       </div>
-      <div id="miniMapStatus" class="tiny">Determining location…</div>
-    </div>
+    </section>
 
-    <h2 style="margin-top:14px">Signaller</h2>
-    <div class="tiny">Primary Signaller Public Key (64-hex override)</div>
-    <input id="hexSig" class="mono" placeholder="64-hex (blank = default)" spellcheck="false" />
-    <div class="tiny">Default: <code class="mono">8ad525942fc13bdf468a640a18716cbd91ba75d3bcb0ca198f73e9cd0cf34a88</code></div>
+    <section class="modal-section">
+      <div class="section-title">Pose TX</div>
+      <div class="row">
+        <span class="kv">Hz: <b id="poseHz">0</b></span>
+        <span class="kv">Sent: <b id="poseSent">0</b></span>
+        <span class="kv">Dropped: <b id="poseDrop">0</b></span>
+        <span class="kv">Rate: <b id="poseRate">0.0</b> <span class="tiny">kbps</span></span>
+      </div>
+    </section>
 
-    <h2 style="margin-top:14px">Pose TX</h2>
-    <div class="row">
-      <span class="kv">Hz: <b id="poseHz">0</b></span>
-      <span class="kv">Sent: <b id="poseSent">0</b></span>
-      <span class="kv">Dropped: <b id="poseDrop">0</b></span>
-      <span class="kv">Rate: <b id="poseRate">0.0</b> <span class="tiny">kbps</span></span>
-    </div>
+    <section class="modal-section">
+      <div class="section-title">Local Pose</div>
+      <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
+      <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
+      <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+    </section>
 
-    <h2 style="margin-top:14px">Local Pose</h2>
-    <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
-    <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
-    <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+    <section class="modal-section">
+      <div class="section-title">Wallet</div>
+      <button id="nuke" title="Hard reset identity & caches">
+        <span class="big">⚠️ CAUTION ⚠️</span>
+        <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
+      </button>
+      <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>
+    </section>
 
-    <h2 style="margin-top:14px">Wallet</h2>
-    <button id="nuke" title="Hard reset identity & caches">
-      <span class="big">⚠️ CAUTION ⚠️</span>
-      <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
-    </button>
-    <div class="tiny" style="margin-top:6px">Generates a new NKN seed and clears caches. You will appear as a new peer.</div>
-
-    <h2 style="margin-top:14px">Peers</h2>
-    <div class="tiny" id="peerSummary">—</div>
-    <div id="peerList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px"></div>
+    <section class="modal-section">
+      <div class="section-title">Peers</div>
+      <div class="tiny" id="peerSummary">—</div>
+      <div id="peerList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px"></div>
+    </section>
   </aside>
 
   <!-- Entry points -->
