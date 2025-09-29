@@ -1,5 +1,6 @@
 import { PointerLockControls } from 'PointerLockControls';
 import { now, isMobile } from './utils.js';
+import { ui } from './ui.js';
 
 export class Input {
   constructor(sceneMgr) {
@@ -7,7 +8,8 @@ export class Input {
     this.controls = new PointerLockControls(sceneMgr.dolly, document.body);
     this.m = { f:false,b:false,l:false,r:false, run:false, crouch:false, jump:false };
 
-    document.body.addEventListener('click', () => {
+    document.body.addEventListener('click', (e) => {
+      if (ui.menuPane && ui.menuPane.style.display === 'block') return;
       if (!sceneMgr.renderer.xr.isPresenting && !isMobile) this.controls.lock();
     });
 

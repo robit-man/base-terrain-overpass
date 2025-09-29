@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { UniformHexGrid } from './grid.js';
 import { now } from './utils.js';
+import { worldToLatLon } from './geolocate.js';
 
 export class TileManager {
   constructor(scene, spacing = 5, tileRadius = 10, audio = null) {
@@ -51,9 +52,6 @@ export class TileManager {
       scene.userData._tmLightsAdded = true;
     }
 
-    document.addEventListener('gps-updated', e => {
-      if (!this.origin) { this.origin = e.detail; this._ensureType(0, 0, 'interactive'); }
-    }, { once: true });
   }
 
   /* ---------------- small helpers ---------------- */
@@ -311,7 +309,7 @@ export class TileManager {
 
     const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, metalness: .15, roughness: .45 });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
-    const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: .52, transparent: true, color: 0xa8a8a8 }));
+    const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 1, transparent: false, color: 0xa8a8a8 }));
     wire.frustumCulled = false; wire.renderOrder = 1;
 
     const group = new THREE.Group(); group.add(mesh, wire);
@@ -366,8 +364,6 @@ export class TileManager {
       return (bx*bx + bz*bz) - (ax*ax + az*az);
     });
 
-    const mLat = 111320;
-    const mLon = 111320 * Math.cos(this.origin.lat * Math.PI / 180);
     const MAX_CON = 6; let active = 0;
 
     const apply = (i, val) => {
@@ -416,8 +412,9 @@ export class TileManager {
         const i = q.shift(); active++;
         const wx = grid.group.position.x + pos.getX(i);
         const wz = grid.group.position.z + pos.getZ(i);
-        const lat = this.origin.lat + wz / mLat;
-        const lon = this.origin.lon + wx / mLon;
+        const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+        const lat = ll?.lat ?? this.origin.lat;
+        const lon = ll?.lon ?? this.origin.lon;
         fetch(`https://epqs.nationalmap.gov/v1/json?x=${lon}&y=${lat}&wkid=4326&units=Meters`)
           .then(r => r.json()).then(d => apply(i, d?.value ?? 0))
           .catch(() => apply(i, 0));
@@ -443,10 +440,9 @@ export class TileManager {
   }
 
   _enqueueVisualFetch(tile, i, wx, wz) {
-    const mLat = 111320;
-    const mLon = 111320 * Math.cos(this.origin.lat * Math.PI / 180);
-    const lat = this.origin.lat + wz / mLat;
-    const lon = this.origin.lon + wx / mLon;
+    const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+    const lat = ll?.lat ?? this.origin.lat;
+    const lon = ll?.lon ?? this.origin.lon;
 
     tile.pending++;
     this._visFetchQ.push({ tileId: `${tile.q},${tile.r}`, i, lat, lon });
@@ -463,7 +459,10 @@ export class TileManager {
         .then(r => r.json())
         .then(j => this._applyVisualSample(tile, job.i, Number.isFinite(j?.value) ? j.value : 0))
         .catch(() => this._applyVisualSample(tile, job.i, 0))
-        .finally(() => { this._visFetchActive--; this._drainVisualFetchQ(); });
+        .finally(() => {
+          this._visFetchActive = Math.max(0, this._visFetchActive - 1);
+          this._drainVisualFetchQ();
+        });
     }
   }
 
@@ -576,6 +575,22 @@ export class TileManager {
          : this._addVisualTile(q, r);
   }
 
+  setOrigin(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    const changed =
+      !this.origin ||
+      Math.abs(lat - this.origin.lat) > 1e-6 ||
+      Math.abs(lon - this.origin.lon) > 1e-6;
+
+    this.origin = { lat, lon };
+
+    if (changed) {
+      this._resetAllTiles();
+      this._ensureType(0, 0, 'interactive');
+    }
+  }
+
   _discardTile(id) {
     const t = this.tiles.get(id);
     if (!t) return;
@@ -587,6 +602,21 @@ export class TileManager {
     } catch { /* noop */ }
     this.tiles.delete(id);
     this._markRelaxListDirty();
+  }
+
+  _resetAllTiles() {
+    for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
+    this.tiles.clear();
+    this._visFetchQ.length = 0;
+    this._visFetchActive = 0;
+    this.GLOBAL_MIN_Y = +Infinity;
+    this.GLOBAL_MAX_Y = -Infinity;
+    this._globalDirty = true;
+    this._lastRecolorAt = 0;
+    this._relaxKeys = [];
+    this._relaxCursor = 0;
+    this._relaxKeysDirty = true;
+    this._lastHeight = 0;
   }
 
   _markRelaxListDirty() {

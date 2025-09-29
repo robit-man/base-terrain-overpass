@@ -13,11 +13,14 @@ export class AudioEngine {
     this.refDistance = 18;
     this.rolloff = 2.0;
     this.duration = 0.08;
+    this.impactDuration = 0.22;
+    this.impactVolume = 0.22;
     this.MAX_VOICES = 64;
     this._voices = 0;
 
     // Prebuild a few short brown-noise scratch buffers
-    this._buffers = this._makeScratchBuffers(3);
+    this._scratchBuffers = this._makeScratchBuffers(3);
+    this._impactBufferCache = new Map();
 
     const resume = () => {
       try { this.ctx.resume?.(); } catch { }
@@ -62,7 +65,7 @@ export class AudioEngine {
     this.scene.add(holder);
 
     const snd = new THREE.PositionalAudio(this.listener);
-    const buf = this._buffers[(Math.random() * this._buffers.length) | 0];
+    const buf = this._scratchBuffers[(Math.random() * this._scratchBuffers.length) | 0];
     snd.setBuffer(buf);
     snd.setRefDistance(this.refDistance);
     snd.setRolloffFactor(this.rolloff);
@@ -77,6 +80,60 @@ export class AudioEngine {
     try { snd.play(); } catch { }
 
     const ms = (this.duration / rate) * 1000 + 60;
+    setTimeout(() => {
+      try { snd.stop(); } catch { }
+      holder.remove(snd);
+      this.scene.remove(holder);
+      this._voices = Math.max(0, this._voices - 1);
+    }, ms);
+  }
+
+  _getImpactBuffer(frequency = 340, roughness = 0.3, duration = this.impactDuration) {
+    const key = `${Math.round(frequency)}:${Math.round(roughness * 100)}:${duration.toFixed(2)}`;
+    if (this._impactBufferCache.has(key)) return this._impactBufferCache.get(key);
+
+    const sr = this.ctx.sampleRate;
+    const len = Math.max(1, Math.floor(sr * duration));
+    const buffer = this.ctx.createBuffer(1, len, sr);
+    const data = buffer.getChannelData(0);
+
+    const omega = (2 * Math.PI * frequency) / sr;
+    let phase = 0;
+    const rough = THREE.MathUtils.clamp(roughness, 0, 1);
+
+    for (let i = 0; i < len; i++) {
+      const t = i / len;
+      const attack = Math.min(1, t * 32);
+      const decay = Math.pow(1 - t, 3);
+      phase += omega;
+      let sample = Math.sin(phase);
+      if (rough > 0) sample = sample * (1 - rough) + (Math.random() * 2 - 1) * rough;
+      data[i] = sample * attack * decay;
+    }
+
+    this._impactBufferCache.set(key, buffer);
+    return buffer;
+  }
+
+  triggerImpact(x, y, z, { intensity = 1, frequency = 360, roughness = 0.35, decay = this.impactDuration } = {}) {
+    if (!this._enabled || !this.listener || this._voices >= this.MAX_VOICES) return;
+
+    const holder = new THREE.Object3D();
+    holder.position.set(x, y, z);
+    this.scene.add(holder);
+
+    const snd = new THREE.PositionalAudio(this.listener);
+    const buf = this._getImpactBuffer(frequency, roughness, decay);
+    snd.setBuffer(buf);
+    snd.setRefDistance(this.refDistance * 0.85);
+    snd.setRolloffFactor(this.rolloff * 0.9);
+    snd.setVolume(this.impactVolume * THREE.MathUtils.clamp(intensity, 0.05, 4));
+
+    holder.add(snd);
+    this._voices++;
+    try { snd.play(); } catch { }
+
+    const ms = decay * 1000 + 80;
     setTimeout(() => {
       try { snd.stop(); } catch { }
       holder.remove(snd);

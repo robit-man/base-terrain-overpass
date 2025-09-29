@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { metresPerDegree } from './geolocate.js';
 
 const FEATURES = {
   BUILDINGS: true,
@@ -17,14 +18,6 @@ const BUILD_FRAME_BUDGET_MS = 2.0; // ms budget to spend per frame on feature bu
 const BUILD_IDLE_BUDGET_MS = 8.0; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 1.0; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 1.5; // ms per frame allotted to resnap tiles
-
-function metresPerDegree(lat) {
-  const phi = THREE.MathUtils.degToRad(lat);
-  return {
-    dLat: 111132.92 - 559.82 * Math.cos(2 * phi) + 1.175 * Math.cos(4 * phi),
-    dLon: 111412.84 * Math.cos(phi) - 93.5 * Math.cos(3 * phi),
-  };
-}
 
 function averagePoint(flat) {
   let sx = 0;
@@ -101,8 +94,17 @@ export class BuildingManager {
     radius = 800,
     tileSize,
     color = 0xffffff,
-    roadWidth = 14,
+    roadWidth = 6,
     roadOffset = 0.06,
+    roadStep = 8,              // avg metres between samples (was hard-coded 1.25)
+    roadAdaptive = true,       // adapt step on sharp turns
+    roadMinStep = 6,           // smallest step on sharp curves
+    roadMaxStep = 16,          // largest step on straights
+    roadAngleThresh = 0.35,    // ~20°: angles above this count as “sharp”
+    roadMaxSegments = 400,     // hard cap: max centerline points per road
+    roadLit = false,           // unlit by default (faster)
+    roadShadows = false,       // disable shadows on roads
+    roadColor = 0x222222,      // default color
     extraDepth = 0.02,
     extensionHeight = 2,
     maxConcurrentFetches = 1, // retained for API compatibility
@@ -115,6 +117,15 @@ export class BuildingManager {
     this.color = color;
     this.roadWidth = roadWidth;
     this.roadOffset = roadOffset;
+    this.roadStep = roadStep;
+    this.roadAdaptive = roadAdaptive;
+    this.roadMinStep = roadMinStep;
+    this.roadMaxStep = roadMaxStep;
+    this.roadAngleThresh = roadAngleThresh;
+    this.roadMaxSegments = roadMaxSegments;
+    this.roadLit = roadLit;
+    this.roadShadows = roadShadows;
+    this.roadColor = roadColor;
     this.roadHeightOffset = 0.12;
     this.extraDepth = extraDepth;
     this.extensionHeight = extensionHeight;
@@ -140,12 +151,17 @@ export class BuildingManager {
     this._hoverLabelCtx = null;
     this._hoverLabelTexture = null;
     this._hoverInfo = null;
+    this.physics = null;
 
     this.lat0 = null;
     this.lon0 = null;
     this.lat = null;
     this.lon = null;
     this._hasOrigin = false;
+
+    // NOTE: signs UI kept for compatibility, but solids auto-align to wires now.
+    this.solidSign = [1, 1, 1, 1, 1, 1];
+    //this._initSolidSignUI?.() || (this._initSolidSignUI = this._makeSolidSignUI.bind(this), this._initSolidSignUI());
 
     this._tileStates = new Map();
     this._neededTiles = new Set();
@@ -181,6 +197,109 @@ export class BuildingManager {
 
     this._cachePrefix = `${CACHE_PREFIX}:${this.tileSize}:`;
   }
+
+  setPhysicsEngine(physics) {
+    this.physics = physics || null;
+    if (!this.physics) return;
+    for (const state of this._tileStates.values()) {
+      if (!state?.buildings) continue;
+      for (const building of state.buildings) {
+        if (building?.solid) this.physics.registerStaticMesh(building.solid, { forceUpdate: true });
+      }
+    }
+  }
+
+  // ——————————————————————————————————————————————————————————
+  // UI (still present, but flipping does not break alignment anymore)
+  _makeSolidSignUI() {
+    if (typeof document === 'undefined') return;
+
+    const labels = ['rx', 'ry', 'sx', 'sy', 'sz', 'ty'];
+    const panel = document.createElement('div');
+    panel.style.cssText = `
+      position:fixed; left:12px; top:12px; z-index:99999;
+      font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background:rgba(20,20,20,0.75); color:#fff; padding:8px 10px; border-radius:8px;
+      box-shadow:0 4px 12px rgba(0,0,0,0.25); backdrop-filter: blur(2px);
+      user-select:none;
+    `;
+
+    const title = document.createElement('div');
+    title.textContent = 'Solid Signs (auto-aligned)';
+    title.style.cssText = 'font-weight:600; margin-bottom:6px;';
+    panel.appendChild(title);
+
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:6px; flex-wrap:wrap;';
+    panel.appendChild(row);
+
+    const chips = [];
+    const rebuild = () => {
+      chips.forEach((c, i) => c.textContent = `${labels[i]}:${this.solidSign[i] > 0 ? '+' : '−'}`);
+      // Rebuild solids & picks (wireframe stays canonical)
+      this._rebuildAllSolids();
+    };
+
+    labels.forEach((lab, i) => {
+      const chip = document.createElement('button');
+      chip.textContent = `${lab}:${this.solidSign[i] > 0 ? '+' : '−'}`;
+      chip.style.cssText = `
+        cursor:pointer; border:none; border-radius:6px; padding:6px 8px;
+        background:#2a2a2a; color:#fff; font-weight:600;
+      `;
+      chip.onclick = () => {
+        this.solidSign[i] = this.solidSign[i] === 1 ? -1 : 1;
+        rebuild();
+      };
+      chips.push(chip);
+      row.appendChild(chip);
+    });
+
+    const reset = document.createElement('button');
+    reset.textContent = 'reset';
+    reset.style.cssText = `
+      margin-left:8px; cursor:pointer; border:none; border-radius:6px; padding:6px 8px;
+      background:#444; color:#fff; font-weight:600;
+    `;
+    reset.onclick = () => {
+      this.solidSign = [1, 1, 1, 1, 1, 1];
+      rebuild();
+    };
+    panel.appendChild(document.createElement('div')).style.cssText = 'height:6px;';
+    panel.appendChild(reset);
+
+    document.body.appendChild(panel);
+    this._solidSignPanel = panel;
+  }
+
+  _rebuildAllSolids() {
+    for (const state of this._tileStates.values()) {
+      if (!state?.buildings?.length) continue;
+      for (const b of state.buildings) this._rebuildSolidAndPick(b);
+    }
+  }
+
+  _rebuildSolidAndPick(building) {
+    if (!building || !building.info) return;
+    const info = building.info;
+    // Regenerate solid/pick geometry straight from footprint → exact overlay
+    const solidGeo = this._makeSolidGeometry(info.rawFootprint, info.height);
+
+    if (building.solid) {
+      building.solid.geometry.dispose();
+      building.solid.geometry = solidGeo.clone();
+      building.solid.position.y = info.baseHeight + this.extraDepth;
+      building.solid.updateMatrixWorld(true);
+      this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
+    }
+    if (building.pick) {
+      building.pick.geometry.dispose();
+      building.pick.geometry = solidGeo.clone();
+      building.pick.position.y = info.baseHeight + this.extraDepth;
+      building.pick.updateMatrixWorld(true);
+    }
+  }
+  // ——————————————————————————————————————————————————————————
 
   setOrigin(lat, lon) {
     const baseLat = this.tileManager?.origin?.lat ?? lat;
@@ -438,61 +557,77 @@ export class BuildingManager {
     this._enqueueBuildJob(job);
   }
 
+  // ——————————————————————————————————————————————————————————
+  // BUILDINGS
+
   _buildBuilding(flat, tags, id) {
     const rawFootprint = flat.slice();
-    const dense = this._densifyPolygon(flat, 1.5);
-    if (dense.length < 6) return null;
-
-    const shape = new THREE.Shape();
-    for (let i = 0; i < dense.length; i += 2) {
-      const x = dense[i];
-      const z = dense[i + 1];
-      if (i === 0) shape.moveTo(x, z);
-      else shape.lineTo(x, z);
-    }
-    shape.autoClose = true;
+    if (rawFootprint.length < 6) return null;
 
     const height = this._chooseBuildingHeight(tags);
     const extrusion = height + this.extensionHeight;
 
-    const geo = new THREE.ExtrudeGeometry(shape, {
-      depth: extrusion,
-      bevelEnabled: false,
-    })
-      .rotateX(-Math.PI / 2)
-      .translate(0, -this.extraDepth, 0);
-
-    const baseline = this._lowestGround(flat) + this.extraDepth;
+    const baseline = this._lowestGround(rawFootprint) + this.extraDepth;
     const groundBase = baseline - this.extraDepth;
+
+    // Wireframe (canonical reference)
     const wireGeom = this._makeWireGeometry(rawFootprint, groundBase, extrusion);
     const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
-    edges.position.set(0, 0, 0);
     edges.castShadow = false;
     edges.receiveShadow = false;
 
-    const address = formatAddress(tags);
+    // Solid + picker: generated directly from same footprint, upright, no funny business
+    const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
 
-    const pickMesh = new THREE.Mesh(geo.clone(), this._pickMaterial);
+    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
     pickMesh.position.set(0, baseline, 0);
 
-    const centroid = averagePoint(dense);
+    const fillMat = this._buildingFillMaterial || (
+      this._buildingFillMaterial = new THREE.MeshBasicMaterial({
+        color: 0x222222,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+        side: THREE.DoubleSide,
+      })
+    );
+    const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
+    solidMesh.position.set(0, baseline, 0);
+    solidMesh.renderOrder = 1;
 
-    const info = {
-      id,
-      address,
-      rawFootprint,
-      height: extrusion,
-      baseHeight: groundBase,
-      centroid,
-      tags: { ...tags },
-      tile: null,
-    };
+    const centroid = averagePoint(rawFootprint);
+    const address = formatAddress(tags);
+    const info = { id, address, rawFootprint, height: extrusion, baseHeight: groundBase, centroid, tags: { ...tags }, tile: null };
 
-    pickMesh.userData.buildingInfo = info;
     edges.userData.buildingInfo = info;
+    pickMesh.userData.buildingInfo = info;
+    solidMesh.userData.buildingInfo = info;
 
-    return { render: edges, pick: pickMesh, info };
+    return { render: edges, solid: solidMesh, pick: pickMesh, info };
   }
+
+  // Build a vertical prism from the 2D footprint that exactly overlays the wireframe
+  _makeSolidGeometry(footprint, height) {
+    const shape = new THREE.Shape();
+    for (let i = 0; i < footprint.length; i += 2) {
+      const x = footprint[i];
+      const z = footprint[i + 1];
+      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
+    }
+    shape.autoClose = true;
+
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+    // rotate to XZ (Y up) then undo the Z mirror introduced by the rotation
+    geo.rotateX(-Math.PI / 2).scale(1, 1, -1);
+    geo.computeBoundingSphere();
+    geo.computeBoundingBox();
+    return geo;
+  }
+
+  // ——————————————————————————————————————————————————————————
 
   _enqueueMerge(tileKey) {
     if (this._pendingMergeTiles.has(tileKey)) return;
@@ -597,13 +732,16 @@ export class BuildingManager {
       case 'building': {
         const building = this._buildBuilding(feature.flat, feature.tags, feature.id);
         if (!building) return;
-        const { render, pick, info } = building;
+        const { render, solid, pick, info } = building;
         info.tile = tileKey;
         this.group.add(render);
+        if (solid) this.group.add(solid);
         this._pickerRoot.add(pick);
         render.updateMatrixWorld(true);
         pick.updateMatrixWorld(true);
+        if (solid) solid.updateMatrixWorld(true);
         this._resnapBuilding(building);
+        if (solid && this.physics) this.physics.registerStaticMesh(solid, { forceUpdate: true });
         state.buildings.push(building);
         break;
       }
@@ -654,8 +792,8 @@ export class BuildingManager {
         : '';
     console.log(
       `[Buildings] applied ${builtBuildings} buildings + ${builtExtras} extras for ${job.tileKey}` +
-        (job.fromCache ? ' (cache)' : '') +
-        mismatch
+      (job.fromCache ? ' (cache)' : '') +
+      mismatch
     );
   }
 
@@ -698,7 +836,6 @@ export class BuildingManager {
     while (job.index < job.sources.length) {
       const b = job.sources[job.index++];
       if (!b.render) continue;
-      // we only need to ensure matrixWorld up-to-date
       b.render.updateMatrixWorld(true);
       const elapsed = performance.now() - start;
       if (elapsed > MERGE_BUDGET_MS) break;
@@ -793,7 +930,6 @@ export class BuildingManager {
     }
     if (this._hoverStem) {
       this._hoverStem.geometry.dispose();
-      this._hoverStem.geometry = new THREE.BufferGeometry();
       this._hoverStem.visible = false;
     }
     if (this._hoverLabel) this._hoverLabel.visible = false;
@@ -855,6 +991,9 @@ export class BuildingManager {
     const texture = new THREE.CanvasTexture(canvas);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
+    texture.generateMipmaps = false;               // avoids blurry downsizing
+    texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+
     const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
     const geometry = new THREE.PlaneGeometry(1.6, 0.6);
     const label = new THREE.Mesh(geometry, material);
@@ -871,26 +1010,131 @@ export class BuildingManager {
     this._hoverGroup.add(label);
   }
 
+  _roundRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, w * 0.5, h * 0.5);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.lineTo(x + w - rr, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    ctx.lineTo(x + w, y + h - rr);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    ctx.lineTo(x + rr, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    ctx.lineTo(x, y + rr);
+    ctx.quadraticCurveTo(x, y, x + rr, y);
+    ctx.closePath();
+  }
+
+  _wrapText(ctx, text, maxWidth) {
+    const words = String(text || '').split(/\s+/);
+    const lines = [];
+    let cur = '';
+
+    for (let i = 0; i < words.length; i++) {
+      const test = cur ? cur + ' ' + words[i] : words[i];
+      if (ctx.measureText(test).width <= maxWidth) {
+        cur = test;
+      } else {
+        if (cur) lines.push(cur);
+        // If single word is too long, hard-break it
+        let w = words[i];
+        if (ctx.measureText(w).width > maxWidth) {
+          let piece = '';
+          for (let j = 0; j < w.length; j++) {
+            const test2 = piece + w[j];
+            if (ctx.measureText(test2).width <= maxWidth) piece = test2;
+            else { lines.push(piece); piece = w[j]; }
+          }
+          cur = piece;
+        } else {
+          cur = w;
+        }
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+
+  _ellipsize(ctx, text, maxWidth) {
+    const E = '…';
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    while (text.length > 0 && ctx.measureText(text + E).width > maxWidth) {
+      text = text.slice(0, -1);
+    }
+    return text ? text + E : E;
+  }
+
+
   _updateLabelText(text) {
     if (!this._hoverLabelCtx || !this._hoverLabelTexture) return;
+
     const ctx = this._hoverLabelCtx;
     const canvas = this._hoverLabelCanvas;
+
+    // Hi-DPI crispness without going nuts
+    const DPR = (typeof window !== 'undefined') ? Math.min(window.devicePixelRatio || 1, 2) : 1;
+    // If you didn’t change the base size above, you can scale it here instead:
+    // canvas.width = 512 * DPR; canvas.height = 256 * DPR;
+
+    // Style & layout knobs
+    const PAD = 28 * DPR;
+    const MAX_LINES = 3;
+    const BASE_FONT = 56 * DPR;
+    const MIN_FONT = 28 * DPR;
+    const LINE_GAP = 1.15;  // line-height multiplier
+    const RADIUS = 18 * DPR;
+
+    // Clear & draw background (rounded rectangle looks nicer)
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = 'rgba(18,18,18,0.82)';
-    const pad = 24;
-    ctx.fillRect(pad / 2, pad / 2, canvas.width - pad, canvas.height - pad);
+    this._roundRect(ctx, PAD * 0.5, PAD * 0.5, canvas.width - PAD, canvas.height - PAD, RADIUS);
+    ctx.fill();
+
+    // Fit text: shrink font until it fits in <= MAX_LINES, then ellipsize last line if necessary
+    const maxTextWidth = canvas.width - PAD * 2;
+    let fontSize = BASE_FONT;
+    let lines = [];
+
+    while (fontSize >= MIN_FONT) {
+      ctx.font = `700 ${fontSize}px "Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      lines = this._wrapText(ctx, String(text || ''), maxTextWidth);
+      if (lines.length <= MAX_LINES) break;
+      fontSize -= 2 * DPR;
+    }
+
+    if (lines.length > MAX_LINES) {
+      lines = lines.slice(0, MAX_LINES);
+      // Ellipsize the last line
+      lines[MAX_LINES - 1] = this._ellipsize(ctx, lines[MAX_LINES - 1], maxTextWidth);
+    }
+
+    // Vertical layout
+    const lineHeight = fontSize * LINE_GAP;
+    const totalHeight = lines.length * lineHeight;
+    let y = (canvas.height - totalHeight) * 0.5 + lineHeight * 0.5;
+
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 56px "Inter", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillText(lines[i], canvas.width * 0.5, y);
+      y += lineHeight;
+    }
+
     this._hoverLabelTexture.needsUpdate = true;
 
-    const metrics = ctx.measureText(text);
-    const w = THREE.MathUtils.clamp(metrics.width / canvas.width, 0.2, 0.85);
-    const width = 1.6 + w * 1.5;
-    this._hoverLabel.scale.set(width, 0.75, 1);
+    // Keep plane aspect correct: scale X and Y together based on canvas aspect and line count
+    const aspect = canvas.width / canvas.height;
+
+    // Base geometry is 1.6 (w) x 0.6 (h). We choose a target world height that grows a bit with line count.
+    const baseW = 1.6, baseH = 0.6;
+    const worldH = 0.55 + 0.12 * (lines.length - 1);  // 1 line ≈ 0.55, 2 lines ≈ 0.67, 3 lines ≈ 0.79
+    const worldW = worldH * aspect;
+
+    this._hoverLabel.scale.set(worldW / baseW, worldH / baseH, 1);
   }
+
 
   _buildHighlightGeometry(info) {
     return this._makeWireGeometry(info.rawFootprint, info.baseHeight, info.height);
@@ -982,6 +1226,11 @@ export class BuildingManager {
       building.render.position.set(0, 0, 0);
       building.render.updateMatrixWorld(true);
     }
+    if (building.solid) {
+      building.solid.position.y = baseline;
+      building.solid.updateMatrixWorld(true);
+      this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
+    }
     if (building.pick) {
       building.pick.position.y = baseline;
       building.pick.updateMatrixWorld(true);
@@ -1006,7 +1255,7 @@ export class BuildingManager {
       arr[i + 2] = z;
     }
     attr.needsUpdate = true;
-    mesh.geometry.computeVertexNormals();
+    if (this.roadLit) mesh.geometry.computeVertexNormals(); // skip for MeshBasicMaterial
   }
 
   _resnapWater(mesh) {
@@ -1027,15 +1276,15 @@ export class BuildingManager {
     const geomData = this._makeRoadGeometry(flat);
     if (!geomData) return null;
     const { geo, basePos, center } = geomData;
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0xd8d8d8,
-      metalness: 0.4,
-      roughness: 0.25,
-      emissive: 0x000000,
-    });
+
+    const mat = this.roadLit
+      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.25 })
+      : new THREE.MeshBasicMaterial({ color: this.roadColor }); // unlit = no normals
+
     const mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
+    mesh.castShadow = !!this.roadShadows;
+    mesh.receiveShadow = !!this.roadShadows;
+
     mesh.userData.type = 'road';
     mesh.userData.osmId = id;
     mesh.userData.basePos = basePos;
@@ -1177,10 +1426,31 @@ export class BuildingManager {
 
   _makeRoadGeometry(flat) {
     if (flat.length < 4) return null;
-    const line = this._densifyLine(flat, 1.25);
+
+    // 1) Adaptive / fixed resampling with coarser step
+    let line = this.roadAdaptive
+      ? this._densifyLineAdaptive(flat, this.roadMinStep, this.roadMaxStep, this.roadAngleThresh)
+      : this._densifyLine(flat, this.roadStep);
+
+    // 2) Hard cap on segments
+    if ((line.length / 2) > this.roadMaxSegments) {
+      const stride = Math.ceil((line.length / 2) / this.roadMaxSegments);
+      const filtered = [];
+      for (let i = 0; i < line.length; i += 2 * stride) {
+        filtered.push(line[i], line[i + 1]);
+      }
+      // keep the last point
+      const L = line.length;
+      if (filtered[filtered.length - 2] !== line[L - 2] || filtered[filtered.length - 1] !== line[L - 1]) {
+        filtered.push(line[L - 2], line[L - 1]);
+      }
+      line = filtered;
+    }
+
     const segments = line.length / 2;
     if (segments < 2) return null;
 
+    // Heights (unchanged)
     const rawH = new Float32Array(segments);
     const smH = new Float32Array(segments);
     for (let i = 0, j = 0; i < segments; i++, j += 2) {
@@ -1194,9 +1464,7 @@ export class BuildingManager {
     const centres = [];
 
     for (let i = 0, j = 0; i < segments; i++, j += 2) {
-      const cx = line[j];
-      const cz = line[j + 1];
-      const cy = smH[i];
+      const cx = line[j], cz = line[j + 1], cy = smH[i];
       centres.push(new THREE.Vector3(cx, cy, cz));
     }
 
@@ -1217,7 +1485,9 @@ export class BuildingManager {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     geo.setIndex(idx);
-    geo.computeVertexNormals();
+
+    if (this.roadLit) geo.computeVertexNormals();
+    geo.getAttribute('position').setUsage(THREE.DynamicDrawUsage);
 
     const basePos = new Float32Array(pos);
     const centre = centres[Math.floor(centres.length / 2)] ?? { x: 0, z: 0 };
@@ -1257,6 +1527,42 @@ export class BuildingManager {
         out.push(x0 + dx * t, z0 + dz * t);
       }
     }
+    return out;
+  }
+
+  _densifyLineAdaptive(base, minStep = 6, maxStep = 16, angleThresh = 0.35) {
+    const out = [];
+    const n = base.length / 2;
+    if (n < 2) return base.slice();
+
+    const v = (i) => ({ x: base[i * 2], z: base[i * 2 + 1] });
+    for (let i = 0; i < n - 1; i++) {
+      const p0 = i > 0 ? v(i - 1) : v(i);
+      const p1 = v(i);
+      const p2 = v(i + 1);
+
+      let ax = p1.x - p0.x, az = p1.z - p0.z;
+      let bx = p2.x - p1.x, bz = p2.z - p1.z;
+      const al = Math.hypot(ax, az) || 1;
+      const bl = Math.hypot(bx, bz) || 1;
+      ax /= al; az /= al; bx /= bl; bz /= bl;
+
+      const dot = Math.max(-1, Math.min(1, ax * bx + az * bz));
+      const theta = Math.acos(dot);
+
+      const t = Math.min(1, theta / angleThresh);
+      const step = maxStep - (maxStep - minStep) * t;
+
+      const dx = p2.x - p1.x, dz = p2.z - p1.z;
+      const len = Math.hypot(dx, dz);
+      const seg = Math.max(1, Math.ceil(len / step));
+      for (let s = 0; s < seg; s++) {
+        const u = s / seg;
+        out.push(p1.x + dx * u, p1.z + dz * u);
+      }
+    }
+
+    out.push(base[base.length - 2], base[base.length - 1]);
     return out;
   }
 
@@ -1309,10 +1615,14 @@ export class BuildingManager {
     const minZ = tz * this.tileSize;
     const maxZ = (tz + 1) * this.tileSize;
     const { dLat, dLon } = metresPerDegree(this.lat0);
-    const minLon = this.lon0 + minX / dLon;
-    const maxLon = this.lon0 + maxX / dLon;
-    const minLat = this.lat0 + minZ / dLat;
-    const maxLat = this.lat0 + maxZ / dLat;
+    const lonA = this.lon0 + minX / dLon;
+    const lonB = this.lon0 + maxX / dLon;
+    const latA = this.lat0 - minZ / dLat;
+    const latB = this.lat0 - maxZ / dLat;
+    const minLat = Math.min(latA, latB);
+    const maxLat = Math.max(latA, latB);
+    const minLon = Math.min(lonA, lonB);
+    const maxLon = Math.max(lonA, lonB);
     return [minLat, minLon, maxLat, maxLon];
   }
 
@@ -1320,7 +1630,7 @@ export class BuildingManager {
     const { dLat, dLon } = metresPerDegree(this.lat0);
     return {
       x: (lon - this.lon0) * dLon,
-      z: (lat - this.lat0) * dLat,
+      z: (this.lat0 - lat) * dLat,
     };
   }
 
@@ -1415,6 +1725,12 @@ export class BuildingManager {
         this.group.remove(building.render);
         building.render.geometry.dispose();
         building.render = null;
+      }
+      if (building.solid) {
+        this.physics?.unregisterStaticMesh(building.solid);
+        this.group.remove(building.solid);
+        building.solid.geometry?.dispose?.();
+        building.solid = null;
       }
       if (building.pick) {
         this._pickerRoot.remove(building.pick);

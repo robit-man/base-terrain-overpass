@@ -26,6 +26,15 @@
       background:repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px); box-shadow:0 3px 0 #000, inset 0 0 0 3px #ffd400; }
     #nuke .big{ display:block; font-size:20px; letter-spacing:1px }
     #nuke .sub{ display:block; font-size:12px; font-weight:700 }
+    #miniMapBlock{ display:flex; flex-direction:column; gap:8px; background:#0006; border:1px solid #222; padding:10px; border-radius:12px }
+    #miniMapCanvas{ filter:saturate(0)hue-rotate(180deg)invert(0.9)contrast(1.2);width:100%; max-width:260px; aspect-ratio:1; border-radius:10px; background:#111; border:1px solid #333; display:block }
+    .mini-map-controls{ display:flex; gap:8px }
+    .mini-map-controls button{ flex:1; border:1px solid #333; background:#111; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
+    .mini-map-controls button:hover{ background:#1d1d1d }
+    .mini-map-manual{ display:flex; flex-wrap:wrap; gap:6px }
+    .mini-map-manual input{ flex:1 1 120px }
+    .mini-map-manual button{ flex:1 1 110px; border:1px solid #333; background:#181818; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
+    .mini-map-manual button:hover{ background:#232323 }
   </style>
 
   <!-- NKN SDK (global window.nkn) -->
@@ -77,6 +86,21 @@
     <div style="margin-top:10px">
       <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
       <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
+    </div>
+
+    <h2 style="margin-top:14px">Location</h2>
+    <div id="miniMapBlock">
+      <canvas id="miniMapCanvas" width="220" height="220" aria-label="Mini map preview"></canvas>
+      <div class="mini-map-controls">
+        <button id="miniMapRecenter" type="button">Follow: On</button>
+        <button id="miniMapSet" type="button">Set Loc</button>
+      </div>
+      <div class="mini-map-manual">
+        <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
+        <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
+        <button id="miniMapApply" type="button">Apply Manual</button>
+      </div>
+      <div id="miniMapStatus" class="tiny">Determining location…</div>
     </div>
 
     <h2 style="margin-top:14px">Signaller</h2>

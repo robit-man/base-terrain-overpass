@@ -7,7 +7,11 @@ export class SceneManager {
     this.renderer.setSize(innerWidth, innerHeight);
     this.renderer.setPixelRatio(devicePixelRatio);
     this.renderer.xr.enabled = true;
-    this.renderer.xr.setReferenceSpaceType?.('local');
+    try {
+      this.renderer.xr.setReferenceSpaceType?.('local-floor');
+    } catch (_) {
+      this.renderer.xr.setReferenceSpaceType?.('local');
+    }
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 

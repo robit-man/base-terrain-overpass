@@ -36,8 +36,8 @@ export class UniformHexGrid {
       color: 0x2f2f33,
       metalness: 0.35,
       roughness: 0.85,
-      transparent: true,
-      opacity: 0.55,
+      transparent: false,
+      opacity: 1,
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(this.geometry, mat);
@@ -47,8 +47,8 @@ export class UniformHexGrid {
     const wireMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       wireframe: true,
-      opacity: 0.9,
-      transparent: true,
+      opacity: 1,
+      transparent: false,
       depthWrite: false,
     });
     const wire = new THREE.Mesh(this.geometry, wireMat);

@@ -136,7 +136,12 @@ export class GeoButton {
   ask() {
     navigator.geolocation.getCurrentPosition(p => {
       document.dispatchEvent(new CustomEvent('gps-updated', {
-        detail: { lat: p.coords.latitude, lon: p.coords.longitude }
+        detail: {
+          lat: p.coords.latitude,
+          lon: p.coords.longitude,
+          accuracy: p.coords.accuracy,
+          source: 'device'
+        }
       }));
     }, () => { /* ignore */ }, { enableHighAccuracy: true });
   }

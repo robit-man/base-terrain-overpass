@@ -42,6 +42,7 @@ export class Avatar {
         if (obj.material && 'metalness' in obj.material) {
           obj.material.metalness = 0.2;
           obj.material.roughness = 0.6;
+          obj.material.wireframe = true;
         }
       }
     });
