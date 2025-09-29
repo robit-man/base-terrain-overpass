@@ -98,10 +98,10 @@ export class BuildingManager {
     roadOffset = 0.06,
     roadStep = 8,              // avg metres between samples (was hard-coded 1.25)
     roadAdaptive = true,       // adapt step on sharp turns
-    roadMinStep = 6,           // smallest step on sharp curves
-    roadMaxStep = 16,          // largest step on straights
+    roadMinStep = 12,           // smallest step on sharp curves
+    roadMaxStep = 24,          // largest step on straights
     roadAngleThresh = 0.35,    // ~20°: angles above this count as “sharp”
-    roadMaxSegments = 400,     // hard cap: max centerline points per road
+    roadMaxSegments = 200,     // hard cap: max centerline points per road
     roadLit = false,           // unlit by default (faster)
     roadShadows = false,       // disable shadows on roads
     roadColor = 0x222222,      // default color

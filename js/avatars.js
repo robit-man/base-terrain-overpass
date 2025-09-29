@@ -4,6 +4,57 @@ import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 
 const MODEL_URL = 'https://threejs.org/examples/models/gltf/Soldier.glb';
 
+function buildFallbackTemplate() {
+  const root = new THREE.Group();
+
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3a82f7, metalness: 0.15, roughness: 0.65 });
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xffd8b5, metalness: 0.05, roughness: 0.4 });
+
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.32, 1.05, 12, 18), bodyMat);
+  body.castShadow = true; body.receiveShadow = true;
+  root.add(body);
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.24, 18, 14), headMat);
+  head.castShadow = true; head.receiveShadow = true;
+  head.position.y = 0.95 + 0.24 + 0.05; // sit just above body top
+  root.add(head);
+
+  const visor = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.18, 0.08, 12, 1, true), new THREE.MeshStandardMaterial({ color: 0x222831, metalness: 0.6, roughness: 0.2, side: THREE.DoubleSide }));
+  visor.rotation.z = Math.PI / 2;
+  visor.position.set(0, head.position.y + 0.02, 0.18);
+  root.add(visor);
+
+  // Arms (simple sticks)
+  const armGeo = new THREE.CapsuleGeometry(0.09, 0.65, 8, 12);
+  const armL = new THREE.Mesh(armGeo, bodyMat);
+  armL.rotation.z = Math.PI / 2;
+  armL.position.set(0.46, 0.45, 0);
+  armL.castShadow = armL.receiveShadow = true;
+  root.add(armL);
+  const armR = armL.clone(); armR.position.x = -0.46; root.add(armR);
+
+  // Legs (two shorter capsules)
+  const legGeo = new THREE.CapsuleGeometry(0.11, 0.8, 10, 16);
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x2d2f3a, metalness: 0.1, roughness: 0.7 });
+  const legL = new THREE.Mesh(legGeo, legMat);
+  legL.position.set(0.18, -0.7, 0);
+  legL.castShadow = legL.receiveShadow = true;
+  root.add(legL);
+  const legR = legL.clone(); legR.position.x = -0.18; root.add(legR);
+
+  // Ensure feet rest on y=0 plane
+  const bounds = new THREE.Box3().setFromObject(root);
+  const min = bounds.min.clone();
+  root.position.y -= min.y;
+
+  const bbox = new THREE.Box3().setFromObject(root);
+  const size = new THREE.Vector3(); bbox.getSize(size);
+  const height = size.y || 1.7;
+  const footYOffset = -bbox.min.y;
+
+  return { template: root, footYOffset, height };
+}
+
 function byName(animations, name) {
   const n = (name || '').toLowerCase();
   return animations.find(c => (c.name || '').toLowerCase() === n) || null;
@@ -206,7 +257,7 @@ export class AvatarFactory {
 
   static load() {
     if (this._promise) return this._promise;
-    this._promise = new Promise((resolve, reject) => {
+    this._promise = new Promise((resolve) => {
       const loader = new GLTFLoader();
       loader.load(MODEL_URL, (gltf) => {
         const template = gltf.scene;
@@ -221,7 +272,12 @@ export class AvatarFactory {
 
         const factory = new AvatarFactory(template, { Idle, Walk, Run }, footYOffset, height);
         resolve(factory);
-      }, undefined, reject);
+      }, undefined, (err) => {
+        console.warn('[avatar] gltf load failed, falling back to primitive avatar', err);
+        const fallback = buildFallbackTemplate();
+        const factory = new AvatarFactory(fallback.template, { Idle: null, Walk: null, Run: null }, fallback.footYOffset, fallback.height);
+        resolve(factory);
+      });
     });
     return this._promise;
   }

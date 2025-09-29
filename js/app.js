@@ -68,14 +68,25 @@ class App {
     // UI poller
     this._uiTimer = setInterval(() => this._updateLocalPoseUI(), 200);
 
+    // Avatars for both the local player and remote peers share the same factory promise.
+    this.avatarFactoryPromise = AvatarFactory.load().catch((err) => {
+      console.warn('[avatar] load failed', err);
+      return null;
+    });
+
     // Networking
-    this.remotes = new Remotes(this.sceneMgr, (x, z) => this.hexGridMgr.getHeightAt(x, z));
+    this.remotes = new Remotes(
+      this.sceneMgr,
+      (x, z) => this.hexGridMgr.getHeightAt(x, z),
+      this.avatarFactoryPromise
+    );
     this.mesh = new Mesh(this);
 
     // Local third-person avatar shell (hidden when true FPV or XR)
     this.localAvatar = null;
-    this.avatarFactoryPromise = AvatarFactory.load()
+    this.avatarFactoryPromise
       .then(factory => {
+        if (!factory) return;
         this.localAvatar = factory.create();
         this.localAvatar.group.name = 'local-avatar';
         this.sceneMgr.remoteLayer.add(this.localAvatar.group);

@@ -1,6 +1,8 @@
 // mesh.js
 import * as THREE from 'three';
 import { ui, setNkn, setSig, setSigMeta } from './ui.js';
+import { createDiscovery } from './nats.js';
+import { latLonToWorld, worldToLatLon } from './geolocate.js';
 import { now, fmtAgo, isHex64, shortHex, rad, deg } from './utils.js';
 
 /**
@@ -33,9 +35,17 @@ export class Mesh {
     this.client = null; this.selfPub = null; this.selfAddr = null;
     this.signallerHex = ''; this.DEFAULT_SIG = '8ad525942fc13bdf468a640a18716cbd91ba75d3bcb0ca198f73e9cd0cf34a88';
 
+    // Discovery (NATS)
+    this.discovery = null;
+    this.discoveryRoom = this._deriveDiscoveryRoom();
+    this.discoveryStatus = { state: 'idle', detail: '' };
+    this.discoveryInitInFlight = false;
+    this._discoveryHello = new Set();
+    this._signallerLatencyMs = null;
+
     this.peers = new Map();      // pub -> { addr?: string, lastTs: number }
     this.addrPool = new Map();   // addr -> { lastAck?, rttMs?, lastProbe?, lastMsg? }
-    this.latestPose = new Map(); // pub -> { p, q, ts, j }
+    this.latestPose = new Map(); // pub -> { p, q, ts, j, geo? }
     this.knownIds  = new Map();  // pub -> Set(ids)
 
     // Sessions (ncp-js)
@@ -71,6 +81,7 @@ export class Mesh {
 
     this._applySig(localStorage.getItem('NKN_SIG_HEX') || '');
     this._connect();
+    this._updateDiscoveryUi();
 
     if (ui.hexSig) {
       ui.hexSig.value = localStorage.getItem('NKN_SIG_HEX') || '';
@@ -210,8 +221,212 @@ export class Mesh {
     const v = (raw || '').trim().toLowerCase();
     this.signallerHex = isHex64(v) ? v : this.DEFAULT_SIG;
     if (isHex64(v)) localStorage.setItem('NKN_SIG_HEX', v);
-    setSig(`Mesh: targeting ${shortHex(this.signallerHex, 8, 8)}`, 'warn');
-    setSigMeta('probing…');
+    this._updateDiscoveryUi();
+  }
+
+  /* ───────── Discovery (NATS) integration ───────── */
+
+  _deriveDiscoveryRoom() {
+    if (typeof location === 'undefined') return 'mesh-default';
+    const host = (location.hostname || 'local').toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const pathBits = (location.pathname || '')
+      .split('/')
+      .filter(Boolean)
+      .slice(0, 2)
+      .map(seg => seg.toLowerCase().replace(/[^a-z0-9-]/g, '-'))
+      .filter(Boolean)
+      .join('-');
+    const slug = [host, pathBits].filter(Boolean).join('-').replace(/-+/g, '-') || 'mesh';
+    return `mesh-${slug}`.replace(/-+/g, '-');
+  }
+
+  _originLatLon() {
+    const origin = this.app?.hexGridMgr?.origin;
+    if (origin && Number.isFinite(origin.lat) && Number.isFinite(origin.lon)) return origin;
+    const state = this.app?._locationState;
+    if (state && Number.isFinite(state.lat) && Number.isFinite(state.lon)) return state;
+    return null;
+  }
+
+  _worldToGeo(x, z) {
+    const origin = this._originLatLon();
+    if (!origin) return null;
+    return worldToLatLon(x, z, origin.lat, origin.lon);
+  }
+
+  _geoToWorld(lat, lon) {
+    const origin = this._originLatLon();
+    if (!origin) return null;
+    return latLonToWorld(lat, lon, origin.lat, origin.lon);
+  }
+
+  _localGroundAt(x, z) {
+    if (!this.app?.hexGridMgr?.getHeightAt) return null;
+    const y = this.app.hexGridMgr.getHeightAt(x, z);
+    return Number.isFinite(y) ? y : null;
+  }
+
+  _geoPayload(x, z, actualY) {
+    const geo = this._worldToGeo(x, z);
+    if (!geo) return null;
+    const ground = this._localGroundAt(x, z);
+    const eye = Number.isFinite(actualY) && Number.isFinite(ground) ? (actualY - ground) : null;
+    const out = {
+      lat: +geo.lat.toFixed(7),
+      lon: +geo.lon.toFixed(7)
+    };
+    if (Number.isFinite(ground)) out.ground = +ground.toFixed(3);
+    if (Number.isFinite(eye)) out.eye = +eye.toFixed(3);
+    return out;
+  }
+
+  _discoveryMeta() {
+    const meta = { app: 'mesh', ver: 'v1' };
+    if (typeof navigator !== 'undefined' && navigator.userAgent) {
+      meta.ua = navigator.userAgent.substring(0, 80);
+    }
+    return meta;
+  }
+
+  _updateDiscoveryUi() {
+    const state = this.discoveryStatus?.state || 'idle';
+    const detail = this.discoveryStatus?.detail || '';
+    if (state === 'ready') {
+      setSig(`Discovery: ${this.discoveryRoom}`, 'ok');
+    } else if (state === 'connecting') {
+      setSig('Discovery: connecting…', 'warn');
+    } else if (state === 'error') {
+      setSig('Discovery: offline', 'err');
+    } else {
+      setSig('Discovery: idle', 'warn');
+    }
+
+    const meta = [];
+    if (this.discoveryRoom) meta.push(`room ${this.discoveryRoom}`);
+    if (isHex64(this.signallerHex)) meta.push(`fallback ${shortHex(this.signallerHex, 6, 4)}`);
+    if (Number.isFinite(this._signallerLatencyMs)) meta.push(`relay ${Math.round(this._signallerLatencyMs)} ms`);
+    if (detail) meta.push(detail);
+    setSigMeta(meta.join(' • ') || '—');
+  }
+
+  async _initDiscovery() {
+    if (!this.selfPub || this.discoveryInitInFlight) return;
+
+    if (this.discovery) {
+      const meta = { ...(this.discovery.me?.meta || {}), ...this._discoveryMeta() };
+      this.discovery.me = { ...(this.discovery.me || {}), nknPub: this.selfPub, addr: this.selfAddr || this.discovery.me?.addr || addrFrom('web', this.selfPub), meta };
+      this.discoveryStatus.state = 'ready';
+      this.discoveryStatus.detail = `peers ${this.discovery.peers.length}`;
+      this._updateDiscoveryUi();
+      this.discovery.presence({ resume: true }).catch(() => { });
+      this.discovery.handshakeAll(meta, { wantAck: true }).catch(() => { });
+      return;
+    }
+
+    this.discoveryInitInFlight = true;
+    this.discoveryStatus = { state: 'connecting', detail: '' };
+    this._updateDiscoveryUi();
+
+    try {
+      const meta = this._discoveryMeta();
+      this.discovery = await createDiscovery({
+        room: this.discoveryRoom,
+        me: { nknPub: this.selfPub, addr: this.selfAddr || addrFrom('web', this.selfPub), meta }
+      });
+
+      this.discovery.on('peer', (peer) => this._handleDiscoveryPeer(peer, 'presence'));
+      this.discovery.on('handshake', (peer) => this._handleDiscoveryPeer(peer, 'handshake'));
+      this.discovery.on('handshake_ack', (peer) => this._handleDiscoveryPeer(peer, 'ack'));
+      this.discovery.on('status', (ev) => this._handleDiscoveryStatus(ev));
+
+      for (const peer of this.discovery.peers) this._handleDiscoveryPeer(peer, 'persisted');
+
+      this.discoveryStatus.state = 'ready';
+      this.discoveryStatus.detail = `peers ${this.discovery.peers.length}`;
+      this._updateDiscoveryUi();
+
+      this.discovery.handshakeAll(meta, { wantAck: true }).catch(() => { });
+    } catch (err) {
+      console.warn('[discovery] init failed', err);
+      this.discoveryStatus = { state: 'error', detail: err?.message || 'init failed' };
+      this._updateDiscoveryUi();
+    } finally {
+      this.discoveryInitInFlight = false;
+    }
+  }
+
+  _handleDiscoveryStatus(ev) {
+    if (!ev) return;
+    if (ev.type === 'disconnect') {
+      this.discoveryStatus.state = 'connecting';
+      this.discoveryStatus.detail = 'nats reconnecting';
+    } else if (ev.type === 'reconnect') {
+      this.discoveryStatus.state = 'ready';
+      this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
+      const meta = this._discoveryMeta();
+      this.discovery?.handshakeAll(meta, { wantAck: true }).catch(() => { });
+    } else if (ev.type === 'update') {
+      this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
+    }
+    this._updateDiscoveryUi();
+  }
+
+  _handleDiscoveryPeer(peer, via = 'presence') {
+    if (!peer) return;
+    const pub = (peer.nknPub || '').toLowerCase();
+    if (!isHex64(pub) || pub === this.selfPub) return;
+
+    const ts = now();
+    this._touchPeer(pub, ts);
+
+    let ent = this.peers.get(pub);
+    if (!ent) {
+      ent = { addr: null, lastTs: ts, isVestigial: false };
+      this.peers.set(pub, ent);
+    }
+    if (peer.addr && isAddr(peer.addr) && !ent.addr) ent.addr = peer.addr;
+    if (peer.addr && isAddr(peer.addr)) {
+      const pool = this.addrPool.get(peer.addr) || {};
+      if (!pool.lastProbe) pool.lastProbe = ts;
+      this.addrPool.set(peer.addr, pool);
+    }
+
+    if (Array.isArray(peer.meta?.ids)) {
+      for (const id of peer.meta.ids) this._idSet(pub).add(id);
+    }
+
+    this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
+    this._updateDiscoveryUi();
+
+    const firstSight = !this._discoveryHello.has(pub);
+    if (firstSight) {
+      this._discoveryHello.add(pub);
+      if (via === 'presence' || via === 'persisted') {
+        this.discovery?.handshake(pub, this._discoveryMeta(), { wantAck: true }).catch(() => { });
+        this._fireDiscoveryHello(pub);
+        this._sendPoseSnapshotTo(pub).catch(() => { });
+      } else if (via === 'handshake') {
+        this._fireDiscoveryHello(pub);
+        this._sendPoseSnapshotTo(pub).catch(() => { });
+      }
+    }
+  }
+
+  _fireDiscoveryHello(pub) {
+    if (!this.client || !this.selfPub) return;
+    const t = now();
+    const hello = JSON.stringify({ type: 'hello', from: this.selfPub, ts: t });
+    const ask = JSON.stringify({ type: 'peers_req', from: this.selfPub, ts: t });
+    const targets = this._bestAddrs(pub);
+    for (const to of targets) {
+      this._sendRaw(to, hello).catch(() => { });
+      this._sendRaw(to, ask).catch(() => { });
+    }
+    if (isHex64(this.signallerHex)) {
+      const relay = `signal.${this.signallerHex}`;
+      this._sendRaw(relay, hello).catch(() => { });
+      this._sendRaw(relay, ask).catch(() => { });
+    }
   }
 
   /* ───────── Helpers ───────── */
@@ -266,6 +481,8 @@ export class Mesh {
         if (ui.myAddr) ui.myAddr.textContent = this.selfAddr || '—';
         if (ui.myPub)  ui.myPub.textContent  = this.selfPub || '—';
         setNkn('NKN: connected', 'ok');
+
+        this._initDiscovery();
 
         // Announce & request peers to *all known targets* (includes bootstrapped addrs)
         this._blast({ type: 'hello', from: this.selfPub, ts: now() });
@@ -323,7 +540,10 @@ export class Mesh {
 
           // If the signaller, update UI
           const sigAddr = isHex64(this.signallerHex) ? `signal.${this.signallerHex}` : '';
-          if (src === sigAddr) setSigMeta(`latency: ${Math.round(rtt)} ms`);
+          if (src === sigAddr) {
+            this._signallerLatencyMs = rtt;
+            this._updateDiscoveryUi();
+          }
 
           this._saveBookSoon();
           return;
@@ -371,8 +591,46 @@ export class Mesh {
           this._touchPeer(pub, t);
           const info = { rtt: this.addrPool.get(src)?.rttMs ?? null, age: fmtAgo(now() - msg.ts) };
           const pose = msg.pose;
-          this.latestPose.set(pub, { p: pose.p, q: pose.q, ts: msg.ts, j: pose.j ? 1 : 0 });
-          this.app.remotes.update(pub, { p: pose.p, q: pose.q, j: pose.j ? 1 : 0 }, info);
+
+          const poseOut = {
+            p: Array.isArray(pose.p) ? pose.p.map(v => Number(v)) : [0, 0, 0],
+            q: Array.isArray(pose.q) ? pose.q.map(v => Number(v)) : [0, 0, 0, 1],
+            j: pose.j ? 1 : 0
+          };
+
+          let geoNorm = null;
+          if (msg.geo) {
+            const lat = Number(msg.geo.lat);
+            const lon = Number(msg.geo.lon);
+            if (Number.isFinite(lat) && Number.isFinite(lon)) {
+              geoNorm = { lat, lon };
+              const eyeVal = Number(msg.geo.eye);
+              if (Number.isFinite(eyeVal)) geoNorm.eye = eyeVal;
+              const groundVal = Number(msg.geo.ground);
+              if (Number.isFinite(groundVal)) geoNorm.ground = groundVal;
+            }
+          }
+
+          if (geoNorm) {
+            const w = this._geoToWorld(geoNorm.lat, geoNorm.lon);
+            if (w) {
+              poseOut.p[0] = +w.x.toFixed(3);
+              poseOut.p[2] = +w.z.toFixed(3);
+
+              const localGround = this._localGroundAt(w.x, w.z);
+              const eye = Number.isFinite(geoNorm.eye)
+                ? geoNorm.eye
+                : (Number.isFinite(geoNorm.ground) && Number.isFinite(poseOut.p[1]) ? (poseOut.p[1] - geoNorm.ground) : null);
+              if (Number.isFinite(localGround) && Number.isFinite(eye)) {
+                poseOut.p[1] = +(localGround + eye).toFixed(3);
+              }
+            }
+          }
+
+          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, geo: geoNorm });
+          this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
+            console.warn('[remotes] update failed', err);
+          });
           this._renderPeers();
           return;
         }
@@ -487,7 +745,10 @@ export class Mesh {
       const lp = this.latestPose.get(pub);
       if (lp) {
         const eul = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(lp.q[0], lp.q[1], lp.q[2], lp.q[3]), 'YXZ');
-        poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: ${lp.p.map(v => v.toFixed(2)).join(', ')} | yaw ${deg(eul.y).toFixed(1)}°${lp.j ? ' • jumped' : ''}`;
+        const ll = lp.geo && Number.isFinite(lp.geo.lat) && Number.isFinite(lp.geo.lon)
+          ? ` | ll ${lp.geo.lat.toFixed(5)}, ${lp.geo.lon.toFixed(5)}`
+          : '';
+        poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: ${lp.p.map(v => v.toFixed(2)).join(', ')}${ll} | yaw ${deg(eul.y).toFixed(1)}°${lp.j ? ' • jumped' : ''}`;
       } else {
         poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: —`;
       }
@@ -553,14 +814,21 @@ export class Mesh {
     this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], t };
 
     const y = Number.isFinite(yOverride) ? yOverride : p.y;
-    const pkt = JSON.stringify({
-      type: 'pose', from: this.selfPub, ts: t,
+    const payload = {
+      type: 'pose',
+      from: this.selfPub,
+      ts: t,
       pose: {
         p: [+p.x.toFixed(3), +y.toFixed(3), +p.z.toFixed(3)],
         q: [+q.x.toFixed(4), +q.y.toFixed(4), +q.z.toFixed(4), +q.w.toFixed(4)],
         j: jumpEvent ? 1 : 0
       }
-    });
+    };
+
+    const geo = this._geoPayload(p.x, p.z, y);
+    if (geo) payload.geo = geo;
+
+    const pkt = JSON.stringify(payload);
     this._noteBytes(pkt);
     this.hzCount++;
 
@@ -590,7 +858,7 @@ export class Mesh {
 
     const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, dol.rotation.y, 0, 'YXZ'));
 
-    const pkt = JSON.stringify({
+    const payload = {
       type: 'pose',
       from: this.selfPub,
       ts: now(),
@@ -599,7 +867,11 @@ export class Mesh {
         q: [+qSend.x.toFixed(3), +qSend.y.toFixed(3), +qSend.z.toFixed(3), +qSend.w.toFixed(3)],
         j: 0
       }
-    });
+    };
+    const geo = this._geoPayload(dol.position.x, dol.position.z, actualY);
+    if (geo) payload.geo = geo;
+
+    const pkt = JSON.stringify(payload);
 
     const addrs = this._bestAddrs(pub);
     let sent = false;

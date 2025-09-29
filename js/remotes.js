@@ -28,6 +28,7 @@ export class Remotes {
   async ensure(pub) {
     if (this.map.has(pub)) return this.map.get(pub);
     const factory = await this.avatarFactoryPromise;
+    if (!factory) return null;
 
     const group = new THREE.Group();
     group.name = `remote-${pub.slice(0,8)}`;
@@ -58,13 +59,16 @@ export class Remotes {
     return ent;
   }
 
-  async update(pub, pose, info) {
+  async update(pub, pose, info, geo = null) {
     const ent = await this.ensure(pub);
+    if (!ent) return;
     const x = pose.p[0], y = pose.p[1], z = pose.p[2];
 
-    const groundY = Number.isFinite(y)
-      ? y - 1.6
+    const geoEye = Number.isFinite(geo?.eye) ? Number(geo.eye) : null;
+    const groundYRaw = Number.isFinite(y)
+      ? (Number.isFinite(geoEye) ? y - geoEye : y - 1.6)
       : (this.heightAt ? this.heightAt(x, z) : 0);
+    const groundY = Number.isFinite(groundYRaw) ? groundYRaw : 0;
 
     ent.targetPos.set(x, groundY, z);
 
@@ -76,10 +80,15 @@ export class Remotes {
 
     const t = now();
     if (t - ent._labelAt > 250) {
-      const curY = ent.avatar.group.position.y;
+      const curY = Number.isFinite(ent.avatar.group.position.y)
+        ? ent.avatar.group.position.y
+        : (Number.isFinite(ent.targetPos.y) ? ent.targetPos.y : 0);
+      const ll = geo && Number.isFinite(geo.lat) && Number.isFinite(geo.lon)
+        ? `LL ${geo.lat.toFixed(5)},${geo.lon.toFixed(5)}`
+        : null;
       const txt = `${shortHex(pub, 8, 6)}
 rtt ${info?.rtt != null ? Math.round(info.rtt) + 'ms' : '—'} • age ${info?.age ?? '—'}
-P(${x.toFixed(2)},${curY.toFixed(2)},${z.toFixed(2)})
+P(${x.toFixed(2)},${curY.toFixed(2)},${z.toFixed(2)})${ll ? `\n${ll}` : ''}
 YPR ${deg(eul.y).toFixed(1)}/${deg(eul.x).toFixed(1)}/${deg(eul.z).toFixed(1)}`;
       ent.group.remove(ent.label); ent.label.material.map.dispose(); ent.label.material.dispose();
       ent.label = makeLabel(txt); ent.label.position.set(0, ent.avatar.height + 0.35, 0); ent.group.add(ent.label);
@@ -96,7 +105,8 @@ YPR ${deg(eul.y).toFixed(1)}/${deg(eul.x).toFixed(1)}/${deg(eul.z).toFixed(1)}`;
 
       const sx = THREE.MathUtils.lerp(pa.x, ent.targetPos.x, alphaPos);
       const sz = THREE.MathUtils.lerp(pa.z, ent.targetPos.z, alphaPos);
-      const groundY = this.heightAt ? this.heightAt(sx, sz) : ent.targetPos.y;
+      const sampled = this.heightAt ? this.heightAt(sx, sz) : null;
+      const groundY = Number.isFinite(sampled) ? sampled : ent.targetPos.y;
 
       ent.avatar.setPosition(sx, groundY, sz);
 
