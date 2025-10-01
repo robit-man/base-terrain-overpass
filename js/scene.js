@@ -19,8 +19,8 @@ export class SceneManager {
     document.body.appendChild(VRButton.createButton(this.renderer));
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(0x121212, 40, 220);
-    this.scene.background = new THREE.Color(0x121212);
+    this.scene.fog = new THREE.Fog(0xffffff, 40, 220);
+    this.scene.background = new THREE.Color(0xffffff);
 
     // 🎯 Camera stays at (0,0,0) in dolly local space; dolly handles eye height
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 1000);
@@ -49,7 +49,7 @@ export class SceneManager {
     keyLight.shadow.camera.bottom = -320;
     this.scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x526dff, 0.55);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 2);
     rimLight.position.set(-220, 140, -260);
     this.scene.add(rimLight);
 

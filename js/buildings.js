@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { metresPerDegree } from './geolocate.js';
-import { ui } from './ui.js';
 
 const FEATURES = {
   BUILDINGS: true,
@@ -115,6 +114,8 @@ export class BuildingManager {
     this.camera = camera;
     this.tileManager = tileManager;
     this.radius = radius;
+    this._baseRadius = radius;
+    this._currentPerfQuality = 1;
     this.tileSize = tileSize || (tileManager?.tileRadius ? tileManager.tileRadius * 1.75 : 160);
     this.color = color;
     this.roadWidth = roadWidth;
@@ -196,6 +197,13 @@ export class BuildingManager {
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
     this._pickMaterial.depthWrite = false;
     this._pickMaterial.depthTest = false;
+
+    this._trackingNode = null;
+    if (camera?.parent?.isObject3D) {
+      this._trackingNode = camera.parent;
+    } else if (scene?.getObjectByName) {
+      this._trackingNode = scene.getObjectByName('player-dolly') || null;
+    }
 
     this._cachePrefix = `${CACHE_PREFIX}:${this.tileSize}:`;
 
@@ -315,74 +323,111 @@ export class BuildingManager {
     }
   }
 
-  updateQoS({ fps, target = TARGET_FPS } = {}) {
-    if (!Number.isFinite(fps) || fps <= 0) return;
-    if (!Number.isFinite(target) || target <= 0) target = TARGET_FPS;
+  applyPerfProfile(profile = {}) {
+    const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._currentPerfQuality;
+    const quality = THREE.MathUtils.clamp(qualityRaw ?? 1, 0.3, 1.1);
+    this._currentPerfQuality = quality;
 
-    const alpha = 0.12;
-    this._smoothedFps = this._smoothedFps * (1 - alpha) + fps * alpha;
+    const fps = Number.isFinite(profile?.smoothedFps) ? profile.smoothedFps : this._smoothedFps;
+    if (Number.isFinite(fps)) this._smoothedFps = fps;
+
+    const target = Number.isFinite(profile?.targetFps) && profile.targetFps > 0
+      ? profile.targetFps
+      : (this._qosTargetFps || TARGET_FPS);
     this._qosTargetFps = target;
 
-    const ratio = this._smoothedFps / target;
-    let desiredLevel = 'high';
-    if (ratio < 0.7) desiredLevel = 'low';
-    else if (ratio < 0.92) desiredLevel = 'medium';
+    const lerp = (lo, hi) => lo + (hi - lo) * quality;
+    this._frameBudgetMs = lerp(0.45, BUILD_FRAME_BUDGET_MS);
+    this._idleBudgetMs = lerp(2.4, BUILD_IDLE_BUDGET_MS);
+    this._mergeBudgetMs = lerp(1.6, MERGE_BUDGET_MS);
+    this._resnapFrameBudgetMs = lerp(0.35, RESNAP_FRAME_BUDGET_MS);
+    this._resnapInterval = lerp(RESNAP_INTERVAL * 3.6, RESNAP_INTERVAL);
+    this._tileUpdateInterval = lerp(0.55, 0);
+    this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
+    if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
 
-    if (desiredLevel !== this._qosLevel) this._applyQoSLevel(desiredLevel);
-  }
+    const desiredRadius = this._baseRadius;
+    if (Math.abs(desiredRadius - this.radius) > 0.5) {
+      this.radius = desiredRadius;
+      this._refreshRadiusVisibility();
+    }
 
-  _applyQoSLevel(level) {
+    const level = quality >= 0.82 ? 'high' : (quality >= 0.6 ? 'medium' : 'low');
     this._qosLevel = level;
 
-    let frameBudget, idleBudget, mergeBudget, resnapBudget, resnapInterval, tileInterval;
-    if (level === 'high') {
-      frameBudget = BUILD_FRAME_BUDGET_MS;
-      idleBudget = BUILD_IDLE_BUDGET_MS;
-      mergeBudget = MERGE_BUDGET_MS;
-      resnapBudget = RESNAP_FRAME_BUDGET_MS;
-      resnapInterval = RESNAP_INTERVAL;
-      tileInterval = 0;
-    } else if (level === 'medium') {
-      frameBudget = Math.max(0.9, BUILD_FRAME_BUDGET_MS * 0.55);
-      idleBudget = Math.max(3.5, BUILD_IDLE_BUDGET_MS * 0.5);
-      mergeBudget = Math.max(3, MERGE_BUDGET_MS * 0.6);
-      resnapBudget = Math.max(0.6, RESNAP_FRAME_BUDGET_MS * 0.55);
-      resnapInterval = RESNAP_INTERVAL * 1.8;
-      tileInterval = 0.25;
-    } else {
-      frameBudget = Math.max(0.55, BUILD_FRAME_BUDGET_MS * 0.3);
-      idleBudget = Math.max(2.2, BUILD_IDLE_BUDGET_MS * 0.3);
-      mergeBudget = Math.max(2, MERGE_BUDGET_MS * 0.35);
-      resnapBudget = Math.max(0.4, RESNAP_FRAME_BUDGET_MS * 0.35);
-      resnapInterval = RESNAP_INTERVAL * 3.2;
-      tileInterval = 0.45;
+    return {
+      quality,
+      level,
+      frameBudget: this._frameBudgetMs,
+      idleBudget: this._idleBudgetMs,
+      mergeBudget: this._mergeBudgetMs,
+      resnapBudget: this._resnapFrameBudgetMs,
+      resnapInterval: this._resnapInterval,
+      radius: this.radius,
+    };
+  }
+
+  updateQoS({ fps, target = TARGET_FPS, quality } = {}) {
+    if (Number.isFinite(fps) && fps > 0) {
+      const alpha = 0.12;
+      this._smoothedFps = this._smoothedFps * (1 - alpha) + fps * alpha;
+    }
+    if (!Number.isFinite(target) || target <= 0) target = TARGET_FPS;
+    this._qosTargetFps = target;
+
+    let resolvedQuality = quality;
+    if (!Number.isFinite(resolvedQuality)) {
+      const safeTarget = target || TARGET_FPS;
+      const ratio = safeTarget > 0 ? this._smoothedFps / safeTarget : 1;
+      if (ratio >= 1.0) resolvedQuality = 1;
+      else if (ratio >= 0.92) resolvedQuality = 0.85;
+      else if (ratio >= 0.75) resolvedQuality = 0.65;
+      else resolvedQuality = 0.45;
     }
 
-    this._frameBudgetMs = frameBudget;
-    this._idleBudgetMs = idleBudget;
-    this._mergeBudgetMs = mergeBudget;
-    this._resnapFrameBudgetMs = resnapBudget;
-    this._resnapInterval = resnapInterval;
-    this._tileUpdateInterval = tileInterval;
-    this._tileUpdateTimer = 0;
+    return this.applyPerfProfile({
+      quality: resolvedQuality,
+      smoothedFps: this._smoothedFps,
+      targetFps: target,
+    });
+  }
 
-    if (typeof console !== 'undefined' && console.log) {
-      console.log(
-        `[Buildings][QoS] level=${level} fps≈${this._smoothedFps.toFixed(1)} budgets frame=${this._frameBudgetMs.toFixed(2)}ms idle=${this._idleBudgetMs.toFixed(2)}ms merge=${this._mergeBudgetMs.toFixed(2)}ms resnap=${this._resnapFrameBudgetMs.toFixed(2)}ms interval=${this._resnapInterval.toFixed(2)}s`
-      );
+  _refreshRadiusVisibility() {
+    for (const state of this._tileStates.values()) {
+      if (!state) continue;
+
+      let anyBuildingVisible = false;
+      if (state.buildings?.length) {
+        for (const building of state.buildings) {
+          const centre = building?.info?.centroid;
+          const inside = centre ? this._isInsideRadius(centre) : true;
+          if (building.render) building.render.visible = inside;
+          if (building.solid) building.solid.visible = inside;
+          if (building.pick) building.pick.visible = inside;
+          if (inside) anyBuildingVisible = true;
+        }
+      }
+
+      if (state.mergedGroup) state.mergedGroup.visible = anyBuildingVisible;
+
+      if (state.extras?.length) {
+        for (const extra of state.extras) {
+          const centre = extra?.userData?.center;
+          const inside = centre ? this._isInsideRadius(centre) : true;
+          extra.visible = inside;
+        }
+      }
     }
 
-    const qosText = `QoS: ${level} · frame ${this._frameBudgetMs.toFixed(1)}ms · merge ${this._mergeBudgetMs.toFixed(1)}ms`;
-    if (ui.hudQos) {
-      ui.hudQos.textContent = qosText;
-      ui.hudQos.classList.remove('flash');
-      void ui.hudQos.offsetWidth;
-      ui.hudQos.classList.add('flash');
+    if (this._hoverInfo) {
+      const centre = this._hoverInfo?.centroid;
+      if (centre && !this._isInsideRadius(centre)) this.clearHover();
     }
   }
+
   // ——————————————————————————————————————————————————————————
 
-  setOrigin(lat, lon) {
+  setOrigin(lat, lon, { forceRefresh = false } = {}) {
     const baseLat = this.tileManager?.origin?.lat ?? lat;
     const baseLon = this.tileManager?.origin?.lon ?? lon;
     const originChanged =
@@ -402,6 +447,10 @@ export class BuildingManager {
     if (!this._hasOrigin) {
       this._hasOrigin = true;
       this._clearAllTiles();
+      this._updateTiles(true);
+    } else if (forceRefresh) {
+      this._clearAllTiles();
+      this._currentCenter = null;
       this._updateTiles(true);
     }
   }
@@ -446,7 +495,8 @@ export class BuildingManager {
   }
 
   _updateTiles(force = false) {
-    this.camera.getWorldPosition(this._tmpVec);
+    const anchor = this._resolveTrackingNode();
+    anchor.getWorldPosition(this._tmpVec);
     const key = this._tileKeyForWorld(this._tmpVec.x, this._tmpVec.z);
     if (!force && key === this._currentCenter) return;
     this._currentCenter = key;
@@ -485,6 +535,22 @@ export class BuildingManager {
     if (missing.length && !this._patchInflight) {
       this._fetchPatch(Array.from(needed), missing);
     }
+  }
+
+  _resolveTrackingNode() {
+    if (this._trackingNode?.isObject3D) return this._trackingNode;
+    if (this.camera?.parent?.isObject3D) {
+      this._trackingNode = this.camera.parent;
+      return this._trackingNode;
+    }
+    if (this.scene?.getObjectByName) {
+      const dolly = this.scene.getObjectByName('player-dolly');
+      if (dolly) {
+        this._trackingNode = dolly;
+        return dolly;
+      }
+    }
+    return this.camera;
   }
 
   _createTileState(tileKey) {

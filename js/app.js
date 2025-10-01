@@ -16,12 +16,14 @@ import { ChaseCam } from './chasecam.js';
 import { BuildingManager } from './buildings.js';
 import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
+import { PerformanceTuner } from './performance.js';
 
 const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 const RAD = THREE.MathUtils.degToRad;
 const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
 const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
 const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
+const PLAYER_POSE_KEY = 'xr.playerPose.v1';
 
 class App {
   constructor() {
@@ -33,9 +35,26 @@ class App {
 
     // Core systems
     this.sceneMgr = new SceneManager();
+    this._poseStoredState = null;
+    this._poseLatestState = null;
+    this._poseSaveTimer = 0;
+    this._poseDirty = false;
+    this._posePersistenceReady = false;
+    this._pendingPoseRestore = this._loadStoredPose();
+    this._poseRestored = !!this._pendingPoseRestore;
+    if (this._pendingPoseRestore) {
+      const initialPose = this._clonePoseSnapshot(this._pendingPoseRestore);
+      this._poseStoredState = initialPose;
+      this._poseLatestState = initialPose ? this._clonePoseSnapshot(initialPose) : null;
+    }
     this.sensors = new Sensors();
     this.input = new Input(this.sceneMgr);
     this._physicsPrimed = false;
+
+    this._perf = new PerformanceTuner({ targetFps: 60, minQuality: 0.35, maxQuality: 1.05 });
+    this._perfSnapshots = { tiles: null, buildings: null };
+    this._hudHeadingState = { deg: null, source: null };
+    this._hudMetaCached = null;
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -46,6 +65,14 @@ class App {
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,
     });
+
+    const initialProfile = this._perf.profile();
+    const initialTiles = this.hexGridMgr.applyPerfProfile?.(initialProfile) || null;
+    const initialBuildings = this.buildings.applyPerfProfile?.(initialProfile) || null;
+    if (initialTiles) this._perfSnapshots.tiles = initialTiles;
+    if (initialBuildings) this._perfSnapshots.buildings = initialBuildings;
+    this._updateHudMeta(initialProfile);
+    this._updateHudCompass();
 
     this._setupPhysics();
 
@@ -63,6 +90,17 @@ class App {
     const storedCompass = this._loadCompassPref();
     if (storedCompass != null) this._compassEnabled = storedCompass;
 
+    if (ui.yawOffsetRange) {
+      ui.yawOffsetRange.addEventListener('input', () => {
+        this._manualYawOffset = THREE.MathUtils.degToRad(Number(ui.yawOffsetRange.value) || 0);
+        ui.yawOffsetValue.textContent = `${ui.yawOffsetRange.value}°`;
+      });
+      this._manualYawOffset = THREE.MathUtils.degToRad(Number(ui.yawOffsetRange.value) || 0);
+      if (ui.yawOffsetValue) ui.yawOffsetValue.textContent = `${ui.yawOffsetRange.value}°`;
+    } else {
+      this._manualYawOffset = 0;
+    }
+
     document.addEventListener('gps-updated', (ev) => this._handleGpsUpdate(ev.detail));
 
     const storedManual = this._loadStoredManualLocation();
@@ -75,7 +113,6 @@ class App {
     // Motion / physics shim (jump, crouch, mobile drag, eye height)
     this.move = new Locomotion(this.sceneMgr, this.input, this.sensors.orient);
     this.clock = new THREE.Clock();
-    this._perf = { targetFps: 60, smoothedFps: 60, accum: 0 };
     this._geoWatchId = null;
     this._mobileNav = isMobile ? {
       active: false,
@@ -155,6 +192,8 @@ class App {
     this._tmpVec2 = new THREE.Vector3();
     this._tmpVec3 = new THREE.Vector3();
     this._tmpVec4 = new THREE.Vector3();
+    this._tmpQuat = new THREE.Quaternion();
+    this._tmpQuat2 = new THREE.Quaternion();
     this._tmpEuler = new THREE.Euler();
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
@@ -262,6 +301,8 @@ class App {
       });
     }
 
+    this._initPosePersistence();
+
     this.sceneMgr.renderer.setAnimationLoop(() => this._tick());
 
     window.addEventListener('keydown', (e) => {
@@ -313,17 +354,12 @@ class App {
     }
 
     const shouldLock = this._gpsLockEnabled || source === 'manual';
-
-    if (!shouldLock && source !== 'manual') {
-      this._locationSource = source;
-      this._locationState = { lat, lon };
-      this._lastAutoLocation = { lat, lon, source };
-      this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
-      this.miniMap?.forceRedraw?.();
-      return;
+    const detailForApply = { ...detail };
+    if (!shouldLock && source !== 'manual' && detailForApply.recenter == null) {
+      detailForApply.recenter = false;
     }
 
-    this._applyLocation({ lat, lon, source, detail });
+    this._applyLocation({ lat, lon, source, detail: detailForApply });
 
     if (isMobile && this._mobileNav && source !== 'manual') {
       if (this._gpsLockEnabled) {
@@ -341,12 +377,27 @@ class App {
     if (this._manualLatInput) this._manualLatInput.value = lat.toFixed(6);
     if (this._manualLonInput) this._manualLonInput.value = lon.toFixed(6);
 
-    this.hexGridMgr?.setOrigin(lat, lon);
-    this.buildings?.setOrigin(lat, lon);
+    const isManualRequest = source === 'manual' || detail.manual === true;
+
+    this.hexGridMgr?.setOrigin(lat, lon, { immediate: isManualRequest });
+    this.buildings?.setOrigin(lat, lon, { forceRefresh: isManualRequest });
+    if (isManualRequest) {
+      this.physics?.resetTerrain?.();
+      this._poseStoredState = null;
+      this._poseLatestState = null;
+      this._poseDirty = true;
+      this._poseSaveTimer = 0;
+      this._poseRestored = false;
+      this._pendingPoseRestore = null;
+    }
 
     const allowRecenter = detail.recenter !== false && (this._gpsLockEnabled || source === 'manual');
-    if (allowRecenter) {
+    const skipRecenterForStoredPose = this._poseRestored && detail.force !== true && !isManualRequest;
+    if (allowRecenter && !skipRecenterForStoredPose) {
       this._resetPlayerPosition();
+      if (isManualRequest) {
+        this.hexGridMgr?.update(this.sceneMgr?.dolly?.position || new THREE.Vector3());
+      }
     }
 
     if (source === 'manual') {
@@ -378,6 +429,117 @@ class App {
     const groundY = this.hexGridMgr?.getHeightAt?.(0, 0) ?? 0;
     dolly.position.set(0, groundY + eyeHeight, 0);
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
+  }
+
+  buildTeleportOffer(offsetMeters = 2.5) {
+    const dolly = this.sceneMgr?.dolly;
+    const origin = this.hexGridMgr?.origin;
+    if (!dolly || !origin) return null;
+
+    const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(dolly.quaternion);
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+    forward.normalize();
+
+    const offset = Number.isFinite(offsetMeters) ? offsetMeters : 2.5;
+
+    const landing = dolly.position.clone();
+    const groundHere = this.hexGridMgr?.getHeightAt(dolly.position.x, dolly.position.z);
+    const baseGround = Number.isFinite(groundHere) ? groundHere : (landing.y - eyeHeight);
+    landing.y = baseGround;
+    landing.addScaledVector(forward, offset);
+
+    const landingGround = this.hexGridMgr?.getHeightAt(landing.x, landing.z);
+    const groundVal = Number.isFinite(landingGround) ? landingGround : baseGround;
+
+    const latLon = worldToLatLon(landing.x, landing.z, origin.lat, origin.lon);
+    if (!latLon) return null;
+
+    const yaw = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
+
+    return {
+      lat: +latLon.lat.toFixed(7),
+      lon: +latLon.lon.toFixed(7),
+      yaw: +yaw.toFixed(6),
+      ground: +groundVal.toFixed(4),
+      eye: +eyeHeight.toFixed(3),
+      offset: +offset.toFixed(2),
+      ts: Date.now()
+    };
+  }
+
+  applyTeleportArrival(dest = {}, fromPub = null) {
+    const lat = Number(dest.lat);
+    const lon = Number(dest.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+
+    const yaw = Number(dest.yaw);
+    const eye = Number.isFinite(dest.eye) ? dest.eye : (this.move?.eyeHeight?.() ?? 1.6);
+    const ground = Number(dest.ground);
+
+    if (!this.sceneMgr?.dolly || !this.hexGridMgr) return false;
+
+    this._handleGpsUpdate({ lat, lon, source: 'manual', force: true, manual: true });
+
+    let completed = false;
+    let attempts = 0;
+    const alignOnce = () => {
+      const origin = this.hexGridMgr?.origin;
+      const dolly = this.sceneMgr?.dolly;
+      if (!origin || !dolly) return false;
+      const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+      if (!world) return false;
+
+      const groundHeight = Number.isFinite(ground)
+        ? ground
+        : this.hexGridMgr?.getHeightAt(world.x, world.z);
+      const baseGround = Number.isFinite(groundHeight) ? groundHeight : (this.hexGridMgr?.getHeightAt?.(0, 0) ?? 0);
+
+      dolly.position.set(world.x, baseGround + eye, world.z);
+      const yawVal = Number.isFinite(yaw) ? yaw : dolly.rotation.y;
+      dolly.rotation.set(0, yawVal, 0);
+      dolly.quaternion.setFromEuler(new THREE.Euler(0, yawVal, 0, 'YXZ'));
+      this._pitch = 0;
+      this.sceneMgr.camera.rotation.set(0, 0, 0);
+      this.sceneMgr.camera.up.set(0, 1, 0);
+      this.physics?.setCharacterPosition?.(dolly.position, eye);
+      this.hexGridMgr?.update(dolly.position);
+
+      this._poseStoredState = null;
+      this._poseLatestState = null;
+      this._poseDirty = true;
+      this._poseSaveTimer = 0;
+      this._poseRestored = false;
+      this._pendingPoseRestore = null;
+
+      if (fromPub && this.mesh?.markTeleportArrivalComplete) {
+        const key = typeof fromPub === 'string' ? fromPub.toLowerCase() : fromPub;
+        this.mesh.markTeleportArrivalComplete(key);
+      }
+      return true;
+    };
+
+    const attemptAlign = () => {
+      if (completed) return;
+      if (alignOnce()) {
+        completed = true;
+        return;
+      }
+      attempts += 1;
+      if (attempts < 10) {
+        requestAnimationFrame(attemptAlign);
+      } else {
+        completed = true;
+        if (fromPub && this.mesh?.markTeleportFailed) {
+          const key = typeof fromPub === 'string' ? fromPub.toLowerCase() : fromPub;
+          this.mesh.markTeleportFailed(key, 'teleport timeout');
+        }
+      }
+    };
+
+    requestAnimationFrame(attemptAlign);
+    return true;
   }
 
   _storeManualLocation(lat, lon) {
@@ -589,13 +751,17 @@ class App {
     dolly.position.z = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
 
     const yawInfo = this.sensors.getYawPitch?.();
-    if (yawInfo?.ready) {
+    const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
+    const compassOffset = this._getCompassYawOffset() || 0;
+    const totalOffset = this._wrapAngle(compassOffset + manualOffset);
+
+    if (yawInfo?.ready && Number.isFinite(yawInfo.yaw)) {
       this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = this._wrapAngle(yawInfo.yaw + this._getCompassYawOffset());
+      this._tmpEuler.y = this._wrapAngle(yawInfo.yaw + totalOffset);
       dolly.quaternion.setFromEuler(this._tmpEuler);
     } else if (Number.isFinite(nav.headingRad)) {
       this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = this._wrapAngle(nav.headingRad + this._getCompassYawOffset());
+      this._tmpEuler.y = this._wrapAngle(nav.headingRad + totalOffset);
       dolly.quaternion.setFromEuler(this._tmpEuler);
     }
 
@@ -733,6 +899,10 @@ class App {
     return Math.atan2(Math.sin(rad), Math.cos(rad));
   }
 
+  _wrapPi(rad) {
+    return this._wrapAngle(rad);
+  }
+
   _getCompassYawOffset() {
     if (!this._gpsLockEnabled || !this._compassEnabled || this._compassYawConfidence <= 0) return 0;
     return this._compassYawOffset;
@@ -836,6 +1006,70 @@ class App {
   }
 
   /* ---------- UI ---------- */
+  _formatPerfLabel(perfState) {
+    const pct = Math.round(THREE.MathUtils.clamp(perfState?.quality ?? 1, 0, 1.05) * 100);
+    const level = perfState?.level ? perfState.level.charAt(0).toUpperCase() + perfState.level.slice(1) : 'Adaptive';
+    return `LOD ${pct}% · ${level}`;
+  }
+
+  _formatPerfDetail(perfState, snapshots = {}) {
+    const tileSnap = snapshots.tiles || {};
+    const buildingSnap = snapshots.buildings || {};
+    const tileNear = Number.isFinite(tileSnap.interactiveRing) ? tileSnap.interactiveRing : '--';
+    const tileFar = Number.isFinite(tileSnap.visualRing) ? tileSnap.visualRing : '--';
+    const buildBudget = Number.isFinite(buildingSnap.frameBudget)
+      ? buildingSnap.frameBudget.toFixed(2)
+      : '--';
+    const mergeBudget = Number.isFinite(buildingSnap.mergeBudget)
+      ? buildingSnap.mergeBudget.toFixed(2)
+      : '--';
+    const radius = Number.isFinite(buildingSnap.radius)
+      ? Math.round(buildingSnap.radius)
+      : '--';
+
+    return `Tiles ${tileNear}/${tileFar} · Build ${buildBudget}/${mergeBudget}ms · Radius ${radius}m`;
+  }
+
+  _updateHudMeta(perfState) {
+    if (!ui.hudDetailMeta) return;
+    const text = this._formatPerfDetail(perfState, this._perfSnapshots);
+    if (text === this._hudMetaCached) return;
+    ui.hudDetailMeta.textContent = text;
+    this._hudMetaCached = text;
+  }
+
+  _updateHudCompass() {
+    const needle = ui.hudCompassNeedle;
+    const textEl = ui.hudHeadingText;
+    const headingDeg = this.sensors?.headingDeg;
+    const headingSource = this.sensors?.headingSource || 'unknown';
+    const hasHeading = Number.isFinite(headingDeg);
+    const rounded = hasHeading ? Math.round(headingDeg) : null;
+
+    const changed =
+      this._hudHeadingState?.deg !== rounded ||
+      this._hudHeadingState?.source !== headingSource;
+    if (!changed) return;
+
+    this._hudHeadingState = { deg: rounded, source: headingSource };
+
+    if (textEl) {
+      textEl.textContent = hasHeading
+        ? `${rounded.toString().padStart(3, '0')}°`
+        : '--°';
+      textEl.dataset.source = headingSource;
+      textEl.title = hasHeading ? `Heading source: ${headingSource}` : 'Heading unavailable';
+    }
+
+    if (needle) {
+      const rotation = hasHeading ? headingDeg : 0;
+      needle.style.transform = `translateX(-50%) rotate(${rotation.toFixed(1)}deg)`;
+      needle.style.opacity = hasHeading ? '1' : '0.35';
+      needle.dataset.source = headingSource;
+      needle.title = hasHeading ? `Heading source: ${headingSource}` : 'Heading unavailable';
+    }
+  }
+
   _updateLocalPoseUI() {
     const { dolly } = this.sceneMgr;
 
@@ -848,18 +1082,253 @@ class App {
     ui.lpSpd.textContent = `${this.move.speed().toFixed(2)} m/s`;
   }
 
+  /* ---------- Pose persistence ---------- */
+
+  _initPosePersistence() {
+    if (this._posePersistenceReady) return;
+    this._posePersistenceReady = true;
+
+    if (this._pendingPoseRestore) {
+      this._applyStoredPose(this._pendingPoseRestore);
+    }
+
+    window.addEventListener('beforeunload', () => {
+      this._persistPose({ snapshot: this._capturePose(), force: true });
+    });
+  }
+
+  _capturePose() {
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return null;
+    const pos = dolly.position;
+    const yawEuler = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
+    const eyeHeight = this.move?.eyeHeight?.();
+    const camera = this.sceneMgr?.camera || null;
+
+    const toQuatArray = (quat) => {
+      if (!quat) return null;
+      const arr = [quat.x, quat.y, quat.z, quat.w];
+      return arr.every((v) => Number.isFinite(v)) ? arr : null;
+    };
+
+    return {
+      px: Number.isFinite(pos.x) ? pos.x : 0,
+      py: Number.isFinite(pos.y) ? pos.y : 0,
+      pz: Number.isFinite(pos.z) ? pos.z : 0,
+      yaw: Number.isFinite(yawEuler.y) ? yawEuler.y : 0,
+      pitch: Number.isFinite(this._pitch) ? this._pitch : 0,
+      eyeHeight: Number.isFinite(eyeHeight) ? eyeHeight : null,
+      dq: toQuatArray(dolly.quaternion),
+      cq: toQuatArray(camera?.quaternion),
+    };
+  }
+
+  _clonePoseSnapshot(pose) {
+    if (!pose) return null;
+    return {
+      px: Number.isFinite(pose.px) ? pose.px : 0,
+      py: Number.isFinite(pose.py) ? pose.py : 0,
+      pz: Number.isFinite(pose.pz) ? pose.pz : 0,
+      yaw: Number.isFinite(pose.yaw) ? pose.yaw : 0,
+      pitch: Number.isFinite(pose.pitch) ? pose.pitch : 0,
+      eyeHeight: Number.isFinite(pose.eyeHeight) ? pose.eyeHeight : null,
+      dq: Array.isArray(pose.dq) ? pose.dq.map((v) => Number(v)) : null,
+      cq: Array.isArray(pose.cq) ? pose.cq.map((v) => Number(v)) : null,
+    };
+  }
+
+  _quaternionDeltaAngle(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) {
+      return null;
+    }
+    const lenA = Math.hypot(a[0], a[1], a[2], a[3]);
+    const lenB = Math.hypot(b[0], b[1], b[2], b[3]);
+    if (lenA === 0 || lenB === 0) return null;
+    const dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]) / (lenA * lenB);
+    const clamped = Math.min(1, Math.max(-1, Math.abs(dot)));
+    return 2 * Math.acos(clamped);
+  }
+
+  _poseChanged(nextPose, prevPose) {
+    if (!prevPose) return true;
+    const dx = (nextPose.px ?? 0) - (prevPose.px ?? 0);
+    const dy = (nextPose.py ?? 0) - (prevPose.py ?? 0);
+    const dz = (nextPose.pz ?? 0) - (prevPose.pz ?? 0);
+    const posDeltaSq = dx * dx + dy * dy + dz * dz;
+    if (posDeltaSq > 1e-4) return true;
+
+    const nextDq = Array.isArray(nextPose.dq) ? nextPose.dq : null;
+    const prevDq = Array.isArray(prevPose.dq) ? prevPose.dq : null;
+    if (!!nextDq !== !!prevDq) return true;
+    if (nextDq && prevDq) {
+      const angle = this._quaternionDeltaAngle(nextDq, prevDq);
+      if (angle != null && angle > THREE.MathUtils.degToRad(0.75)) return true;
+    }
+
+    const nextCq = Array.isArray(nextPose.cq) ? nextPose.cq : null;
+    const prevCq = Array.isArray(prevPose.cq) ? prevPose.cq : null;
+    if (!!nextCq !== !!prevCq) return true;
+    if (nextCq && prevCq) {
+      const angle = this._quaternionDeltaAngle(nextCq, prevCq);
+      if (angle != null && angle > THREE.MathUtils.degToRad(0.75)) return true;
+    }
+
+    const yawDelta = Math.abs(this._wrapAngle((nextPose.yaw ?? 0) - (prevPose.yaw ?? 0)));
+    if (yawDelta > THREE.MathUtils.degToRad(1)) return true;
+
+    const pitchDelta = Math.abs((nextPose.pitch ?? 0) - (prevPose.pitch ?? 0));
+    if (pitchDelta > THREE.MathUtils.degToRad(1)) return true;
+
+    return false;
+  }
+
+  _poseMaybeSave(dt) {
+    const snapshot = this._capturePose();
+    if (!snapshot) return;
+
+    const snapshotClone = this._clonePoseSnapshot(snapshot);
+    this._poseLatestState = snapshotClone;
+
+    if (this._poseChanged(snapshotClone, this._poseStoredState)) {
+      this._poseDirty = true;
+    }
+
+    if (!this._poseDirty) return;
+
+    this._poseSaveTimer += dt;
+    const speed = this.move?.speed?.() ?? 0;
+    const shouldPersist = this._poseSaveTimer >= 2.5 || (speed < 0.05 && this._poseSaveTimer >= 0.6);
+    if (!shouldPersist) return;
+
+    this._persistPose({ snapshot: snapshotClone });
+  }
+
+  _persistPose({ snapshot = null, force = false } = {}) {
+    const sourcePose = snapshot || this._capturePose();
+    if (!sourcePose) return;
+    const pose = this._clonePoseSnapshot(sourcePose);
+
+    if (!force && !this._poseChanged(pose, this._poseStoredState)) {
+      this._poseDirty = false;
+      this._poseSaveTimer = 0;
+      return;
+    }
+
+    try {
+      const stored = { ...pose, ts: Date.now() };
+      localStorage.setItem(PLAYER_POSE_KEY, JSON.stringify(stored));
+      this._poseStoredState = this._clonePoseSnapshot(pose);
+      this._poseLatestState = this._clonePoseSnapshot(pose);
+      this._poseDirty = false;
+      this._poseSaveTimer = 0;
+      this._poseRestored = true;
+    } catch {
+      // Quota errors are non-fatal; we'll retry on the next interval.
+    }
+  }
+
+  _loadStoredPose() {
+    try {
+      const raw = localStorage.getItem(PLAYER_POSE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (!Number.isFinite(parsed.px) || !Number.isFinite(parsed.pz)) return null;
+      const toQuat = (q) => {
+        if (!Array.isArray(q) || q.length !== 4) return null;
+        const arr = q.map((v) => Number(v));
+        return arr.every((v) => Number.isFinite(v)) ? arr : null;
+      };
+      return {
+        px: Number(parsed.px),
+        py: Number.isFinite(parsed.py) ? Number(parsed.py) : 0,
+        pz: Number(parsed.pz),
+        yaw: Number.isFinite(parsed.yaw) ? Number(parsed.yaw) : 0,
+        pitch: Number.isFinite(parsed.pitch) ? Number(parsed.pitch) : 0,
+        eyeHeight: Number.isFinite(parsed.eyeHeight) ? Number(parsed.eyeHeight) : null,
+        dq: toQuat(parsed.dq),
+        cq: toQuat(parsed.cq),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  _applyStoredPose(pose) {
+    if (!pose) return;
+    const dolly = this.sceneMgr?.dolly;
+    const camera = this.sceneMgr?.camera;
+    if (!dolly || !camera) {
+      this._pendingPoseRestore = pose;
+      return;
+    }
+
+    if (Number.isFinite(pose.px) && Number.isFinite(pose.pz)) {
+      const yValue = Number.isFinite(pose.py) ? pose.py : dolly.position.y;
+      dolly.position.set(pose.px, yValue, pose.pz);
+    }
+
+    if (Array.isArray(pose.dq) && pose.dq.length === 4) {
+      dolly.quaternion.set(pose.dq[0], pose.dq[1], pose.dq[2], pose.dq[3]).normalize();
+    } else if (Number.isFinite(pose.yaw)) {
+      dolly.quaternion.setFromEuler(new THREE.Euler(0, pose.yaw, 0, 'YXZ'));
+    }
+
+    if (Array.isArray(pose.cq) && pose.cq.length === 4) {
+      camera.quaternion.set(pose.cq[0], pose.cq[1], pose.cq[2], pose.cq[3]).normalize();
+      const camEuler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+      this._pitch = THREE.MathUtils.clamp(camEuler.x, this._pitchMin, this._pitchMax);
+    } else if (Number.isFinite(pose.pitch)) {
+      const clamped = THREE.MathUtils.clamp(pose.pitch, this._pitchMin, this._pitchMax);
+      this._pitch = clamped;
+      camera.rotation.set(clamped, 0, 0);
+    }
+    camera.up.set(0, 1, 0);
+
+    const eyeHeight = Number.isFinite(pose.eyeHeight) ? pose.eyeHeight : (this.move?.eyeHeight?.() ?? 1.6);
+    const groundY = this.hexGridMgr?.getHeightAt?.(dolly.position.x, dolly.position.z);
+    if (Number.isFinite(groundY) && Number.isFinite(eyeHeight)) {
+      dolly.position.y = groundY + eyeHeight;
+    }
+
+    this.hexGridMgr?.update?.(dolly.position);
+    this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
+
+    const refreshedPose = this._clonePoseSnapshot(this._capturePose());
+    const effectivePose = refreshedPose || this._clonePoseSnapshot(pose);
+    this._poseStoredState = effectivePose;
+    this._poseLatestState = effectivePose ? this._clonePoseSnapshot(effectivePose) : null;
+    this._poseDirty = false;
+    this._poseSaveTimer = 0;
+    this._pendingPoseRestore = null;
+    this._poseRestored = true;
+  }
+
   /* ---------- Main loop ---------- */
   _tick() {
     const dt = this.clock.getDelta();
-    const fpsSample = dt > 0.5 ? this._perf.targetFps : (dt > 1e-4 ? 1 / dt : this._perf.targetFps);
-    const alpha = 0.1;
-    this._perf.smoothedFps = this._perf.smoothedFps * (1 - alpha) + fpsSample * alpha;
-    this._perf.accum += dt;
-    if (this._perf.accum >= 0.3) {
-      if (ui.hudFps) ui.hudFps.textContent = Math.round(this._perf.smoothedFps);
-      this.buildings?.updateQoS?.({ fps: this._perf.smoothedFps, target: this._perf.targetFps });
-      this._perf.accum = 0;
+    const currentTargetFps = this._perf.profile().targetFps;
+    const fpsSample = dt > 0.5 ? currentTargetFps : (dt > 1e-4 ? 1 / dt : currentTargetFps);
+    const perfState = this._perf.sample({ dt, fps: fpsSample });
+    if (perfState.qualityChanged || perfState.hudReady) {
+      const tileSummary = this.hexGridMgr?.applyPerfProfile?.(perfState) || null;
+      const buildingSummary = this.buildings?.applyPerfProfile?.(perfState) || null;
+      if (tileSummary) this._perfSnapshots.tiles = tileSummary;
+      if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
     }
+
+    if (perfState.hudReady) {
+      if (ui.hudFps) ui.hudFps.textContent = Math.round(perfState.smoothedFps);
+      if (ui.hudQos) {
+        ui.hudQos.textContent = this._formatPerfLabel(perfState);
+        ui.hudQos.classList.remove('flash');
+        void ui.hudQos.offsetWidth;
+        ui.hudQos.classList.add('flash');
+      }
+    this._updateHudMeta(perfState);
+    }
+
+    this._updateHudCompass();
 
     if (this._compassYawConfidence > 0) {
       const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -885,13 +1354,14 @@ class App {
     // === ORIENTATION / LOOK ===
     if (!xrOn) {
       if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-        // MOBILE FPV: direct 1:1 mapping from device → dolly. Camera inherits (no extra pitch writes).
+        // MOBILE FPV: direct 1:1 mapping from device → dolly with optional yaw offsets.
         const q = this._deviceQuatForFPV(this.sensors.orient);
-        const yawOffset = this._getCompassYawOffset();
-        if (yawOffset) {
-          this._tmpEuler.setFromQuaternion(q, 'YXZ');
-          this._tmpEuler.y = this._wrapAngle(this._tmpEuler.y + yawOffset);
-          q.setFromEuler(this._tmpEuler);
+        const compassOffset = this._getCompassYawOffset() || 0;
+        const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
+        const totalOffset = this._wrapAngle(compassOffset + manualOffset);
+        if (Math.abs(totalOffset) > 1e-4) {
+          const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), totalOffset);
+          q.multiply(yawQuat);
         }
         dolly.quaternion.copy(q);
         // Enforce camera local zero so it precisely inherits dolly rotation
@@ -994,6 +1464,8 @@ class App {
 
     this.physics?.update(dt);
 
+    this._poseMaybeSave(dt);
+
     this.miniMap?.update();
 
     // Render
@@ -1055,7 +1527,7 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const lift = eyeHeight + 3;
 
-    this._testBall = this.physics.spawnTestBall({ origin, lift });
+    //this._testBall = this.physics.spawnTestBall({ origin, lift });
   }
 }
 

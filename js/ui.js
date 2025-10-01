@@ -27,9 +27,18 @@ const hexSig = document.getElementById('hexSig');
 const nukeBtn = document.getElementById('nuke');
 const hudFps = document.getElementById('hudFps');
 const hudQos = document.getElementById('hudQos');
+const hudDetail = document.getElementById('hudDetail');
+const hudHeadingText = document.getElementById('hudHeadingText');
+const hudDetailMeta = document.getElementById('hudDetailMeta');
+const hudDetailTiles = document.getElementById('hudDetailTiles');
+const hudDetailBuild = document.getElementById('hudDetailBuild');
+const hudDetailRadius = document.getElementById('hudDetailRadius');
+const hudCompassNeedle = document.getElementById('hudCompassNeedle');
 const perfHud = document.getElementById('perfHud');
 const gpsLockToggle = document.getElementById('gpsLockToggle');
 const yawAssistToggle = document.getElementById('yawAssistToggle');
+const yawOffsetRange = document.getElementById('yawOffsetRange');
+const yawOffsetValue = document.getElementById('yawOffsetValue');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 
 function openMenu() {
@@ -66,11 +75,12 @@ export const ui = {
   menuBtn, menuPane, backdrop,
   dotNkn, txtNkn, dotSig, txtSig, txtSigMeta,
   myAddr, myPub,
+  hudDetailTiles, hudDetailBuild, hudDetailRadius,
   poseHzEl, poseSentEl, poseDropEl, poseRateEl,
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
   hexSig, nukeBtn,
-  hudFps, hudQos,
-  gpsLockToggle, yawAssistToggle,
+  hudFps, hudQos, hudDetail, hudHeadingText, hudDetailMeta, hudCompassNeedle,
+  gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
   openMenu, closeMenu
 };

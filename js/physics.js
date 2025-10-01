@@ -188,6 +188,15 @@ export class PhysicsEngine {
     }
   }
 
+  resetTerrain() {
+    if (this.tileColliderMap.size) {
+      for (const mesh of this.tileColliderMap.values()) {
+        this.unregisterStaticMesh(mesh);
+      }
+      this.tileColliderMap.clear();
+    }
+  }
+
   registerStaticMesh(mesh, { forceUpdate = false } = {}) {
     if (!mesh || !this.core || !this.core.RAPIER) return;
 

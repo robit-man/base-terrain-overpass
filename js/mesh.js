@@ -21,6 +21,9 @@ import { now, fmtAgo, isHex64, shortHex, rad, deg } from './utils.js';
 const BOOK_KEY = 'NKN_ADDR_BOOK_V1';
 const BOOK_VER = 1;
 
+const TELEPORT_PENDING_TIMEOUT = 45_000;
+const TELEPORT_STALE_MS = 60_000;
+
 // Health thresholds
 const SIG_HEALTH_MS = 18_000; // if no ACK from signaller in this window → unhealthy
 const BOOK_PROBE_MS = 5_000;  // how often to re-probe address book when unhealthy
@@ -47,6 +50,8 @@ export class Mesh {
     this.addrPool = new Map();   // addr -> { lastAck?, rttMs?, lastProbe?, lastMsg? }
     this.latestPose = new Map(); // pub -> { p, q, ts, j, geo? }
     this.knownIds  = new Map();  // pub -> Set(ids)
+    this.teleportInbox = new Map();  // pub -> { ts, status, respondedAt?, reason? }
+    this.teleportOutbox = new Map(); // pub -> { ts, status, respondedAt?, reason?, dest? }
 
     // Sessions (ncp-js)
     this.sessions = new Map();   // pub -> session
@@ -586,6 +591,57 @@ export class Mesh {
           return;
         }
 
+        if (msg.type === 'teleport_req' && msg.from) {
+          if (!this.selfPub) return;
+          const target = (msg.to || this.selfPub).toLowerCase();
+          if (target !== this.selfPub) return;
+          const from = msg.from.toLowerCase();
+          this._touchPeer(from, t);
+          const msgTs = Number(msg.ts);
+          const entry = this.teleportInbox.get(from) || {};
+          entry.ts = Number.isFinite(msgTs) ? msgTs : t;
+          entry.status = 'pending';
+          entry.respondedAt = undefined;
+          entry.reason = undefined;
+          this.teleportInbox.set(from, entry);
+          this._renderPeers();
+          return;
+        }
+
+        if (msg.type === 'teleport_rsp' && msg.from) {
+          if (!this.selfPub) return;
+          const target = (msg.to || this.selfPub).toLowerCase();
+          if (target !== this.selfPub) return;
+          const from = msg.from.toLowerCase();
+          this._touchPeer(from, t);
+          const msgTs = Number(msg.ts);
+          const entry = this.teleportOutbox.get(from) || { ts: Number.isFinite(msgTs) ? msgTs : t };
+          if (!Number.isFinite(entry.ts)) entry.ts = Number.isFinite(msgTs) ? msgTs : t;
+          entry.respondedAt = t;
+          entry.reason = msg.reason || null;
+
+          if (msg.accepted) {
+            if (msg.dest) {
+              entry.status = 'accepted';
+              entry.dest = msg.dest;
+              const applied = this.app.applyTeleportArrival?.(msg.dest, from);
+              if (applied === false) {
+                entry.status = 'error';
+                entry.reason = 'teleport failed';
+              }
+            } else {
+              entry.status = 'unavailable';
+              entry.reason = entry.reason || 'no destination provided';
+            }
+          } else {
+            entry.status = msg.reason === 'unavailable' ? 'unavailable' : 'rejected';
+          }
+
+          this.teleportOutbox.set(from, entry);
+          this._renderPeers();
+          return;
+        }
+
         if (msg.type === 'pose' && msg.from && Array.isArray(msg.pose?.p) && Array.isArray(msg.pose?.q)) {
           const pub = msg.from.toLowerCase();
           this._touchPeer(pub, t);
@@ -730,8 +786,10 @@ export class Mesh {
 
   _renderPeers() {
     const t = now();
+    this._pruneTeleportState(t);
     const rows = [...this.peers.entries()].sort((a, b) => (b[1].lastTs || 0) - (a[1].lastTs || 0));
     if (ui.peerList) ui.peerList.innerHTML = '';
+    let pendingIncoming = 0;
     for (const [pub, ent] of rows) {
       const row = document.createElement('div'); row.className = 'peer';
       const dot = document.createElement('span'); const online = this._online(pub);
@@ -754,10 +812,261 @@ export class Mesh {
       }
       left.appendChild(name); left.appendChild(meta); left.appendChild(poseDiv);
       row.appendChild(dot); row.appendChild(left);
+
+      const incoming = this.teleportInbox.get(pub);
+      const outgoing = this.teleportOutbox.get(pub);
+      if (incoming?.status === 'pending') pendingIncoming++;
+      const actionsNode = this._buildTeleportActions(pub, incoming, outgoing, t);
+      if (actionsNode) row.appendChild(actionsNode);
+
       if (ui.peerList) ui.peerList.appendChild(row);
     }
     let online = 0; for (const pub of this.peers.keys()) if (this._online(pub)) online++;
-    if (ui.peerSummary) ui.peerSummary.textContent = `${this.peers.size} peers • ${online}/${this.addrPool.size} addrs online`;
+    if (ui.peerSummary) {
+      const parts = [`${this.peers.size} peers`, `${online}/${this.addrPool.size} addrs online`];
+      if (pendingIncoming > 0) parts.push(`${pendingIncoming} teleport request${pendingIncoming > 1 ? 's' : ''}`);
+      ui.peerSummary.textContent = parts.join(' • ');
+    }
+  }
+
+  _pruneTeleportState(nowTs = now()) {
+    const expirePending = (info) => {
+      if (!info) return;
+      const ts = Number.isFinite(info.ts) ? info.ts : nowTs;
+      if (info.status === 'pending' && nowTs - ts > TELEPORT_PENDING_TIMEOUT) {
+        info.status = 'expired';
+        info.respondedAt = nowTs;
+      }
+    };
+
+    const removeIn = [];
+    for (const [pub, info] of this.teleportInbox.entries()) {
+      expirePending(info);
+      if (!info) { removeIn.push(pub); continue; }
+      const ref = Number.isFinite(info.respondedAt) ? info.respondedAt : (Number.isFinite(info.ts) ? info.ts : nowTs);
+      if (nowTs - ref > TELEPORT_STALE_MS) removeIn.push(pub);
+    }
+    removeIn.forEach((pub) => this.teleportInbox.delete(pub));
+
+    const removeOut = [];
+    for (const [pub, info] of this.teleportOutbox.entries()) {
+      expirePending(info);
+      if (!info) { removeOut.push(pub); continue; }
+      const ref = Number.isFinite(info.respondedAt) ? info.respondedAt : (Number.isFinite(info.ts) ? info.ts : nowTs);
+      if (nowTs - ref > TELEPORT_STALE_MS) removeOut.push(pub);
+    }
+    removeOut.forEach((pub) => this.teleportOutbox.delete(pub));
+  }
+
+  _buildTeleportActions(pub, incoming, outgoing, t) {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    let hasContent = false;
+    const addNote = (text) => {
+      if (!text) return;
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = text;
+      actions.appendChild(note);
+      hasContent = true;
+    };
+
+    const fmtSince = (ref) => `${fmtAgo(Math.max(0, t - ref))} ago`;
+
+    if (incoming) {
+      const ts = Number.isFinite(incoming.ts) ? incoming.ts : t;
+      if (incoming.status === 'pending') {
+        addNote(`Incoming teleport request • ${fmtSince(ts)}`);
+        const btnRow = document.createElement('div');
+        btnRow.className = 'btn-row';
+        const acceptBtn = document.createElement('button');
+        acceptBtn.textContent = 'Accept';
+        acceptBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          this._respondTeleport(pub, true);
+        });
+        const declineBtn = document.createElement('button');
+        declineBtn.textContent = 'Decline';
+        declineBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          this._respondTeleport(pub, false);
+        });
+        btnRow.appendChild(acceptBtn);
+        btnRow.appendChild(declineBtn);
+        actions.appendChild(btnRow);
+        hasContent = true;
+      } else {
+        const respondedAt = Number.isFinite(incoming.respondedAt) ? incoming.respondedAt : ts;
+        const since = fmtSince(respondedAt);
+        let msg = 'Teleport request handled';
+        if (incoming.status === 'accepted') msg = 'Accepted teleport request';
+        else if (incoming.status === 'rejected') msg = 'Declined teleport request';
+        else if (incoming.status === 'expired') msg = 'Teleport request expired';
+        else if (incoming.status === 'error') msg = 'Teleport request failed';
+        if (incoming.reason) msg += ` • ${incoming.reason}`;
+        addNote(`${msg} • ${since}`);
+      }
+    }
+
+    const canTeleport = pub && pub !== this.selfPub;
+    if (canTeleport) {
+      const teleBtn = document.createElement('button');
+      const isPending = outgoing?.status === 'pending';
+      teleBtn.textContent = isPending ? 'Teleport Requested…' : 'Teleport';
+      teleBtn.disabled = isPending;
+      teleBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        this._sendTeleportRequest(pub);
+      });
+      actions.appendChild(teleBtn);
+      hasContent = true;
+    }
+
+    if (outgoing) {
+      const ts = Number.isFinite(outgoing.ts) ? outgoing.ts : t;
+      const respondedAt = Number.isFinite(outgoing.respondedAt) ? outgoing.respondedAt : ts;
+      const since = fmtSince(outgoing.status === 'pending' ? ts : respondedAt);
+      let msg = null;
+      switch (outgoing.status) {
+        case 'pending':
+          msg = `Teleport request pending • ${since}`;
+          break;
+        case 'accepted':
+          msg = `Teleport accepted • ${since}`;
+          break;
+        case 'complete':
+          msg = `Teleported successfully • ${since}`;
+          break;
+        case 'rejected':
+          msg = `Teleport request denied • ${since}`;
+          break;
+        case 'expired':
+          msg = `Teleport request expired • ${since}`;
+          break;
+        case 'unavailable':
+          msg = `Teleport unavailable • ${since}`;
+          break;
+        case 'error':
+          msg = `Teleport request failed • ${since}`;
+          break;
+        default:
+          break;
+      }
+      if (msg) {
+        if (outgoing.reason) msg += ` • ${outgoing.reason}`;
+        addNote(msg);
+      }
+    }
+
+    return hasContent ? actions : null;
+  }
+
+  _sendTeleportRequest(pub) {
+    if (!pub || !this.selfPub) return;
+    const key = pub.toLowerCase();
+    if (key === this.selfPub) return;
+    const nowTs = now();
+    const existing = this.teleportOutbox.get(key);
+    if (existing?.status === 'pending') return;
+
+    this.teleportOutbox.set(key, { ts: nowTs, status: 'pending' });
+    this._touchPeer(key, nowTs);
+    this._renderPeers();
+
+    const payload = { type: 'teleport_req', from: this.selfPub, to: key, ts: nowTs };
+    this._sendToPub(key, payload).then((sent) => {
+      if (sent) return;
+      const info = this.teleportOutbox.get(key);
+      if (!info || info.status !== 'pending') return;
+      info.status = 'error';
+      info.respondedAt = now();
+      info.reason = 'unreachable';
+      this.teleportOutbox.set(key, info);
+      this._renderPeers();
+    });
+  }
+
+  _respondTeleport(pub, accept) {
+    if (!pub || !this.selfPub) return;
+    const key = pub.toLowerCase();
+    if (key === this.selfPub) return;
+    const entry = this.teleportInbox.get(key);
+    if (!entry) return;
+
+    let accepted = !!accept;
+    const nowTs = now();
+    const payload = { type: 'teleport_rsp', from: this.selfPub, to: key, ts: nowTs, accepted };
+
+    if (accepted) {
+      const dest = this.app.buildTeleportOffer?.();
+      if (dest) {
+        payload.dest = dest;
+      } else {
+        accepted = false;
+        payload.accepted = false;
+        payload.reason = 'unavailable';
+      }
+    }
+
+    if (!accepted && !payload.reason) payload.reason = 'declined';
+
+    entry.status = accepted ? 'accepted' : 'rejected';
+    if (!accepted && payload.reason) entry.reason = payload.reason;
+    entry.respondedAt = nowTs;
+    this.teleportInbox.set(key, entry);
+    this._touchPeer(key, nowTs);
+    this._renderPeers();
+
+    this._sendToPub(key, payload).then((sent) => {
+      if (sent) return;
+      const info = this.teleportInbox.get(key);
+      if (!info) return;
+      info.status = 'error';
+      info.respondedAt = now();
+      info.reason = 'send failed';
+      this.teleportInbox.set(key, info);
+      this._renderPeers();
+    });
+  }
+
+  markTeleportArrivalComplete(pub) {
+    if (!pub) return;
+    const key = pub.toLowerCase();
+    const entry = this.teleportOutbox.get(key);
+    if (!entry) return;
+    entry.status = 'complete';
+    entry.respondedAt = now();
+    this.teleportOutbox.set(key, entry);
+    this._renderPeers();
+  }
+
+  markTeleportFailed(pub, reason = 'teleport failed') {
+    if (!pub) return;
+    const key = pub.toLowerCase();
+    const entry = this.teleportOutbox.get(key);
+    if (!entry) return;
+    entry.status = 'error';
+    entry.reason = reason;
+    entry.respondedAt = now();
+    this.teleportOutbox.set(key, entry);
+    this._renderPeers();
+  }
+
+  async _sendToPub(pub, payload, { fallback = true } = {}) {
+    if (!pub || !payload) return false;
+    const key = pub.toLowerCase();
+    if (key === this.selfPub) return false;
+    const pkt = JSON.stringify(payload);
+    this._noteBytes(pkt);
+    const addrs = this._bestAddrs(key);
+    for (const to of addrs) {
+      try { await this._sendRaw(to, pkt); this.sent++; return true; } catch { }
+    }
+    if (fallback && isHex64(this.signallerHex)) {
+      try { await this._sendRaw(`signal.${this.signallerHex}`, pkt); this.sent++; return true; } catch { }
+    }
+    this.dropped++;
+    return false;
   }
 
   _online(pub) {

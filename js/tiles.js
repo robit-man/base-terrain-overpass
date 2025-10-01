@@ -4,7 +4,7 @@ import { now } from './utils.js';
 import { worldToLatLon } from './geolocate.js';
 
 export class TileManager {
-  constructor(scene, spacing = 5, tileRadius = 10, audio = null) {
+  constructor(scene, spacing = 10, tileRadius = 15, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.tiles = new Map(); this.origin = null;
@@ -51,6 +51,16 @@ export class TileManager {
       sun.position.set(50, 100, 50); sun.castShadow = true; scene.add(sun);
       scene.userData._tmLightsAdded = true;
     }
+
+    this._baseLod = {
+      interactiveRing: this.INTERACTIVE_RING,
+      visualRing: this.VISUAL_RING,
+      visualCreateBudget: this.VISUAL_CREATE_BUDGET,
+      relaxIters: this.RELAX_ITERS_PER_FRAME,
+      relaxBudget: this.RELAX_FRAME_BUDGET_MS,
+      maxGlobalConVis: this.MAX_GLOBAL_CON_VIS,
+    };
+    this._lodQuality = 1;
 
   }
 
@@ -533,7 +543,12 @@ export class TileManager {
           this._addVisualTile(q, r);
           if (++created >= this.VISUAL_CREATE_BUDGET) break outer;
         } else {
-          if (dist <= this.INTERACTIVE_RING) this._ensureType(q, r, 'interactive');
+          const existing = this.tiles.get(`${q},${r}`);
+          if (dist <= this.INTERACTIVE_RING) {
+            this._ensureType(q, r, 'interactive');
+          } else if (existing && existing.type === 'interactive') {
+            this._ensureType(q, r, 'visual');
+          }
         }
       }
     }
@@ -575,7 +590,7 @@ export class TileManager {
          : this._addVisualTile(q, r);
   }
 
-  setOrigin(lat, lon) {
+  setOrigin(lat, lon, { immediate = false } = {}) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
     const changed =
@@ -588,6 +603,14 @@ export class TileManager {
     if (changed) {
       this._resetAllTiles();
       this._ensureType(0, 0, 'interactive');
+    } else if (immediate && !this.tiles.size) {
+      this._ensureType(0, 0, 'interactive');
+    }
+
+    if (immediate && this.origin) {
+      if (!this._originVec) this._originVec = new THREE.Vector3();
+      this._originVec.set(0, 0, 0);
+      this.update(this._originVec);
     }
   }
 
@@ -668,6 +691,45 @@ export class TileManager {
       }
       if (did) this._pushBuffersToGeometry(tile);
     }
+  }
+
+  applyPerfProfile(profile = {}) {
+    const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._lodQuality;
+    const quality = THREE.MathUtils.clamp(qualityRaw, 0.3, 1.05);
+    this._lodQuality = quality;
+
+    const baseInteractive = this._baseLod.interactiveRing;
+    const baseVisual = this._baseLod.visualRing;
+    const interactive = baseInteractive;
+    const visual = baseVisual;
+    const createBudget = Math.round(18 + quality * 32);
+    const relaxIters = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
+    const relaxBudget = 1 + quality * (this._baseLod.relaxBudget - 1);
+    const maxVis = Math.max(4, Math.round(5 + quality * 11));
+
+    let ringChanged = false;
+    if (this.INTERACTIVE_RING !== interactive) {
+      this.INTERACTIVE_RING = interactive;
+      ringChanged = true;
+    }
+    if (this.VISUAL_RING !== visual) {
+      this.VISUAL_RING = visual;
+      ringChanged = true;
+    }
+    if (ringChanged) this._markRelaxListDirty();
+
+    this.VISUAL_CREATE_BUDGET = createBudget;
+    this.RELAX_ITERS_PER_FRAME = relaxIters;
+    this.RELAX_FRAME_BUDGET_MS = relaxBudget;
+    this.MAX_GLOBAL_CON_VIS = maxVis;
+
+    return {
+      interactiveRing: this.INTERACTIVE_RING,
+      visualRing: this.VISUAL_RING,
+      visualCreateBudget: this.VISUAL_CREATE_BUDGET,
+      relaxIters: this.RELAX_ITERS_PER_FRAME,
+      relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
+    };
   }
 
   getHeightAt(x, z) {
