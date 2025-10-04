@@ -320,4 +320,5 @@ export class Locomotion {
   eyeHeight(){ return this.eyeY; }
   popJumpStarted(){ const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
   jumpHangTime(){ return this._pendingHangTime || 0; }
+  baseEyeHeight(){ return this.baseEye; }
 }

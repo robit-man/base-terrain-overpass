@@ -1508,7 +1508,9 @@ class App {
     if (this.localAvatar) {
       const yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
       const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
-      this.localAvatar.setPosition(pos.x, groundY, pos.z);
+      const baseEyeHeight = this.move.baseEyeHeight?.() ?? eyeHeight;
+      const jumpLift = Math.max(0, eyeHeight - baseEyeHeight);
+      this.localAvatar.setPosition(pos.x, groundY + jumpLift, pos.z);
       this.localAvatar.setQuaternion(qYaw);
       this.localAvatar.setSpeed(this.move.speed());
       this.localAvatar.update(dt);

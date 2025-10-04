@@ -21,7 +21,8 @@ export class ChaseCam {
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
-    this.maxBoom = 6.0;
+    this.maxBoom = 50.0;
+    this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
     this.smooth = 12.0;
 
@@ -33,6 +34,9 @@ export class ChaseCam {
     this.pitchClamp = THREE.MathUtils.degToRad(85); // avoid flipping
 
     this._ensureParentedToDolly();
+    this._orbitPivot = new THREE.Vector3();
+    this._orbitOffset = new THREE.Vector3();
+    this._orbitTarget = new THREE.Vector3();
 
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
@@ -87,16 +91,19 @@ export class ChaseCam {
     // Refresh mobile pitch if available
     this._updateMobilePitch(dt);
 
-    const eye = this.getEyeHeight();
-
     if (this.boom <= this.FIRST_THRESHOLD) {
       // First-person at eyes
       cam.position.set(0, 0, 0);
     } else {
-      // Third-person: behind player in local space
-      const yOffset = 0.35; // shoulder cam
-      const target = new THREE.Vector3(0, eye + yOffset, this.boom);
-      cam.position.lerp(target, Math.min(1, this.smooth * dt));
+      // Third-person: orbit around the head (local origin) with mild lift bias
+      const useMobilePitch = this.isMobile && this.orient?.ready;
+      const pitch = useMobilePitch ? this.pitchFiltered : cam.rotation.x;
+      const orbitAngle = useMobilePitch ? -pitch : pitch;
+      const pivot = this._orbitPivot.set(0, this.pivotLift, 0);
+      const offset = this._orbitOffset.set(0, 0, this.boom)
+        .applyAxisAngle(ChaseCam._X_AXIS, orbitAngle);
+      this._orbitTarget.copy(pivot).add(offset);
+      cam.position.lerp(this._orbitTarget, Math.min(1, this.smooth * dt));
     }
 
     // Apply pitch from sensors ONLY on mobile (no yaw here; avatar stays upright).
@@ -106,3 +113,5 @@ export class ChaseCam {
     }
   }
 }
+
+ChaseCam._X_AXIS = new THREE.Vector3(1, 0, 0);
