@@ -7,24 +7,36 @@ export class MiniMap {
     statusEl,
     recenterBtn,
     setBtn,
+    zoomInBtn,
+    zoomOutBtn,
+    moveBtn,
     tileManager,
     getWorldPosition,
     getHeadingDeg,
+    getPeers,
     onCommitLocation,
     onRequestAuto,
+    onRequestTeleport,
   } = {}) {
     this.canvas = canvas;
     this.ctx = canvas?.getContext('2d') || null;
     this.statusEl = statusEl || null;
     this.recenterBtn = recenterBtn || null;
     this.setBtn = setBtn || null;
+    this.zoomInBtn = zoomInBtn || null;
+    this.zoomOutBtn = zoomOutBtn || null;
+    this.moveBtn = moveBtn || null;
     this.tileManager = tileManager || null;
     this.getWorldPosition = getWorldPosition || null;
     this.getHeadingDeg = getHeadingDeg || (() => 0);
+    this.getPeers = getPeers || null;
     this.onCommitLocation = onCommitLocation || null;
     this.onRequestAuto = onRequestAuto || null;
+    this.onRequestTeleport = onRequestTeleport || null;
 
     this.mapZoom = 16;
+    this.minZoom = 2;
+    this.maxZoom = 19;
     this.tileSize = 256;
     this.tileCache = new Map();
     this.currentLatLon = null;
@@ -41,6 +53,7 @@ export class MiniMap {
     this.needsRedraw = true;
     this._tileErrorNotified = false;
     this.followEnabled = true;
+    this.peerLocations = [];
 
     if (this.canvas) {
       this.canvas.style.cursor = 'grab';
@@ -50,6 +63,9 @@ export class MiniMap {
       this.canvas.addEventListener('pointercancel', (e) => this._onPointerUp(e));
       this.canvas.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
     }
+
+    this.zoomInBtn?.addEventListener('click', () => this._adjustZoom(1));
+    this.zoomOutBtn?.addEventListener('click', () => this._adjustZoom(-1));
 
     this.recenterBtn?.addEventListener('click', () => {
       const next = !this.followEnabled;
@@ -68,11 +84,24 @@ export class MiniMap {
       this.onCommitLocation({ ...this.viewCenter });
     });
 
+    this.moveBtn?.addEventListener('click', () => this._handleMoveRequest());
+
     this._updateFollowButton();
+    this._updateZoomButtons();
+    this._updateMoveButton();
   }
 
   update() {
     if (!this.ctx || !this.tileManager?.origin) return;
+
+    if (typeof this.getPeers === 'function') {
+      const peers = this.getPeers();
+      if (Array.isArray(peers)) {
+        this.peerLocations = peers.filter((p) => Number.isFinite(p?.lat) && Number.isFinite(p?.lon));
+      } else {
+        this.peerLocations = [];
+      }
+    }
 
     const origin = this.tileManager.origin;
     if (!this.viewCenter && origin) {
@@ -122,18 +151,28 @@ export class MiniMap {
       this._pushPathPoint(latLon);
     }
 
+    this._updateMoveButton();
+
     if (this.needsRedraw) {
       this._drawMiniMap(true);
     }
   }
 
-  notifyLocationChange({ lat, lon, source } = {}) {
+  notifyLocationChange({ lat, lon, source, detail } = {}) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     this.activeSource = source || 'unknown';
 
+    const teleported = detail?.teleport === true;
+
     if (source === 'manual') {
-      if (!this.followEnabled) this.userHasPanned = true;
-      if (this.followEnabled) this.viewCenter = { lat, lon };
+      if (teleported) {
+        this.userHasPanned = false;
+        this.viewCenter = { lat, lon };
+      } else if (!this.followEnabled) {
+        this.userHasPanned = true;
+      } else {
+        this.viewCenter = { lat, lon };
+      }
       this.path = [];
     } else if (this.followEnabled || !this.viewCenter) {
       this.viewCenter = { lat, lon };
@@ -144,6 +183,7 @@ export class MiniMap {
     this.needsRedraw = true;
 
     this._setStatus(this.activeSource, lat, lon);
+    this._updateMoveButton();
     this._drawMiniMap(true);
   }
 
@@ -173,6 +213,7 @@ export class MiniMap {
       tileY: this.viewCenter ? this._latToTileY(this.viewCenter.lat, this.mapZoom) : 0,
     };
     e.preventDefault();
+    this._updateMoveButton();
   }
 
   _onPointerMove(e) {
@@ -195,6 +236,7 @@ export class MiniMap {
 
     this.needsRedraw = true;
     this._drawMiniMap(true);
+    this._updateMoveButton();
     e.preventDefault();
   }
 
@@ -205,26 +247,15 @@ export class MiniMap {
     this.dragging = false;
     this.dragState = null;
     this.canvas.style.cursor = 'grab';
+    this._updateMoveButton();
     e.preventDefault();
   }
 
   _onWheel(e) {
     if (!e.ctrlKey) return;
     e.preventDefault();
-    if (e.deltaY < 0) {
-      this.mapZoom = Math.min(this.mapZoom + 1, 19);
-    } else if (e.deltaY > 0) {
-      this.mapZoom = Math.max(this.mapZoom - 1, 2);
-    }
-    if (this.viewCenter) {
-      // Update drag state reference for smooth follow
-      if (this.dragState) {
-        this.dragState.tileX = this._lonToTileX(this.viewCenter.lon, this.mapZoom);
-        this.dragState.tileY = this._latToTileY(this.viewCenter.lat, this.mapZoom);
-      }
-      this.needsRedraw = true;
-      this._drawMiniMap(true);
-    }
+    const step = e.deltaY < 0 ? 1 : (e.deltaY > 0 ? -1 : 0);
+    if (step !== 0) this._adjustZoom(step);
   }
 
   /* ---------------- Drawing ---------------- */
@@ -328,6 +359,43 @@ export class MiniMap {
     const playerTileY = this._latToTileY(this.currentLatLon.lat, zoom);
     const px = playerTileX * ts - originX;
     const py = playerTileY * ts - originY;
+
+    if (Array.isArray(this.peerLocations) && this.peerLocations.length) {
+      ctx.save();
+      ctx.lineWidth = 1.2;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const labelFont = '10px "Inter", "Roboto", sans-serif';
+      for (const peer of this.peerLocations) {
+        if (!Number.isFinite(peer.lat) || !Number.isFinite(peer.lon)) continue;
+        const tileX = this._lonToTileX(peer.lon, zoom);
+        const tileY = this._latToTileY(peer.lat, zoom);
+        const peerPx = tileX * ts - originX;
+        const peerPy = tileY * ts - originY;
+        if (peerPx < -12 || peerPx > width + 12 || peerPy < -12 || peerPy > height + 12) continue;
+        const isSameSpot =
+          Math.abs(peer.lat - this.currentLatLon.lat) < 1e-7 &&
+          Math.abs(peer.lon - this.currentLatLon.lon) < 1e-7;
+        if (isSameSpot) continue;
+
+        ctx.fillStyle = 'rgba(90, 200, 255, 0.9)';
+        ctx.beginPath();
+        ctx.arc(peerPx, peerPy, 4.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(10, 18, 34, 0.85)';
+        ctx.beginPath();
+        ctx.arc(peerPx, peerPy, 4.2, 0, Math.PI * 2);
+        ctx.stroke();
+
+        if (peer.label) {
+          ctx.font = labelFont;
+          ctx.fillStyle = 'rgba(208, 226, 255, 0.9)';
+          ctx.fillText(String(peer.label).slice(0, 6), peerPx, peerPy + 5.5);
+        }
+      }
+      ctx.restore();
+    }
 
     ctx.save();
     ctx.translate(px, py);
@@ -439,12 +507,71 @@ export class MiniMap {
       }
     }
     this._updateFollowButton();
+    this._updateMoveButton();
   }
 
   _updateFollowButton() {
     if (!this.recenterBtn) return;
     this.recenterBtn.textContent = this.followEnabled ? 'Follow: On' : 'Follow: Off';
     this.recenterBtn.setAttribute('aria-pressed', this.followEnabled ? 'true' : 'false');
+  }
+
+  _adjustZoom(step = 0) {
+    if (!Number.isFinite(step) || step === 0) return;
+    const next = Math.max(this.minZoom, Math.min(this.maxZoom, this.mapZoom + step));
+    if (next === this.mapZoom) return;
+    this.mapZoom = next;
+
+    if (this.viewCenter) {
+      if (this.dragState) {
+        this.dragState.tileX = this._lonToTileX(this.viewCenter.lon, this.mapZoom);
+        this.dragState.tileY = this._latToTileY(this.viewCenter.lat, this.mapZoom);
+      }
+      this.needsRedraw = true;
+      this._drawMiniMap(true);
+    }
+
+    this._updateZoomButtons();
+  }
+
+  _updateZoomButtons() {
+    if (this.zoomInBtn) {
+      const disabled = this.mapZoom >= this.maxZoom;
+      this.zoomInBtn.disabled = disabled;
+      this.zoomInBtn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+    if (this.zoomOutBtn) {
+      const disabled = this.mapZoom <= this.minZoom;
+      this.zoomOutBtn.disabled = disabled;
+      this.zoomOutBtn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    }
+  }
+
+  _handleMoveRequest() {
+    if (!this.viewCenter || typeof this.onRequestTeleport !== 'function') return;
+    if (!Number.isFinite(this.viewCenter.lat) || !Number.isFinite(this.viewCenter.lon)) return;
+    if (this.moveBtn?.disabled) return;
+    this.onRequestTeleport({ lat: this.viewCenter.lat, lon: this.viewCenter.lon });
+    this.userHasPanned = false;
+    this.moveBtn?.blur?.();
+    this._updateMoveButton();
+  }
+
+  _updateMoveButton() {
+    if (!this.moveBtn) return;
+    const hasTarget = Boolean(
+      this.viewCenter &&
+      Number.isFinite(this.viewCenter.lat) &&
+      Number.isFinite(this.viewCenter.lon) &&
+      this.userHasPanned
+    );
+    this.moveBtn.disabled = !hasTarget;
+    this.moveBtn.setAttribute('aria-disabled', hasTarget ? 'false' : 'true');
+    if (hasTarget) {
+      this.moveBtn.title = `Teleport to ${this.viewCenter.lat.toFixed(5)}, ${this.viewCenter.lon.toFixed(5)}`;
+    } else {
+      this.moveBtn.title = 'Pan the mini-map to choose a destination';
+    }
   }
 
   _setStatus(source, lat, lon) {
@@ -462,7 +589,7 @@ export class MiniMap {
         break;
     }
     const coords = Number.isFinite(lat) && Number.isFinite(lon)
-      ? `${lat.toFixed(4)}, ${lon.toFixed(4)}`
+      ? `${lat.toFixed(5)}, ${lon.toFixed(5)}`
       : '—';
     this.statusEl.textContent = `${label} · ${coords}`;
   }

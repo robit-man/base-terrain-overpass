@@ -25,6 +25,7 @@ export class PhysicsEngine {
     this.character = null;
     this.characterReady = false;
     this._characterImpactCooldown = 0;
+    this._characterSnapDefaults = { distance: 0.3, slope: 0.6 };
 
     this.collidersReady = new Promise((resolve) => { this._resolveCollidersReady = resolve; });
     this.ready = this._init();
@@ -50,6 +51,8 @@ export class PhysicsEngine {
     if (this._characterImpactCooldown > 0) {
       this._characterImpactCooldown = Math.max(0, this._characterImpactCooldown - dt);
     }
+
+    this._updateCharacterSnap(dt);
 
     this._updateDynamicImpacts(dt);
 
@@ -287,7 +290,9 @@ export class PhysicsEngine {
     const controller = this.core.world.createCharacterController(0.01);
     controller.setApplyImpulsesToDynamicBodies(false);
     controller.enableAutostep?.(0.4, 0.4, true);
-    controller.enableSnapToGround?.(0.3, 0.6);
+    const snapDistance = this._characterSnapDefaults.distance;
+    const snapSlope = this._characterSnapDefaults.slope;
+    controller.enableSnapToGround?.(snapDistance, snapSlope);
 
     const offset = this._characterOffset(eyeHeight, radius, halfHeight);
     const center = this._characterCenter(position, offset, TMP_CHARACTER_CENTER);
@@ -304,7 +309,12 @@ export class PhysicsEngine {
       radius,
       halfHeight,
       offset,
+      snapEnabled: true,
+      snapResumeTimer: 0,
+      snapDistance,
+      snapSlope,
     };
+    this._setCharacterSnap(true);
     this.characterReady = true;
   }
 
@@ -362,6 +372,50 @@ export class PhysicsEngine {
   _characterOffset(eyeHeight = 1.6, radius = 0.35, halfHeight = 0.45) {
     const offset = eyeHeight - (radius + halfHeight);
     return Number.isFinite(offset) ? Math.max(0, offset) : 0;
+  }
+
+  suspendCharacterSnap(duration = 0.3) {
+    if (!this.isCharacterReady()) return;
+    const state = this.character;
+    if (typeof state.controller?.disableSnapToGround !== 'function') {
+      return;
+    }
+    state.snapResumeTimer = Math.max(state.snapResumeTimer || 0, Number.isFinite(duration) ? Math.max(0, duration) : 0.3);
+    this._setCharacterSnap(false);
+  }
+
+  _updateCharacterSnap(dt = 0) {
+    if (!this.isCharacterReady()) return;
+    const state = this.character;
+    if (!state) return;
+    if (state.snapResumeTimer && state.snapResumeTimer > 0) {
+      state.snapResumeTimer = Math.max(0, state.snapResumeTimer - Math.max(0, dt));
+      if (state.snapResumeTimer === 0) {
+        this._setCharacterSnap(true);
+      }
+    }
+  }
+
+  _setCharacterSnap(enabled) {
+    if (!this.isCharacterReady()) return;
+    const state = this.character;
+    const controller = state?.controller;
+    if (!controller) return;
+
+    if (enabled) {
+      if (!state.snapEnabled) {
+        const dist = state.snapDistance ?? this._characterSnapDefaults.distance;
+        const slope = state.snapSlope ?? this._characterSnapDefaults.slope;
+        controller.enableSnapToGround?.(dist, slope);
+        state.snapEnabled = true;
+      }
+      return;
+    }
+
+    if (state.snapEnabled && typeof controller.disableSnapToGround === 'function') {
+      controller.disableSnapToGround();
+      state.snapEnabled = false;
+    }
   }
 
   _characterCenter(position, offset, target = new THREE.Vector3()) {

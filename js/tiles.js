@@ -35,7 +35,7 @@ export class TileManager {
 
     // ---- caching config ----
     this.CACHE_VER = 'v1';
-    // Keys look like: tile:v1:<type>:<spacing>:<tileRadius>:<q>,<r>
+    this._originCacheKey = 'na';
 
     this.ray = new THREE.Raycaster();
     this.DOWN = new THREE.Vector3(0, -1, 0);
@@ -201,8 +201,14 @@ export class TileManager {
 
   /* ---------- caching helpers ---------- */
 
+  _originKeyForCache(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return 'na';
+    const quant = (value) => (Math.round(value * 100000) / 100000).toFixed(5);
+    return `${quant(lat)},${quant(lon)}`;
+  }
   _cacheKey(tile) {
-    return `tile:${this.CACHE_VER}:${tile.type}:${this.spacing}:${this.tileRadius}:${tile.q},${tile.r}`;
+    const originKey = this._originCacheKey || 'na';
+    return `tile:${this.CACHE_VER}:${originKey}:${tile.type}:${this.spacing}:${this.tileRadius}:${tile.q},${tile.r}`;
   }
   _tryLoadTileFromCache(tile) {
     try {
@@ -599,6 +605,7 @@ export class TileManager {
       Math.abs(lon - this.origin.lon) > 1e-6;
 
     this.origin = { lat, lon };
+    this._originCacheKey = this._originKeyForCache(lat, lon);
 
     if (changed) {
       this._resetAllTiles();
@@ -742,5 +749,10 @@ export class TileManager {
     const hit = this.ray.intersectObjects(meshes, true);
     if (hit.length) { this._lastHeight = hit[0].point.y; return this._lastHeight; }
     return this._lastHeight;
+  }
+
+  dispose() {
+    this._resetAllTiles();
+    this.tiles.clear();
   }
 }

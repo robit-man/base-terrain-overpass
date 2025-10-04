@@ -1,125 +1,44 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
   <title>XR + Desktop + Mobile Nav — NKN Mesh (event-driven pose + sessions)</title>
-  <style>
-    html, body { margin:0; height:100%; overflow:hidden; background:#111a; color:#eeea; font-family:monospace }
-    body.modal-open{ overflow:hidden; }
-    #hint { border-radius:2rem; position:fixed; top:1rem; left:1rem; font-size:.75rem; background:rgba(0,0,0,.5); padding:.5em 1em; pointer-events:none; z-index:10 }
-    #backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.35); backdrop-filter:blur(10px); display:none; z-index:19 }
-    #menuPane{ position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:min(520px,92vw); max-height:92vh;overflow:auto; background:#0b0b0fcc; backdrop-filter:saturate(120%) blur(12px); border:1px solid rgba(255,255,255,0.08); border-radius:18px; z-index:20; display:none; padding:24px 24px 32px; overflow:auto; max-height:calc(100vh - 4rem); }
-    #menuPane h2{ margin:12px 0 8px; font-size:16px }
-    .kv{ display:flex; align-items:center; gap:8px; background:#0008; border:1px solid #222; padding:6px 8px; border-radius:8px; margin:2px 0 }
-    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
-    .tiny{ font-size:12px; color:#9aa0a6 }
-    .mono{ font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace }
-    .dot{ aspect-ratio:1/1;width:10px; height:10px; border-radius:50%; background:#444; border:1px solid #222 }
-    .ok{ background:#30cf6b } .warn{ background:#f7b500 } .err{ background:#e84d4d }
-    input[type=text]{ width:100%; background:#000; color:#eee; border:1px solid #333; border-radius:8px; padding:8px 10px }
-    .peer{ display:flex;flex-flow:column;position:relative; gap:10px; align-items:flex-start; border:1px solid #222; background:#0a0a0a; border-radius:10px; padding:8px }
-    .peer .name{ font-family:ui-monospace, Menlo, Consolas, monospace }
-    .peer .meta{  font-size:12px; color:#9aa0a6 }
-    .peer .pose{font-size:12px; color:#ccc; margin-top:2px }
-    .peer .actions{ margin-left:auto; display:flex; flex-direction:column; gap:6px; align-items:flex-end }
-    .peer .actions button{ border:1px solid #333; background:#111; color:#eee; padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px; letter-spacing:0.02em; text-transform:uppercase }
-    .peer .actions button:hover{ background:#1d1d1d }
-    .peer .actions button:disabled{ opacity:0.4; cursor:default }
-    .peer .actions .note{ font-size:11px; color:#9aa0a6; max-width:220px; text-align:right }
-    .peer .actions .btn-row{ display:flex; gap:6px }
-    .peer::nth-child(2){
-      max-width:200px;
-    }
-    #nuke{ margin-top:8px; width:100%; padding:14px 10px; cursor:pointer; border:6px solid #000; border-radius:18px; font-weight:900; text-transform:uppercase; color:#000;
-      background:repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px); box-shadow:0 3px 0 #000, inset 0 0 0 3px #ffd400; }
-    #nuke .big{ display:block; font-size:20px; letter-spacing:1px }
-    #nuke .sub{font-size:20px; font-weight:bold; text-shadow:2px 2px 0px #f7b500,2px -2px 0px #f7b500,-2px 2px 0px #f7b500, -2px -2px 0px #f7b500;display:block; font-size:12px; font-weight:700 }
-    #miniMapCanvas{ filter:saturate(0)hue-rotate(180deg)invert(0.9)contrast(1.2); background:#111; }
-    .mini-map-controls{ display:flex; gap:8px }
-    .mini-map-controls button{ flex:1; border:1px solid #333; background:#111; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
-    .mini-map-controls button:hover{ background:#1d1d1d }
-    .mini-map-manual{ display:flex; flex-wrap:wrap; gap:6px }
-    .mini-map-manual input{ flex:1 1 120px }
-    .mini-map-manual button{ flex:1 1 110px; border:1px solid #333; background:#181818; color:#eee; padding:8px 0; border-radius:8px; cursor:pointer; font-family:inherit; font-size:12px; letter-spacing:0.04em; text-transform:uppercase }
-    .mini-map-manual button:hover{ background:#232323 }
-    .toggle-row{ display:flex; align-items:flex-start; gap:10px; background:#0008; border:1px solid #222; border-radius:10px; padding:10px 12px; cursor:pointer }
-    .toggle-row input[type=checkbox]{ width:18px; height:18px; accent-color:#4da3ff; margin-top:2px }
-    .toggle-text{ display:flex; flex-direction:column; gap:4px }
-    .toggle-title{ font-size:14px; letter-spacing:0.04em; text-transform:uppercase; color:#fafafa; }
-    .slider-row{ display:flex; flex-direction:column; gap:6px; background:#0008; border:1px solid #222; border-radius:10px; padding:10px 12px; margin-top:10px; }
-    .slider-row label{ display:flex; justify-content:space-between; align-items:center; font-size:12px; color:#c6cad5; }
-    .slider-row input[type=range]{ width:100%; }
-    #perfHud{ position:fixed; top:1rem; right:1rem; display:flex; flex-direction:column; gap:4px; align-items:flex-end; background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px 14px; font-size:12px; color:#e6e9f0; z-index:12; pointer-events:auto; cursor:pointer; min-width:120px; transition:background 0.2s ease; backdrop-filter: blur(10px);}
-    #perfHud:hover{ background:rgba(0,0,0,0.7); }
-    #perfHud:focus-visible{ outline:2px solid #7fd5ff; outline-offset:3px; }
-    #perfHud .hud-fps{ font-size:14px; font-weight:600; letter-spacing:0.04em; }
-    #perfHud .hud-qos{ font-size:12px; opacity:0.85; }
-    #perfHud .hud-detail{ display:flex; flex-flow:wrap; align-items:center; gap:6px; font-size:11px; opacity:0.78; letter-spacing:0.01em; }
-    #perfHud .hud-compass{ position:relative; width:18px; height:18px; border:1px solid rgba(255,255,255,0.25); border-radius:50%; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.25); }
-    #perfHud .hud-compass::after{ content:''; position:absolute; width:2px; height:2px; border-radius:50%; background:rgba(255,255,255,0.45); top:3px; left:50%; transform:translateX(-50%); }
-    #perfHud .hud-compass-needle{ position:absolute; bottom:50%; left:50%; width:2px; height:8px; background:#7fd5ff; border-radius:2px; transform-origin:50% 100%; transform:translateX(-50%) rotate(0deg); transition:transform 0.1s ease-out; }
-    #perfHud .hud-compass-needle[data-source="orientation"]{ background:#c0c6ff; }
-    #perfHud .hud-compass-needle[data-source="webkit"]{ background:#ffb067; }
-    #perfHud .hud-compass-needle[data-source="magnetometer"]{ background:#7fd5ff; }
-    #perfHud .hud-heading{ font-variant-numeric:tabular-nums; font-weight:600; opacity:0.88; }
-    #perfHud .hud-meta{ opacity:0.78; }
-    #perfHud .hud-qos.flash{ animation: hudFlash 0.8s ease-out; }
-    #myAddr{
-      overflow:clip;text-overflow: ellipsis;
-    }
-    #myPub{
-            overflow:clip;text-overflow: ellipsis;
-
-    }
-    @keyframes hudFlash { from { color:#7fd5ff; } to { color:inherit; } }
-    #miniMapDock{ position:fixed; top:1rem; left:1rem; background:rgba(0,0,0,0.55); border-radius:12px; z-index:11; display:flex; flex-direction:column; align-items:center; backdrop-filter:blur(10px)brightness(2);  gap:6px;}
-    #miniMapDock canvas{ width:180px; height:180px; border-radius:10px; opacity: 0.5; display:block; }
-    #miniMapControls{ display:flex; flex-direction:column; gap:10px; background:rgba(0,0,0,0.45); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:12px; }
-    #miniMapControls .mini-map-controls button,
-    #miniMapControls .mini-map-manual button{ background:#171717; }
-    .modal-section{margin-bottom:18px; display:flex; flex-direction:column; gap:10px; }
-    .modal-section .section-title{ font-size:16px; font-weight:600; letter-spacing:0.04em; text-transform:uppercase; color:#fafafa; opacity:0.9; }
-    .button-row{ display:flex; gap:8px; flex-wrap:wrap; }
-    .button-row button{ flex:1 1 140px; border:1px solid #333; background:#111; color:#eee; padding:10px 12px; border-radius:10px; cursor:pointer; font-family:inherit; font-size:13px; letter-spacing:0.03em; text-transform:uppercase; transition:background 0.2s ease, transform 0.2s ease; }
-    .button-row button:hover{ background:#1d1d1d; transform:translateY(-1px); }
-    .modal-note{ font-size:12px; color:#9aa0a6; }
-    .modal-header{ display:flex; flex-direction:column; gap:4px; margin-bottom:18px; }
-    .modal-header h2{ margin:0; font-size:18px; font-weight:700; letter-spacing:0.05em; text-transform:uppercase; }
-  </style>
+  <link rel="stylesheet" href="style.css">
 
   <!-- NKN SDK (global window.nkn) -->
   <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
 
   <script>
-(function () {
-  function checkAndRemove() {
-    var el = document.getElementById('VRButton');
-    if (!el) return false;
+    (function () {
+      function checkAndRemove() {
+        var el = document.getElementById('VRButton');
+        if (!el) return false;
 
-    var txt = (el.textContent || "").trim().toUpperCase();
-    if (txt === "VR NOT AVAILABLE" || txt.includes("VR NOT AVAILABLE") || txt === "VR NOT SUPPORTED" || txt.includes("VR NOT SUPPORTED") || txt === "WEBXR NOT AVAILABLE" || txt.includes("WEBXR NOT AVAILABLE")) {
-      el.remove();
-      return true;
-    }
-    return false;
-  }
+        var txt = (el.textContent || "").trim().toUpperCase();
+        if (txt === "VR NOT AVAILABLE" || txt.includes("VR NOT AVAILABLE") || txt === "VR NOT SUPPORTED" || txt.includes("VR NOT SUPPORTED") || txt === "WEBXR NOT AVAILABLE" || txt.includes("WEBXR NOT AVAILABLE")) {
+          el.remove();
+          return true;
+        }
+        return false;
+      }
 
-  // Run now or on DOM ready
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", checkAndRemove, { once: true });
-  } else {
-    checkAndRemove();
-  }
+      // Run now or on DOM ready
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", checkAndRemove, { once: true });
+      } else {
+        checkAndRemove();
+      }
 
-  // Catch late-inserted buttons
-  var mo = new MutationObserver(function (_, obs) {
-    if (checkAndRemove()) obs.disconnect();
-  });
-  mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
-})();
-</script>
+      // Catch late-inserted buttons
+      var mo = new MutationObserver(function (_, obs) {
+        if (checkAndRemove()) obs.disconnect();
+      });
+      mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    })();
+  </script>
   <!-- three.js import map -->
   <script type="importmap">
     {
@@ -134,27 +53,66 @@
     }
   </script>
 </head>
+
 <body>
   <div id="perfHud" aria-live="polite" aria-expanded="false" role="button" tabindex="0" title="Open control center">
-    <span class="hud-fps">FPS: <span id="hudFps">60</span></span>
-    <span class="hud-qos" id="hudQos">LOD 100% · High</span>
-    <span class="hud-detail" id="hudDetail">
-      <span class="hud-compass" aria-hidden="true"><span class="hud-compass-needle" id="hudCompassNeedle"></span></span>
-      <span class="hud-heading" id="hudHeadingText">--°</span>
-      <span class="hud-meta" id="hudDetailMeta"><span id="hudDetailTiles">Tiles 2/10</span><span id="hudDetailBuild">Build 2.0ms/3.0ms</span><span id="hudDetailRadius">Radius 800m</span></span>
-    </span>
+    <div class="hud-shell" id="hudDetail">
+      <div class="hud-topline">
+        <div class="hud-compass" aria-hidden="true">
+          <span class="hud-compass-needle" id="hudCompassNeedle"></span>
+        </div>
+        <div class="hud-heading-block">
+          <span class="hud-label">Heading</span>
+          <span class="hud-heading" id="hudHeadingText">--°</span>
+        </div>
+        <div class="hud-fps-block">
+          <span class="hud-label">FPS</span>
+          <span class="hud-fps" id="hudFps">60</span>
+        </div>
+      </div>
+      <div class="hud-metrics">
+        <div class="hud-metric">
+          <span class="hud-label">Quality</span>
+          <span class="hud-qos" id="hudQos">LOD 100% · High</span>
+        </div>
+        <div class="hud-metric">
+          <span class="hud-label">Tiles</span>
+          <span class="hud-value" id="hudDetailTiles">2 / 10</span>
+        </div>
+        <div class="hud-metric">
+          <span class="hud-label">Build</span>
+          <span class="hud-value" id="hudDetailBuild">2.0ms / 3.0ms</span>
+        </div>
+        <div class="hud-metric">
+          <span class="hud-label">Radius</span>
+          <span class="hud-value" id="hudDetailRadius">800m</span>
+        </div>
+      </div>
+      <div class="hud-geo">
+        <div class="hud-geo-item">
+          <span class="hud-label">Lat</span>
+          <span class="hud-value" id="hudLat">--</span>
+        </div>
+        <div class="hud-geo-item">
+          <span class="hud-label">Lon</span>
+          <span class="hud-value" id="hudLon">--</span>
+        </div>
+      </div>
+    </div>
   </div>
   <div id="miniMapDock">
     <canvas id="miniMapCanvas" width="220" height="220" aria-label="Mini map preview"></canvas>
+    <div class="mini-map-zoom-stack" aria-label="Mini map movement controls">
+      <button id="miniMapZoomIn" type="button" aria-label="Zoom in">+</button>
+      <button id="miniMapZoomOut" type="button" aria-label="Zoom out">-</button>
+      <button id="miniMapMove" type="button" aria-label="Teleport to map center">Move</button>
+    </div>
   </div>
 
   <!-- Modal overlay -->
   <div id="backdrop" aria-hidden="true"></div>
   <aside id="menuPane" aria-label="World Control Center">
-    <div class="modal-header">
-      <h2>World Control Center</h2>
-      <p class="modal-note">Tap outside this panel to close. Unlock permissions for smoother tracking.</p>
-    </div>
+
 
     <section class="modal-section">
       <div class="section-title">Network Status</div>
@@ -198,7 +156,8 @@
           <input id="gpsLockToggle" type="checkbox" checked />
           <span class="toggle-text">
             <span class="toggle-title">Lock world to GPS</span>
-            <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling geolocation.</span>
+            <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling
+              geolocation.</span>
           </span>
         </label>
       </div>
@@ -241,4 +200,5 @@
   <script type="module" src="./js/persist.js"></script>
 
 </body>
+
 </html>

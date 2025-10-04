@@ -29,16 +29,20 @@ const hudFps = document.getElementById('hudFps');
 const hudQos = document.getElementById('hudQos');
 const hudDetail = document.getElementById('hudDetail');
 const hudHeadingText = document.getElementById('hudHeadingText');
-const hudDetailMeta = document.getElementById('hudDetailMeta');
 const hudDetailTiles = document.getElementById('hudDetailTiles');
 const hudDetailBuild = document.getElementById('hudDetailBuild');
 const hudDetailRadius = document.getElementById('hudDetailRadius');
 const hudCompassNeedle = document.getElementById('hudCompassNeedle');
 const perfHud = document.getElementById('perfHud');
+const hudLat = document.getElementById('hudLat');
+const hudLon = document.getElementById('hudLon');
 const gpsLockToggle = document.getElementById('gpsLockToggle');
 const yawAssistToggle = document.getElementById('yawAssistToggle');
 const yawOffsetRange = document.getElementById('yawOffsetRange');
 const yawOffsetValue = document.getElementById('yawOffsetValue');
+const miniMapZoomIn = document.getElementById('miniMapZoomIn');
+const miniMapZoomOut = document.getElementById('miniMapZoomOut');
+const miniMapMove = document.getElementById('miniMapMove');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 
 function openMenu() {
@@ -80,7 +84,9 @@ export const ui = {
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
   hexSig, nukeBtn,
-  hudFps, hudQos, hudDetail, hudHeadingText, hudDetailMeta, hudCompassNeedle,
+  hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
+  hudLat, hudLon,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
+  miniMapZoomIn, miniMapZoomOut, miniMapMove,
   openMenu, closeMenu
 };

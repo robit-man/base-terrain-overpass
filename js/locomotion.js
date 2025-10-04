@@ -8,10 +8,11 @@ export class Locomotion {
   constructor(sceneMgr, input, orientationRef) {
     this.sceneMgr = sceneMgr; this.input = input; this.orientationRef = orientationRef || { ready: false };
     this.baseSpeed = 2; this.runMul = 2.5; this._spd = 0;
-    this.GRAV = 20; 
+    this.GRAV = 20;
     this.baseEye = 1.6; this.crouchEye = 0.9; this.jumpPeak = 2.4;
     this.eyeY = this.baseEye; this.vertVel = 0; this.jumpState = 'idle';
     this.CROUCH_EASE = 6; this._jumpJustStarted = false;
+    this._pendingHangTime = 0;
 
     this._vrAxisDeadzone = 0.2;
     this._vrTurnSpeed = THREE.MathUtils.degToRad(110);
@@ -41,6 +42,7 @@ export class Locomotion {
     if (this.input.consumeJump() && this.jumpState === 'idle') {
       const h = this.jumpPeak - this.baseEye;
       this.vertVel = Math.sqrt(2 * this.GRAV * h);
+      this._pendingHangTime = (2 * this.vertVel) / this.GRAV;
       this.jumpState = 'jumping';
       this._jumpJustStarted = true;
     }
@@ -48,7 +50,10 @@ export class Locomotion {
       this.vertVel -= this.GRAV * dt;
       this.eyeY += this.vertVel * dt;
       if (this.eyeY <= this.baseEye) {
-        this.eyeY = this.baseEye; this.vertVel = 0; this.jumpState = 'idle';
+        this.eyeY = this.baseEye;
+        this.vertVel = 0;
+        this.jumpState = 'idle';
+        this._pendingHangTime = 0;
       }
     } else {
       const target = this.input.m.crouch ? this.crouchEye : this.baseEye;
@@ -314,4 +319,5 @@ export class Locomotion {
   speed(){ return this._spd; }
   eyeHeight(){ return this.eyeY; }
   popJumpStarted(){ const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
+  jumpHangTime(){ return this._pendingHangTime || 0; }
 }

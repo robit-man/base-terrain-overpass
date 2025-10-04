@@ -55,6 +55,7 @@ class App {
     this._perfSnapshots = { tiles: null, buildings: null };
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
+    this._hudGeoCached = { lat: null, lon: null };
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -192,6 +193,8 @@ class App {
     this._tmpVec2 = new THREE.Vector3();
     this._tmpVec3 = new THREE.Vector3();
     this._tmpVec4 = new THREE.Vector3();
+    this._tmpVec5 = new THREE.Vector3();
+    this._tmpVec6 = new THREE.Vector3();
     this._tmpQuat = new THREE.Quaternion();
     this._tmpQuat2 = new THREE.Quaternion();
     this._tmpEuler = new THREE.Euler();
@@ -253,6 +256,9 @@ class App {
       statusEl: document.getElementById('miniMapStatus'),
       recenterBtn: document.getElementById('miniMapRecenter'),
       setBtn: document.getElementById('miniMapSet'),
+      zoomInBtn: ui.miniMapZoomIn,
+      zoomOutBtn: ui.miniMapZoomOut,
+      moveBtn: ui.miniMapMove,
       tileManager: this.hexGridMgr,
       getWorldPosition: () => this.sceneMgr?.dolly?.position,
       getHeadingDeg: () => {
@@ -262,6 +268,7 @@ class App {
         const deg = (Math.atan2(forward.x, forward.z) * 180) / Math.PI;
         return (deg + 360) % 360;
       },
+      getPeers: () => this._collectPeerLocations(),
       onCommitLocation: ({ lat, lon }) => {
         this._handleGpsUpdate({ lat, lon, source: 'manual' });
       },
@@ -274,6 +281,9 @@ class App {
             preserveManual: false,
           });
         }
+      },
+      onRequestTeleport: ({ lat, lon }) => {
+        this._handleMiniMapTeleport({ lat, lon });
       },
     });
 
@@ -420,6 +430,18 @@ class App {
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
+  }
+
+  _handleMiniMapTeleport({ lat, lon } = {}) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    this._handleGpsUpdate({
+      lat,
+      lon,
+      source: 'manual',
+      manual: true,
+      teleport: true,
+      force: true,
+    });
   }
 
   _resetPlayerPosition() {
@@ -773,6 +795,24 @@ class App {
 
   /* ---------- Helpers ---------- */
 
+  _collectPeerLocations() {
+    const origin = this.hexGridMgr?.origin;
+    if (!origin || !this.remotes?.map?.size) return [];
+    const peers = [];
+    for (const ent of this.remotes.map.values()) {
+      const pos = ent?.avatar?.group?.position || ent?.targetPos;
+      if (!pos) continue;
+      const latLon = worldToLatLon(pos.x, pos.z, origin.lat, origin.lon);
+      if (!latLon) continue;
+      const label = typeof ent.pub === 'string'
+        ? ent.pub.slice(0, 4).toUpperCase()
+        : undefined;
+      peers.push({ lat: latLon.lat, lon: latLon.lon, label });
+      if (peers.length >= 24) break;
+    }
+    return peers;
+  }
+
   _createCompassDial() {
     if (!this.sceneMgr?.camera) return null;
     const mount = new THREE.Group();
@@ -1015,27 +1055,40 @@ class App {
   _formatPerfDetail(perfState, snapshots = {}) {
     const tileSnap = snapshots.tiles || {};
     const buildingSnap = snapshots.buildings || {};
-    const tileNear = Number.isFinite(tileSnap.interactiveRing) ? tileSnap.interactiveRing : '--';
-    const tileFar = Number.isFinite(tileSnap.visualRing) ? tileSnap.visualRing : '--';
-    const buildBudget = Number.isFinite(buildingSnap.frameBudget)
-      ? buildingSnap.frameBudget.toFixed(2)
-      : '--';
-    const mergeBudget = Number.isFinite(buildingSnap.mergeBudget)
-      ? buildingSnap.mergeBudget.toFixed(2)
-      : '--';
-    const radius = Number.isFinite(buildingSnap.radius)
-      ? Math.round(buildingSnap.radius)
-      : '--';
+    const tileNear = Number.isFinite(tileSnap.interactiveRing) ? tileSnap.interactiveRing : null;
+    const tileFar = Number.isFinite(tileSnap.visualRing) ? tileSnap.visualRing : null;
+    const buildBudget = Number.isFinite(buildingSnap.frameBudget) ? buildingSnap.frameBudget : null;
+    const mergeBudget = Number.isFinite(buildingSnap.mergeBudget) ? buildingSnap.mergeBudget : null;
+    const radiusMeters = Number.isFinite(buildingSnap.radius) ? Math.round(buildingSnap.radius) : null;
 
-    return `Tiles ${tileNear}/${tileFar} · Build ${buildBudget}/${mergeBudget}ms · Radius ${radius}m`;
+    const formatMs = (value) => (Number.isFinite(value) ? value.toFixed(2) : '--');
+
+    return {
+      tiles: `${tileNear != null ? tileNear : '--'} / ${tileFar != null ? tileFar : '--'}`,
+      build: `${formatMs(buildBudget)} / ${formatMs(mergeBudget)} ms`,
+      radius: radiusMeters != null ? `${radiusMeters} m` : '--',
+    };
   }
 
   _updateHudMeta(perfState) {
-    if (!ui.hudDetailMeta) return;
-    const text = this._formatPerfDetail(perfState, this._perfSnapshots);
-    if (text === this._hudMetaCached) return;
-    ui.hudDetailMeta.textContent = text;
-    this._hudMetaCached = text;
+    const detail = this._formatPerfDetail(perfState, this._perfSnapshots);
+    if (!detail) return;
+
+    const cached = this._hudMetaCached || {};
+
+    if (ui.hudDetailTiles && detail.tiles !== cached.tiles) {
+      ui.hudDetailTiles.textContent = detail.tiles;
+    }
+
+    if (ui.hudDetailBuild && detail.build !== cached.build) {
+      ui.hudDetailBuild.textContent = detail.build;
+    }
+
+    if (ui.hudDetailRadius && detail.radius !== cached.radius) {
+      ui.hudDetailRadius.textContent = detail.radius;
+    }
+
+    this._hudMetaCached = { ...detail };
   }
 
   _updateHudCompass() {
@@ -1067,6 +1120,27 @@ class App {
       needle.style.opacity = hasHeading ? '1' : '0.35';
       needle.dataset.source = headingSource;
       needle.title = hasHeading ? `Heading source: ${headingSource}` : 'Heading unavailable';
+    }
+  }
+
+  _updateHudGeo({ lat, lon } = {}) {
+    if (!ui.hudLat || !ui.hudLon) return;
+
+    const latLabel = Number.isFinite(lat) ? lat.toFixed(5) : '--';
+    const lonLabel = Number.isFinite(lon) ? lon.toFixed(5) : '--';
+    const latTitle = Number.isFinite(lat) ? `Latitude ${lat.toFixed(7)}` : 'Latitude unavailable';
+    const lonTitle = Number.isFinite(lon) ? `Longitude ${lon.toFixed(7)}` : 'Longitude unavailable';
+
+    if (this._hudGeoCached.lat !== latLabel) {
+      ui.hudLat.textContent = latLabel;
+      ui.hudLat.title = latTitle;
+      this._hudGeoCached.lat = latLabel;
+    }
+
+    if (this._hudGeoCached.lon !== lonLabel) {
+      ui.hudLon.textContent = lonLabel;
+      ui.hudLon.title = lonTitle;
+      this._hudGeoCached.lon = lonLabel;
     }
   }
 
@@ -1390,22 +1464,20 @@ class App {
 
     const eyeHeight = this.move.eyeHeight();
     const desiredMove = this._tmpVec2.copy(dolly.position).sub(prevPos);
-    desiredMove.y = 0;
 
     let allowedMove = desiredMove;
     if (this.physics?.isCharacterReady?.()) {
       allowedMove = this.physics.resolveCharacterMovement(prevPos, eyeHeight, desiredMove);
     }
-    if (allowedMove) allowedMove.y = 0;
     if (!allowedMove) {
       desiredMove.set(0, 0, 0);
       allowedMove = desiredMove;
     }
 
-    const desiredLen = desiredMove.length();
-    const allowedLen = allowedMove.length();
-    const impactLoss = Math.max(0, desiredLen - allowedLen);
-    if (impactLoss > 0.02 && desiredLen > 0.05 && this.physics?.notifyCharacterImpact) {
+    const desiredHorizLen = this._tmpVec5.copy(desiredMove).setY(0).length();
+    const allowedHorizLen = this._tmpVec6.copy(allowedMove).setY(0).length();
+    const impactLoss = Math.max(0, desiredHorizLen - allowedHorizLen);
+    if (impactLoss > 0.02 && desiredHorizLen > 0.05 && this.physics?.notifyCharacterImpact) {
       const impactPos = this._tmpVec4.copy(prevPos).addScaledVector(allowedMove, 0.5);
       const intensity = THREE.MathUtils.clamp(impactLoss * 8, 0.12, 2.5);
       this.physics.notifyCharacterImpact(impactPos, intensity);
@@ -1460,11 +1532,24 @@ class App {
     const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
     const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, eSend.y, 0, 'YXZ'));
     const jumpEvt = this.move.popJumpStarted();
+    if (jumpEvt && this.physics?.suspendCharacterSnap) {
+      const hangTime = this.move?.jumpHangTime?.() ?? 0;
+      const resumeDelay = Number.isFinite(hangTime) && hangTime > 0
+        ? THREE.MathUtils.clamp(hangTime * 0.55, 0.2, 0.8)
+        : 0.35;
+      this.physics.suspendCharacterSnap(resumeDelay);
+    }
     this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
 
     this.physics?.update(dt);
 
     this._poseMaybeSave(dt);
+
+    const origin = this.hexGridMgr?.origin;
+    if (origin) {
+      const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
+      if (hudLatLon) this._updateHudGeo(hudLatLon);
+    }
 
     this.miniMap?.update();
 
