@@ -161,7 +161,12 @@ class App {
       .catch(() => {});
 
     // Third-person chase cam (we'll bypass it in mobile FPV)
-    this.chase = new ChaseCam(this.sceneMgr, () => this.move.eyeHeight());
+    const sampleHeight = (x, z) => {
+      const mgr = this.hexGridMgr;
+      if (!mgr || typeof mgr.getHeightAt !== 'function') return NaN;
+      return mgr.getHeightAt(x, z);
+    };
+    this.chase = new ChaseCam(this.sceneMgr, () => this.move.eyeHeight(), this.sensors?.orient ?? null, sampleHeight);
 
     // Desktop pitch accumulator (mouse look). Camera carries pitch on desktop only.
     this._pitch = 0;

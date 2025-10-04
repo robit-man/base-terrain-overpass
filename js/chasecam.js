@@ -13,16 +13,18 @@ export class ChaseCam {
    * @param {() => number} getEyeHeightFn  returns current eye height (e.g., crouch/jump)
    * @param {{a:number,b:number,g:number,ready:boolean}=} orientationRef  optional mobile sensors.orient
    */
-  constructor(sceneMgr, getEyeHeightFn, orientationRef = null) {
+  constructor(sceneMgr, getEyeHeightFn, orientationRef = null, heightSampler = null) {
     this.sceneMgr = sceneMgr;
     this.getEyeHeight = getEyeHeightFn || (() => 1.6);
     this.orient = orientationRef;
+    this.heightAt = typeof heightSampler === 'function' ? heightSampler : null;
 
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
     this.maxBoom = 50.0;
     this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
+    this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
     this.smooth = 12.0;
 
@@ -37,6 +39,8 @@ export class ChaseCam {
     this._orbitPivot = new THREE.Vector3();
     this._orbitOffset = new THREE.Vector3();
     this._orbitTarget = new THREE.Vector3();
+    this._worldTarget = new THREE.Vector3();
+    this._clampedLocal = new THREE.Vector3();
 
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
@@ -103,6 +107,24 @@ export class ChaseCam {
       const offset = this._orbitOffset.set(0, 0, this.boom)
         .applyAxisAngle(ChaseCam._X_AXIS, orbitAngle);
       this._orbitTarget.copy(pivot).add(offset);
+
+      if (this.heightAt) {
+        const parent = cam.parent || this.sceneMgr.dolly;
+        parent.updateMatrixWorld?.(true);
+        const worldTarget = this._worldTarget.copy(this._orbitTarget);
+        parent.localToWorld(worldTarget);
+        const groundY = this.heightAt(worldTarget.x, worldTarget.z);
+        if (Number.isFinite(groundY)) {
+          const minY = groundY + this.surfaceClearance;
+          if (worldTarget.y < minY) {
+            worldTarget.y = minY;
+            this._clampedLocal.copy(worldTarget);
+            parent.worldToLocal(this._clampedLocal);
+            this._orbitTarget.copy(this._clampedLocal);
+          }
+        }
+      }
+
       cam.position.lerp(this._orbitTarget, Math.min(1, this.smooth * dt));
     }
 

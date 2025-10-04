@@ -11,8 +11,8 @@ export class TileManager {
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;          // near player ⇒ high-res
-    this.VISUAL_RING = 10;              // far field ⇒ 7-vertex tiles
-    this.VISUAL_CREATE_BUDGET = 50;     // cap new visuals per frame
+    this.VISUAL_RING = 30;              // far field ⇒ vastly expanded coverage
+    this.VISUAL_CREATE_BUDGET = 150;    // cap new visuals per frame
 
     // ---- interactive (high-res) relaxation ----
     this.RELAX_ITERS_PER_FRAME = 4;
@@ -23,7 +23,7 @@ export class TileManager {
     // ---- global queue for low-res fetches ----
     this._visFetchQ = [];
     this._visFetchActive = 0;
-    this.MAX_GLOBAL_CON_VIS = 16;
+    this.MAX_GLOBAL_CON_VIS = 48;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;  // almost black
@@ -709,10 +709,10 @@ export class TileManager {
     const baseVisual = this._baseLod.visualRing;
     const interactive = baseInteractive;
     const visual = baseVisual;
-    const createBudget = Math.round(18 + quality * 32);
+    const createBudget = Math.round((18 + quality * 32) * 3);
     const relaxIters = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
     const relaxBudget = 1 + quality * (this._baseLod.relaxBudget - 1);
-    const maxVis = Math.max(4, Math.round(5 + quality * 11));
+    const maxVis = Math.max(4, Math.round((5 + quality * 11) * 3));
 
     let ringChanged = false;
     if (this.INTERACTIVE_RING !== interactive) {
