@@ -37,18 +37,59 @@ body.modal-open {
     z-index: 19
 }
 
+/* BASE: desktop behavior unchanged (centered modal) */
 #menuPane {
   position: fixed;
-  inset: 3rem 1rem auto 1rem;   /* top/right/bottom/left */
-  margin: auto;                 /* center horizontally */
-  max-width: 800px;
-  left: 0; right: 0;            /* needed with margin:auto */
+  background: linear-gradient(135deg, rgba(10, 14, 24, 0.92), rgba(24, 34, 52, 0.82));
+  border: 1px solid rgba(94, 138, 255, 0.28);
+  box-shadow: 0 12px 30px rgba(8, 12, 24, 0.55);
+  border-radius: 18px;
+  z-index: 20;
+  padding: 1rem;
+
+  /* sizing */
+  width: 800px;
+  max-width: calc(100vw - 2rem);
+  max-height: calc(100vh - 6rem);
+
+  /* center on desktop */
   top: 50%;
-  translate: 0 -50%;            /* translate only on Y (safer than full transform) */
+  left: 50%;
+  transform: translate(-50%, -50%);
+
+  /* scrolling */
   overflow: auto;
-  max-height: calc(100dvh - 6rem);
-  -webkit-overflow-scrolling: touch;
+
+  /* your show/hide logic still works — keep display:none set via JS */
+  display: none;
 }
+
+/* MOBILE FIX: remove transforms so WebKit allows scrolling, anchor near top */
+@media (max-width: 768px) {
+  #menuPane {
+    /* kill transform (the iOS troublemaker) */
+    transform: none;
+
+    /* center horizontally without transforms */
+    left: 1rem;
+    right: 1rem;
+    margin-left: auto;
+    margin-right: auto;
+    width: auto; /* ignore fixed 800px on small screens */
+
+    /* anchor near top to avoid needing vertical centering transforms */
+    top: 1rem;
+
+    /* use dynamic viewport to avoid iOS 100vh bugs */
+    max-height: calc(100dvh - 2rem);
+
+    /* enable momentum scroll on iOS */
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* optional: your scrollbar rule had a typo; this hides WebKit scrollbars */
+*::-webkit-scrollbar { display: none; }
 
 #menuPane h2 {
     margin: 12px 0 8px;
