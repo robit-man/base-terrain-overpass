@@ -49,7 +49,7 @@ export class Mesh {
     this.peers = new Map();      // pub -> { addr?: string, lastTs: number }
     this.addrPool = new Map();   // addr -> { lastAck?, rttMs?, lastProbe?, lastMsg? }
     this.latestPose = new Map(); // pub -> { p, q, ts, j, geo? }
-    this.knownIds  = new Map();  // pub -> Set(ids)
+    this.knownIds = new Map();  // pub -> Set(ids)
     this.teleportInbox = new Map();  // pub -> { ts, status, respondedAt?, reason? }
     this.teleportOutbox = new Map(); // pub -> { ts, status, respondedAt?, reason?, dest? }
 
@@ -77,7 +77,7 @@ export class Mesh {
     this._bootstrapFromBook(); // populate peers/addrPool/knownIds up-front
 
     setInterval(() => {
-      if (ui.poseHzEl)   ui.poseHzEl.textContent   = String(this.hzCount);
+      if (ui.poseHzEl) ui.poseHzEl.textContent = String(this.hzCount);
       if (ui.poseSentEl) ui.poseSentEl.textContent = String(this.sent);
       if (ui.poseDropEl) ui.poseDropEl.textContent = String(this.dropped);
       this.hzCount = 0; this._updateRate();
@@ -98,6 +98,9 @@ export class Mesh {
     this._bookProbeTimer = setInterval(() => this._probeBookIfNeeded(), BOOK_PROBE_MS);
   }
 
+  _isSelf(pub) {
+    return (pub || '').toLowerCase() === (this.selfPub || '').toLowerCase();
+  }
   /* ───────── Address book: load / save / bootstrap / probe ───────── */
 
   _loadBook() {
@@ -133,7 +136,7 @@ export class Mesh {
         const addrs = [];
         for (const a of addrSet) {
           const pool = this.addrPool.get(a) || {};
-          const old  = (prev?.addrs || []).find(x => x.addr === a) || {};
+          const old = (prev?.addrs || []).find(x => x.addr === a) || {};
           addrs.push({
             addr: a,
             lastAck: pool.lastAck ?? old.lastAck ?? null,
@@ -174,7 +177,7 @@ export class Mesh {
       for (const a of addrs) {
         if (!isAddr(a.addr)) continue;
         const m = this.addrPool.get(a.addr) || {};
-        if (a.lastAck)   m.lastAck   = a.lastAck;
+        if (a.lastAck) m.lastAck = a.lastAck;
         if (a.lastProbe) m.lastProbe = a.lastProbe;
         if (a.rttMs != null) m.rttMs = a.rttMs;
         this.addrPool.set(a.addr, m);
@@ -200,12 +203,12 @@ export class Mesh {
       (p.addrs || []).forEach(a => { if (isAddr(a.addr)) targets.add(a.addr); });
 
       const hello = JSON.stringify({ type: 'hello', from: this.selfPub, ts: t });
-      const ask   = JSON.stringify({ type: 'peers_req', from: this.selfPub, ts: t });
+      const ask = JSON.stringify({ type: 'peers_req', from: this.selfPub, ts: t });
 
       for (const to of targets) {
         const m = this.addrPool.get(to) || {}; m.lastProbe = t; this.addrPool.set(to, m);
-        this._sendRaw(to, hello).catch(() => {});
-        this._sendRaw(to, ask).catch(() => {});
+        this._sendRaw(to, hello).catch(() => { });
+        this._sendRaw(to, ask).catch(() => { });
       }
     }
   }
@@ -484,7 +487,7 @@ export class Mesh {
         this.selfAddr = this.client.addr || null;
         this.selfPub = (this.client.getPublicKey() || '').toLowerCase();
         if (ui.myAddr) ui.myAddr.textContent = this.selfAddr || '—';
-        if (ui.myPub)  ui.myPub.textContent  = this.selfPub || '—';
+        if (ui.myPub) ui.myPub.textContent = this.selfPub || '—';
         setNkn('NKN: connected', 'ok');
 
         this._initDiscovery();
@@ -520,13 +523,14 @@ export class Mesh {
         const t = now();
 
         if (msg.type === 'hello' && msg.from) {
+          if (this._isSelf(msg.from)) return;              // <-- avoid self-remote
           const pub = msg.from.toLowerCase();
           this._touchPeer(pub, t);
           this.app.remotes.ensure(pub);
           this._saveBookSoon();
 
           // ★ Auto-snapshot back to greeter
-          this._sendPoseSnapshotTo(pub).catch(() => {});
+          this._sendPoseSnapshotTo(pub).catch(() => { });
           return;
         }
 
@@ -571,7 +575,7 @@ export class Mesh {
             this.app.remotes.ensure(pub);
 
             // ★ Auto-snapshot to each discovered peer
-            this._sendPoseSnapshotTo(pub).catch(() => {});
+            this._sendPoseSnapshotTo(pub).catch(() => { });
           }
           this._renderPeers();
           this._saveBookSoon();
@@ -586,7 +590,7 @@ export class Mesh {
           if (msg.from && /^[0-9a-f]{64}$/i.test(msg.from)) {
             const pub = msg.from.toLowerCase();
             this._touchPeer(pub, t);
-            this._sendPoseSnapshotTo(pub).catch(() => {});
+            this._sendPoseSnapshotTo(pub).catch(() => { });
           }
           return;
         }
@@ -643,6 +647,7 @@ export class Mesh {
         }
 
         if (msg.type === 'pose' && msg.from && Array.isArray(msg.pose?.p) && Array.isArray(msg.pose?.q)) {
+          if (this._isSelf(msg.from)) return;
           const pub = msg.from.toLowerCase();
           this._touchPeer(pub, t);
           const info = { rtt: this.addrPool.get(src)?.rttMs ?? null, age: fmtAgo(now() - msg.ts) };
@@ -1091,7 +1096,7 @@ export class Mesh {
       this._idSet(pub).forEach(id => set.add(addrFrom(id, pub)));
       set.add(addrFrom('peer', pub)); set.add(addrFrom('web', pub)); set.add(addrFrom('phone', pub));
     }
-    return [...set].filter(a => a !== this.selfAddr);
+    return [...set].filter(a => a !== this.selfAddr && !a.endsWith(`.${this.selfPub}`));
   }
 
   _blast(obj) {
@@ -1185,10 +1190,10 @@ export class Mesh {
     const addrs = this._bestAddrs(pub);
     let sent = false;
     for (const to of addrs) {
-      try { await this._sendRaw(to, pkt); sent = true; break; } catch {}
+      try { await this._sendRaw(to, pkt); sent = true; break; } catch { }
     }
     if (!sent) {
-      try { await this._sendRaw(`signal.${this.signallerHex}`, pkt); sent = true; } catch {}
+      try { await this._sendRaw(`signal.${this.signallerHex}`, pkt); sent = true; } catch { }
     }
     if (sent) this.sent++; else this.dropped++;
   }
