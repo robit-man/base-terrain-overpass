@@ -2,6 +2,13 @@ import * as THREE from 'three';
 import { UniformHexGrid } from './grid.js';
 import { now } from './utils.js';
 import { worldToLatLon } from './geolocate.js';
+import { geohashEncode, pickGeohashPrecision } from './geohash.js';
+import { TerrainRelay } from './terrainRelay.js';
+
+const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
+const DEFAULT_TERRAIN_DATASET = 'mapzen';
+const DM_BUDGET_BYTES = 2800;
+const MAX_LOCATIONS_PER_BATCH = 800;
 
 export class TileManager {
   constructor(scene, spacing = 10, tileRadius = 15, audio = null) {
@@ -10,20 +17,15 @@ export class TileManager {
     this.tiles = new Map(); this.origin = null;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 2;          // near player ⇒ high-res
-    this.VISUAL_RING = 30;              // far field ⇒ vastly expanded coverage
-    this.VISUAL_CREATE_BUDGET = 150;    // cap new visuals per frame
+    this.INTERACTIVE_RING = 2;
+    this.VISUAL_RING = 30;
+    this.VISUAL_CREATE_BUDGET = 150;
 
     // ---- interactive (high-res) relaxation ----
     this.RELAX_ITERS_PER_FRAME = 4;
     this.RELAX_ALPHA = 1.0;
     this.NORMALS_EVERY = 6;
     this.RELAX_FRAME_BUDGET_MS = 3.0;
-
-    // ---- global queue for low-res fetches ----
-    this._visFetchQ = [];
-    this._visFetchActive = 0;
-    this.MAX_GLOBAL_CON_VIS = 48;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;  // almost black
@@ -58,10 +60,25 @@ export class TileManager {
       visualCreateBudget: this.VISUAL_CREATE_BUDGET,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
-      maxGlobalConVis: this.MAX_GLOBAL_CON_VIS,
     };
     this._lodQuality = 1;
 
+    this.relayMode = 'geohash';
+    this.relayAddress = DEFAULT_TERRAIN_RELAY;
+    this.relayDataset = DEFAULT_TERRAIN_DATASET;
+    this.relayTimeoutMs = 45000;
+    this._relayStatus = { text: 'idle', level: 'info' };
+
+    this.terrainRelay = new TerrainRelay({
+      defaultRelay: this.relayAddress,
+      dataset: this.relayDataset,
+      mode: this.relayMode,
+      onStatus: (text, level) => { this._relayStatus = { text, level }; },
+    });
+
+    this._populateQueue = [];
+    this._populateBusy = false;
+    this._encoder = new TextEncoder();
   }
 
   /* ---------------- small helpers ---------------- */
@@ -199,6 +216,197 @@ export class TileManager {
     tile.col.needsUpdate = true;
   }
 
+  _collectTileLatLon(tile) {
+    const pos = tile.pos;
+    const out = new Array(pos.count);
+    for (let i = 0; i < pos.count; i++) {
+      const wx = tile.grid.group.position.x + pos.getX(i);
+      const wz = tile.grid.group.position.z + pos.getZ(i);
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      const lat = Number.isFinite(ll?.lat) ? ll.lat : this.origin.lat;
+      const lon = Number.isFinite(ll?.lon) ? ll.lon : this.origin.lon;
+      out[i] = { lat: Number(lat.toFixed(6)), lng: Number(lon.toFixed(6)) };
+    }
+    return out;
+  }
+
+  _buildProgressiveLevels(tile) {
+    const pos = tile.pos;
+    const indices = Array.from({ length: pos.count }, (_, i) => i);
+    indices.sort((a, b) => {
+      const ax = pos.getX(a), az = pos.getZ(a);
+      const bx = pos.getX(b), bz = pos.getZ(b);
+      return (ax * ax + az * az) - (bx * bx + bz * bz);
+    });
+
+    const levels = [];
+    let cursor = 0;
+    let chunk = Math.max(6, Math.ceil(indices.length * 0.06));
+    while (cursor < indices.length) {
+      const end = Math.min(indices.length, cursor + chunk);
+      levels.push(indices.slice(cursor, end));
+      cursor = end;
+      chunk = Math.max(8, Math.min(indices.length - cursor, Math.ceil(chunk * 1.8)));
+      if (chunk <= 0) chunk = indices.length - cursor;
+    }
+    return levels;
+  }
+
+  _indicesToBatchesLatLng(indices, latLon) {
+    const batches = [];
+    let cur = [];
+    let curBytes = 0;
+    for (const idx of indices) {
+      const loc = latLon[idx];
+      const candidate = { type: 'elev.query', dataset: this.relayDataset, locations: cur.concat([loc]) };
+      const bytes = this._encoder.encode(JSON.stringify(candidate)).length;
+      if (bytes <= DM_BUDGET_BYTES && candidate.locations.length <= MAX_LOCATIONS_PER_BATCH) {
+        cur.push(loc);
+        curBytes = bytes;
+      } else {
+        if (cur.length) batches.push({ items: cur.slice(), bytes: curBytes });
+        cur = [loc];
+        curBytes = this._encoder.encode(JSON.stringify({ type: 'elev.query', dataset: this.relayDataset, locations: cur })).length;
+      }
+    }
+    if (cur.length) batches.push({ items: cur.slice(), bytes: curBytes });
+    return batches;
+  }
+
+  _indicesToBatchesGeohash(indices, geohashes, precision) {
+    const meta = { enc: 'geohash', prec: precision };
+    const batches = [];
+    let cur = [];
+    let curBytes = 0;
+    for (const idx of indices) {
+      const gh = geohashes[idx];
+      const candidate = { type: 'elev.query', dataset: this.relayDataset, geohashes: cur.concat([gh]), ...meta };
+      const bytes = this._encoder.encode(JSON.stringify(candidate)).length;
+      if (bytes <= DM_BUDGET_BYTES && candidate.geohashes.length <= MAX_LOCATIONS_PER_BATCH) {
+        cur.push(gh);
+        curBytes = bytes;
+      } else {
+        if (cur.length) batches.push({ items: cur.slice(), bytes: curBytes, meta });
+        cur = [gh];
+        curBytes = this._encoder.encode(JSON.stringify({ type: 'elev.query', dataset: this.relayDataset, geohashes: cur, ...meta })).length;
+      }
+    }
+    if (cur.length) batches.push({ items: cur.slice(), bytes: curBytes, meta });
+    return batches;
+  }
+
+  _applyRelayResults(tile, results, { mode, indexByLatLon, indexByGeohash }) {
+    for (const res of results) {
+      let idx;
+      if (mode === 'geohash') {
+        const key = res.geohash || res.hash;
+        idx = key ? indexByGeohash?.get(key) : undefined;
+      } else if (res.location) {
+        const { lat, lng } = res.location;
+        const key = `${(+lat).toFixed(6)},${(+lng).toFixed(6)}`;
+        idx = indexByLatLon?.get(key);
+      }
+      if (idx == null) continue;
+      const height = Number(res.elevation);
+      if (!Number.isFinite(height)) continue;
+      this._applySample(tile, idx, height);
+    }
+  }
+
+  _applySample(tile, idx, height) {
+    const pos = tile.pos;
+    pos.setY(idx, height);
+    pos.needsUpdate = true;
+
+    if (tile.ready[idx] !== 1) tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
+    tile.ready[idx] = 1;
+    tile.fetched.add(idx);
+
+    this._pullGeometryToBuffers(tile, idx);
+    this._updateGlobalFromValue(height);
+
+    if (!tile.col) this._ensureColorAttr(tile);
+    const l = this._lumFromYGlobal(height);
+    const o = 3 * idx;
+    tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
+    tile.col.needsUpdate = true;
+
+    if (this.audio) {
+      const wx = tile.grid.group.position.x + tile.pos.getX(idx);
+      const wy = height;
+      const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
+      this.audio.triggerScratch(wx, wy, wz, 0.9);
+    }
+  }
+
+  _nearestAnchorFill(tile) {
+    const ready = tile.ready;
+    const pos = tile.pos;
+    const n = pos.count;
+    const nearest = new Int32Array(n).fill(-1);
+    const queue = new Int32Array(n);
+    let head = 0; let tail = 0;
+
+    for (let i = 0; i < n; i++) {
+      if (ready[i]) {
+        nearest[i] = i;
+        queue[tail++] = i;
+      }
+    }
+    if (tail === 0) return;
+
+    while (head < tail) {
+      const cur = queue[head++];
+      for (const nbr of tile.neighbors[cur]) {
+        if (nearest[nbr] !== -1) continue;
+        nearest[nbr] = nearest[cur];
+        queue[tail++] = nbr;
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      if (ready[i]) continue;
+      const src = nearest[i];
+      if (src === -1) continue;
+      const y = pos.getY(src);
+      pos.setY(i, y);
+    }
+    pos.needsUpdate = true;
+    if (tile.col) tile.col.needsUpdate = true;
+  }
+
+  _smoothUnknowns(tile, iterations = 1) {
+    const pos = tile.pos;
+    const ready = tile.ready;
+    const next = new Float32Array(pos.count);
+
+    for (let iter = 0; iter < iterations; iter++) {
+      let touched = false;
+      for (let i = 0; i < pos.count; i++) {
+        if (ready[i]) continue;
+        let sum = 0;
+        let cnt = 0;
+        for (const nbr of tile.neighbors[i]) {
+          const y = pos.getY(nbr);
+          if (Number.isFinite(y)) { sum += y; cnt++; }
+        }
+        if (cnt >= 2) {
+          const val = sum / cnt;
+          next[i] = val;
+          touched = true;
+        } else {
+          next[i] = pos.getY(i);
+        }
+      }
+      if (!touched) break;
+      for (let i = 0; i < pos.count; i++) {
+        if (ready[i]) continue;
+        pos.setY(i, next[i]);
+      }
+      pos.needsUpdate = true;
+    }
+  }
+
   /* ---------- caching helpers ---------- */
 
   _originKeyForCache(lat, lon) {
@@ -208,7 +416,8 @@ export class TileManager {
   }
   _cacheKey(tile) {
     const originKey = this._originCacheKey || 'na';
-    return `tile:${this.CACHE_VER}:${originKey}:${tile.type}:${this.spacing}:${this.tileRadius}:${tile.q},${tile.r}`;
+    const datasetKey = (this.relayDataset || '').replace(/[^a-z0-9._-]/gi, '').slice(0, 40);
+    return `tile:${this.CACHE_VER}:${originKey}:${tile.type}:${this.spacing}:${this.tileRadius}:${datasetKey}:${this.relayMode}:${tile.q},${tile.r}`;
   }
   _tryLoadTileFromCache(tile) {
     try {
@@ -292,7 +501,7 @@ export class TileManager {
     this._markRelaxListDirty();
 
     if (!this._tryLoadTileFromCache(tile)) {
-      setTimeout(() => this._populateInteractive(id), 0);
+      this._queuePopulate(tile, true);
     }
     return tile;
   }
@@ -344,173 +553,119 @@ export class TileManager {
 
     const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
+    const neighbors = this._buildAdjacency(low.geometry.getIndex(), pos.count);
 
     const tile = {
       type: 'visual',
       grid: { group: low.group, mesh: low.mesh, geometry: low.geometry, mat: low.mat, wireMat: low.wireMat },
       q, r,
       pos,
+      neighbors,
       ready,
       fetched: new Set(),
       populating: false,
-      pending: 0,
+      unreadyCount: pos.count,
       col: low.geometry.attributes.color
     };
     this.tiles.set(id, tile);
 
     if (!this._tryLoadTileFromCache(tile)) {
-      setTimeout(() => this._populateVisual(id), 0);
+      this._queuePopulate(tile, false);
     }
     return tile;
   }
 
   /* ---------------- fetching ---------------- */
 
-  _populateInteractive(id) {
-    const tile = this.tiles.get(id); if (!tile || tile.type !== 'interactive' || !this.origin || tile.populating) return;
+  _queuePopulate(tile, priority = false) {
+    if (!tile || tile.populating || tile._queued) return;
+    tile._queued = true;
+    if (priority) this._populateQueue.unshift(tile);
+    else this._populateQueue.push(tile);
+    this._drainPopulateQueue();
+  }
+
+  _drainPopulateQueue() {
+    if (this._populateBusy) return;
+    const next = this._populateQueue.shift();
+    if (!next) return;
+    next._queued = false;
+    this._populateBusy = true;
+    this._populateTile(next)
+      .catch(() => {})
+      .finally(() => {
+        this._populateBusy = false;
+        this._drainPopulateQueue();
+      });
+  }
+
+  async _populateTile(tile) {
+    if (!tile || !this.origin) { if (tile) tile.populating = false; return; }
+    if (!this.relayAddress) { tile.populating = false; return; }
     tile.populating = true;
 
-    const { grid, pos, fetched } = tile;
-    const n = pos.count;
+    try {
+      const pos = tile.pos;
+      const count = pos.count;
+      if (!Number.isFinite(count) || count === 0) { tile.populating = false; return; }
 
-    // far → near ordering
-    const q = []; for (let i = 0; i < n; i++) q.push(i);
-    q.sort((a, b) => {
-      const ax = pos.getX(a), az = pos.getZ(a), bx = pos.getX(b), bz = pos.getZ(b);
-      return (bx*bx + bz*bz) - (ax*ax + az*az);
-    });
+      const latLon = this._collectTileLatLon(tile);
+      const mode = this.relayMode;
+      const precision = pickGeohashPrecision(this.spacing);
+      const geohashes = mode === 'geohash' ? latLon.map(({ lat, lng }) => geohashEncode(lat, lng, precision)) : null;
 
-    const MAX_CON = 6; let active = 0;
-
-    const apply = (i, val) => {
-      // 1) height
-      pos.setY(i, val);
-      pos.needsUpdate = true;
-      if (!tile.ready[i]) {
-        tile.ready[i] = 1;
-        tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
-      } else {
-        tile.ready[i] = 1;
+      const indexByLatLon = new Map();
+      if (mode === 'latlng') {
+        for (let i = 0; i < latLon.length; i++) {
+          const { lat, lng } = latLon[i];
+          indexByLatLon.set(`${lat.toFixed(6)},${lng.toFixed(6)}`, i);
+        }
       }
-      fetched.add(i);
-      this._pullGeometryToBuffers(tile, i);
+      const indexByGeohash = geohashes ? new Map(geohashes.map((gh, i) => [gh, i])) : null;
 
-      // 2) global range + immediate color
-      this._updateGlobalFromValue(val);
-      if (!tile.col) this._ensureColorAttr(tile);
-      const l = this._lumFromYGlobal(val);
-      const o = 3 * i;
-      tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
-      tile.col.needsUpdate = true;
+      const levels = this._buildProgressiveLevels(tile);
+      this._ensureTileBuffers(tile);
 
-      // 3) spatial audio scratch
-      if (this.audio) {
-        const wx = grid.group.position.x + pos.getX(i);
-        const wy = val;
-        const wz = grid.group.position.z + pos.getZ(i);
-        this.audio.triggerScratch(wx, wy, wz, 1.0);
+      for (const levelIndices of levels) {
+        const batches = (mode === 'geohash')
+          ? this._indicesToBatchesGeohash(levelIndices, geohashes, precision)
+          : this._indicesToBatchesLatLng(levelIndices, latLon);
+
+        for (const batch of batches) {
+          const payload = { type: 'elev.query', dataset: this.relayDataset };
+          if (mode === 'geohash') {
+            payload.geohashes = batch.items;
+            payload.enc = 'geohash';
+            payload.prec = precision;
+          } else {
+            payload.locations = batch.items;
+          }
+
+          let json = null;
+          try {
+            json = await this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs);
+          } catch (e) {
+            console.warn('[terrain] batch error', e);
+            continue;
+          }
+          const results = json?.results;
+          if (Array.isArray(results) && results.length) {
+            this._applyRelayResults(tile, results, {
+              mode,
+              indexByLatLon,
+              indexByGeohash,
+            });
+          }
+
+          this._nearestAnchorFill(tile);
+          this._smoothUnknowns(tile, 1);
+          tile.grid.geometry.computeVertexNormals();
+        }
       }
 
-      // 4) normals + bookkeeping
-      tile.normTick = (tile.normTick + 1) % this.NORMALS_EVERY;
-      if (tile.normTick === 0 || (active === 1 && q.length === 0)) grid.geometry.computeVertexNormals();
-
-      if (fetched.size === pos.count) {
-        this._applyAllColorsGlobal(tile);
-        this._saveTileToCache(tile);
-      }
-
-      active--; dequeue();
-    };
-
-    const dequeue = () => {
-      while (active < MAX_CON && q.length) {
-        const i = q.shift(); active++;
-        const wx = grid.group.position.x + pos.getX(i);
-        const wz = grid.group.position.z + pos.getZ(i);
-        const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
-        const lat = ll?.lat ?? this.origin.lat;
-        const lon = ll?.lon ?? this.origin.lon;
-        fetch(`https://epqs.nationalmap.gov/v1/json?x=${lon}&y=${lat}&wkid=4326&units=Meters`)
-          .then(r => r.json()).then(d => apply(i, d?.value ?? 0))
-          .catch(() => apply(i, 0));
-      }
-      if (active === 0 && q.length === 0) tile.populating = false;
-    };
-
-    dequeue();
-  }
-
-  _populateVisual(id) {
-    const tile = this.tiles.get(id); if (!tile || tile.type !== 'visual' || !this.origin || tile.populating) return;
-    tile.populating = true;
-
-    const pos = tile.pos;
-    tile.pending = 0;
-    for (let i = 0; i < pos.count; i++) {
-      const wx = tile.grid.group.position.x + pos.getX(i);
-      const wz = tile.grid.group.position.z + pos.getZ(i);
-      this._enqueueVisualFetch(tile, i, wx, wz);
-    }
-    this._drainVisualFetchQ();
-  }
-
-  _enqueueVisualFetch(tile, i, wx, wz) {
-    const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
-    const lat = ll?.lat ?? this.origin.lat;
-    const lon = ll?.lon ?? this.origin.lon;
-
-    tile.pending++;
-    this._visFetchQ.push({ tileId: `${tile.q},${tile.r}`, i, lat, lon });
-  }
-
-  _drainVisualFetchQ() {
-    while (this._visFetchActive < this.MAX_GLOBAL_CON_VIS && this._visFetchQ.length) {
-      const job = this._visFetchQ.shift();
-      const tile = this.tiles.get(job.tileId);
-      if (!tile || tile.type !== 'visual') continue;
-      this._visFetchActive++;
-
-      fetch(`https://epqs.nationalmap.gov/v1/json?x=${job.lon}&y=${job.lat}&wkid=4326&units=Meters`)
-        .then(r => r.json())
-        .then(j => this._applyVisualSample(tile, job.i, Number.isFinite(j?.value) ? j.value : 0))
-        .catch(() => this._applyVisualSample(tile, job.i, 0))
-        .finally(() => {
-          this._visFetchActive = Math.max(0, this._visFetchActive - 1);
-          this._drainVisualFetchQ();
-        });
-    }
-  }
-
-  _applyVisualSample(tile, i, val) {
-    if (!this.tiles.has(`${tile.q},${tile.r}`)) return;
-    if (tile.type !== 'visual') return;
-
-    const pos = tile.pos;
-    pos.setY(i, val);
-    pos.needsUpdate = true;
-    tile.ready[i] = 1;
-    tile.fetched.add(i);
-
-    this._updateGlobalFromValue(val);
-    if (!tile.col) this._ensureColorAttr(tile);
-    const l = this._lumFromYGlobal(val);
-    const o = 3 * i;
-    tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
-    tile.col.needsUpdate = true;
-
-    if (this.audio) {
-      const wx = tile.grid.group.position.x + pos.getX(i);
-      const wy = val;
-      const wz = tile.grid.group.position.z + pos.getZ(i);
-      this.audio.triggerScratch(wx, wy, wz, 0.85);
-    }
-
-    tile.pending = Math.max(0, tile.pending - 1);
-    if (tile.pending === 0) {
-      tile.grid.geometry.computeVertexNormals();
       this._applyAllColorsGlobal(tile);
       this._saveTileToCache(tile);
+    } finally {
       tile.populating = false;
     }
   }
@@ -569,10 +724,7 @@ export class TileManager {
     this._ensureRelaxList();
     this._drainRelaxQueue();
 
-    // 5) keep global fetchers busy
-    this._drainVisualFetchQ();
-
-    // 6) throttle recolor sweep when global range changes
+    // 5) throttle recolor sweep when global range changes
     if (this._globalDirty) {
       const t = now();
       if (t - this._lastRecolorAt > 100) {
@@ -637,8 +789,8 @@ export class TileManager {
   _resetAllTiles() {
     for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
     this.tiles.clear();
-    this._visFetchQ.length = 0;
-    this._visFetchActive = 0;
+    this._populateQueue.length = 0;
+    this._populateBusy = false;
     this.GLOBAL_MIN_Y = +Infinity;
     this.GLOBAL_MAX_Y = -Infinity;
     this._globalDirty = true;
@@ -712,8 +864,6 @@ export class TileManager {
     const createBudget = Math.round((18 + quality * 32) * 3);
     const relaxIters = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
     const relaxBudget = 1 + quality * (this._baseLod.relaxBudget - 1);
-    const maxVis = Math.max(4, Math.round((5 + quality * 11) * 3));
-
     let ringChanged = false;
     if (this.INTERACTIVE_RING !== interactive) {
       this.INTERACTIVE_RING = interactive;
@@ -728,8 +878,6 @@ export class TileManager {
     this.VISUAL_CREATE_BUDGET = createBudget;
     this.RELAX_ITERS_PER_FRAME = relaxIters;
     this.RELAX_FRAME_BUDGET_MS = relaxBudget;
-    this.MAX_GLOBAL_CON_VIS = maxVis;
-
     return {
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
@@ -749,6 +897,37 @@ export class TileManager {
     const hit = this.ray.intersectObjects(meshes, true);
     if (hit.length) { this._lastHeight = hit[0].point.y; return this._lastHeight; }
     return this._lastHeight;
+  }
+
+  setRelayAddress(addr) {
+    this.relayAddress = (addr || '').trim();
+    this.terrainRelay?.setRelayAddress(this.relayAddress);
+  }
+
+  setRelayDataset(dataset) {
+    this.relayDataset = (dataset || '').trim() || DEFAULT_TERRAIN_DATASET;
+    this.terrainRelay?.setDataset(this.relayDataset);
+  }
+
+  setRelayMode(mode) {
+    this.relayMode = mode === 'latlng' ? 'latlng' : 'geohash';
+    this.terrainRelay?.setMode(this.relayMode);
+  }
+
+  getRelayStatus() {
+    return this._relayStatus;
+  }
+
+  refreshTiles() {
+    for (const tile of this.tiles.values()) {
+      tile.ready.fill(0);
+      tile.fetched.clear();
+      tile.unreadyCount = tile.pos.count;
+      this._initColorsNearBlack(tile);
+      tile.populating = false;
+      tile._queued = false;
+      this._queuePopulate(tile, tile.type === 'interactive');
+    }
   }
 
   dispose() {

@@ -18,6 +18,10 @@
   <!-- NKN SDK (global window.nkn) -->
   <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
 
+  <!-- Leaflet for minimap -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
   <script>
     (function () {
       function checkAndRemove() {
@@ -94,6 +98,14 @@
           <span class="hud-label">Radius</span>
           <span class="hud-value" id="hudDetailRadius">800m</span>
         </div>
+        <div class="hud-metric">
+          <span class="hud-label">NKN</span>
+          <span class="hud-value" id="hudNknStatus">—</span>
+        </div>
+        <div class="hud-metric">
+          <span class="hud-label">Terrain</span>
+          <span class="hud-value" id="hudTerrainStatus">idle</span>
+        </div>
       </div>
       <div class="hud-geo">
         <div class="hud-geo-item">
@@ -108,70 +120,81 @@
     </div>
   </div>
   <div id="miniMapDock">
-    <canvas id="miniMapCanvas" width="220" height="220" aria-label="Mini map preview"></canvas>
-    <div class="mini-map-zoom-stack" aria-label="Mini map movement controls">
-      <button id="miniMapZoomIn" type="button" aria-label="Zoom in">+</button>
-      <button id="miniMapZoomOut" type="button" aria-label="Zoom out">-</button>
+    <div id="miniMapMap" class="mini-map-panel" aria-label="Mini map preview"></div>
+    <div class="mini-map-action-stack" aria-label="Mini map actions">
       <button id="miniMapMove" type="button" aria-label="Teleport to map center">Move</button>
+      <button id="miniMapCenter" type="button" aria-label="Center and follow the avatar">Center</button>
     </div>
   </div>
 
   <!-- Modal overlay -->
   <div id="backdrop" aria-hidden="true"></div>
   <aside id="menuPane" aria-label="World Control Center">
-
+    <header class="modal-header">
+      <h2>Control Center</h2>
+    </header>
 
     <section class="modal-section">
-      <div class="section-title">Network Status</div>
-      <div class="row">
+      <h3 class="section-title">Network</h3>
+      <div class="status-grid">
         <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
         <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
       </div>
       <div class="tiny" id="txtSigMeta">—</div>
       <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
       <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
+      <div class="kv">terrain: <span class="mono" id="terrainRelayStatus">idle</span></div>
     </section>
 
     <section class="modal-section">
-      <div class="section-title">Permissions</div>
+      <h3 class="section-title">Terrain Relay</h3>
+      <label for="terrainRelayInput">Relay address</label>
+      <input id="terrainRelayInput" type="text" class="mono" spellcheck="false" placeholder="forwarder.… or pubkey" />
+      <label for="terrainDatasetInput">Dataset</label>
+      <input id="terrainDatasetInput" type="text" value="mapzen" />
+      <div class="choice-row" role="radiogroup" aria-label="Terrain query mode">
+        <label><input type="radio" name="terrainMode" id="terrainModeGeohash" value="geohash" checked /> Geohash</label>
+        <label><input type="radio" name="terrainMode" id="terrainModeLatLng" value="latlng" /> Lat/Lng</label>
+      </div>
+      <p class="modal-note">Override the relay or dataset used for terrain sampling. Updates apply to new tiles immediately.</p>
+    </section>
+
+    <section class="modal-section">
+      <h3 class="section-title">Navigation &amp; Sensors</h3>
       <div class="button-row">
         <button id="request" type="button">Enable Sensors</button>
         <button id="geo" type="button">Enable Geolocation</button>
       </div>
-      <p class="modal-note">Sensors align orientation while geolocation streams your live position.</p>
-    </section>
-
-    <section class="modal-section">
-      <div class="section-title">Location</div>
-      <div id="miniMapControls">
-        <div class="mini-map-controls">
-          <button id="miniMapRecenter" type="button">Follow: On</button>
-          <button id="miniMapSet" type="button">Set Loc</button>
-          <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
-        </div>
-        <div class="slider-row">
-          <label for="yawOffsetRange">Yaw Offset <span id="yawOffsetValue">0°</span></label>
-          <input id="yawOffsetRange" type="range" min="-180" max="180" value="0" step="1" />
-        </div>
-        <div class="mini-map-manual">
-          <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
-          <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
-          <button id="miniMapApply" type="button">Apply Manual</button>
-        </div>
-        <div id="miniMapStatus" class="tiny">Determining location…</div>
-        <label class="toggle-row" for="gpsLockToggle">
-          <input id="gpsLockToggle" type="checkbox" checked />
-          <span class="toggle-text">
-            <span class="toggle-title">Lock world to GPS</span>
-            <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling
-              geolocation.</span>
-          </span>
-        </label>
+      <div class="mini-map-controls">
+        <button id="miniMapRecenter" type="button">Follow: On</button>
+        <button id="miniMapSet" type="button">Set Location</button>
+        <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
       </div>
+      <div class="slider-row">
+        <label for="yawOffsetRange">Yaw Offset <span id="yawOffsetValue">0°</span></label>
+        <input id="yawOffsetRange" type="range" min="-180" max="180" value="0" step="1" />
+      </div>
+      <label class="toggle-row" for="gpsLockToggle">
+        <input id="gpsLockToggle" type="checkbox" checked />
+        <span class="toggle-text">
+          <span class="toggle-title">Lock world to GPS</span>
+          <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling geolocation.</span>
+        </span>
+      </label>
     </section>
 
     <section class="modal-section">
-      <div class="section-title">Pose TX</div>
+      <h3 class="section-title">Location</h3>
+      <div class="mini-map-manual">
+        <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
+        <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
+        <button id="miniMapApply" type="button">Apply Manual</button>
+      </div>
+      <div id="miniMapStatus" class="tiny">Determining location…</div>
+    </section>
+
+    <section class="modal-section">
+      <h3 class="section-title">Pose TX</h3>
       <div class="row">
         <span class="kv">Hz: <b id="poseHz">0</b></span>
         <span class="kv">Sent: <b id="poseSent">0</b></span>
@@ -181,14 +204,14 @@
     </section>
 
     <section class="modal-section">
-      <div class="section-title">Local Pose</div>
+      <h3 class="section-title">Local Pose</h3>
       <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
       <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
       <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
     </section>
 
     <section class="modal-section">
-      <div class="section-title">Wallet</div>
+      <h3 class="section-title">Wallet</h3>
       <button id="nuke" title="Hard reset identity & caches">
         <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
       </button>
@@ -196,9 +219,9 @@
     </section>
 
     <section class="modal-section">
-      <div class="section-title">Peers</div>
+      <h3 class="section-title">Peers</h3>
       <div class="tiny" id="peerSummary">—</div>
-      <div id="peerList" style="display:flex;flex-direction:column;gap:8px;margin-top:6px"></div>
+      <div id="peerList" class="peer-list"></div>
     </section>
   </aside>
 

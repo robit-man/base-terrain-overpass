@@ -24,6 +24,7 @@ const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
 const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
 const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
 const PLAYER_POSE_KEY = 'xr.playerPose.v1';
+const DEFAULT_TERRAIN_DATASET = 'mapzen';
 
 class App {
   constructor() {
@@ -59,7 +60,11 @@ class App {
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
-    this.hexGridMgr = new TileManager(this.sceneMgr.scene, 5, 50, this.audio);
+    this._meshClientPromise = null;
+    const terrainClientProvider = () => this._getMeshClient();
+    this.hexGridMgr = new TileManager(this.sceneMgr.scene, 5, 50, this.audio, {
+      terrainRelayClient: terrainClientProvider,
+    });
 
     this.buildings = new BuildingManager({
       scene: this.sceneMgr.scene,
@@ -257,13 +262,12 @@ class App {
     }
 
     this.miniMap = new MiniMap({
-      canvas: document.getElementById('miniMapCanvas'),
+      mapContainer: document.getElementById('miniMapMap'),
       statusEl: document.getElementById('miniMapStatus'),
       recenterBtn: document.getElementById('miniMapRecenter'),
       setBtn: document.getElementById('miniMapSet'),
-      zoomInBtn: ui.miniMapZoomIn,
-      zoomOutBtn: ui.miniMapZoomOut,
       moveBtn: ui.miniMapMove,
+      centerBtn: ui.miniMapCenter,
       tileManager: this.hexGridMgr,
       getWorldPosition: () => this.sceneMgr?.dolly?.position,
       getHeadingDeg: () => {
@@ -290,6 +294,45 @@ class App {
       onRequestTeleport: ({ lat, lon }) => {
         this._handleMiniMapTeleport({ lat, lon });
       },
+    });
+
+    this._terrainStatusEl = ui.terrainRelayStatus || null;
+    this._hudTerrainStatusEl = ui.hudTerrainStatus || null;
+
+    const relayInput = ui.terrainRelayInput;
+    const datasetInput = ui.terrainDatasetInput;
+    const modeGeohash = ui.terrainModeGeohash;
+    const modeLatLng = ui.terrainModeLatLng;
+
+    if (relayInput) relayInput.value = this.hexGridMgr.relayAddress || '';
+    if (datasetInput) datasetInput.value = this.hexGridMgr.relayDataset || DEFAULT_TERRAIN_DATASET;
+    if (modeGeohash && modeLatLng) {
+      if (this.hexGridMgr.relayMode === 'latlng') modeLatLng.checked = true;
+      else modeGeohash.checked = true;
+    }
+
+    relayInput?.addEventListener('change', () => {
+      const addr = relayInput.value.trim();
+      this.hexGridMgr.setRelayAddress(addr);
+      this.hexGridMgr.refreshTiles();
+    });
+
+    datasetInput?.addEventListener('change', () => {
+      const dataset = datasetInput.value.trim() || DEFAULT_TERRAIN_DATASET;
+      this.hexGridMgr.setRelayDataset(dataset);
+      this.hexGridMgr.refreshTiles();
+    });
+
+    modeGeohash?.addEventListener('change', () => {
+      if (!modeGeohash.checked) return;
+      this.hexGridMgr.setRelayMode('geohash');
+      this.hexGridMgr.refreshTiles();
+    });
+
+    modeLatLng?.addEventListener('change', () => {
+      if (!modeLatLng.checked) return;
+      this.hexGridMgr.setRelayMode('latlng');
+      this.hexGridMgr.refreshTiles();
     });
 
     const applyManual = () => {
@@ -816,6 +859,76 @@ class App {
       if (peers.length >= 24) break;
     }
     return peers;
+  }
+
+  _getMeshClient() {
+    if (this._meshClientPromise) return this._meshClientPromise;
+
+    this._meshClientPromise = new Promise((resolve, reject) => {
+      const start = performance.now();
+      const timeoutMs = 20000;
+
+      const tryResolve = () => {
+        if (performance.now() - start > timeoutMs) {
+          this._meshClientPromise = null;
+          reject(new Error('Mesh client unavailable'));
+          return;
+        }
+
+        const mesh = this.mesh;
+        if (!mesh) {
+          requestAnimationFrame(tryResolve);
+          return;
+        }
+
+        const client = mesh.client;
+        if (!client) {
+          setTimeout(tryResolve, 100);
+          return;
+        }
+
+        if (client.addr) {
+          resolve(client);
+          return;
+        }
+
+        const timer = setTimeout(() => {
+          this._meshClientPromise = null;
+          reject(new Error('Mesh client connect timeout'));
+        }, timeoutMs);
+
+        const handleConnect = () => {
+          clearTimeout(timer);
+          resolve(client);
+        };
+
+        if (typeof client.onConnect === 'function') {
+          client.onConnect(handleConnect);
+        } else {
+          // Fallback: polling
+          const poll = () => {
+            if (client.addr) {
+              clearTimeout(timer);
+              resolve(client);
+            } else if (performance.now() - start > timeoutMs) {
+              clearTimeout(timer);
+              this._meshClientPromise = null;
+              reject(new Error('Mesh client connect timeout'));
+            } else {
+              setTimeout(poll, 100);
+            }
+          };
+          poll();
+        }
+      };
+
+      tryResolve();
+    }).catch((err) => {
+      this._meshClientPromise = null;
+      throw err;
+    });
+
+    return this._meshClientPromise;
   }
 
   _createCompassDial() {
@@ -1394,6 +1507,18 @@ class App {
       const buildingSummary = this.buildings?.applyPerfProfile?.(perfState) || null;
       if (tileSummary) this._perfSnapshots.tiles = tileSummary;
       if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
+    }
+
+    const relayStatus = this.hexGridMgr?.getRelayStatus?.();
+    if (relayStatus) {
+      if (this._terrainStatusEl) {
+        this._terrainStatusEl.textContent = relayStatus.text || 'idle';
+        this._terrainStatusEl.dataset.state = relayStatus.level || 'info';
+      }
+      if (this._hudTerrainStatusEl) {
+        this._hudTerrainStatusEl.textContent = relayStatus.text || 'idle';
+        this._hudTerrainStatusEl.dataset.state = relayStatus.level || 'info';
+      }
     }
 
     if (perfState.hudReady) {

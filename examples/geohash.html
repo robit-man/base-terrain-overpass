@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NKN + OSM + Three.js — Progressive Live Elevation (GH ↔ LatLng)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet (OSM) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet.draw -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <!-- NKN SDK UMD (global `nkn`) with fallback -->
+  <script src="https://cdn.jsdelivr.net/gh/nknorg/nkn-sdk-js/dist/nkn.min.js"
+          onerror="(function(){var s=document.createElement('script');s.src='https://unpkg.com/nkn-sdk/dist/nkn.min.js';document.head.appendChild(s);}())"></script>
+
+  <!-- three.js via importmap (latest) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@latest/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@latest/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    *{box-sizing: border-box;}
+    a{color:var(--accent);text-decoration:none}
+    :root { --bg:#0b0f14; --card:#121923; --ink:#e8eef7; --muted:#9eb0c7; --accent:#6ee7ff; --ok:#7ee787; --bad:#ff6b6b; }
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;}
+    .wrap{max-width:1200px;margin:24px auto;padding:16px}
+    .grid{display:grid;grid-template-columns:1.1fr 1fr;gap:16px}
+    .card{background:var(--card);border:1px solid #1e2a36;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);padding:16px}
+    h1{font-size:20px;margin:0 0 10px}
+    label{display:block;margin:10px 0 6px;color:var(--muted)}
+    input[type=text], input[type=number], textarea{
+      width:100%;padding:10px 12px;border-radius:12px;border:1px solid #2a3a4e;background:#0e1420;color:var(--ink);outline:none}
+    textarea{min-height:120px;max-height:300px}
+    input:focus, textarea:focus{border-color:var(--accent)}
+    .row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+    .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:end}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .btn{margin-top:10px;display:inline-flex;align-items:center;gap:8px;border:1px solid #2a3a4e;background:#0e1420;color:var(--ink);padding:9px 12px;border-radius:12px;cursor:pointer}
+    .btn[disabled]{opacity:.55;cursor:not-allowed}
+    .btn:hover{border-color:var(--accent)}
+    .status{margin-top:8px;font-size:12px;color:var(--muted)}
+    .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#0e1420;border:1px solid #2a3a4e}
+    pre{white-space:pre-wrap;background:#0c1118;border:1px solid #1f2c3b;border-radius:12px;padding:12px;max-height:260px;overflow:auto}
+    .ok{color:var(--ok)} .bad{color:var(--bad)}
+    #map{height:420px;border-radius:12px;overflow:hidden;border:1px solid #1e2a36}
+    #threeWrap{height:500px;border-radius:12px;overflow:hidden;border:1px solid #1e2a36;background:#0c1118}
+    .rangeRow{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center}
+    input[type=range]{width:100%}
+    .muted{color:var(--muted);font-size:12px}
+    .modeToggle{display:inline-flex;gap:8px;align-items:center;margin-bottom:8px;}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>NKN Elevation Topo — Progressive Live (coarse→fine, Morton-ordered) with Geohash/LatLng toggle</h1>
+ <a href="https://www.opentopodata.org/datasets/mapzen/" target="_blank"><h3>Fetch and host the mapzen open topo data ~ 1.7 TB</h3></a>
+  <div class="grid">
+    <div class="card">
+      <div class="row2">
+        <div>
+          <label for="relay">Relay address (saved)</label>
+          <input id="relay" type="text" placeholder="forwarder.… or pubkey" />
+        </div>
+        <div>
+          <label for="dataset">Dataset</label>
+          <input id="dataset" type="text" value="mapzen" />
+        </div>
+      </div>
+
+      <div class="row3">
+        <div>
+          <label for="nx">Grid X (cols)</label>
+          <input id="nx" type="number" min="2" max="512" step="1" value="64" />
+        </div>
+        <div>
+          <label for="ny">Grid Y (rows)</label>
+          <input id="ny" type="number" min="2" max="512" step="1" value="64" />
+        </div>
+        <div>
+          <label for="zScale">Z exaggeration</label>
+          <input id="zScale" type="number" step="0.1" value="1.0" />
+        </div>
+      </div>
+
+      <label>Grid spacing (meters)</label>
+      <div class="rangeRow">
+        <span class="muted">5m</span>
+        <input id="spacing" type="range" min="5" max="500" step="5" value="50" />
+        <span id="spacingVal" class="muted">50 m</span>
+      </div>
+      <div class="muted">Draw a rectangle, spacing sets grid density. Then “Regenerate from spacing”.</div>
+
+      <div class="row2">
+        <button id="regenBtn" class="btn">🔁 Regenerate from spacing</button>
+        <button id="drawBtn" class="btn">✏️ Draw rectangle</button>
+      </div>
+
+      <div class="row2">
+        <button id="locBtn" class="btn">📍 Use my location</button>
+        <button id="queryBtn" class="btn" disabled>🚀 Query progressive elevation via NKN</button>
+      </div>
+
+      <div class="modeToggle">
+        <button id="toggleModeBtn" class="btn">📦 Send as: Geohash</button>
+        <span id="modeHint" class="muted">Toggle to switch between geohash and lat/lng payloads.</span>
+      </div>
+
+      <div id="map"></div>
+
+      <label for="pointsBox">Bulk points (pipe-separated: <code>lat,lng|lat,lng|…</code>)</label>
+      <textarea id="pointsBox" placeholder="lat,lng|lat,lng|…"></textarea>
+
+      <div class="status">
+        <div>My NKN address: <span id="myAddr" class="tag">—</span></div>
+        <div>Connection: <span id="conn" class="tag">initializing…</span></div>
+        <div id="sdkStatus" class="status">Loading nkn-sdk…</div>
+        <div id="pointCount" class="status"></div>
+        <div id="progress" class="status"></div>
+        <div id="levelInfo" class="status"></div>
+      </div>
+
+      <label>Logs</label>
+      <pre id="log"></pre>
+    </div>
+
+    <div class="card">
+      <label>3D Topography (true scale, no patchwork)</label>
+      <div id="threeWrap"></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+(function(){
+  // ---------- DOM ----------
+  const logEl = document.getElementById('log');
+  const relayEl = document.getElementById('relay');
+  const datasetEl = document.getElementById('dataset');
+  const nxEl = document.getElementById('nx');
+  const nyEl = document.getElementById('ny');
+  const zScaleEl = document.getElementById('zScale');
+  const spacingEl = document.getElementById('spacing');
+  const spacingVal = document.getElementById('spacingVal');
+  const locBtn = document.getElementById('locBtn');
+  const drawBtn = document.getElementById('drawBtn');
+  const regenBtn = document.getElementById('regenBtn');
+  const queryBtn = document.getElementById('queryBtn');
+  const myAddrEl = document.getElementById('myAddr');
+  const connEl = document.getElementById('conn');
+  const sdkStatus = document.getElementById('sdkStatus');
+  const pointsBox = document.getElementById('pointsBox');
+  const pointCountEl = document.getElementById('pointCount');
+  const progressEl = document.getElementById('progress');
+  const levelInfoEl = document.getElementById('levelInfo');
+  const threeWrap = document.getElementById('threeWrap');
+  const toggleModeBtn = document.getElementById('toggleModeBtn');
+  const modeHint = document.getElementById('modeHint');
+
+  // ---------- Mode toggle (persisted) ----------
+  const LS_RELAY='nkn.forwarder.dest', LS_DATASET='nkn.forwarder.dataset', LS_MODE='nkn.forwarder.mode';
+  relayEl.value = localStorage.getItem(LS_RELAY) || '';
+  datasetEl.value = localStorage.getItem(LS_DATASET) || (datasetEl.value || 'mapzen');
+  relayEl.addEventListener('change', ()=>localStorage.setItem(LS_RELAY, relayEl.value.trim()));
+  datasetEl.addEventListener('change', ()=>localStorage.setItem(LS_DATASET, datasetEl.value.trim()));
+  let SEND_MODE = localStorage.getItem(LS_MODE) || 'geohash'; // 'geohash' | 'latlng'
+  function renderMode(){
+    toggleModeBtn.textContent = (SEND_MODE==='geohash') ? '📦 Send as: Geohash' : '📦 Send as: Lat/Lng';
+    modeHint.textContent = (SEND_MODE==='geohash')
+      ? 'Using geohash payloads (compact). Click to switch to lat/lng.'
+      : 'Using lat/lng payloads. Click to switch to geohash.';
+  }
+  renderMode();
+  toggleModeBtn.addEventListener('click', ()=>{
+    SEND_MODE = (SEND_MODE==='geohash') ? 'latlng' : 'geohash';
+    localStorage.setItem(LS_MODE, SEND_MODE);
+    renderMode();
+  });
+
+  // ---------- Utils ----------
+  function log(...args){
+    const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a, null, 2)).join(' ');
+    logEl.textContent += line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(...args);
+  }
+  function setConn(txt, ok){
+    connEl.textContent = txt;
+    connEl.style.borderColor = ok ? 'rgba(126,231,135,.6)' : '#2a3a4e';
+    connEl.style.color = ok ? 'var(--ok)' : 'var(--muted)';
+    queryBtn.disabled = !ok;
+  }
+  function requireSDK(){
+    if (!window.nkn || !nkn.MultiClient) {
+      sdkStatus.innerHTML = '<span class="bad">nkn-sdk not loaded. Check CDN.</span>';
+      throw new Error('nkn-sdk not loaded');
+    }
+    sdkStatus.innerHTML = '<span class="ok">nkn-sdk loaded.</span>';
+  }
+  function splitTokens(text){
+    if (!text) return [];
+    return text.replace(/\r/g,'').split(/\s*\|\s*|\n+/).map(s=>s.trim()).filter(Boolean);
+  }
+  function countPointsBox(){
+    const n = splitTokens(pointsBox.value).length;
+    pointCountEl.textContent = n ? (n + ' points prepared') : '';
+  }
+  pointsBox.addEventListener('input', countPointsBox);
+  spacingVal.textContent = `${spacingEl.value} m`;
+  spacingEl.addEventListener('input', ()=>{ spacingVal.textContent = `${spacingEl.value} m`; });
+
+  // ---------- Geohash (tiny impl) ----------
+  const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+  const GHMAP = Object.fromEntries([...GH32].map((c,i)=>[c,i]));
+  function geohashEncode(lat, lon, precision=9){
+    let bit=0, even=true, latMin=-90,latMax=90,lonMin=-180,lonMax=180, ch=0, hash='';
+    while (hash.length < precision){
+      if (even){ const mid=(lonMin+lonMax)/2; if (lon > mid){ ch |= (1<<(4-bit)); lonMin=mid; } else { lonMax=mid; } }
+      else { const mid=(latMin+latMax)/2; if (lat > mid){ ch |= (1<<(4-bit)); latMin=mid; } else { latMax=mid; } }
+      even=!even;
+      if (bit<4){ bit++; } else { hash += GH32[ch]; bit=0; ch=0; }
+    }
+    return hash;
+  }
+  function pickGeohashPrecision(spacingM){
+    if (spacingM >= 1500) return 6;   // ~1.2km
+    if (spacingM >= 300)  return 7;   // ~150m
+    if (spacingM >= 60)   return 8;   // ~38m
+    if (spacingM >= 10)   return 9;   // ~4.8m
+    return 10;                        // ~1.2m
+  }
+
+  // ---------- Leaflet Map ----------
+  let map, rectLayer, drawHandler, meMarker, lastBounds=null;
+  function initMap(){
+    map = L.map('map');
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+    map.setView([37.7749, -122.4194], 11);
+
+    drawHandler = new L.Draw.Rectangle(map, { shapeOptions: { color: '#6ee7ff', weight: 2 } });
+    map.on(L.Draw.Event.CREATED, function (e) {
+      if (rectLayer) { map.removeLayer(rectLayer); }
+      rectLayer = e.layer.addTo(map);
+      lastBounds = rectLayer.getBounds();
+      generateGridFromBounds(lastBounds);
+    });
+  }
+  function useMyLocation(){
+    if (!navigator.geolocation) { log('⚠️ Geolocation not available'); return; }
+    navigator.geolocation.getCurrentPosition(pos=>{
+      const { latitude:lat, longitude:lng } = pos.coords;
+      map.setView([lat,lng], 12);
+      if (meMarker) { map.removeLayer(meMarker); }
+      meMarker = L.marker([lat,lng]).addTo(map).bindPopup('You are here').openPopup();
+    }, err=> log('⚠️ Geolocation error:', err.message||err));
+  }
+  function startDrawRectangle(){ if (drawHandler) drawHandler.enable(); }
+
+  // Accurate meters/degree at latitude
+  function metersPerDegLat(phiRad){
+    return 111132.954 - 559.822*Math.cos(2*phiRad) + 1.175*Math.cos(4*phiRad) - 0.0023*Math.cos(6*phiRad);
+  }
+  function metersPerDegLon(phiRad){
+    return 111412.84*Math.cos(phiRad) - 93.5*Math.cos(3*phiRad) + 0.118*Math.cos(5*phiRad);
+  }
+
+  function generateGridFromBounds(bounds){
+    const sw = bounds.getSouthWest();
+    const ne = bounds.getNorthEast();
+    const south = +sw.lat, west = +sw.lng, north = +ne.lat, east = +ne.lng;
+    const latC = (south+north)/2 * Math.PI/180;
+    const mDegLatC = metersPerDegLat(latC);
+    const mDegLonC = metersPerDegLon(latC);
+
+    const heightM = Math.max(1, (north - south) * mDegLatC);
+    const widthM  = Math.max(1, (east  - west)  * mDegLonC);
+
+    const spacing = Math.max(1, parseFloat(spacingEl.value||'50'));
+    const ny = Math.max(2, Math.floor(heightM/spacing) + 1);
+    const nx = Math.max(2, Math.floor(widthM/spacing)  + 1);
+
+    nxEl.value = String(nx);
+    nyEl.value = String(ny);
+
+    const dLatDeg = spacing / mDegLatC;
+    const parts = [];
+    for (let iy=0; iy<ny; iy++){
+      const lat = Math.max(south, Math.min(north, north - iy * dLatDeg));
+      const phi = lat * Math.PI/180;
+      const mDegLonRow = metersPerDegLon(phi);
+      const dLonDegRow = spacing / mDegLonRow;
+      for (let ix=0; ix<nx; ix++){
+        const lng = Math.max(west, Math.min(east, west + ix * dLonDegRow));
+        parts.push(`${lat.toFixed(6)},${lng.toFixed(6)}`);
+      }
+    }
+    pointsBox.value = parts.join('|');
+    countPointsBox();
+    log(`🧮 Grid from spacing ${spacing} m → ${nx}×${ny} (${parts.length} pts)`);
+  }
+  regenBtn.addEventListener('click', ()=>{ if (lastBounds) generateGridFromBounds(lastBounds); else log('ℹ️ draw a rectangle first'); });
+
+  // ---------- NKN ----------
+  const pending = new Map(); // id -> {resolve, timeout}
+  function uuidv4(){
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
+      const r = Math.random()*16|0, v = c==='x'?r:(r&0x3|0x8); return v.toString(16);
+    });
+  }
+  function sendWithReply(mc, dest, obj, timeoutMs=25000) {
+    const id = obj.id || uuidv4(); obj.id = id;
+    thePayloadBytes = new TextEncoder().encode(JSON.stringify(obj)).length;
+    const p = new Promise((resolve, reject)=>{
+      const t = setTimeout(()=>{ pending.delete(id); reject(new Error('DM reply timeout')); }, timeoutMs);
+      pending.set(id, { resolve, timeout: t });
+    });
+    mc.send(dest, JSON.stringify(obj)).then(()=>{
+      log('📤 sent DM', { id, bytes: thePayloadBytes, dest });
+    }).catch(err=>{
+      const st = pending.get(id); if (st){ clearTimeout(st.timeout); pending.delete(id); }
+      log('❌ send error:', err && err.message || err);
+    });
+    return p;
+  }
+  function handleIncoming(src, payload){
+    const text = (typeof payload==='string') ? payload : new TextDecoder().decode(payload);
+    let msg; try { msg = JSON.parse(text); } catch { log('📥 incoming (raw):', text); return; }
+    if (msg && msg.type === 'http.response' && msg.id && pending.has(msg.id)) {
+      const st = pending.get(msg.id); clearTimeout(st.timeout); pending.delete(msg.id); st.resolve(msg); return;
+    }
+    log('📥 unsolicited from', src, msg);
+  }
+  let thePayloadBytes = 0;
+
+  // ---------- Three.js (true-scale, live refine) ----------
+  let renderer, camera, controls, scene, mesh, geom, posAttr, colorAttr, elevs, isFinal, minY, maxY, nx, ny;
+  let idxByLL, idxByGH;
+
+  // per-frame smoothing cadence
+  let lastSmoothMS = 0;
+  const SMOOTH_INTERVAL_MS = 45;
+  const SMOOTH_PASSES_PER_TICK = 1;
+
+  function initThree(){
+    const w = threeWrap.clientWidth, h = threeWrap.clientHeight;
+    renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio||1));
+    threeWrap.innerHTML = '';
+    threeWrap.appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1118);
+
+    camera = new THREE.PerspectiveCamera(50, w/h, 0.1, 1e7);
+    camera.position.set(0, 800, 800);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0,0,0);
+    controls.update();
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 0.8);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(500, 1000, 500);
+    scene.add(dir);
+
+    animate();
+    window.addEventListener('resize', onResize);
+  }
+  function onResize(){
+    const w = threeWrap.clientWidth, h = threeWrap.clientHeight;
+    if (!renderer) return;
+    renderer.setSize(w, h);
+    camera.aspect = w/h; camera.updateProjectionMatrix();
+  }
+  function animate(){
+    requestAnimationFrame(animate);
+    const now = performance.now();
+    if (geom && now - lastSmoothMS >= SMOOTH_INTERVAL_MS) {
+      smoothUnknowns(SMOOTH_PASSES_PER_TICK);
+      geom.computeVertexNormals();
+      lastSmoothMS = now;
+    }
+    if (renderer && scene && camera) renderer.render(scene, camera);
+  }
+
+  function metersPerDegLat(phiRad){ return 111132.954 - 559.822*Math.cos(2*phiRad) + 1.175*Math.cos(4*phiRad) - 0.0023*Math.cos(6*phiRad); }
+  function metersPerDegLon(phiRad){ return 111412.84*Math.cos(phiRad) - 93.5*Math.cos(3*phiRad) + 0.118*Math.cos(5*phiRad); }
+
+  function makeSkeletonMesh(nx_, ny_, lats, lngs){
+    nx = nx_; ny = ny_;
+    const N = nx*ny;
+    const south = Math.min(...lats);
+    const west  = Math.min(...lngs);
+
+    const pos = new Float32Array(N*3);
+    let minX=+Infinity, maxX=-Infinity, minZ=+Infinity, maxZ=-Infinity;
+    for (let iy=0; iy<ny; iy++){
+      const lat = lats[iy];
+      const phi = lat * Math.PI/180.0;
+      const mDegLat = metersPerDegLat(phi);
+      const mDegLon = metersPerDegLon(phi);
+      const northMeters = (lat - south) * mDegLat;
+      for (let ix=0; ix<nx; ix++){
+        const lng = lngs[ix];
+        const eastMeters = (lng - west) * mDegLon;
+        const idx = iy*nx + ix, i3 = idx*3;
+        pos[i3+0] = eastMeters; pos[i3+1] = 0; pos[i3+2] = northMeters;
+        if (eastMeters<minX) minX=eastMeters; if (eastMeters>maxX) maxX=eastMeters;
+        if (northMeters<minZ) minZ=northMeters; if (northMeters>maxZ) maxZ=northMeters;
+      }
+    }
+    const cx = 0.5*(minX+maxX), cz = 0.5*(minZ+maxZ);
+    for (let i=0;i<N;i++){ pos[i*3+0]-=cx; pos[i*3+2]-=cz; }
+
+    const index = new Uint32Array((nx-1)*(ny-1)*6);
+    let w = 0;
+    for (let iy=0; iy<ny-1; iy++){
+      for (let ix=0; ix<nx-1; ix++){
+        const a = iy*nx + ix, b = a+1, c = a+nx, d = c+1;
+        index[w++]=a; index[w++]=b; index[w++]=d; index[w++]=a; index[w++]=d; index[w++]=c;
+      }
+    }
+
+    const colors = new Float32Array(N*3);
+    for (let i=0;i<N;i++){ colors[i*3+0]=0.22; colors[i*3+1]=0.26; colors[i*3+2]=0.36; }
+
+    geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geom.setIndex(new THREE.BufferAttribute(index, 1));
+    geom.computeVertexNormals();
+
+    posAttr   = geom.getAttribute('position');
+    colorAttr = geom.getAttribute('color');
+
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92, metalness: 0.0 });
+    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh.material.dispose(); }
+    mesh = new THREE.Mesh(geom, mat);
+    scene.add(mesh);
+
+    const widthM  = (Math.max(...pos.filter((_,i)=>i%3===0)) - Math.min(...pos.filter((_,i)=>i%3===0))) || 1;
+    const heightM = (Math.max(...pos.filter((_,i)=>i%3===2)) - Math.min(...pos.filter((_,i)=>i%3===2))) || 1;
+    const maxSpan = Math.max(widthM, heightM);
+    controls.target.set(0,0,0);
+    camera.position.set(0, Math.max(800, maxSpan*0.9), Math.max(800, maxSpan*0.9));
+    controls.update();
+
+    elevs   = new Array(N).fill(NaN);
+    isFinal = new Array(N).fill(false);
+    minY = +Infinity; maxY = -Infinity;
+  }
+
+  function updateVertexColor(idx, y){
+    if (y<minY) minY=y;
+    if (y>maxY) maxY=y;
+    const t = (maxY===minY) ? 0.5 : (y - minY) / (maxY - minY);
+    const i3 = idx*3;
+    let r,g,b;
+    if (t < 0.25) { r=0.1; g=0.2+t; b=0.6 + t*0.6; }
+    else if (t < 0.5) { r=0.1 + (t-0.25)*1.2; g=0.8; b=0.2; }
+    else if (t < 0.8) { r=0.5 + (t-0.5)*1.0; g=0.35 + (t-0.5)*0.4; b=0.2; }
+    else { r=1; g=1; b=1; }
+    colorAttr.array[i3+0]=r; colorAttr.array[i3+1]=g; colorAttr.array[i3+2]=b;
+  }
+
+  // ---------- Nearest-anchor fill + smoothing ----------
+  function nearestAnchorFill(){
+    const N = nx*ny;
+    const nearest = new Int32Array(N).fill(-1);
+    const q = new Int32Array(N); let qh=0, qt=0;
+    for (let i=0;i<N;i++){ if (isFinal[i]){ nearest[i]=i; q[qt++]=i; } }
+    if (qt===0) return;
+    const push = (j, src) => { if (j<0 || j>=N) return; if (nearest[j]!==-1) return; nearest[j]=src; q[qt++]=j; };
+    while (qh<qt){
+      const i=q[qh++], x=i%nx, y=(i-x)/nx, src=nearest[i];
+      if (x>0)     push(i-1, src);
+      if (x<nx-1)  push(i+1, src);
+      if (y>0)     push(i-nx, src);
+      if (y<ny-1)  push(i+nx, src);
+    }
+    for (let i=0;i<N;i++){
+      if (isFinal[i]) continue;
+      const src = nearest[i];
+      if (src>=0){
+        const z = elevs[src];
+        if (Number.isFinite(z)){
+          elevs[i] = z;
+          posAttr.array[i*3+1] = z;
+          updateVertexColor(i, z);
+        }
+      }
+    }
+    posAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+  }
+
+  function smoothUnknowns(iterations=1){
+    for (let it=0; it<iterations; it++){
+      for (let y=0; y<ny; y++){
+        for (let x=0; x<nx; x++){
+          const i = y*nx + x;
+          if (isFinal[i]) continue;
+          let sum=0, cnt=0;
+          if (x>0){   const v=elevs[i-1];   if (Number.isFinite(v)){ sum+=v; cnt++; } }
+          if (x<nx-1){const v=elevs[i+1];   if (Number.isFinite(v)){ sum+=v; cnt++; } }
+          if (y>0){   const v=elevs[i-nx]; if (Number.isFinite(v)){ sum+=v; cnt++; } }
+          if (y<ny-1){const v=elevs[i+nx]; if (Number.isFinite(v)){ sum+=v; cnt++; } }
+          if (cnt>=2){
+            const v = sum/cnt;
+            elevs[i] = v;
+            posAttr.array[i*3+1] = v;
+            updateVertexColor(i, v);
+          }
+        }
+      }
+    }
+    posAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+  }
+
+  // ---------- Progressive schedule (exact distribution) ----------
+  function log2Floor(n){ return Math.floor(Math.log2(Math.max(1,n))); }
+  function highestPow2LE(n){ return 1 << log2Floor(n); }
+  function morton2(x, y){
+    function part1By1(n){
+      n &= 0x0000ffff;
+      n = (n | (n << 8)) & 0x00FF00FF;
+      n = (n | (n << 4)) & 0x0F0F0F0F;
+      n = (n | (n << 2)) & 0x33333333;
+      n = (n | (n << 1)) & 0x55555555;
+      return n;
+    }
+    return (part1By1(y) << 1) | part1By1(x);
+  }
+  function buildProgressiveIndexLevels(nx, ny){
+    const base = highestPow2LE(Math.min(nx-1, ny-1));
+    const strides = []; for (let s=base; s>=1; s>>=1) strides.push(s);
+    const scheduled = new Uint8Array(nx*ny);
+    const levels = [];
+    for (const step of strides){
+      const thisLevel = [];
+      for (let y=0; y<ny; y+=step){
+        for (let x=0; x<nx; x+=step){
+          const i = y*nx + x;
+          if (!scheduled[i]){ thisLevel.push(i); scheduled[i]=1; }
+        }
+      }
+      const mortonKeys = thisLevel.map(i=>{
+        const y = Math.floor(i / nx), x = i % nx;
+        return { i, k: morton2(Math.floor(x/step), Math.floor(y/step)) };
+      }).sort((a,b)=>a.k-b.k).map(o=>o.i);
+      levels.push(mortonKeys);
+    }
+    return levels;
+  }
+
+  // ---------- Chunking honoring schedule, for both modes ----------
+  const DM_BUDGET_BYTES = 2800;  // conservative
+  const MAX_LOCS_HARD   = 800;   // guard
+  function byteLen(obj){ return new TextEncoder().encode(JSON.stringify(obj)).length; }
+
+  function indicesToBatchesLatLng(dataset, indices, toLatLng){
+    const batches = [];
+    let cur = [], curBytes = 0;
+    for (const idx of indices){
+      const loc = toLatLng(idx);
+      const candidate = { type:'elev.query', dataset, locations: cur.concat([loc]) };
+      const blen = byteLen(candidate);
+      if (blen<=DM_BUDGET_BYTES && candidate.locations.length<=MAX_LOCS_HARD){
+        cur.push(loc); curBytes=blen;
+      } else {
+        if (cur.length) batches.push({ locations: cur.slice(), bytes: curBytes });
+        cur = [loc]; curBytes = byteLen({ type:'elev.query', dataset, locations: cur });
+      }
+    }
+    if (cur.length) batches.push({ locations: cur.slice(), bytes: curBytes });
+    return batches;
+  }
+
+  function indicesToBatchesGeohash(dataset, indices, toGeohash, meta){
+    const batches = [];
+    let cur = [], curBytes = 0;
+    for (const idx of indices){
+      const gh = toGeohash(idx);
+      const candidate = { type:'elev.query', dataset, geohashes: cur.concat([gh]), ...meta };
+      const blen = byteLen(candidate);
+      if (blen<=DM_BUDGET_BYTES && candidate.geohashes.length<=MAX_LOCS_HARD){
+        cur.push(gh); curBytes=blen;
+      } else {
+        if (cur.length) batches.push({ geohashes: cur.slice(), bytes: curBytes, meta });
+        cur = [gh]; curBytes = byteLen({ type:'elev.query', dataset, geohashes: cur, ...meta });
+      }
+    }
+    if (cur.length) batches.push({ geohashes: cur.slice(), bytes: curBytes, meta });
+    return batches;
+  }
+
+  // ---------- Wire ----------
+  let mc;
+  async function main(){
+    initMap();
+    useMyLocation();
+    drawBtn.addEventListener('click', startDrawRectangle);
+    regenBtn.addEventListener('click', ()=>{ if (lastBounds) generateGridFromBounds(lastBounds); else log('ℹ️ draw a rectangle first'); });
+    locBtn.addEventListener('click', useMyLocation);
+    initThree();
+    requireSDK();
+
+    mc = new nkn.MultiClient({ numSubClients: 4, originalClient: false });
+    myAddrEl.textContent = '…';
+    setConn('connecting…', false);
+
+    mc.onConnect(()=>{
+      myAddrEl.textContent = mc.addr;
+      setConn('connected', true);
+      log('✅ NKN connected as', mc.addr);
+    });
+    mc.onMessage(({ src, payload }) => handleIncoming(src, payload));
+
+    document.addEventListener('keydown', (e)=>{ if (e.key==='Enter' && (e.metaKey||e.ctrlKey)) queryBtn.click(); });
+
+    queryBtn.addEventListener('click', async ()=>{
+      const dest = (relayEl.value || '').trim();
+      const dataset = (datasetEl.value || 'mapzen').trim();
+      const nxVal = Math.max(2, Math.min(512, parseInt(nxEl.value||'64',10)));
+      const nyVal = Math.max(2, Math.min(512, parseInt(nyEl.value||'64',10)));
+      const zEx = parseFloat(zScaleEl.value || '1.0');
+      if (!dest) return log('⚠️ enter relay address');
+
+      // Parse full grid (row-major)
+      const toks = splitTokens(pointsBox.value);
+      const pts = [];
+      for (const tok of toks){
+        const m = tok.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+        if (!m) continue;
+        pts.push({lat: parseFloat(m[1]), lng: parseFloat(m[2])});
+      }
+      if (pts.length !== nxVal*nyVal){
+        log(`⚠️ expected ${nxVal*nyVal} points, got ${pts.length}. Aborting (need full grid for progressive).`);
+        return;
+      }
+
+      // Axes
+      const firstRow = pts.slice(0, nxVal);
+      const firstCol = pts.filter((_,i)=> i%nxVal===0);
+      const lngs = firstRow.map(p=>p.lng);
+      const lats = firstCol.map(p=>p.lat);
+
+      // Index maps for replies
+      idxByLL = new Map();
+      for (let i=0;i<pts.length;i++){
+        idxByLL.set(`${pts[i].lat.toFixed(6)},${pts[i].lng.toFixed(6)}`, i);
+      }
+
+      // Mesh
+      makeSkeletonMesh(nxVal, nyVal, lats, lngs);
+
+      // Progressive schedule (this is the EXACT fetch distribution you wanted)
+      const levels = buildProgressiveIndexLevels(nxVal, nyVal);
+      levelInfoEl.textContent = `Levels: ${levels.map((L,i)=>`L${i+1}:${L.length}`).join(' | ')}`;
+
+      // Helpers for idx→payload
+      const toLatLng   = (i)=> pts[i];
+      const spacingM   = Math.max(1, parseFloat(spacingEl.value||'50'));
+      const ghPrec     = pickGeohashPrecision(spacingM);
+      const toGeohash  = (i)=> geohashEncode(pts[i].lat, pts[i].lng, ghPrec);
+
+      // If GH mode, prep reverse map (geohash→index) at same precision
+      idxByGH = null;
+      if (SEND_MODE==='geohash'){
+        idxByGH = new Map();
+        for (let i=0;i<pts.length;i++) idxByGH.set(geohashEncode(pts[i].lat, pts[i].lng, ghPrec), i);
+        log(`🧭 geohash mode: precision ${ghPrec} (spacing≈${spacingM}m)`);
+      }
+
+      function applyResults(results, isGH){
+        let any=false;
+        for (const r of results){
+          let i = undefined;
+          if (isGH && r.geohash && idxByGH)          i = idxByGH.get(r.geohash);
+          else if (r.location){
+            const key = `${(+r.location.lat).toFixed(6)},${(+r.location.lng).toFixed(6)}`;
+            i = idxByLL.get(key);
+          }
+          if (i===undefined) continue;
+          const y = ((r.elevation ?? 0)*1.0) * zEx;
+          elevs[i] = y;
+          isFinal[i] = true;
+          posAttr.array[i*3+1] = y;
+          updateVertexColor(i, y);
+          any=true;
+        }
+        if (any){ posAttr.needsUpdate = true; colorAttr.needsUpdate = true; }
+      }
+
+      // Iterate levels: for each level, create batches in the ORDER of its indices
+      let levelNo=0, totalFetched=0, totalPts=pts.length;
+      for (const levelIndices of levels){
+        levelNo++;
+
+        let batches;
+        let modeLabel;
+        if (SEND_MODE==='geohash'){
+          const meta = { enc:'geohash', prec: ghPrec };
+          batches = indicesToBatchesGeohash(dataset, levelIndices, toGeohash, meta);
+          modeLabel = `geohash@${ghPrec}`;
+        } else {
+          batches = indicesToBatchesLatLng(dataset, levelIndices, toLatLng);
+          modeLabel = 'lat/lng';
+        }
+
+        progressEl.textContent = `Level ${levelNo}/${levels.length} — ${batches.length} batches (${modeLabel})`;
+        let bi=0;
+
+        for (const b of batches){
+          bi++;
+          const env = (SEND_MODE==='geohash')
+            ? { type:'elev.query', dataset, geohashes: b.geohashes, ...b.meta }
+            : { type:'elev.query', dataset, locations: b.locations };
+
+          const t0 = performance.now();
+          const resp = await sendWithReply(mc, dest, env, 60000)
+            .catch(e=>{ log('❌ batch send error:', e?.message||e); return null; });
+          const dt = Math.round(performance.now()-t0);
+          if (!resp){ log(`❌ L${levelNo} batch ${bi} failed`); continue; }
+
+          let json=null;
+          if (resp.body_b64) { try { json = JSON.parse(atob(resp.body_b64)); } catch(e){ log(`❓ L${levelNo} batch ${bi} bad JSON`, e); continue; } }
+          else if (resp.body) { json = (typeof resp.body === 'string') ? JSON.parse(resp.body) : resp.body; }
+          if (!json || !Array.isArray(json.results)) { log(`❓ L${levelNo} batch ${bi} unexpected`, json); continue; }
+
+          applyResults(json.results, SEND_MODE==='geohash');
+          totalFetched += json.results.length;
+
+          // Key: hole-free preview & gentle refinement
+          nearestAnchorFill();  // every unfetched vertex gets nearest fetched height
+          smoothUnknowns(2);    // soften seams; anchors fixed
+
+          progressEl.textContent = `Level ${levelNo}/${levels.length} — batch ${bi}/${batches.length} (${totalFetched}/${totalPts}) — ${dt} ms`;
+          log(`🧩 L${levelNo} batch ${bi}/${batches.length} applied (${json.results.length} pts)`);
+          geom.computeVertexNormals();
+        }
+      }
+
+      progressEl.textContent = `Done. Samples: ${isFinal.filter(Boolean).length}/${pts.length}`;
+      geom.computeVertexNormals();
+      log('✅ progressive refine complete');
+    });
+  }
+
+  window.addEventListener('load', () => {
+    try { main(); } 
+    catch (e) { log('❌ init error:', e.message || e); }
+  });
+
+})();
+</script>
+</body>
+</html>

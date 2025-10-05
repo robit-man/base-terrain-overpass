@@ -36,13 +36,19 @@ const hudCompassNeedle = document.getElementById('hudCompassNeedle');
 const perfHud = document.getElementById('perfHud');
 const hudLat = document.getElementById('hudLat');
 const hudLon = document.getElementById('hudLon');
+const hudNknStatus = document.getElementById('hudNknStatus');
+const hudTerrainStatus = document.getElementById('hudTerrainStatus');
 const gpsLockToggle = document.getElementById('gpsLockToggle');
 const yawAssistToggle = document.getElementById('yawAssistToggle');
 const yawOffsetRange = document.getElementById('yawOffsetRange');
 const yawOffsetValue = document.getElementById('yawOffsetValue');
-const miniMapZoomIn = document.getElementById('miniMapZoomIn');
-const miniMapZoomOut = document.getElementById('miniMapZoomOut');
 const miniMapMove = document.getElementById('miniMapMove');
+const miniMapCenter = document.getElementById('miniMapCenter');
+const terrainRelayStatus = document.getElementById('terrainRelayStatus');
+const terrainRelayInput = document.getElementById('terrainRelayInput');
+const terrainDatasetInput = document.getElementById('terrainDatasetInput');
+const terrainModeGeohash = document.getElementById('terrainModeGeohash');
+const terrainModeLatLng = document.getElementById('terrainModeLatLng');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 
 function openMenu() {
@@ -71,7 +77,15 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && menuPane?.style.display === 'block') closeMenu();
 });
 
-export function setNkn(t, c) { txtNkn.textContent = t; dotNkn.className = 'dot ' + (c || ''); }
+export function setNkn(t, c) {
+  txtNkn.textContent = t;
+  dotNkn.className = 'dot ' + (c || '');
+  if (hudNknStatus) {
+    hudNknStatus.textContent = t;
+    const state = c === 'err' ? 'error' : (c || '');
+    hudNknStatus.dataset.state = state;
+  }
+}
 export function setSig(t, c) { txtSig.textContent = t; dotSig.className = 'dot ' + (c || ''); }
 export function setSigMeta(t) { txtSigMeta.textContent = t; }
 
@@ -85,8 +99,10 @@ export const ui = {
   peerSummary, peerList,
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
-  hudLat, hudLon,
+  hudLat, hudLon, hudNknStatus, hudTerrainStatus,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
-  miniMapZoomIn, miniMapZoomOut, miniMapMove,
+  miniMapMove, miniMapCenter,
+  terrainRelayStatus, terrainRelayInput, terrainDatasetInput,
+  terrainModeGeohash, terrainModeLatLng,
   openMenu, closeMenu
 };
