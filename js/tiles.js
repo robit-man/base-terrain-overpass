@@ -1,3 +1,4 @@
+// tiles.js
 import * as THREE from 'three';
 import { UniformHexGrid } from './grid.js';
 import { now } from './utils.js';
@@ -63,22 +64,31 @@ export class TileManager {
     };
     this._lodQuality = 1;
 
+    // ---- Relay wiring ----
     this.relayMode = 'geohash';
     this.relayAddress = DEFAULT_TERRAIN_RELAY;
     this.relayDataset = DEFAULT_TERRAIN_DATASET;
     this.relayTimeoutMs = 45000;
     this._relayStatus = { text: 'idle', level: 'info' };
+    this._relayWasConnected = false;
 
     this.terrainRelay = new TerrainRelay({
       defaultRelay: this.relayAddress,
       dataset: this.relayDataset,
       mode: this.relayMode,
-      onStatus: (text, level) => { this._relayStatus = { text, level }; },
+      onStatus: (text, level) => this._onRelayStatus(text, level),
     });
 
+    // ---- populate plumbing ----
     this._populateQueue = [];
     this._populateBusy = false;
     this._encoder = new TextEncoder();
+
+    // Backfill scheduler (used to re-queue missed tiles, center-out)
+    this._backfillTimer = null;
+    // Light periodic sweep in case relay came up slightly later or some batches failed transiently
+    this._backfillIntervalMs = 2500;
+    this._periodicBackfill = setInterval(() => this._backfillMissing({ onlyIfRelayReady: true }), this._backfillIntervalMs);
   }
 
   /* ---------------- small helpers ---------------- */
@@ -575,7 +585,20 @@ export class TileManager {
     return tile;
   }
 
-  /* ---------------- fetching ---------------- */
+  /* ---------------- fetching & backfill ---------------- */
+
+  _tileNeedsFetch(tile) {
+    if (!tile) return false;
+    if (!Number.isFinite(tile.unreadyCount)) tile.unreadyCount = tile.pos.count;
+    return tile.unreadyCount > 0;
+  }
+
+  _queuePopulateIfNeeded(tile, priority = false) {
+    if (!tile) return;
+    if (!this._tileNeedsFetch(tile)) return;
+    if (tile.populating || tile._queued) return;
+    this._queuePopulate(tile, priority);
+  }
 
   _queuePopulate(tile, priority = false) {
     if (!tile || tile.populating || tile._queued) return;
@@ -645,7 +668,8 @@ export class TileManager {
           try {
             json = await this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs);
           } catch (e) {
-            console.warn('[terrain] batch error', e);
+            // Keep going; backfill will re-queue later
+            // console.warn('[terrain] batch error', e);
             continue;
           }
           const results = json?.results;
@@ -668,6 +692,57 @@ export class TileManager {
     } finally {
       tile.populating = false;
     }
+  }
+
+  /* ---------------- backfill orchestration ---------------- */
+
+  _scheduleBackfill(delayMs = 0) {
+    if (this._backfillTimer) clearTimeout(this._backfillTimer);
+    this._backfillTimer = setTimeout(() => {
+      this._backfillMissing({ onlyIfRelayReady: false });
+    }, Math.max(0, delayMs));
+  }
+
+  _backfillMissing({ onlyIfRelayReady = false } = {}) {
+    if (!this.origin) return;
+
+    // If requested, only run when relay says connected
+    if (onlyIfRelayReady && !(this._relayStatus?.text === 'connected' || this._relayStatus?.level === 'ok')) return;
+
+    // Center-out ordering from (0,0)
+    const entries = [...this.tiles.values()]
+      .filter(t => this._tileNeedsFetch(t) && !t.populating && !t._queued)
+      .map(t => ({ t, d: this._hexDist(t.q, t.r, 0, 0) }))
+      .sort((a, b) => a.d - b.d);
+
+    for (const { t } of entries) {
+      // Prioritize closer (center) tiles
+      const priority = (t.q === 0 && t.r === 0) || t.type === 'interactive';
+      this._queuePopulateIfNeeded(t, priority);
+    }
+  }
+
+  _prewarmVisualRing(q0 = 0, r0 = 0) {
+    // Build every visual tile out to VISUAL_RING immediately (ignore per-frame budget)
+    for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
+      const rMin = Math.max(-this.VISUAL_RING, -dq - this.VISUAL_RING);
+      const rMax = Math.min(this.VISUAL_RING, -dq + this.VISUAL_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.INTERACTIVE_RING) continue;
+        if (!this.tiles.has(`${q},${r}`)) {
+          // _addVisualTile will queue a populate if no cache exists
+          this._addVisualTile(q, r);
+        } else {
+          // If it already exists and wasn't ready (e.g. relay not up) — re-queue
+          const t = this.tiles.get(`${q},${r}`);
+          this._queuePopulateIfNeeded(t, false);
+        }
+      }
+    }
+    // Make sure missed/populating tiles are backfilled soon after
+    this._scheduleBackfill(0);
   }
 
   /* ---------------- per-frame: ensure LOD, relax, prune ---------------- */
@@ -709,6 +784,9 @@ export class TileManager {
             this._ensureType(q, r, 'interactive');
           } else if (existing && existing.type === 'interactive') {
             this._ensureType(q, r, 'visual');
+          } else if (existing) {
+            // If it exists and still needs data, keep it moving
+            this._queuePopulateIfNeeded(existing, false);
           }
         }
       }
@@ -748,6 +826,8 @@ export class TileManager {
          : this._addVisualTile(q, r);
   }
 
+  /* ---------------- Origin & relay hooks ---------------- */
+
   setOrigin(lat, lon, { immediate = false } = {}) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
@@ -762,8 +842,11 @@ export class TileManager {
     if (changed) {
       this._resetAllTiles();
       this._ensureType(0, 0, 'interactive');
+      // Pre-create + queue all visual tiles so they fetch even before moving
+      this._prewarmVisualRing(0, 0);
     } else if (immediate && !this.tiles.size) {
       this._ensureType(0, 0, 'interactive');
+      this._prewarmVisualRing(0, 0);
     }
 
     if (immediate && this.origin) {
@@ -771,35 +854,22 @@ export class TileManager {
       this._originVec.set(0, 0, 0);
       this.update(this._originVec);
     }
+
+    // Kick a center-out backfill in case some tiles were created pre-relay
+    this._scheduleBackfill(50);
   }
 
-  _discardTile(id) {
-    const t = this.tiles.get(id);
-    if (!t) return;
-    this.scene.remove(t.grid.group);
-    try {
-      t.grid.geometry?.dispose?.();
-      t.grid.mat?.dispose?.();
-      t.grid.wireMat?.dispose?.();
-    } catch { /* noop */ }
-    this.tiles.delete(id);
-    this._markRelaxListDirty();
+  _onRelayStatus(text, level) {
+    this._relayStatus = { text, level };
+    const isConnected = (text === 'connected' || level === 'ok');
+    if (isConnected && !this._relayWasConnected) {
+      this._relayWasConnected = true;
+      // Relay just became ready → retro backfill from center out
+      this._scheduleBackfill(0);
+    }
   }
 
-  _resetAllTiles() {
-    for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
-    this.tiles.clear();
-    this._populateQueue.length = 0;
-    this._populateBusy = false;
-    this.GLOBAL_MIN_Y = +Infinity;
-    this.GLOBAL_MAX_Y = -Infinity;
-    this._globalDirty = true;
-    this._lastRecolorAt = 0;
-    this._relaxKeys = [];
-    this._relaxCursor = 0;
-    this._relaxKeysDirty = true;
-    this._lastHeight = 0;
-  }
+  /* ---------------- LOD / perf ---------------- */
 
   _markRelaxListDirty() {
     this._relaxKeysDirty = true;
@@ -873,7 +943,12 @@ export class TileManager {
       this.VISUAL_RING = visual;
       ringChanged = true;
     }
-    if (ringChanged) this._markRelaxListDirty();
+    if (ringChanged) {
+      this._markRelaxListDirty();
+      // If ring changed, ensure visuals exist & are queued
+      this._prewarmVisualRing(0, 0);
+      this._scheduleBackfill(0);
+    }
 
     this.VISUAL_CREATE_BUDGET = createBudget;
     this.RELAX_ITERS_PER_FRAME = relaxIters;
@@ -886,6 +961,8 @@ export class TileManager {
       relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
     };
   }
+
+  /* ---------------- Queries & controls ---------------- */
 
   getHeightAt(x, z) {
     // collide with interactive tiles only
@@ -902,16 +979,21 @@ export class TileManager {
   setRelayAddress(addr) {
     this.relayAddress = (addr || '').trim();
     this.terrainRelay?.setRelayAddress(this.relayAddress);
+    // Re-try missed tiles with new relay
+    this._scheduleBackfill(0);
   }
 
   setRelayDataset(dataset) {
     this.relayDataset = (dataset || '').trim() || DEFAULT_TERRAIN_DATASET;
     this.terrainRelay?.setDataset(this.relayDataset);
+    // Dataset change invalidates cache usefulness for pending → re-queue
+    this._scheduleBackfill(0);
   }
 
   setRelayMode(mode) {
     this.relayMode = mode === 'latlng' ? 'latlng' : 'geohash';
     this.terrainRelay?.setMode(this.relayMode);
+    this._scheduleBackfill(0);
   }
 
   getRelayStatus() {
@@ -928,9 +1010,42 @@ export class TileManager {
       tile._queued = false;
       this._queuePopulate(tile, tile.type === 'interactive');
     }
+    this._scheduleBackfill(0);
+  }
+
+  /* ---------------- Cleanup ---------------- */
+
+  _discardTile(id) {
+    const t = this.tiles.get(id);
+    if (!t) return;
+    this.scene.remove(t.grid.group);
+    try {
+      t.grid.geometry?.dispose?.();
+      t.grid.mat?.dispose?.();
+      t.grid.wireMat?.dispose?.();
+    } catch { /* noop */ }
+    this.tiles.delete(id);
+    this._markRelaxListDirty();
+  }
+
+  _resetAllTiles() {
+    for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
+    this.tiles.clear();
+    this._populateQueue.length = 0;
+    this._populateBusy = false;
+    this.GLOBAL_MIN_Y = +Infinity;
+    this.GLOBAL_MAX_Y = -Infinity;
+    this._globalDirty = true;
+    this._lastRecolorAt = 0;
+    this._relaxKeys = [];
+    this._relaxCursor = 0;
+    this._relaxKeysDirty = true;
+    this._lastHeight = 0;
   }
 
   dispose() {
+    if (this._backfillTimer) { clearTimeout(this._backfillTimer); this._backfillTimer = null; }
+    if (this._periodicBackfill) { clearInterval(this._periodicBackfill); this._periodicBackfill = null; }
     this._resetAllTiles();
     this.tiles.clear();
   }
