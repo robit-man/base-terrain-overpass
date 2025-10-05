@@ -43,7 +43,7 @@ export class AudioEngine {
       const data = buf.getChannelData(0);
 
       let last = Math.random() * 2 - 1;
-      const wobbleHz = 12000 + Math.random() * 125;
+      const wobbleHz = 120 + Math.random() * 125;
       for (let i = 0; i < len; i++) {
         const t = i / len;
         const white = Math.random() * 2 - 1;
@@ -88,7 +88,7 @@ export class AudioEngine {
     }, ms);
   }
 
-  _getImpactBuffer(frequency = 340, roughness = 0.3, duration = this.impactDuration) {
+  _getImpactBuffer(frequency = 120, roughness = 0.2, duration = this.impactDuration) {
     const key = `${Math.round(frequency)}:${Math.round(roughness * 100)}:${duration.toFixed(2)}`;
     if (this._impactBufferCache.has(key)) return this._impactBufferCache.get(key);
 
@@ -115,7 +115,7 @@ export class AudioEngine {
     return buffer;
   }
 
-  triggerImpact(x, y, z, { intensity = 1, frequency = 360, roughness = 0.35, decay = this.impactDuration } = {}) {
+  triggerImpact(x, y, z, { intensity = 0.5, frequency = 120, roughness = 0.15, decay = this.impactDuration } = {}) {
     if (!this._enabled || !this.listener || this._voices >= this.MAX_VOICES) return;
 
     const holder = new THREE.Object3D();
@@ -133,7 +133,7 @@ export class AudioEngine {
     this._voices++;
     try { snd.play(); } catch { }
 
-    const ms = decay * 1000 + 80;
+    const ms = decay * 100 + 80;
     setTimeout(() => {
       try { snd.stop(); } catch { }
       holder.remove(snd);

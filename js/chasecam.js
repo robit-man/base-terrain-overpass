@@ -22,17 +22,17 @@ export class ChaseCam {
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
-    this.maxBoom = 50.0;
+    this.maxBoom = 500.0;
     this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
     this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
-    this.smooth = 12.0;
+    this.smooth = 24.0;
 
     // Mobile-device pitch handling
     this.isMobile = /Mobi|Android/i.test(navigator.userAgent);
     this.pitchZero = null;      // beta at calibration
     this.pitchFiltered = 0;     // radians
-    this.pitchHz = 12;          // smoothing rate
+    this.pitchHz = 60;          // smoothing rate
     this.pitchClamp = THREE.MathUtils.degToRad(85); // avoid flipping
 
     this._ensureParentedToDolly();
@@ -45,7 +45,7 @@ export class ChaseCam {
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
       this.targetBoom = THREE.MathUtils.clamp(
-        this.targetBoom + e.deltaY * 0.002,
+        this.targetBoom + e.deltaY * 0.01,
         this.minBoom,
         this.maxBoom
       );

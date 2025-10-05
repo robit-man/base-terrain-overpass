@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;500;600;700&display=swap');
+
 html,
 body {
     margin: 0;
@@ -11,11 +13,28 @@ body {
 body.modal-open {
     overflow: hidden;
 }
-*-webkit-scrollbar {
-        display: none;
-    }
-    *{        scrollbar-width: none;
+
+* {
+    font-family: "Rajdhani", sans-serif !important;
+    letter-spacing: 0.04em;
 }
+
+body>canvas {
+    top: 0px;
+    position: fixed;
+    z-index: 0;
+    left: 0px;
+}
+
+*-webkit-scrollbar {
+    display: none;
+}
+
+* {
+    scrollbar-width: none;
+    box-sizing: border-box;
+}
+
 #hint {
     border-radius: 2rem;
     position: fixed;
@@ -32,79 +51,90 @@ body.modal-open {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, .35);
-    backdrop-filter: blur(10px);
+    backdrop-filter: blur(50px)brightness(0.8)contrast(0.8)saturate(0)brightness(0.5);
     display: none;
-    z-index: 19
+    z-index: 19;
+    height: 100vh;
+    width: 100vw;
 }
 
 /* BASE: desktop behavior unchanged (centered modal) */
 #menuPane {
-  position: fixed;
-  background: linear-gradient(135deg, rgba(10, 14, 24, 0.92), rgba(24, 34, 52, 0.82));
-  border: 1px solid rgba(94, 138, 255, 0.28);
-  box-shadow: 0 12px 30px rgba(8, 12, 24, 0.55);
-  border-radius: 18px;
-  z-index: 20;
-  padding: 1rem;
+    position: relative;
+    backdrop-filter: blur(50px);
+    box-shadow: 0 12px 30px rgba(8, 12, 24, 0.55);
+    border-radius: 26px;
+    z-index: 20;
+    padding: 2rem;
 
-  /* sizing */
-  width: 800px;
-  max-width: calc(100vw - 2rem);
-  max-height: calc(100vh - 6rem);
+    /* sizing */
+    width: 800px;
+    margin: auto;
+    border: 1px solid #ffffff1a;
+    max-width: calc(100vw - 2rem);
+    max-height: calc(100vh - 8rem);
 
-  /* center on desktop */
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+    /* center on desktop */
 
-  /* scrolling */
-  overflow: auto;
 
-  /* your show/hide logic still works — keep display:none set via JS */
-  display: none;
+
+    /* scrolling */
+    overflow: auto;
+
+    /* your show/hide logic still works — keep display:none set via JS */
+    display: none;
+    box-sizing: border-box;
+    top: 4rem;
 }
 
 /* MOBILE FIX: remove transforms so WebKit allows scrolling, anchor near top */
 @media (max-width: 768px) {
-  #menuPane {
-    /* kill transform (the iOS troublemaker) */
-    transform: none;
+    #menuPane {
+        /* kill transform (the iOS troublemaker) */
+        transform: none;
 
-    /* center horizontally without transforms */
-    left: 1rem;
-    right: 1rem;
-    margin-left: auto;
-    margin-right: auto;
-    width: auto; /* ignore fixed 800px on small screens */
+        /* center horizontally without transforms */
+        left: 1rem;
+        right: 1rem;
+        margin-left: auto;
+        margin-right: auto;
+        width: auto;
+        /* ignore fixed 800px on small screens */
 
-    /* anchor near top to avoid needing vertical centering transforms */
-    top: 1rem;
+        /* anchor near top to avoid needing vertical centering transforms */
+        top: 1rem;
 
-    /* use dynamic viewport to avoid iOS 100vh bugs */
-    max-height: calc(100dvh - 2rem);
+        /* use dynamic viewport to avoid iOS 100vh bugs */
+        max-height: calc(100dvh - 2rem);
 
-    /* enable momentum scroll on iOS */
-    -webkit-overflow-scrolling: touch;
-  }
+        /* enable momentum scroll on iOS */
+        -webkit-overflow-scrolling: touch;
+    }
 }
 
 /* optional: your scrollbar rule had a typo; this hides WebKit scrollbars */
-*::-webkit-scrollbar { display: none; }
+*::-webkit-scrollbar {
+    display: none;
+}
 
 #menuPane h2 {
-    margin: 12px 0 8px;
-    font-size: 16px
+    /* margin: 12px 0 8px; */
+    opacity: 0.2;
+    text-align: left;
+    font-size: 24px;
+    width: 100%;
 }
 
 .kv {
     display: flex;
     align-items: center;
     gap: 8px;
-    background: #0008;
-    border: 1px solid #222;
-    padding: 6px 8px;
+    background: ttrans;
+    border: 1px dashed #ffffff1a;
+    padding: 1rem 1.2rem;
     border-radius: 8px;
-    margin: 2px 0
+    box-sizing: border-box;
+    /* margin: 2px 0; */
 }
 
 .row {
@@ -146,11 +176,11 @@ body.modal-open {
 
 input[type=text] {
     width: 100%;
-    background: #000;
+    background: transparent;
     color: #eee;
-    border: 1px solid #333;
+    border: 1px solid #ffffff1a;
     border-radius: 8px;
-    padding: 8px 10px
+    padding: 1rem 1.2rem;
 }
 
 .peer {
@@ -234,12 +264,13 @@ input[type=text] {
     padding: 14px 10px;
     cursor: pointer;
     border: 6px solid #000;
-    border-radius: 18px;
+    border-radius: 1rem;
+    opacity: 0.2;
     font-weight: 900;
     text-transform: uppercase;
     color: #000;
-    background: repeating-linear-gradient(45deg, #ffd400 0, #ffd400 16px, #000 16px, #000 28px);
-    box-shadow: 0 3px 0 #000, inset 0 0 0 3px #ffd400;
+    background: repeating-linear-gradient(45deg, #ffffff 0, #ffffff 16px, #000 16px, #000 28px);
+    box-shadow: unset;
 }
 
 #nuke .big {
@@ -251,10 +282,12 @@ input[type=text] {
 #nuke .sub {
     font-size: 20px;
     font-weight: bold;
-    text-shadow: 2px 2px 0px #f7b500, 2px -2px 0px #f7b500, -2px 2px 0px #f7b500, -2px -2px 0px #f7b500;
+    text-shadow: 2px 2px 0px #000000, 2px -2px 0px #000000, -2px 2px 0px #000000, -2px -2px 0px #000000;
     display: block;
     font-size: 12px;
-    font-weight: 700
+    color: white;
+    font-weight: 700;
+    font-size: 1.5rem;
 }
 
 .mini-map-panel {
@@ -266,8 +299,17 @@ input[type=text] {
 }
 
 #miniMapMap {
-    width:  180px;
+    width: 180px;
     height: 180px;
+    transition: all 0.5s ease;
+    transition-delay: 1s;
+}
+
+#miniMapMap:hover {
+    width: 512px;
+    max-width: calc(100vw - 4rem);
+    height: 512px;
+    transition-delay: 0s;
 }
 
 .mini-map-controls {
@@ -278,13 +320,15 @@ input[type=text] {
 .mini-map-controls button,
 .mini-map-action-stack button {
     flex: 1;
-    padding: 8px 0;
-    border-radius: 10px;
-    background: rgba(16, 26, 44, 0.65);
-    border: 1px solid rgba(86, 118, 188, 0.26);
-    box-shadow: inset 0 0 12px rgba(10, 18, 32, 0.55);
-    color: #eee;
+    padding: 1rem 1.2rem;
+    width: auto;
+    border-radius: 8px;
+    background-color: transparent;
+    border: 1px solid #ffffff1a;
+    color: #ffffff33;
     cursor: pointer;
+    height: min-content;
+    min-width: max-content;
     font-family: inherit;
     font-size: 12px;
     letter-spacing: 0.04em;
@@ -329,10 +373,10 @@ input[type=text] {
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    background: #0008;
-    border: 1px solid #222;
+    background: #00000033;
+    border: 1px solid #ffffff1a;
     border-radius: 10px;
-    padding: 10px 12px;
+    padding: 1rem 1.2rem;
     cursor: pointer
 }
 
@@ -360,11 +404,12 @@ input[type=text] {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    background: #0008;
-    border: 1px solid #222;
+    background: transparent;
+    border: 1px solid #ffffff1a;
     border-radius: 10px;
-    padding: 10px 12px;
-    margin-top: 10px;
+    padding: 1rem 1.2rem;
+    /* margin-top: 10px; */
+    color: #ffffff33;
 }
 
 .slider-row label {
@@ -372,7 +417,7 @@ input[type=text] {
     justify-content: space-between;
     align-items: center;
     font-size: 12px;
-    color: #c6cad5;
+    color: #ffffff33;
 }
 
 .slider-row input[type=range] {
@@ -383,12 +428,12 @@ input[type=text] {
     position: fixed;
     top: 1rem;
     right: 1rem;
-    width: 240px;
-    padding: 14px 16px 16px;
-    border-radius: 16px;
-    background: linear-gradient(135deg, rgba(10, 14, 24, 0.92), rgba(24, 34, 52, 0.82));
-    border: 1px solid rgba(94, 138, 255, 0.28);
-    box-shadow: 0 12px 30px rgba(8, 12, 24, 0.55);
+    width: 120px;
+    padding: 0.5rem;
+    border-radius: 26px;
+    /* background: linear-gradient(135deg, rgba(10, 14, 24, 0.92), rgba(24, 34, 52, 0.82)); */
+    border: 1px solid #ffffff0a;
+    /* box-shadow: 0 12px 30px rgba(8, 12, 24, 0.55); */
     color: #e9efff;
     font-size: 12px;
     letter-spacing: 0.02em;
@@ -400,10 +445,8 @@ input[type=text] {
 }
 
 #perfHud:hover {
-    transform: translateY(-2px);
-    border-color: rgba(125, 197, 255, 0.45);
-    box-shadow: 0 16px 40px rgba(6, 12, 28, 0.65);
-    background: linear-gradient(135deg, rgba(14, 20, 34, 0.94), rgba(30, 42, 64, 0.88));
+    background-color: #00000011;
+
 }
 
 #perfHud:focus-visible {
@@ -416,13 +459,15 @@ input[type=text] {
     flex-direction: column;
     gap: 12px;
     width: 100%;
+    color: #ffffff33 !important;
 }
 
 #perfHud .hud-topline {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
+    display: flex;
+    grid-template-columns: auto1 1fr auto;
     align-items: center;
     gap: 12px;
+    flex-flow: wrap;
 }
 
 #perfHud .hud-label {
@@ -437,12 +482,12 @@ input[type=text] {
     width: 36px;
     height: 36px;
     border-radius: 50%;
-    border: 1px solid rgba(125, 197, 255, 0.32);
-    background: radial-gradient(circle at 30% 30%, rgba(120, 180, 255, 0.25), rgba(18, 28, 48, 0.65));
+    border: 1px solid #ffffff1a;
+    /* background: radial-gradient(circle at 30% 30%, rgba(120, 180, 255, 0.25), rgba(18, 28, 48, 0.65)); */
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: inset 0 0 12px rgba(12, 24, 48, 0.6);
+    /* box-shadow: inset 0 0 12px rgba(12, 24, 48, 0.6); */
 }
 
 #perfHud .hud-compass::after {
@@ -504,9 +549,9 @@ input[type=text] {
     gap: 2px;
     padding: 6px 10px;
     border-radius: 10px;
-    background: rgba(26, 42, 74, 0.55);
+    /* background: rgba(26, 42, 74, 0.55); */
     border: 1px solid rgba(120, 184, 255, 0.28);
-    box-shadow: inset 0 0 12px rgba(16, 28, 52, 0.6);
+    /* box-shadow: inset 0 0 12px rgba(16, 28, 52, 0.6); */
 }
 
 #perfHud .hud-fps {
@@ -519,7 +564,7 @@ input[type=text] {
 
 #perfHud .hud-metrics {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(1, minmax(0, 1fr));
     gap: 8px;
 }
 
@@ -530,9 +575,10 @@ input[type=text] {
     gap: 4px;
     padding: 8px 10px;
     border-radius: 10px;
-    background: rgba(16, 26, 44, 0.6);
-    border: 1px solid rgba(86, 118, 188, 0.26);
-    box-shadow: inset 0 0 12px rgba(10, 18, 32, 0.55);
+    /* background: rgb(14 16 18 / 60%); */
+    /* border: 1px solid rgba(86, 118, 188, 0.26); */
+    /* box-shadow: inset 0 0 12px rgba(10, 18, 32, 0.55); */
+    color: #ffffff33 !important;
 }
 
 #perfHud .hud-metric .hud-value,
@@ -541,7 +587,7 @@ input[type=text] {
     font-family: 'IBM Plex Mono', 'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 12px;
     letter-spacing: 0.02em;
-    color: #f3f6ff;
+    color: #ffffff33;
 }
 
 #perfHud .hud-qos {
@@ -557,6 +603,7 @@ input[type=text] {
 #perfHud .hud-geo {
     display: flex;
     gap: 8px;
+    flex-flow: column;
 }
 
 #perfHud .hud-geo-item {
@@ -590,13 +637,11 @@ input[type=text] {
     position: fixed;
     top: 1rem;
     left: 1rem;
-    height:auto;
-    width:auto;
+    height: auto;
+    width: auto;
     padding: 18px;
-    border-radius: 18px;
-    background: linear-gradient(135deg, rgba(8, 12, 22, 0.92), rgba(20, 30, 48, 0.86));
-    border: 1px solid rgba(86, 132, 220, 0.28);
-    box-shadow: 0 14px 34px rgba(6, 10, 20, 0.62);
+    border-radius: 26px;
+    border: 1px solid #ffffff1a;
     z-index: 11;
     display: flex;
     flex-direction: column;
@@ -606,28 +651,38 @@ input[type=text] {
 }
 
 #miniMapDock .mini-map-panel {
-    border: 1px solid rgba(120, 176, 255, 0.3);
-    box-shadow: 0 18px 38px rgba(4, 8, 18, 0.6);
+    filter: saturate(0)contrast(1.2)invert(1)brightness(1.2)contrast(0.8)opacity(0.5)
 }
 
 #miniMapDock .mini-map-action-stack {
-display:flex;flex-flow:row;gap:8px;
+    display: flex;
+    flex-flow: row;
+    gap: 8px;
+    width: 100%;
 }
 
 .modal-section {
     margin-bottom: 18px;
     display: flex;
-    flex-direction: column;
+    flex-flow: wrap;
     gap: 10px;
+    justify-content: flex-start;
 }
 
 .modal-section .section-title {
     font-size: 16px;
-    font-weight: 600;
+    font-weight: 900;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: #fafafa;
-    opacity: 0.9;
+    color: #ffffff55;
+    margin-right: auto;
+    opacity: 1;
+    background: #00000033;
+    border-radius: 8px;
+    border: 1px dashed #ffffff1a;
+    padding: 1rem 1.2rem;
+    height: fit-content;
+    margin: unset;
 }
 
 .modal-header {
@@ -712,14 +767,14 @@ display:flex;flex-flow:row;gap:8px;
 
 .button-row button {
     flex: 1 1 140px;
-    border: 1px solid #333;
-    background: #111;
-    color: #eee;
-    padding: 10px 12px;
+    border: 1px solid #ffffff1a;
+    background: transparent;
+    color: #ffffff33;
+    padding: 1rem 1.2rem;
     border-radius: 10px;
     cursor: pointer;
     font-family: inherit;
-    font-size: 13px;
+    font-size: 12px;
     letter-spacing: 0.03em;
     text-transform: uppercase;
     transition: background 0.2s ease, transform 0.2s ease;
@@ -745,7 +800,7 @@ display:flex;flex-flow:row;gap:8px;
 .modal-header h2 {
     margin: 0;
     font-size: 18px;
-    font-weight: 700;
+    font-weight: 100;
     letter-spacing: 0.05em;
     text-transform: uppercase;
 }

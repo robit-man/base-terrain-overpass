@@ -62,7 +62,7 @@ class App {
     this.audio = new AudioEngine(this.sceneMgr);
     this._meshClientPromise = null;
     const terrainClientProvider = () => this._getMeshClient();
-    this.hexGridMgr = new TileManager(this.sceneMgr.scene, 5, 50, this.audio, {
+    this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
     });
 
@@ -1141,7 +1141,7 @@ class App {
     // Ensure a Perspective camera mounted at the dolly origin (first-person)
     const oldCam = this.sceneMgr.camera;
     if (!(oldCam instanceof THREE.PerspectiveCamera)) {
-      const cam = new THREE.PerspectiveCamera(75, oldCam.aspect || innerWidth / innerHeight, 0.05, 1000);
+      const cam = new THREE.PerspectiveCamera(75, oldCam.aspect || innerWidth / innerHeight, 0.05, 100000);
       cam.position.set(0, 0, 0);
       cam.rotation.set(0, 0, 0);
       try { this.sceneMgr.dolly.remove(oldCam); } catch {}

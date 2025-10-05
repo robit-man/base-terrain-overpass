@@ -8,59 +8,68 @@ import { TerrainRelay } from './terrainRelay.js';
 
 const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
-
-// NKN DM payload budget (conservative); the relay will reject oversize payloads.
 const DM_BUDGET_BYTES = 2800;
-// Safety cap on location count per request.
 const MAX_LOCATIONS_PER_BATCH = 800;
+const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
+
+// phased acquisition for interactive tiles
+const PHASE_SEED = 0; // center + 6 tips
+const PHASE_EDGE = 1; // midpoints on 6 sides
+const PHASE_FULL = 2; // remaining unknowns / full pass
+
+// axial neighbors for hex tiles (pointy-top)
+const HEX_DIRS = [
+  [1, 0], [1, -1], [0, -1],
+  [-1, 0], [-1, 1], [0, 1],
+];
 
 export class TileManager {
   constructor(scene, spacing = 10, tileRadius = 15, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
-    this.audio = audio;
-    this.tiles = new Map();
-    this.origin = null;
+    this.audio = audio;   // spatial audio engine
+    this.tiles = new Map(); this.origin = null;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 4;
-    this.VISUAL_RING = 30;
-    this.VISUAL_CREATE_BUDGET = 200;
+    this.INTERACTIVE_RING = 2;
+    this.VISUAL_RING = 20;
+    // turbo: do not throttle per-frame visual tile creation
+    this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
 
-    // ---- interactive relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 16;
+    // ---- interactive (high-res) relaxation ----
+    this.RELAX_ITERS_PER_FRAME = 12;
     this.RELAX_ALPHA = 1.0;
-    this.NORMALS_EVERY = 12;
-    this.RELAX_FRAME_BUDGET_MS = 3.0;
+    this.NORMALS_EVERY = 10;
+    // keep relax cheap so fetching dominates
+    this.RELAX_FRAME_BUDGET_MS = 2.0;
 
-    // ---- GLOBAL grayscale controls ----
+    // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
-    this.LUM_MAX = 0.80;
+    this.LUM_MAX = 0.90;
     this.GLOBAL_MIN_Y = +Infinity;
     this.GLOBAL_MAX_Y = -Infinity;
     this._globalDirty = false;
     this._lastRecolorAt = 0;
 
-    // ---- caching ----
+    // ---- wireframe colors ----
+    this.VISUAL_WIREFRAME_COLOR = 0xffffff;
+    this.INTERACTIVE_WIREFRAME_COLOR = 0xffffff;
+
+    // ---- caching config ----
     this.CACHE_VER = 'v1';
     this._originCacheKey = 'na';
 
-    // ---- raycasters ----
     this.ray = new THREE.Raycaster();
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._lastHeight = 0;
-    this._samplerRay = new THREE.Raycaster(); // used for visual→interactive sampling
 
-    // ---- relax list plumbing ----
     this._relaxKeys = [];
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
 
     if (!scene.userData._tmLightsAdded) {
-      scene.add(new THREE.AmbientLight(0xffffff, .55));
-      const sun = new THREE.DirectionalLight(0xffffff, .65);
-      sun.position.set(50, 100, 50);
-      sun.castShadow = true;
-      scene.add(sun);
+      scene.add(new THREE.AmbientLight(0xffffff, .055));
+      const sun = new THREE.DirectionalLight(0xffffff, .065);
+      sun.position.set(50, 100, 50); sun.castShadow = true; scene.add(sun);
       scene.userData._tmLightsAdded = true;
     }
 
@@ -88,18 +97,32 @@ export class TileManager {
       onStatus: (text, level) => this._onRelayStatus(text, level),
     });
 
-    // ---- populate plumbing ----
-    this._populateQueue = [];
-    this._populateBusy = false;
+    // ---- populate plumbing (PHASED) ----
+    this._populateQueue = [];          // entries: { tile, phase, priority }
+    this._populateInflight = 0;
+    this._populateBusy = false;        // legacy flag
+    this.MAX_CONCURRENT_POPULATES = 12; // try 16–24 if the relay tolerates it
     this._encoder = new TextEncoder();
 
-    // High concurrency to “send it” (both across tiles and within a tile)
-    this.POPULATE_CONCURRENCY = 10; // tiles at once
-    this._populateInFlight = 0;
+    // ---- network governor (token bucket) ----
+    this.RATE_QPS = 12;               // max terrainRelay calls per second
+    this.RATE_BPS = 256 * 1024;       // max payload bytes per second
+    this._rateTokensQ = this.RATE_QPS;
+    this._rateTokensB = this.RATE_BPS;
+    this._rateBucketResetAt = (performance?.now?.() ?? Date.now());
+    this._rateTicker = setInterval(() => {
+      this._rateTokensQ = this.RATE_QPS;
+      this._rateTokensB = this.RATE_BPS;
+      this._drainPopulateQueue();
+    }, 1000);
 
-    // Backfill scheduler
+    // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
-    this._periodicBackfill = setInterval(() => this._backfillMissing({ onlyIfRelayReady: true, edgeFirst: true }), 2500);
+    this._backfillIntervalMs = 300; // was 2500
+    this._periodicBackfill = setInterval(
+      () => this._backfillMissing({ onlyIfRelayReady: true }),
+      this._backfillIntervalMs
+    );
   }
 
   /* ---------------- small helpers ---------------- */
@@ -109,16 +132,140 @@ export class TileManager {
     return { x: 1.5 * a * q, z: a * ((Math.sqrt(3) / 2) * q + Math.sqrt(3) * r) };
   }
   _hexCorners(a) {
-    const out = [];
-    for (let i = 0; i < 6; i++) {
-      const ang = (Math.PI / 3) * i;
-      out.push({ x: a * Math.cos(ang), z: a * Math.sin(ang) });
-    }
-    return out;
+    const out = []; for (let i = 0; i < 6; i++) {
+      const ang = (Math.PI / 3) * i; out.push({ x: a * Math.cos(ang), z: a * Math.sin(ang) });
+    } return out;
   }
   _hexDist(q1, r1, q2, r2) {
     const dq = q1 - q2, dr = r1 - r2, ds = (-q1 - r1) - (-q2 - r2);
     return (Math.abs(dq) + Math.abs(dr) + Math.abs(ds)) / 2;
+  }
+
+  _getTile(q, r) { return this.tiles.get(`${q},${r}`) || null; }
+  _getMeshForTile(t) { return t?.grid?.mesh || null; }
+  _gatherNeighborMeshes(q, r) {
+    const out = [];
+    for (const [dq, dr] of HEX_DIRS) {
+      const n = this._getTile(q + dq, r + dr);
+      const m = this._getMeshForTile(n);
+      if (m) out.push(m);
+    }
+    return out;
+  }
+
+  _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
+    this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+    if (primaryMesh) {
+      const hit = this.ray.intersectObject(primaryMesh, true);
+      if (hit && hit.length) return hit[0].point.y;
+    }
+    for (let i = 0; i < neighborMeshes.length; i++) {
+      const hit = this.ray.intersectObject(neighborMeshes[i], true);
+      if (hit && hit.length) return hit[0].point.y;
+    }
+    if (nearestGeomAttr?.isBufferAttribute) {
+      let best = Infinity, bestY = approx;
+      const arr = nearestGeomAttr.array;
+      const px = (primaryMesh?.parent?.position.x || 0);
+      const pz = (primaryMesh?.parent?.position.z || 0);
+      for (let i = 0; i < arr.length; i += 3) {
+        const dx = (arr[i] + px) - wx;
+        const dz = (arr[i + 2] + pz) - wz;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < best) { best = d2; bestY = arr[i + 1]; }
+      }
+      return bestY;
+    }
+    return approx;
+  }
+
+  // tighter rim: only the true outermost ring
+  _isRimVertex(tile, idx) {
+    const x = tile.pos.getX(idx), z = tile.pos.getZ(idx);
+    const r2 = x * x + z * z;
+    const a = this.tileRadius;
+    const rim = a * 0.985; // tighter than before: avoid grabbing near-rim neighbors
+    return r2 >= rim * rim;
+  }
+
+  _angleOf(x, z) {
+    let a = Math.atan2(z, x);
+    if (a < 0) a += Math.PI * 2;
+    return a; // [0, 2π)
+  }
+  _angDiff(a, b) {
+    let d = Math.abs(a - b);
+    if (d > Math.PI) d = 2 * Math.PI - d;
+    return d;
+  }
+
+  // classify outer ring into 6 sides and 6 corners (by angle & radius)
+  _classifyRimAndCorners(tile) {
+    const pos = tile.pos;
+    const aR = this.tileRadius;
+    const RIM_MIN = aR * 0.972;     // outer band
+    const CORNER_MIN = aR * 0.985;  // the very tips
+    const CORNER_ARC = Math.PI / 15; // ~12°
+    const SIDE_ARC = Math.PI / 12;   // classify to nearest side direction
+
+    // corner directions at 0,60,120...
+    const cornerAng = Array.from({ length: 6 }, (_, i) => i * (Math.PI / 3));
+    // side directions halfway between corners (30°, 90°, ...)
+    const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+
+    const sides = Array.from({ length: 6 }, () => []);
+    const corners = Array.from({ length: 6 }, () => []);
+    const rim = [];
+
+    // inner band near corners (helps prevent folding right behind the tip)
+    const innerCornerBand = new Set();
+
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+      if (r < RIM_MIN) {
+        // mark inner band around corners
+        if (r >= aR * 0.92) {
+          const a = this._angleOf(x, z);
+          for (let c = 0; c < 6; c++) {
+            if (this._angDiff(a, cornerAng[c]) < CORNER_ARC) {
+              innerCornerBand.add(i);
+              break;
+            }
+          }
+        }
+        continue;
+      }
+      rim.push(i);
+
+      const a = this._angleOf(x, z);
+      // corner?
+      let isCorner = false;
+      if (r >= CORNER_MIN) {
+        for (let c = 0; c < 6; c++) {
+          if (this._angDiff(a, cornerAng[c]) < CORNER_ARC) {
+            corners[c].push(i);
+            isCorner = true;
+            break;
+          }
+        }
+      }
+      if (isCorner) continue;
+
+      // otherwise side: pick nearest side direction
+      let best = 0, bestD = Infinity;
+      for (let s = 0; s < 6; s++) {
+        const d = this._angDiff(a, sideAng[s]);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      if (bestD < SIDE_ARC) sides[best].push(i);
+      else {
+        // fallback: still treat as side using nearest
+        sides[best].push(i);
+      }
+    }
+
+    return { rim, sides, corners, innerCornerBand };
   }
 
   /* ---------- adjacency & buffers (interactive) ---------- */
@@ -144,6 +291,10 @@ export class TileManager {
         tile.yA[i] = y; tile.yB[i] = y;
       }
     }
+    // ensure lock mask
+    if (!tile.locked || tile.locked.length !== n) {
+      tile.locked = new Uint8Array(n); // 1 => pinned (do not relax/smooth)
+    }
   }
   _relaxOnce(tile) {
     if (tile.type !== 'interactive') return false;
@@ -152,13 +303,14 @@ export class TileManager {
     if (tile.unreadyCount === 0) return false;
 
     const ready = tile.ready;
+    const locked = tile.locked || new Uint8Array(tile.pos.count);
     const adj = tile.neighbors;
     const read = tile.flip ? tile.yB : tile.yA;
     const write = tile.flip ? tile.yA : tile.yB;
     const alpha = this.RELAX_ALPHA;
 
     for (let i = 0; i < tile.pos.count; i++) {
-      if (ready[i]) { write[i] = read[i]; continue; }
+      if (ready[i] || locked[i]) { write[i] = read[i]; continue; }
       let sum = 0, cnt = 0;
       for (const j of adj[i]) { sum += read[j]; cnt++; }
       write[i] = (cnt > 0) ? read[i] + (sum / cnt - read[i]) * alpha : read[i];
@@ -220,9 +372,7 @@ export class TileManager {
     if (y > this.GLOBAL_MAX_Y) { this.GLOBAL_MAX_Y = y; changed = true; }
     if (changed) this._globalDirty = true;
   }
-  _updateGlobalFromArray(arr) {
-    for (let i = 0; i < arr.length; i++) this._updateGlobalFromValue(arr[i]);
-  }
+  _updateGlobalFromArray(arr) { for (let i = 0; i < arr.length; i++) this._updateGlobalFromValue(arr[i]); }
   _lumFromYGlobal(y) {
     const minY = this.GLOBAL_MIN_Y, maxY = this.GLOBAL_MAX_Y;
     if (!Number.isFinite(minY) || !Number.isFinite(maxY) || maxY - minY < 1e-6) return this.LUM_MIN;
@@ -252,30 +402,6 @@ export class TileManager {
       out[i] = { lat: Number(lat.toFixed(6)), lng: Number(lon.toFixed(6)) };
     }
     return out;
-  }
-
-  // Edge-first inside each tile: farthest verts first so boundaries get aligned ASAP.
-  _buildProgressiveLevels(tile) {
-    const pos = tile.pos;
-    const indices = Array.from({ length: pos.count }, (_, i) => i);
-    // Sort by radius DESC (edge → center)
-    indices.sort((a, b) => {
-      const ax = pos.getX(a), az = pos.getZ(a);
-      const bx = pos.getX(b), bz = pos.getZ(b);
-      return (bx * bx + bz * bz) - (ax * ax + az * az);
-    });
-
-    const levels = [];
-    let cursor = 0;
-    let chunk = Math.max(10, Math.ceil(indices.length * 0.08)); // slightly larger chunks to get edges fast
-    while (cursor < indices.length) {
-      const end = Math.min(indices.length, cursor + chunk);
-      levels.push(indices.slice(cursor, end));
-      cursor = end;
-      chunk = Math.max(12, Math.min(indices.length - cursor, Math.ceil(chunk * 1.8)));
-      if (chunk <= 0) chunk = indices.length - cursor;
-    }
-    return levels;
   }
 
   _indicesToBatchesLatLng(indices, latLon) {
@@ -335,6 +461,8 @@ export class TileManager {
       if (idx == null) continue;
       const height = Number(res.elevation);
       if (!Number.isFinite(height)) continue;
+      // unlock if we had pinned this vertex previously
+      if (tile.locked) tile.locked[idx] = 0;
       this._applySample(tile, idx, height);
     }
   }
@@ -347,6 +475,9 @@ export class TileManager {
     if (tile.ready[idx] !== 1) tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
     tile.ready[idx] = 1;
     tile.fetched.add(idx);
+
+    // data landed: make sure the pin is released
+    if (tile.locked) tile.locked[idx] = 0;
 
     this._pullGeometryToBuffers(tile, idx);
     this._updateGlobalFromValue(height);
@@ -367,6 +498,7 @@ export class TileManager {
 
   _nearestAnchorFill(tile) {
     const ready = tile.ready;
+    const locked = tile.locked || new Uint8Array(tile.pos.count);
     const pos = tile.pos;
     const n = pos.count;
     const nearest = new Int32Array(n).fill(-1);
@@ -374,7 +506,8 @@ export class TileManager {
     let head = 0; let tail = 0;
 
     for (let i = 0; i < n; i++) {
-      if (ready[i]) {
+      // treat locked surface as seeds too
+      if (ready[i] || locked[i]) {
         nearest[i] = i;
         queue[tail++] = i;
       }
@@ -391,7 +524,7 @@ export class TileManager {
     }
 
     for (let i = 0; i < n; i++) {
-      if (ready[i]) continue;
+      if (ready[i] || locked[i]) continue;
       const src = nearest[i];
       if (src === -1) continue;
       const y = pos.getY(src);
@@ -404,13 +537,15 @@ export class TileManager {
   _smoothUnknowns(tile, iterations = 1) {
     const pos = tile.pos;
     const ready = tile.ready;
+    const locked = tile.locked || new Uint8Array(pos.count);
     const next = new Float32Array(pos.count);
 
     for (let iter = 0; iter < iterations; iter++) {
       let touched = false;
       for (let i = 0; i < pos.count; i++) {
-        if (ready[i]) continue;
-        let sum = 0, cnt = 0;
+        if (ready[i] || locked[i]) continue;
+        let sum = 0;
+        let cnt = 0;
         for (const nbr of tile.neighbors[i]) {
           const y = pos.getY(nbr);
           if (Number.isFinite(y)) { sum += y; cnt++; }
@@ -425,7 +560,7 @@ export class TileManager {
       }
       if (!touched) break;
       for (let i = 0; i < pos.count; i++) {
-        if (ready[i]) continue;
+        if (ready[i] || locked[i]) continue;
         pos.setY(i, next[i]);
       }
       pos.needsUpdate = true;
@@ -473,6 +608,16 @@ export class TileManager {
       this._updateGlobalFromArray(data.y);
       this._applyAllColorsGlobal(tile);
 
+      // consider interactive cache as full-done
+      if (!tile._phase) tile._phase = {};
+      if (tile.type === 'interactive') {
+        tile._phase.seedDone = true;
+        tile._phase.edgeDone = true;
+        tile._phase.fullDone = true;
+      } else {
+        tile._phase.fullDone = true;
+      }
+
       return true;
     } catch { return false; }
   }
@@ -491,9 +636,9 @@ export class TileManager {
 
   /* ---------------- creation: interactive tile ---------------- */
 
-  _addInteractiveTile(q, r, { seedFromVisual = null } = {}) {
+  _addInteractiveTile(q, r) {
     const id = `${q},${r}`;
-    if (this.tiles.has(id) && this.tiles.get(id).type === 'interactive') return this.tiles.get(id);
+    if (this.tiles.has(id)) return this.tiles.get(id);
 
     const grid = new UniformHexGrid(this.spacing, this.tileRadius * 2);
     grid.group.name = `tile-${id}`;
@@ -501,9 +646,22 @@ export class TileManager {
     grid.group.position.set(wp.x, 0, wp.z);
     this.scene.add(grid.group);
 
+    // overlay wireframe for interactive tiles (custom color)
+    const wire = new THREE.Mesh(
+      grid.geometry,
+      new THREE.MeshBasicMaterial({
+        wireframe: true,
+        transparent: true,
+        opacity: 0.03,
+        color: this.INTERACTIVE_WIREFRAME_COLOR
+      })
+    );
+    wire.frustumCulled = false; wire.renderOrder = 1;
+    grid.group.add(wire);
+
     const pos = grid.geometry.attributes.position;
     const neighbors = this._buildAdjacency(grid.geometry.getIndex(), pos.count);
-    const ready = new Uint8Array(pos.count); // 1=fetched
+    const ready = new Uint8Array(pos.count);
 
     const tile = {
       type: 'interactive',
@@ -516,7 +674,10 @@ export class TileManager {
       yA: null, yB: null, flip: false,
       normTick: 0,
       col: null,
-      unreadyCount: pos.count
+      unreadyCount: pos.count,
+      _phase: { seedDone: false, edgeDone: false, fullDone: false },
+      _queuedPhases: new Set(),
+      locked: new Uint8Array(pos.count)
     };
     this._ensureTileBuffers(tile);
     this.tiles.set(id, tile);
@@ -524,13 +685,7 @@ export class TileManager {
     this._initColorsNearBlack(tile);
     this._markRelaxListDirty();
 
-    // If we are upgrading from a visual, seed heights from the low-res mesh
-    if (seedFromVisual) {
-      this._seedInteractiveFromVisual(tile, seedFromVisual);
-    }
-
     if (!this._tryLoadTileFromCache(tile)) {
-      // Interactive tiles should be top priority
       this._queuePopulate(tile, true);
     }
     return tile;
@@ -562,9 +717,9 @@ export class TileManager {
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
     geom.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, metalness: .15, roughness: .45 });
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, metalness: .01, roughness: .95, transparent: true, opacity: 0.5, color: 0x111111 });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
-    const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 1, transparent: false, color: 0xa8a8a8 }));
+    const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 0.05, transparent: true, color: this.VISUAL_WIREFRAME_COLOR }));
     wire.frustumCulled = false; wire.renderOrder = 1;
 
     const group = new THREE.Group(); group.add(mesh, wire);
@@ -595,218 +750,628 @@ export class TileManager {
       fetched: new Set(),
       populating: false,
       unreadyCount: pos.count,
-      col: low.geometry.attributes.color
+      col: low.geometry.attributes.color,
+      _phase: { fullDone: false },
+      _queuedPhases: new Set()
     };
     this.tiles.set(id, tile);
 
     if (!this._tryLoadTileFromCache(tile)) {
-      // Visual tiles get queued immediately so edges align ASAP
-      this._queuePopulate(tile, true);
+      this._queuePopulate(tile, false);
     }
     return tile;
   }
 
-  /* ---------------- visual → interactive promotion ---------------- */
-
-  _seedInteractiveFromVisual(hiTile, lowTile) {
-    // Sample the low-res mesh vertically at each high-res vertex to *seed* heights.
-    // This avoids the “flat at 0” flash during promotion.
-    try {
-      const lowMesh = lowTile.grid.mesh;
-      const groupPos = lowTile.grid.group.position;
-      const pos = hiTile.pos;
-
-      // Prepare: include only this mesh in ray tests
-      const prevMatrixWorldAuto = lowMesh.matrixAutoUpdate;
-      lowMesh.updateMatrixWorld(true);
-
-      for (let i = 0; i < pos.count; i++) {
-        const xw = hiTile.grid.group.position.x + pos.getX(i);
-        const zw = hiTile.grid.group.position.z + pos.getZ(i);
-
-        this._samplerRay.set(new THREE.Vector3(xw, 10000, zw), this.DOWN);
-        const hits = this._samplerRay.intersectObject(lowMesh, true);
-        if (hits && hits.length) {
-          const y = hits[0].point.y;
-          pos.setY(i, y);
-          if (hiTile.col) {
-            const l = this._lumFromYGlobal(y);
-            const o = 3 * i;
-            hiTile.col.array[o] = hiTile.col.array[o + 1] = hiTile.col.array[o + 2] = l;
-          }
-          this._updateGlobalFromValue(y);
-        }
-      }
-
-      pos.needsUpdate = true;
-      hiTile.grid.geometry.computeVertexNormals();
-      this._ensureTileBuffers(hiTile);
-      this._pullGeometryToBuffers(hiTile);
-      this._applyAllColorsGlobal(hiTile);
-
-      lowMesh.matrixAutoUpdate = prevMatrixWorldAuto;
-    } catch (e) {
-      // If sampling fails for any reason, just keep default seed (near black + relax).
-      // console.warn('seedInteractiveFromVisual failed', e);
-    }
-  }
+  /* ---------------- promotion: visual -> interactive (seam + corner safe) ---------------- */
 
   _promoteVisualToInteractive(q, r) {
     const id = `${q},${r}`;
-    const low = this.tiles.get(id);
-    if (!low || low.type !== 'visual') return this._addInteractiveTile(q, r);
+    const v = this.tiles.get(id);
+    if (!v || v.type !== 'visual') return this._addInteractiveTile(q, r);
 
-    // Create the interactive using the visual as seed
-    const hi = this._addInteractiveTile(q, r, { seedFromVisual: low });
+    const grid = new UniformHexGrid(this.spacing, this.tileRadius * 2);
+    grid.group.name = `tile-${id}`;
+    grid.group.position.copy(v.grid.group.position);
+    this.scene.add(grid.group);
 
-    // Remove the low group once the high is in
-    try {
-      this.scene.remove(low.grid.group);
-      low.grid.geometry?.dispose?.();
-      low.grid.mat?.dispose?.();
-      low.grid.wireMat?.dispose?.();
-    } catch {}
-    // Replace map entry with the hi tile
-    this.tiles.set(id, hi);
+    // overlay wireframe for interactive
+    const wire = new THREE.Mesh(
+      grid.geometry,
+      new THREE.MeshBasicMaterial({
+        wireframe: true,
+        transparent: true,
+        opacity: 0.02,
+        color: this.INTERACTIVE_WIREFRAME_COLOR
+      })
+    );
+    wire.frustumCulled = false; wire.renderOrder = 1;
+    grid.group.add(wire);
+
+    const pos = grid.geometry.attributes.position;
+    const neighbors = this._buildAdjacency(grid.geometry.getIndex(), pos.count);
+    const ready = new Uint8Array(pos.count);
+
+    const t = {
+      type: 'interactive',
+      grid, q, r,
+      pos,
+      neighbors,
+      ready,
+      fetched: new Set(),
+      populating: false,
+      yA: null, yB: null, flip: false,
+      normTick: 0,
+      col: null,
+      unreadyCount: pos.count,
+      _phase: { seedDone: false, edgeDone: false, fullDone: false },
+      _queuedPhases: new Set(),
+      locked: new Uint8Array(pos.count)
+    };
+
+    // Seed heights from visual + neighbors, but corner-aware
+    const lowMesh = v.grid.mesh;
+    const lowPosAttr = v.grid.geometry?.attributes?.position || null;
+    const neighborMeshes = this._gatherNeighborMeshes(q, r);
+    const base = grid.group.position;
+
+    for (let i = 0; i < pos.count; i++) {
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+
+      const y = this._robustSampleHeight(wx, wz, lowMesh, neighborMeshes, lowPosAttr, this._lastHeight);
+      pos.setY(i, Number.isFinite(y) ? y : 0);
+    }
+    pos.needsUpdate = true;
+    grid.geometry.computeVertexNormals();
+
+    this._ensureTileBuffers(t);
+    this._pullGeometryToBuffers(t);
+    this._initColorsNearBlack(t);
+    this._applyAllColorsGlobal(t);
+
+    // Swap into map, dispose low-res
+    this.tiles.set(id, t);
     this._markRelaxListDirty();
+    try {
+      this.scene.remove(v.grid.group);
+      v.grid.geometry?.dispose?.();
+      v.grid.mat?.dispose?.();
+      v.grid.wireMat?.dispose?.();
+    } catch { }
 
-    // Ensure it starts fetching immediately (edges first inside tile)
-    this._queuePopulateIfNeeded(hi, true);
-    return hi;
+    // Seal edges with corner-safe snapping and relax inner corner band
+    this._sealEdgesCornerSafe(t);
+    this._fixStuckZeros(t, /*rimOnly=*/true);
+
+    // Fetch phased full-res now
+    this._queuePopulate(t, true);
+    return t;
   }
 
-  /* ---------------- fetching ---------------- */
+  /* ---------------- hard edge sealing from corners (pin) ---------------- */
+
+  _selectCenterIndex(tile) {
+    let best = 0, bestR2 = Infinity;
+    const pos = tile.pos;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r2 = x * x + z * z;
+      if (r2 < bestR2) { bestR2 = r2; best = i; }
+    }
+    return best;
+  }
+
+  _selectCornerTipIndices(tile) {
+    const cls = this._classifyRimAndCorners(tile);
+    const tips = [];
+    for (let c = 0; c < 6; c++) {
+      const arr = cls.corners[c];
+      if (!arr || !arr.length) continue;
+      let pick = arr[0], best = -Infinity;
+      for (const i of arr) {
+        const x = tile.pos.getX(i), z = tile.pos.getZ(i);
+        const r2 = x * x + z * z;
+        if (r2 > best) { best = r2; pick = i; }
+      }
+      tips.push(pick);
+    }
+    return tips;
+  }
+
+  _selectEdgeMidpointIndices(tile) {
+    const aR = this.tileRadius;
+    const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+    const cls = this._classifyRimAndCorners(tile);
+    const picks = [];
+    for (let s = 0; s < 6; s++) {
+      const arr = cls.sides[s];
+      if (!arr || !arr.length) continue;
+      let pick = arr[0], best = Infinity;
+      for (const i of arr) {
+        const x = tile.pos.getX(i), z = tile.pos.getZ(i);
+        const r = Math.hypot(x, z);
+        if (r < aR * 0.96) continue; // prefer near rim
+        const a = this._angleOf(x, z);
+        const d = this._angDiff(a, sideAng[s]);
+        if (d < best) { best = d; pick = i; }
+      }
+      picks.push(pick);
+    }
+    return picks;
+  }
+  // Make the perimeter identical to the visual hex: for each of the 6 sides,
+  // force the TRUE rim vertices to lie on the straight segment between its
+  // adjacent corner tips. Lock them so relax/smooth cannot curve the edge.
+  _pinEdgesFromCorners(tile) {
+    if (!tile || tile.type !== 'interactive') return;
+
+    const pos = tile.pos;
+    const n = pos.count;
+    const aR = this.tileRadius;
+
+    // Use the classifier to find rim + per-side membership, but filter to the *true* rim.
+    const cls = this._classifyRimAndCorners(tile);
+    const tips = this._selectCornerTipIndices(tile);
+    if (!tips || tips.length < 6) return;
+
+    // We only want the outermost ring for each side.
+    const RIM_STRICT = aR * 0.985; // match _isRimVertex threshold
+    const sideRimStrict = Array.from({ length: 6 }, () => []);
+    for (let s = 0; s < 6; s++) {
+      const list = cls.sides[s] || [];
+      for (const i of list) {
+        const x = pos.getX(i), z = pos.getZ(i);
+        if (x * x + z * z >= RIM_STRICT * RIM_STRICT) sideRimStrict[s].push(i);
+      }
+    }
+
+    const locked = tile.locked || new Uint8Array(n);
+
+    // For each side, project rim verts onto the side segment (tip->tip) and set y by linear interpolation
+    for (let s = 0; s < 6; s++) {
+      const iA = tips[s];
+      const iB = tips[(s + 1) % 6];
+      if (iA == null || iB == null) continue;
+
+      const Ax = pos.getX(iA), Az = pos.getZ(iA), Ay = pos.getY(iA);
+      const Bx = pos.getX(iB), Bz = pos.getZ(iB), By = pos.getY(iB);
+
+      // if tips aren't finite yet (e.g. before SEED lands), skip this side
+      if (!Number.isFinite(Ay) || !Number.isFinite(By)) continue;
+
+      const ABx = Bx - Ax, ABz = Bz - Az;
+      const denom = ABx * ABx + ABz * ABz;
+      if (denom < 1e-8) continue;
+
+      for (const i of sideRimStrict[s]) {
+        if (tile.ready[i]) continue;  // don't overwrite fetched data
+
+        // Parametric projection onto AB -> t in [0..1]
+        const Px = pos.getX(i), Pz = pos.getZ(i);
+        let t = ((Px - Ax) * ABx + (Pz - Az) * ABz) / denom;
+        if (!Number.isFinite(t)) t = 0;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+
+        // Interpolate height along the straight edge
+        const y = Ay + t * (By - Ay);
+        pos.setY(i, y);
+        locked[i] = 1;               // keep the rim straight; relax/smooth ignore locked
+      }
+    }
+
+    tile.locked = locked;
+    pos.needsUpdate = true;
+  }
+
+
+
+  _sealEdgesCornerSafe(tile) {
+    if (!tile || tile.type !== 'interactive') return;
+
+    const cls = this._classifyRimAndCorners(tile);
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+
+    const locked = tile.locked || new Uint8Array(pos.count);
+
+    // helper: raycast to a specific neighbor first
+    const rayToMesh = (mesh, x, z) => {
+      if (!mesh) return null;
+      this.ray.set(new THREE.Vector3(x, 1e6, z), this.DOWN);
+      const hit = this.ray.intersectObject(mesh, true);
+      return (hit && hit.length) ? hit[0].point.y : null;
+    };
+
+    // side snapping: prefer the opposite side neighbor
+    for (let s = 0; s < 6; s++) {
+      const nq = tile.q + HEX_DIRS[s][0];
+      const nr = tile.r + HEX_DIRS[s][1];
+      const nTile = this._getTile(nq, nr);
+      const nMesh = this._getMeshForTile(nTile);
+
+      for (const i of cls.sides[s]) {
+        if (locked[i]) continue; // don't override pinned straight edge
+        const wx = base.x + pos.getX(i);
+        const wz = base.z + pos.getZ(i);
+
+        let y = null;
+        if (nMesh) y = rayToMesh(nMesh, wx, wz);
+        if (y == null) {
+          // fallback: any neighbor
+          this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+          const hits = this.ray.intersectObjects(this._gatherNeighborMeshes(tile.q, tile.r), true);
+          if (hits && hits.length) y = hits[0].point.y;
+        }
+        if (Number.isFinite(y)) pos.setY(i, y);
+      }
+    }
+
+    // corner snapping: median of the two adjacent neighbors
+    for (let c = 0; c < 6; c++) {
+      const sa = c; // adjacent sides: c and c+1
+      const sb = (c + 1) % 6;
+
+      const nAq = tile.q + HEX_DIRS[sa][0], nAr = tile.r + HEX_DIRS[sa][1];
+      const nBq = tile.q + HEX_DIRS[sb][0], nBr = tile.r + HEX_DIRS[sb][1];
+      const mA = this._getMeshForTile(this._getTile(nAq, nAr));
+      const mB = this._getMeshForTile(this._getTile(nBq, nBr));
+
+      for (const i of cls.corners[c]) {
+        if (locked[i]) continue; // respect pins if any
+        const wx = base.x + pos.getX(i);
+        const wz = base.z + pos.getZ(i);
+
+        const a = mA ? rayToMesh(mA, wx, wz) : null;
+        const b = mB ? rayToMesh(mB, wx, wz) : null;
+        let y = null;
+
+        if (Number.isFinite(a) && Number.isFinite(b)) {
+          y = (a + b) * 0.5;
+        } else if (Number.isFinite(a)) {
+          y = a;
+        } else if (Number.isFinite(b)) {
+          y = b;
+        } else {
+          this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+          const hits = this.ray.intersectObjects(this._gatherNeighborMeshes(tile.q, tile.r), true);
+          if (hits && hits.length) y = hits[0].point.y;
+        }
+
+        if (Number.isFinite(y)) pos.setY(i, y);
+      }
+    }
+
+    // small, local relaxation just behind the tips with the rim held fixed
+    this._relaxCornerInnerBand(tile, cls, 2);
+
+    pos.needsUpdate = true;
+    tile.grid.geometry.computeVertexNormals();
+  }
+
+  _relaxCornerInnerBand(tile, cls, iters = 1) {
+    if (!cls?.innerCornerBand?.size) return;
+    const pos = tile.pos;
+    const fixed = new Set(cls.rim); // keep the true rim fixed
+
+    const band = Array.from(cls.innerCornerBand);
+    for (let k = 0; k < iters; k++) {
+      for (const i of band) {
+        if (fixed.has(i)) continue;
+        // 1 Laplacian step using only band neighbors + rim
+        let sum = 0, cnt = 0;
+        for (const j of tile.neighbors[i]) {
+          if (fixed.has(j) || cls.innerCornerBand.has(j)) {
+            const y = pos.getY(j);
+            if (Number.isFinite(y)) { sum += y; cnt++; }
+          }
+        }
+        if (cnt >= 2) {
+          pos.setY(i, sum / cnt);
+        }
+      }
+    }
+  }
+
+  _fixStuckZeros(tile, rimOnly = true) {
+    if (!tile) return;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const neighborMeshes = [];
+    for (const t of this.tiles.values()) {
+      if (t === tile) continue;
+      const m = this._getMeshForTile(t);
+      if (m) neighborMeshes.push(m);
+    }
+    if (!neighborMeshes.length) return;
+
+    const locked = tile.locked || new Uint8Array(pos.count);
+
+    let touched = false;
+    for (let i = 0; i < pos.count; i++) {
+      if (rimOnly && !this._isRimVertex(tile, i)) continue;
+      if (locked[i]) continue;
+      const curY = pos.getY(i);
+      if (Math.abs(curY) > 1e-4) continue;
+
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+      const y = this._robustSampleHeight(wx, wz, null, neighborMeshes, null, curY);
+      if (Number.isFinite(y) && Math.abs(y) > 1e-4) {
+        pos.setY(i, y);
+        touched = true;
+      }
+    }
+    if (touched) {
+      pos.needsUpdate = true;
+      tile.grid.geometry.computeVertexNormals();
+    }
+  }
+
+  /* ---------------- fetching & backfill (PHASED) ---------------- */
 
   _tileNeedsFetch(tile) {
     if (!tile) return false;
     if (!Number.isFinite(tile.unreadyCount)) tile.unreadyCount = tile.pos.count;
-    return tile.unreadyCount > 0;
+
+    if (tile.type === 'visual') {
+      return !(tile._phase?.fullDone) || tile.unreadyCount > 0;
+    }
+    // interactive: any phase not done OR there are still unknowns
+    return !(tile._phase?.seedDone && tile._phase?.edgeDone && tile._phase?.fullDone) || tile.unreadyCount > 0;
+  }
+
+  _phaseKey(phase) {
+    return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
+  }
+
+  _isPhaseQueued(tile, phase) {
+    const key = this._phaseKey(phase);
+    if (tile._queuedPhases?.has(key)) return true;
+    for (const e of this._populateQueue) {
+      if (e.tile === tile && e.phase === phase) return true;
+    }
+    return false;
   }
 
   _queuePopulateIfNeeded(tile, priority = false) {
     if (!tile) return;
     if (!this._tileNeedsFetch(tile)) return;
-    if (tile.populating || tile._queued) return;
-    this._queuePopulate(tile, priority);
+    if (tile.populating) return;
+
+    if (tile.type === 'visual') {
+      if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
+      return;
+    }
+    if (!tile._phase.seedDone) this._queuePopulatePhase(tile, PHASE_SEED, priority);
+    else if (!tile._phase.edgeDone) this._queuePopulatePhase(tile, PHASE_EDGE, priority);
+    else if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
   }
 
   _queuePopulate(tile, priority = false) {
-    if (!tile || tile.populating || tile._queued) return;
-    tile._queued = true;
-    if (priority) this._populateQueue.unshift(tile);
-    else this._populateQueue.push(tile);
+    this._queuePopulateIfNeeded(tile, priority);
+  }
+
+  _queuePopulatePhase(tile, phase, priority = false) {
+    if (!tile) return;
+    if (this._isPhaseQueued(tile, phase)) return;
+    const key = this._phaseKey(phase);
+    tile._queuedPhases?.add(key);
+    const entry = { tile, phase, priority: !!priority };
+    if (priority) this._populateQueue.unshift(entry);
+    else this._populateQueue.push(entry);
     this._drainPopulateQueue();
   }
 
+  async _acquireNetBudget(bytes) {
+    while (true) {
+      const nowT = (performance?.now?.() ?? Date.now());
+      if (!this._rateBucketResetAt || nowT - this._rateBucketResetAt >= 1000) {
+        this._rateBucketResetAt = nowT;
+        this._rateTokensQ = this.RATE_QPS;
+        this._rateTokensB = this.RATE_BPS;
+      }
+      if (this._rateTokensQ > 0 && this._rateTokensB >= bytes) {
+        this._rateTokensQ -= 1;
+        this._rateTokensB -= Math.max(0, bytes | 0);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 8));
+    }
+  }
+
   _drainPopulateQueue() {
-    // High-concurrency drain
-    while (this._populateInFlight < this.POPULATE_CONCURRENCY) {
+    while (this._populateInflight < this.MAX_CONCURRENT_POPULATES && this._populateQueue.length) {
       const next = this._populateQueue.shift();
       if (!next) break;
-      next._queued = false;
-      this._populateInFlight++;
-      this._populateTile(next)
-        .catch(() => {})
+
+      const { tile, phase } = next;
+      if (!tile) continue;
+
+      if (tile.populating) {
+        this._populateQueue.push(next);
+        break;
+      }
+
+      this._populateInflight++;
+      tile.populating = true;
+
+      this._populateTilePhase(tile, phase)
+        .catch(() => { /* ignore; backfill will retry */ })
         .finally(() => {
-          this._populateInFlight = Math.max(0, this._populateInFlight - 1);
+          const k = this._phaseKey(phase);
+          tile._queuedPhases?.delete(k);
+          tile.populating = false;
+          this._populateInflight = Math.max(0, this._populateInflight - 1);
           this._drainPopulateQueue();
         });
     }
   }
 
-  async _populateTile(tile) {
+  async _populateTilePhase(tile, phase) {
     if (!tile || !this.origin) { if (tile) tile.populating = false; return; }
     if (!this.relayAddress) { tile.populating = false; return; }
-    tile.populating = true;
 
-    try {
-      const pos = tile.pos;
-      const count = pos.count;
-      if (!Number.isFinite(count) || count === 0) { tile.populating = false; return; }
+    const pos = tile.pos;
+    const count = pos.count;
+    if (!Number.isFinite(count) || count === 0) { tile.populating = false; return; }
 
-      const latLon = this._collectTileLatLon(tile);
-      const mode = this.relayMode;
-      const precision = pickGeohashPrecision(this.spacing);
-      const geohashes = mode === 'geohash' ? latLon.map(({ lat, lng }) => geohashEncode(lat, lng, precision)) : null;
-
-      const indexByLatLon = new Map();
-      if (mode === 'latlng') {
-        for (let i = 0; i < latLon.length; i++) {
-          const { lat, lng } = latLon[i];
-          indexByLatLon.set(`${lat.toFixed(6)},${lng.toFixed(6)}`, i);
+    // ---- choose indices for this phase ----
+    let indices = null;
+    if (tile.type === 'visual') {
+      // visuals always fetch the full 7 verts
+      indices = Array.from({ length: count }, (_, i) => i);
+    } else {
+      if (phase === PHASE_SEED) {
+        const center = this._selectCenterIndex(tile);
+        const tips = this._selectCornerTipIndices(tile);
+        indices = Array.from(new Set([center, ...tips]));
+      } else if (phase === PHASE_EDGE) {
+        indices = this._selectEdgeMidpointIndices(tile);
+      } else {
+        // PHASE_FULL: fetch remaining unknowns only
+        indices = [];
+        for (let i = 0; i < count; i++) if (!tile.ready[i]) indices.push(i);
+        if (indices.length === 0) {
+          // nothing left; mark done & finish phase chain
+          if (tile.type === 'interactive') {
+            tile._phase.fullDone = true;
+            if (tile.locked) tile.locked.fill(0);
+            this._saveTileToCache(tile);
+          } else {
+            tile._phase.fullDone = true;
+            this._saveTileToCache(tile);
+          }
+          return;
         }
       }
-      const indexByGeohash = geohashes ? new Map(geohashes.map((gh, i) => [gh, i])) : null;
+    }
 
-      const levels = this._buildProgressiveLevels(tile);   // edge → center
-      this._ensureTileBuffers(tile);
+    // If truly nothing to do in this phase, mark + chain forward immediately
+    if (!indices || indices.length === 0) {
+      if (tile.type === 'interactive') {
+        if (phase === PHASE_SEED) {
+          tile._phase.seedDone = true;
+          this._queuePopulatePhase(tile, PHASE_EDGE);
+        } else if (phase === PHASE_EDGE) {
+          tile._phase.edgeDone = true;
+          this._queuePopulatePhase(tile, PHASE_FULL);
+        } else {
+          tile._phase.fullDone = true;
+          if (tile.locked) tile.locked.fill(0);
+          this._saveTileToCache(tile);
+        }
+      } else {
+        tile._phase.fullDone = true;
+        this._saveTileToCache(tile);
+      }
+      return;
+    }
 
-      // Build ALL batches for this tile first, then fire them concurrently.
-      const allBatches = [];
-      for (const levelIndices of levels) {
-        const batches = (mode === 'geohash')
-          ? this._indicesToBatchesGeohash(levelIndices, geohashes, precision)
-          : this._indicesToBatchesLatLng(levelIndices, latLon);
-        for (const b of batches) allBatches.push(b);
+    // ---- build batches & fire queries (with net budget gating) ----
+    const latLon = this._collectTileLatLon(tile);
+    const mode = this.relayMode;
+    const precision = pickGeohashPrecision(this.spacing);
+    const geohashes = mode === 'geohash'
+      ? latLon.map(({ lat, lng }) => geohashEncode(lat, lng, precision))
+      : null;
+
+    const indexByLatLon = new Map();
+    if (mode === 'latlng') {
+      for (let i = 0; i < latLon.length; i++) {
+        const { lat, lng } = latLon[i];
+        indexByLatLon.set(`${lat.toFixed(6)},${lng.toFixed(6)}`, i);
+      }
+    }
+    const indexByGeohash = geohashes ? new Map(geohashes.map((gh, i) => [gh, i])) : null;
+
+    const batches = (mode === 'geohash')
+      ? this._indicesToBatchesGeohash(indices, geohashes, precision)
+      : this._indicesToBatchesLatLng(indices, latLon);
+
+    const queries = batches.map((batch) => {
+      const payload = { type: 'elev.query', dataset: this.relayDataset };
+      if (mode === 'geohash') {
+        payload.geohashes = batch.items;
+        payload.enc = 'geohash';
+        payload.prec = precision;
+      } else {
+        payload.locations = batch.items;
       }
 
-      const doBatch = async (batch) => {
-        const payload = { type: 'elev.query', dataset: this.relayDataset };
-        if (mode === 'geohash') { payload.geohashes = batch.items; payload.enc = 'geohash'; payload.prec = precision; }
-        else { payload.locations = batch.items; }
+      const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
 
-        let json = null;
-        try {
-          json = await this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs);
-        } catch {
-          return; // transient errors get backfilled later
-        }
-        const results = json?.results;
-        if (Array.isArray(results) && results.length) {
-          this._applyRelayResults(tile, results, { mode, indexByLatLon, indexByGeohash });
-        }
-      };
+      return this._acquireNetBudget(approxBytes).then(() =>
+        this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs)
+          .then((json) => {
+            const results = json?.results || [];
+            if (results.length) {
+              this._applyRelayResults(tile, results, { mode, indexByLatLon, indexByGeohash });
+            }
+          })
+          .catch(() => { /* swallow; backfill/next phases will retry */ })
+      );
+    });
 
-      // Fire everything; no per-tile staggering.
-      const promises = allBatches.map(doBatch);
-      await Promise.allSettled(promises);
+    await Promise.allSettled(queries);
 
-      // Post-pass smoothing to fill remaining unknowns
-      this._nearestAnchorFill(tile);
-      this._smoothUnknowns(tile, 1);
-      tile.grid.geometry.computeVertexNormals();
+    // ---- enforce straight sides BEFORE any smoothing/filling ----
+    if (tile.type === 'interactive' && (phase === PHASE_SEED || phase === PHASE_EDGE)) {
+      this._pinEdgesFromCorners(tile);  // creates/updates tile.locked
+    }
 
-      this._applyAllColorsGlobal(tile);
+    // ---- blend / seal with pinned edges acting as anchors ----
+    this._nearestAnchorFill(tile);
+    this._smoothUnknowns(tile, 1);
+    this._sealEdgesCornerSafe(tile);
+    this._fixStuckZeros(tile, /*rimOnly=*/true);
+
+    pos.needsUpdate = true;
+    tile.grid.geometry.computeVertexNormals();
+    this._applyAllColorsGlobal(tile);
+
+    // ---- mark phase complete & chain next ----
+    if (tile.type === 'interactive') {
+      if (phase === PHASE_SEED) {
+        tile._phase.seedDone = true;
+        this._queuePopulatePhase(tile, PHASE_EDGE);
+      } else if (phase === PHASE_EDGE) {
+        tile._phase.edgeDone = true;
+        this._queuePopulatePhase(tile, PHASE_FULL);
+      } else {
+        tile._phase.fullDone = true;
+        // release pins after full pass; remaining locks will be overwritten as samples land
+        if (tile.locked) tile.locked.fill(0);
+        this._saveTileToCache(tile);
+      }
+    } else {
+      tile._phase.fullDone = true;
       this._saveTileToCache(tile);
-    } finally {
-      tile.populating = false;
     }
   }
 
+
   /* ---------------- backfill orchestration ---------------- */
 
-  _scheduleBackfill(delayMs = 0, opts = {}) {
+  _scheduleBackfill(delayMs = 0) {
     if (this._backfillTimer) clearTimeout(this._backfillTimer);
     this._backfillTimer = setTimeout(() => {
-      this._backfillMissing({ onlyIfRelayReady: false, edgeFirst: true, ...opts });
+      this._backfillMissing({ onlyIfRelayReady: false });
     }, Math.max(0, delayMs));
   }
 
-  _backfillMissing({ onlyIfRelayReady = false, edgeFirst = true, refQ = 0, refR = 0 } = {}) {
+  _backfillMissing({ onlyIfRelayReady = false } = {}) {
     if (!this.origin) return;
 
-    // Only run when relay is ready if requested
     if (onlyIfRelayReady && !(this._relayStatus?.text === 'connected' || this._relayStatus?.level === 'ok')) return;
 
-    // Order tiles by distance from ref tile; edgeFirst means farthest first
     const entries = [...this.tiles.values()]
-      .filter(t => this._tileNeedsFetch(t) && !t.populating && !t._queued)
-      .map(t => ({ t, d: this._hexDist(t.q, t.r, refQ, refR) }))
-      .sort((a, b) => edgeFirst ? (b.d - a.d) : (a.d - b.d));
+      .filter(t => this._tileNeedsFetch(t) && !t.populating && !this._isPhaseQueued(t, PHASE_SEED) && !this._isPhaseQueued(t, PHASE_EDGE) && !this._isPhaseQueued(t, PHASE_FULL))
+      .map(t => ({ t, priority: (t.type === 'interactive' ? 0 : 1), d: this._hexDist(t.q, t.r, 0, 0) }))
+      .sort((a, b) => (a.priority - b.priority) || (a.d - b.d));
 
     for (const { t } of entries) {
-      const priority = t.type === 'interactive' || this._hexDist(t.q, t.r, refQ, refR) > (this.INTERACTIVE_RING + 1);
-      this._queuePopulateIfNeeded(t, priority);
+      const p = (t.type === 'interactive') || (t.q === 0 && t.r === 0);
+      this._queuePopulateIfNeeded(t, p);
     }
   }
 
@@ -822,11 +1387,11 @@ export class TileManager {
           this._addVisualTile(q, r);
         } else {
           const t = this.tiles.get(`${q},${r}`);
-          this._queuePopulateIfNeeded(t, true);
+          this._queuePopulateIfNeeded(t, false);
         }
       }
     }
-    this._scheduleBackfill(0, { refQ: q0, refR: r0, edgeFirst: true });
+    this._scheduleBackfill(0);
   }
 
   /* ---------------- per-frame: ensure LOD, relax, prune ---------------- */
@@ -839,7 +1404,7 @@ export class TileManager {
     const rf = ((-1 / 3 * playerPos.x) + (Math.sqrt(3) / 3 * playerPos.z)) / a;
     const q0 = Math.round(qf), r0 = Math.round(rf);
 
-    // 1) interactive ring (promote visuals in place where necessary)
+    // 1) interactive ring
     for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
       const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
       const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
@@ -855,7 +1420,7 @@ export class TileManager {
       }
     }
 
-    // 2) visuals outward with budget (no reset; just create if missing)
+    // 2) visuals outward with budget
     let created = 0;
     outer:
     for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
@@ -871,7 +1436,11 @@ export class TileManager {
           if (++created >= this.VISUAL_CREATE_BUDGET) break outer;
         } else {
           const existing = this.tiles.get(`${q},${r}`);
-          if (existing) this._queuePopulateIfNeeded(existing, dist >= (this.VISUAL_RING - 2)); // prioritize outer edge
+          if (dist <= this.INTERACTIVE_RING && existing.type === 'visual') {
+            this._promoteVisualToInteractive(q, r);
+          } else if (existing) {
+            this._queuePopulateIfNeeded(existing, false);
+          }
         }
       }
     }
@@ -882,14 +1451,11 @@ export class TileManager {
       if (dist > this.VISUAL_RING) this._discardTile(id);
     }
 
-    // 4) continuously backfill edge→center from current position
-    this._backfillMissing({ onlyIfRelayReady: false, edgeFirst: true, refQ: q0, refR: r0 });
-
-    // 5) relax
+    // 4) relax
     this._ensureRelaxList();
     this._drainRelaxQueue();
 
-    // 6) throttle recolor sweep when global range changes
+    // 5) recolor sweep when global range changes
     if (this._globalDirty) {
       const t = now();
       if (t - this._lastRecolorAt > 100) {
@@ -905,21 +1471,15 @@ export class TileManager {
     const cur = this.tiles.get(id);
     if (!cur) {
       return want === 'interactive' ? this._addInteractiveTile(q, r)
-           : this._addVisualTile(q, r);
+        : this._addVisualTile(q, r);
     }
     if (cur.type === want) return cur;
-
-    if (want === 'interactive' && cur.type === 'visual') {
+    if (cur.type === 'visual' && want === 'interactive') {
       return this._promoteVisualToInteractive(q, r);
     }
-
-    // Demotion path (rare): just recreate simple visual
-    if (want === 'visual' && cur.type === 'interactive') {
-      this._discardTile(id);
-      return this._addVisualTile(q, r);
-    }
-
-    return cur;
+    this._discardTile(id);
+    return want === 'interactive' ? this._addInteractiveTile(q, r)
+      : this._addVisualTile(q, r);
   }
 
   /* ---------------- Origin & relay hooks ---------------- */
@@ -937,11 +1497,10 @@ export class TileManager {
 
     if (changed) {
       this._resetAllTiles();
-      // Create center tile as interactive and prewarm visuals
-      this._addInteractiveTile(0, 0);
+      this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
     } else if (immediate && !this.tiles.size) {
-      this._addInteractiveTile(0, 0);
+      this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
     }
 
@@ -951,17 +1510,22 @@ export class TileManager {
       this.update(this._originVec);
     }
 
-    // Kick edge-first backfill in case tiles existed pre-relay
-    this._scheduleBackfill(50, { refQ: 0, refR: 0, edgeFirst: true });
+    this._scheduleBackfill(50);
   }
 
   _onRelayStatus(text, level) {
     this._relayStatus = { text, level };
     const isConnected = (text === 'connected' || level === 'ok');
+    if (isConnected) {
+      this.MAX_CONCURRENT_POPULATES = 12;
+      this.RATE_QPS = 12; this.RATE_BPS = 256 * 1024;
+    } else {
+      this.MAX_CONCURRENT_POPULATES = 6;
+      this.RATE_QPS = 6; this.RATE_BPS = 128 * 1024;
+    }
     if (isConnected && !this._relayWasConnected) {
       this._relayWasConnected = true;
-      // Relay just became ready → edge-first backfill from current view
-      this._scheduleBackfill(0, { edgeFirst: true });
+      this._scheduleBackfill(0);
     }
   }
 
@@ -1010,7 +1574,7 @@ export class TileManager {
       let did = false;
       for (let k = 0; k < this.RELAX_ITERS_PER_FRAME; k++) {
         if (this._relaxOnce(tile)) did = true;
-        if ((nowPerf() - start) > this.RELAX_FRAME_BUDGET_MS) break;
+        if (nowPerf() - start > this.RELAX_FRAME_BUDGET_MS) break;
       }
       if (did) this._pushBuffersToGeometry(tile);
     }
@@ -1018,34 +1582,26 @@ export class TileManager {
 
   applyPerfProfile(profile = {}) {
     const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._lodQuality;
-    const quality = THREE.MathUtils.clamp(qualityRaw, 0.3, 1.05);
+    const quality = THREE.MathUtils.clamp(qualityRaw, 0.3, 1.2);
     this._lodQuality = quality;
 
     const baseInteractive = this._baseLod.interactiveRing;
     const baseVisual = this._baseLod.visualRing;
-    const interactive = baseInteractive;
-    const visual = baseVisual;
-    const createBudget = Math.round((18 + quality * 32) * 3);
-    const relaxIters = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
-    const relaxBudget = 1 + quality * (this._baseLod.relaxBudget - 1);
+
     let ringChanged = false;
-    if (this.INTERACTIVE_RING !== interactive) {
-      this.INTERACTIVE_RING = interactive;
-      ringChanged = true;
-    }
-    if (this.VISUAL_RING !== visual) {
-      this.VISUAL_RING = visual;
-      ringChanged = true;
-    }
+    if (this.INTERACTIVE_RING !== baseInteractive) { this.INTERACTIVE_RING = baseInteractive; ringChanged = true; }
+    if (this.VISUAL_RING !== baseVisual) { this.VISUAL_RING = baseVisual; ringChanged = true; }
     if (ringChanged) {
       this._markRelaxListDirty();
       this._prewarmVisualRing(0, 0);
-      this._scheduleBackfill(0, { refQ: 0, refR: 0, edgeFirst: true });
+      this._scheduleBackfill(0);
     }
 
-    this.VISUAL_CREATE_BUDGET = createBudget;
-    this.RELAX_ITERS_PER_FRAME = relaxIters;
-    this.RELAX_FRAME_BUDGET_MS = relaxBudget;
+    this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
+
+    this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
+    this.RELAX_FRAME_BUDGET_MS = 1.5 + quality * 1.5;
+
     return {
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
@@ -1058,7 +1614,6 @@ export class TileManager {
   /* ---------------- Queries & controls ---------------- */
 
   getHeightAt(x, z) {
-    // collide with interactive tiles only
     const tmp = new THREE.Vector3(x, 10000, z);
     const meshes = [];
     for (const t of this.tiles.values()) if (t.type === 'interactive') meshes.push(t.grid.mesh);
@@ -1072,24 +1627,22 @@ export class TileManager {
   setRelayAddress(addr) {
     this.relayAddress = (addr || '').trim();
     this.terrainRelay?.setRelayAddress(this.relayAddress);
-    this._scheduleBackfill(0, { edgeFirst: true });
+    this._scheduleBackfill(0);
   }
 
   setRelayDataset(dataset) {
     this.relayDataset = (dataset || '').trim() || DEFAULT_TERRAIN_DATASET;
     this.terrainRelay?.setDataset(this.relayDataset);
-    this._scheduleBackfill(0, { edgeFirst: true });
+    this._scheduleBackfill(0);
   }
 
   setRelayMode(mode) {
     this.relayMode = mode === 'latlng' ? 'latlng' : 'geohash';
     this.terrainRelay?.setMode(this.relayMode);
-    this._scheduleBackfill(0, { edgeFirst: true });
+    this._scheduleBackfill(0);
   }
 
-  getRelayStatus() {
-    return this._relayStatus;
-  }
+  getRelayStatus() { return this._relayStatus; }
 
   refreshTiles() {
     for (const tile of this.tiles.values()) {
@@ -1098,10 +1651,18 @@ export class TileManager {
       tile.unreadyCount = tile.pos.count;
       this._initColorsNearBlack(tile);
       tile.populating = false;
-      tile._queued = false;
+      tile._queuedPhases?.clear?.();
+
+      if (!tile._phase) tile._phase = {};
+      if (tile.type === 'interactive') tile._phase = { seedDone: false, edgeDone: false, fullDone: false };
+      else tile._phase = { fullDone: false };
+
+      if (!tile.locked || tile.locked.length !== tile.pos.count) tile.locked = new Uint8Array(tile.pos.count);
+      else tile.locked.fill(0);
+
       this._queuePopulate(tile, tile.type === 'interactive');
     }
-    this._scheduleBackfill(0, { edgeFirst: true });
+    this._scheduleBackfill(0);
   }
 
   /* ---------------- Cleanup ---------------- */
@@ -1114,7 +1675,7 @@ export class TileManager {
       t.grid.geometry?.dispose?.();
       t.grid.mat?.dispose?.();
       t.grid.wireMat?.dispose?.();
-    } catch {}
+    } catch { }
     this.tiles.delete(id);
     this._markRelaxListDirty();
   }
@@ -1124,7 +1685,6 @@ export class TileManager {
     this.tiles.clear();
     this._populateQueue.length = 0;
     this._populateBusy = false;
-    this._populateInFlight = 0;
     this.GLOBAL_MIN_Y = +Infinity;
     this.GLOBAL_MAX_Y = -Infinity;
     this._globalDirty = true;
@@ -1138,6 +1698,7 @@ export class TileManager {
   dispose() {
     if (this._backfillTimer) { clearTimeout(this._backfillTimer); this._backfillTimer = null; }
     if (this._periodicBackfill) { clearInterval(this._periodicBackfill); this._periodicBackfill = null; }
+    if (this._rateTicker) { clearInterval(this._rateTicker); this._rateTicker = null; }
     this._resetAllTiles();
     this.tiles.clear();
   }

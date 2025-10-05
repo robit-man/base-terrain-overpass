@@ -11,12 +11,12 @@ const FEATURES = {
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
 const CACHE_PREFIX = 'bm.tile';
-const CACHE_LIMIT = 160;
+const CACHE_LIMIT = 320;
 const CACHE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
 const MERGE_BUDGET_MS = 6; // milliseconds per idle slice
 const BUILD_FRAME_BUDGET_MS = 2.0; // ms budget to spend per frame on feature builds
 const BUILD_IDLE_BUDGET_MS = 8.0; // ms budget when we have idle time available
-const RESNAP_INTERVAL = 1.0; // seconds between ground rescan passes
+const RESNAP_INTERVAL = 2.0; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 1.5; // ms per frame allotted to resnap tiles
 const TARGET_FPS = 60;
 
@@ -92,21 +92,21 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 800,
+    radius = 12000,
     tileSize,
-    color = 0xffffff,
-    roadWidth = 6,
-    roadOffset = 0.06,
-    roadStep = 2,              // avg metres between samples (was hard-coded 1.25)
+    color = 0x333333,
+    roadWidth = 4,
+    roadOffset = 0.5,
+    roadStep = 12,              // avg metres between samples (was hard-coded 1.25)
     roadAdaptive = true,       // adapt step on sharp turns
     roadMinStep = 4,           // smallest step on sharp curves
     roadMaxStep = 24,          // largest step on straights
     roadAngleThresh = 0.35,    // ~20°: angles above this count as “sharp”
     roadMaxSegments = 200,     // hard cap: max centerline points per road
-    roadLit = false,           // unlit by default (faster)
+    roadLit = true,           // unlit by default (faster)
     roadShadows = false,       // disable shadows on roads
-    roadColor = 0x111111,      // default color
-    extraDepth = 0.01,
+    roadColor = 0xaaaaaa,      // default color
+    extraDepth = 0.1,
     extensionHeight = 2,
     maxConcurrentFetches = 1, // retained for API compatibility
   } = {}) {
@@ -191,7 +191,7 @@ export class BuildingManager {
 
     this._waterTime = 0;
 
-    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
     this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 1 });
     this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 0.9 });
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
@@ -740,10 +740,11 @@ export class BuildingManager {
 
     const fillMat = this._buildingFillMaterial || (
       this._buildingFillMaterial = new THREE.MeshBasicMaterial({
-        color: 0x222222,
+        color: 0x333333,
         transparent: true,
         opacity: 0.9,
         depthWrite: false,
+        blending: THREE.SubtractiveBlending,
         polygonOffset: true,
         polygonOffsetFactor: 1,
         polygonOffsetUnits: 1,
@@ -1120,7 +1121,7 @@ export class BuildingManager {
     dir.y = 0;
     if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
     dir.normalize();
-    const stemLength = 2.3;
+    const stemLength = 2;
     const offset = dir.multiplyScalar(stemLength);
     const labelPos = anchorTop.clone().add(offset);
     labelPos.y += stemLength;
@@ -1144,8 +1145,8 @@ export class BuildingManager {
     this._hoverStem.visible = false;
 
     const canvas = document.createElement('canvas');
-    canvas.width = 512;
-    canvas.height = 256;
+    canvas.width = 800;
+    canvas.height = 400;
     const ctx = canvas.getContext('2d');
     const texture = new THREE.CanvasTexture(canvas);
     texture.minFilter = THREE.LinearFilter;
@@ -1154,7 +1155,7 @@ export class BuildingManager {
     texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
 
     const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
-    const geometry = new THREE.PlaneGeometry(1.6, 0.6);
+    const geometry = new THREE.PlaneGeometry(2.7, 1);
     const label = new THREE.Mesh(geometry, material);
     label.visible = false;
     label.renderOrder = 10;
@@ -1238,8 +1239,8 @@ export class BuildingManager {
     // Style & layout knobs
     const PAD = 28 * DPR;
     const MAX_LINES = 3;
-    const BASE_FONT = 56 * DPR;
-    const MIN_FONT = 28 * DPR;
+    const BASE_FONT = 64 * DPR;
+    const MIN_FONT = 32 * DPR;
     const LINE_GAP = 1.15;  // line-height multiplier
     const RADIUS = 18 * DPR;
 
@@ -1442,7 +1443,7 @@ export class BuildingManager {
     const { geo, basePos, center } = geomData;
 
     const mat = this.roadLit
-      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.25 })
+      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity:0.1, blending: THREE.SubtractiveBlending })
       : new THREE.MeshBasicMaterial({ color: this.roadColor }); // unlit = no normals
 
     const mesh = new THREE.Mesh(geo, mat);
@@ -1956,7 +1957,7 @@ export class BuildingManager {
     return new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: this._waterTime },
-        uColor: { value: new THREE.Color(0x888888) },
+        uColor: { value: new THREE.Color(0x333333) },
       },
       vertexShader: `
         uniform float uTime;
