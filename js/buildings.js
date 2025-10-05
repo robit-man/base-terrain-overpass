@@ -1442,7 +1442,7 @@ export class BuildingManager {
     const { geo, basePos, center } = geomData;
 
     const mat = this.roadLit
-      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity:0.1, blending: THREE.SubtractiveBlending })
+      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity:0.1, blending: THREE.NormalBlending })
       : new THREE.MeshBasicMaterial({ color: this.roadColor }); // unlit = no normals
 
     const mesh = new THREE.Mesh(geo, mat);

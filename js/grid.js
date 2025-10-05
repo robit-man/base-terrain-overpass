@@ -37,8 +37,8 @@ export class UniformHexGrid {
       metalness: 0.05,
       roughness: 0.85,
       transparent: true,
-      opacity: 0.5,
-      side: THREE.DoubleSide,
+      opacity: 1,
+      side: THREE.BackSide,
     });
     const mesh = new THREE.Mesh(this.geometry, mat);
     mesh.frustumCulled = false;
