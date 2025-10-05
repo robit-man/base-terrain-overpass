@@ -2,6 +2,7 @@
 const menuBtn = document.getElementById('menu');
 const menuPane = document.getElementById('menuPane');
 const backdrop = document.getElementById('backdrop');
+const closeButton = document.getElementById('closeButton');
 
 const dotNkn = document.getElementById('dotNkn');
 const txtNkn = document.getElementById('txtNkn');
@@ -73,6 +74,7 @@ perfHud?.addEventListener('keydown', (e) => {
   }
 });
 backdrop?.addEventListener('click', closeMenu);
+closeButton?.addEventListener('click', closeMenu);
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && menuPane?.style.display === 'block') closeMenu();
 });
