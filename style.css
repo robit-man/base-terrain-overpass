@@ -84,12 +84,33 @@ body>canvas {
     /* your show/hide logic still works — keep display:none set via JS */
     display: none;
     box-sizing: border-box;
-    top: 4rem;
+    margin-top: 4rem;
 }
 
 /* MOBILE FIX: remove transforms so WebKit allows scrolling, anchor near top */
 @media (max-width: 768px) {
+<<<<<<< HEAD
  
+=======
+    #menuPane {
+        /* kill transform (the iOS troublemaker) */
+
+        /* center horizontally without transforms */
+        left: 1rem;
+        right: 1rem;
+        margin-left: auto;
+        margin-right: auto;
+        width: auto;
+        /* ignore fixed 800px on small screens */
+
+        /* anchor near top to avoid needing vertical centering transforms */
+
+        /* use dynamic viewport to avoid iOS 100vh bugs */
+
+        /* enable momentum scroll on iOS */
+        -webkit-overflow-scrolling: touch;
+    }
+>>>>>>> 1a525ff90a19d2c0d0104d361c606e0515d9484e
 }
 
 /* optional: your scrollbar rule had a typo; this hides WebKit scrollbars */
@@ -186,8 +207,10 @@ input[type=text] {
 
 .peer .pose {
     font-size: 12px;
-    color: #ccc;
-    margin-top: 2px
+    color: transparent;
+    margin-top: 2px;
+    user-select:none;
+    display:none;
 }
 
 .peer .actions {
