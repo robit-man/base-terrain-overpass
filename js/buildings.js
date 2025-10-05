@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
 import { metresPerDegree } from './geolocate.js';
 
 const FEATURES = {
@@ -19,6 +20,30 @@ const BUILD_IDLE_BUDGET_MS = 4.0; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 2.0; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 0.8; // ms per frame allotted to resnap tiles
 const TARGET_FPS = 60;
+
+/* ---------------- helpers ---------------- */
+// --- DuckDuckGo helpers (use HTML/Lite for embeddable results) ---
+const DDG_ENDPOINTS = [
+  'https://html.duckduckgo.com/html/?q=', // primary
+  'https://duckduckgo.com/html/?q=',
+  'https://duckduckgo.com/lite/?q='       // minimal fallback
+];
+
+const ddgEncode = (s) => encodeURIComponent(s).replace(/%20/g, '+'); // "spaces" -> '+'
+const ddgMainUrl = (q) => `https://duckduckgo.com/?q=${ddgEncode(q)}&ia=web`; // your requested format
+
+function setDuckIframeSrc(iframe, query, onFail) {
+  let i = 0, loaded = false;
+  const tryNext = () => {
+    if (i >= DDG_ENDPOINTS.length) { onFail?.(); return; }
+    loaded = false;
+    iframe.onload = () => { loaded = true; };
+    iframe.src = `${DDG_ENDPOINTS[i]}${ddgEncode(query)}&ia=web`;
+    // If CSP blocks, 'load' won't fire — advance after a short timeout
+    setTimeout(() => { if (!loaded) { i += 1; tryNext(); } }, 1200);
+  };
+  tryNext();
+}
 
 function averagePoint(flat) {
   let sx = 0;
@@ -86,6 +111,11 @@ function formatAddress(tags = {}) {
     .join(', ');
   return text || 'Unknown address';
 }
+
+/* ========================================================================== */
+/*                            BuildingManager                                  */
+/* ========================================================================== */
+
 export class BuildingManager {
   constructor({
     scene,
@@ -96,19 +126,22 @@ export class BuildingManager {
     color = 0x333333,
     roadWidth = 4,
     roadOffset = 0.05,
-    roadStep = 12,              // avg metres between samples (was hard-coded 1.25)
-    roadAdaptive = true,       // adapt step on sharp turns
-    roadMinStep = 4,           // smallest step on sharp curves
-    roadMaxStep = 24,          // largest step on straights
-    roadAngleThresh = 0.35,    // ~20°: angles above this count as “sharp”
-    roadMaxSegments = 100,     // hard cap: max centerline points per road
-    roadLit = false,           // unlit by default (faster)
-    roadShadows = false,       // disable shadows on roads
-    roadColor = 0x333333,      // default color
+    roadStep = 12,
+    roadAdaptive = true,
+    roadMinStep = 4,
+    roadMaxStep = 24,
+    roadAngleThresh = 0.35,
+    roadMaxSegments = 100,
+    roadLit = false,
+    roadShadows = false,
+    roadColor = 0x333333,
     extraDepth = 0.1,
     extensionHeight = 2,
     maxConcurrentFetches = 1, // retained for API compatibility
   } = {}) {
+    this._duckScale = 0.10; // 10% of current size
+    this._duckPersistMs = 2000;
+    this._duckHideTimer = null;
     this.scene = scene;
     this.camera = camera;
     this.tileManager = tileManager;
@@ -148,12 +181,21 @@ export class BuildingManager {
 
     this._hoverEdges = null;
     this._hoverStem = null;
-    this._hoverLabel = null;
+    this._hoverLabel = null;                 // (kept, but hidden when CSS3D panel is shown)
     this._hoverLabelCanvas = null;
     this._hoverLabelCtx = null;
     this._hoverLabelTexture = null;
     this._hoverInfo = null;
     this.physics = null;
+
+    // ---------- CSS3D panel (DuckDuckGo) ----------
+    this._cssEnabled = true;
+    this._cssScene = null;
+    this._cssRenderer = null;
+    this._cssRootEl = null;
+    this._cssPanelObj = null;
+    this._cssPanelQueryKey = null; // track last query
+    this._cssPanelVisible = false;
 
     this.lat0 = null;
     this.lon0 = null;
@@ -161,9 +203,8 @@ export class BuildingManager {
     this.lon = null;
     this._hasOrigin = false;
 
-    // NOTE: signs UI kept for compatibility, but solids auto-align to wires now.
+    // NOTE: signs UI kept for compatibility
     this.solidSign = [1, 1, 1, 1, 1, 1];
-    //this._initSolidSignUI?.() || (this._initSolidSignUI = this._makeSolidSignUI.bind(this), this._initSolidSignUI());
 
     this._tileStates = new Map();
     this._neededTiles = new Set();
@@ -218,7 +259,12 @@ export class BuildingManager {
     this._tileUpdateTimer = 0;
     this._resnapTimer = 0;
     this._qosTargetFps = TARGET_FPS;
+
+    // Init CSS3D (non-invasive overlay)
+    this._ensureCSS3DLayer();
   }
+
+  /* ---------------- public API ---------------- */
 
   setPhysicsEngine(physics) {
     this.physics = physics || null;
@@ -228,97 +274,6 @@ export class BuildingManager {
       for (const building of state.buildings) {
         if (building?.solid) this.physics.registerStaticMesh(building.solid, { forceUpdate: true });
       }
-    }
-  }
-
-  // ——————————————————————————————————————————————————————————
-  // UI (still present, but flipping does not break alignment anymore)
-  _makeSolidSignUI() {
-    if (typeof document === 'undefined') return;
-
-    const labels = ['rx', 'ry', 'sx', 'sy', 'sz', 'ty'];
-    const panel = document.createElement('div');
-    panel.style.cssText = `
-      position:fixed; left:12px; top:12px; z-index:99999;
-      font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background:rgba(20,20,20,0.75); color:#fff; padding:8px 10px; border-radius:8px;
-      box-shadow:0 4px 12px rgba(0,0,0,0.25); backdrop-filter: blur(2px);
-      user-select:none;
-    `;
-
-    const title = document.createElement('div');
-    title.textContent = 'Solid Signs (auto-aligned)';
-    title.style.cssText = 'font-weight:600; margin-bottom:6px;';
-    panel.appendChild(title);
-
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex; gap:6px; flex-wrap:wrap;';
-    panel.appendChild(row);
-
-    const chips = [];
-    const rebuild = () => {
-      chips.forEach((c, i) => c.textContent = `${labels[i]}:${this.solidSign[i] > 0 ? '+' : '−'}`);
-      // Rebuild solids & picks (wireframe stays canonical)
-      this._rebuildAllSolids();
-    };
-
-    labels.forEach((lab, i) => {
-      const chip = document.createElement('button');
-      chip.textContent = `${lab}:${this.solidSign[i] > 0 ? '+' : '−'}`;
-      chip.style.cssText = `
-        cursor:pointer; border:none; border-radius:6px; padding:6px 8px;
-        background:#2a2a2a; color:#fff; font-weight:600;
-      `;
-      chip.onclick = () => {
-        this.solidSign[i] = this.solidSign[i] === 1 ? -1 : 1;
-        rebuild();
-      };
-      chips.push(chip);
-      row.appendChild(chip);
-    });
-
-    const reset = document.createElement('button');
-    reset.textContent = 'reset';
-    reset.style.cssText = `
-      margin-left:8px; cursor:pointer; border:none; border-radius:6px; padding:6px 8px;
-      background:#444; color:#fff; font-weight:600;
-    `;
-    reset.onclick = () => {
-      this.solidSign = [1, 1, 1, 1, 1, 1];
-      rebuild();
-    };
-    panel.appendChild(document.createElement('div')).style.cssText = 'height:6px;';
-    panel.appendChild(reset);
-
-    document.body.appendChild(panel);
-    this._solidSignPanel = panel;
-  }
-
-  _rebuildAllSolids() {
-    for (const state of this._tileStates.values()) {
-      if (!state?.buildings?.length) continue;
-      for (const b of state.buildings) this._rebuildSolidAndPick(b);
-    }
-  }
-
-  _rebuildSolidAndPick(building) {
-    if (!building || !building.info) return;
-    const info = building.info;
-    // Regenerate solid/pick geometry straight from footprint → exact overlay
-    const solidGeo = this._makeSolidGeometry(info.rawFootprint, info.height);
-
-    if (building.solid) {
-      building.solid.geometry.dispose();
-      building.solid.geometry = solidGeo.clone();
-      building.solid.position.y = info.baseHeight + this.extraDepth;
-      building.solid.updateMatrixWorld(true);
-      this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
-    }
-    if (building.pick) {
-      building.pick.geometry.dispose();
-      building.pick.geometry = solidGeo.clone();
-      building.pick.position.y = info.baseHeight + this.extraDepth;
-      building.pick.updateMatrixWorld(true);
     }
   }
 
@@ -391,6 +346,438 @@ export class BuildingManager {
     });
   }
 
+  setOrigin(lat, lon, { forceRefresh = false } = {}) {
+    const baseLat = this.tileManager?.origin?.lat ?? lat;
+    const baseLon = this.tileManager?.origin?.lon ?? lon;
+    const originChanged =
+      !this._hasOrigin ||
+      Math.abs((baseLat ?? 0) - (this.lat0 ?? Infinity)) > 1e-6 ||
+      Math.abs((baseLon ?? 0) - (this.lon0 ?? Infinity)) > 1e-6;
+
+    if (originChanged) {
+      this.lat0 = baseLat;
+      this.lon0 = baseLon;
+      if (this._hasOrigin) this._clearAllTiles();
+    }
+
+    this.lat = lat;
+    this.lon = lon;
+
+    if (!this._hasOrigin) {
+      this._hasOrigin = true;
+      this._clearAllTiles();
+      this._updateTiles(true);
+    } else if (forceRefresh) {
+      this._clearAllTiles();
+      this._currentCenter = null;
+      this._updateTiles(true);
+    }
+  }
+
+  update(dt = 0) {
+    if (!this._hasOrigin || !this.camera) {
+      // still render CSS3D as hidden once to keep layout
+      if (this._cssRenderer && this._cssScene && this.camera) {
+        this._cssRenderer.render(this._cssScene, this.camera);
+      }
+      return;
+    }
+
+    if (this._tileUpdateInterval <= 0) {
+      this._updateTiles();
+    } else {
+      this._tileUpdateTimer += dt;
+      if (this._tileUpdateTimer >= this._tileUpdateInterval) {
+        this._tileUpdateTimer = 0;
+        this._updateTiles();
+      }
+    }
+
+    this._drainBuildQueue(this._frameBudgetMs);
+    this._processMergeQueue();
+
+    this._resnapTimer += dt;
+    if (this._resnapTimer > this._resnapInterval) {
+      this._resnapTimer = 0;
+      this._queueResnapSweep();
+    }
+    this._drainResnapQueue(this._resnapFrameBudgetMs);
+
+    this._waterTime += dt;
+    for (const mat of this._waterMaterials) mat.uniforms.uTime.value = this._waterTime;
+
+    // Keep the old label oriented (if you ever turn it back on)
+    if (this._hoverGroup.visible) this._orientLabel(this.camera);
+
+    // CSS3D panel orientation + render overlay
+    this._updateCSS3DPanelFacing();
+    if (this._cssRenderer && this._cssScene) {
+      this._cssRenderer.render(this._cssScene, this.camera);
+    }
+  }
+
+  dispose() {
+    this.scene?.remove(this.group);
+    this.clearHover();
+    this._clearAllTiles();
+    this._edgeMaterial.dispose();
+    this._highlightEdgeMaterial.dispose();
+    this._stemMaterial.dispose();
+    this._pickMaterial.dispose();
+
+    // CSS3D teardown
+    if (this._cssRenderer) {
+      try {
+        if (this._cssRootEl?.parentNode) this._cssRootEl.parentNode.removeChild(this._cssRootEl);
+      } catch { }
+      this._cssRenderer = null;
+      this._cssScene = null;
+      this._cssPanelObj = null;
+    }
+    if (this._onCssResize) window.removeEventListener('resize', this._onCssResize);
+  }
+
+  /* ---------------- hover & CSS3D panel ---------------- */
+
+  updateHover(raycaster, camera) {
+    if (!this._pickerRoot.children.length) {
+      this.clearHover();
+      return;
+    }
+    const intersects = raycaster.intersectObjects(this._pickerRoot.children, false);
+    if (!intersects.length) {
+      this._scheduleDuckHide?.();
+      return;
+    }this._cancelDuckHide?.();
+
+     this._cancelDuckHide?.();
+     const hit = intersects[0];
+    const info = hit.object.userData.buildingInfo;
+    if (!info) {
+      this.clearHover();
+      return;
+    }
+
+    this._showHover(info, hit.point, camera);
+  }
+
+  clearHover() {
+    if (this._hoverEdges) {
+      this._hoverEdges.geometry.dispose();
+      this._hoverEdges.geometry = new THREE.BufferGeometry();
+      this._hoverEdges.visible = false;
+    }
+    if (this._hoverStem) {
+      this._hoverStem.geometry.dispose();
+      this._hoverStem.visible = false;
+    }
+    if (this._hoverLabel) this._hoverLabel.visible = false;
+    if (this._hoverGroup) this._hoverGroup.visible = false;
+    this._hoverInfo = null;
+
+    // Hide CSS3D panel
+    this._hideDuckDuckGoPanel();
+  }
+
+  _showHover(info, point, camera) {
+    this._ensureHoverArtifacts();
+
+    // Update highlight edges once per target
+    if (this._hoverInfo !== info) {
+      const highlightGeom = this._buildHighlightGeometry(info);
+      this._hoverEdges.geometry.dispose();
+      this._hoverEdges.geometry = highlightGeom;
+      this._hoverEdges.position.set(0, 0, 0);
+
+      // we keep the text label infra but keep it hidden (replaced by CSS3D)
+      const labelText = info.address || 'Unknown';
+      this._updateLabelText(labelText);
+      this._hoverInfo = info;
+      // console.log(`[Buildings] hover ${info.id}: ${labelText}`);
+    }
+     this._setDuckQuery(info);
+
+    this._hoverGroup.visible = true;
+    this._hoverEdges.visible = true;
+
+    const anchorTop = this._chooseAnchorTop(info, point);
+    const camPos = camera.getWorldPosition(this._tmpVec2);
+
+    const dir = camPos.clone().sub(anchorTop);
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
+    dir.normalize();
+    const stemLength = 2;
+    const offset = dir.multiplyScalar(stemLength);
+    const labelPos = anchorTop.clone().add(offset);
+    labelPos.y += stemLength;
+
+    // stem
+    const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
+    this._hoverStem.geometry.dispose();
+    this._hoverStem.geometry = stemGeom;
+    this._hoverStem.visible = true;
+
+    // (hide the old canvas label)
+    if (this._hoverLabel) this._hoverLabel.visible = false;
+
+    // CSS3D panel near the same label position
+    this._showDuckDuckGoPanel(info, labelPos, camera);
+  }
+
+  /* ---------- CSS3D integration ---------- */
+
+  _ensureCSS3DLayer() {
+    if (!this._cssEnabled) return;
+    if (typeof document === 'undefined') return;
+    if (this._cssRenderer) return;
+
+    this._cssScene = new THREE.Scene();
+
+    const renderer = new CSS3DRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    // Style the overlay: fixed, on top, non-interactive so it doesn't steal clicks/drags
+    const el = renderer.domElement;
+    el.style.position = 'fixed';
+    el.style.left = '0';
+    el.style.top = '0';
+    el.style.width = '100%';
+    el.style.height = '100%';
+    el.style.pointerEvents = 'none';     // make entire layer mouse-transparent
+    el.style.zIndex = '9999';            // above your WebGL canvas
+
+    // Root container
+    const root = document.createElement('div');
+    root.id = 'bm-css3d-root';
+    root.style.position = 'fixed';
+    root.style.left = '0';
+    root.style.top = '0';
+    root.style.width = '100%';
+    root.style.height = '100%';
+    root.style.pointerEvents = 'none';
+    root.style.zIndex = '9999';
+    root.appendChild(el);
+    document.body.appendChild(root);
+
+    this._cssRenderer = renderer;
+    this._cssRootEl = root;
+
+    // Resize handler
+    this._onCssResize = () => {
+      if (!this._cssRenderer) return;
+      this._cssRenderer.setSize(window.innerWidth, window.innerHeight);
+    };
+    window.addEventListener('resize', this._onCssResize);
+  }
+
+  // call in constructor:
+  // this._duckPersistMs = 2000; this._duckHideTimer = null;
+
+  _scheduleDuckHide() {
+    if (!this._duckPersistMs) this._duckPersistMs = 2000;
+    clearTimeout(this._duckHideTimer);
+    this._duckHideTimer = setTimeout(() => {
+      this._hideDuckDuckGoPanel?.();
+      this.clearHover?.();
+      this._duckHideTimer = null;
+    }, this._duckPersistMs);
+  }
+
+  _cancelDuckHide() {
+    if (this._duckHideTimer) {
+      clearTimeout(this._duckHideTimer);
+      this._duckHideTimer = null;
+    }
+  }
+
+  _hideDuckDuckGoPanel() {
+    // If you keep your CSS3D panel in this._duck.group or similar, hide it here.
+    // Guarded so it’s safe if not created yet.
+    if (this._duck?.group) this._duck.group.visible = false;
+  }
+  
+  _toDuckUrl(q) {
+  const encoded = encodeURIComponent(String(q || '').trim()).replace(/%20/g, '+');
+  return `https://duckduckgo.com/?q=${encoded}&ia=web`;
+}
+
+_buildSearchQuery(info) {
+  const parts = [];
+  if (info?.address) parts.push(info.address);
+  if (info?.tags?.name) parts.push(info.tags.name);
+  if (info?.tags?.amenity) parts.push(info.tags.amenity);
+  if (info?.tags?.shop) parts.push(info.tags.shop);
+  return parts.filter(Boolean).join(' ');
+}
+
+_setDuckQuery(target) {
+  // target can be a BuildingInfo object or a raw string
+  const query = (typeof target === 'string') ? target : this._buildSearchQuery(target);
+  const href = this._toDuckUrl(query);
+  const root = this._duck?.el || this._duck?.element || this._duck?.dom; // be flexible with your stored ref
+  if (!root) return;
+  const link = root.querySelector('a[data-role="ddg-link"]');
+  if (link) {
+    link.href = href;
+    link.title = `Open “${query}” on DuckDuckGo`;
+  }
+}
+
+
+_makeDuckDuckGoElement(urlOrQuery) {
+  const ddgEncode = (s) => encodeURIComponent(String(s || '').trim()).replace(/%20/g, '+');
+  const toMainDdgUrl = (q) => `https://duckduckgo.com/?q=${ddgEncode(q)}&ia=web`;
+
+  const query = String(urlOrQuery || '').trim();
+  const href = toMainDdgUrl(query);
+
+  const wrap = document.createElement('div');
+  wrap.style.display = 'inline-block';
+  wrap.style.pointerEvents = 'auto';
+  wrap.style.userSelect = 'none';
+
+  const link = document.createElement('a');
+  link.setAttribute('data-role', 'ddg-link');            // <— important
+  link.href = href;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = 'expand';
+  link.title = `Open “${query}” on DuckDuckGo`;
+  link.style.cssText = `
+    cursor: pointer;
+    display: inline-block;
+    background: #000;
+    color: #fff;
+    font: 700 12px/1 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    padding: 4px 8px;
+    border-radius: 6px;
+    text-decoration: none;
+    letter-spacing: .3px;
+  `;
+
+  const stop = (e) => { e.stopPropagation(); };
+  ['pointerdown','click','wheel','touchstart'].forEach(t =>
+    link.addEventListener(t, stop, { capture: true })
+  );
+
+  const cancelHide = () => this._cancelDuckHide?.();
+  const scheduleHide = () => this._scheduleDuckHide?.();
+  link.addEventListener('pointerenter', cancelHide, { capture: true });
+  link.addEventListener('pointerleave', scheduleHide, { capture: true });
+  wrap.addEventListener('pointerenter', cancelHide, { capture: true });
+  wrap.addEventListener('pointerleave', scheduleHide, { capture: true });
+
+  wrap.appendChild(link);
+  return wrap;
+}
+
+
+
+
+  _buildSearchQuery(info) {
+    const t = info?.tags || {};
+    const parts = [];
+
+    // Prefer a proper name first
+    if (t.name) parts.push(String(t.name));
+
+    // Construct address
+    const streetNum = t['addr:housenumber'];
+    const street = t['addr:street'] || t['addr:place'];
+    const addrLine = [streetNum, street].filter(Boolean).join(' ');
+    if (addrLine) parts.push(addrLine);
+
+    const city = t['addr:city']; const state = t['addr:state']; const pc = t['addr:postcode'];
+    const locality = [city, state, pc].filter(Boolean).join(' ');
+    if (locality) parts.push(locality);
+
+    // Fallback: our formatted address
+    if (!parts.length && info.address) parts.push(info.address);
+
+    // Last resort: coordinates
+    if (!parts.length) {
+      const { lat, lon } = this._worldToLatLon(info.centroid.x, info.centroid.z);
+      parts.push(`${lat.toFixed(6)}, ${lon.toFixed(6)}`);
+    }
+
+    // A little hint for intent (optional)
+    parts.push('building info');
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  _duckDuckGoUrlForQuery(q) {
+    // Use the "html" endpoint which is simple and typically frameable
+    return `https://duckduckgo.com/?q=${encodeURIComponent(q)}&ia=web`;
+  }
+
+_showDuckDuckGoPanel(info, worldPos, camera) {
+  if (!this._cssRenderer || !this._cssScene || !this._cssEnabled) return;
+
+  const query = this._buildSearchQuery(info);
+  const queryKey = query;
+  const url = this._duckDuckGoUrlForQuery(query);
+
+  if (!this._cssPanelObj) {
+    const el = this._makeDuckDuckGoElement(query);
+    const obj = new CSS3DObject(el);
+    this._cssScene.add(obj);
+    this._cssPanelObj = obj;
+    this._cssPanelQueryKey = queryKey;
+
+    // store a direct ref to the anchor for fast updates
+    this._cssPanelLink = el.querySelector('a[data-role="ddg-link"]') || null;
+  } else if (this._cssPanelQueryKey !== queryKey) {
+    // UPDATE THE ANCHOR (not an iframe)
+    if (this._cssPanelLink) {
+      this._cssPanelLink.href = url;
+      this._cssPanelLink.title = `Open “${query}” on DuckDuckGo`;
+    } else {
+      // fallback: re-query the element in case ref got lost
+      const link = this._cssPanelObj.element?.querySelector?.('a[data-role="ddg-link"]');
+      if (link) {
+        link.href = url;
+        link.title = `Open “${query}” on DuckDuckGo`;
+        this._cssPanelLink = link;
+      }
+    }
+    this._cssPanelQueryKey = queryKey;
+  }
+
+  // position/orient/scale
+  this._cssPanelObj.position.copy(worldPos);
+  this._faceObjectAtCamera(this._cssPanelObj, camera);
+  const camPos = camera.getWorldPosition(this._tmpVec3);
+  const d = camPos.distanceTo(worldPos);
+  const s = THREE.MathUtils.clamp(d * 0.0022, 0.6, 2.2);
+  this._cssPanelObj.scale.set(s, s, s);
+
+  this._cssPanelObj.visible = true;
+  this._cssPanelVisible = true;
+}
+
+
+  _hideDuckDuckGoPanel() {
+    if (this._cssPanelObj) {
+      this._cssPanelObj.visible = false;
+    }
+    this._cssPanelVisible = false;
+  }
+
+  _faceObjectAtCamera(obj, camera) {
+    if (!obj || !camera) return;
+    const camPos = camera.getWorldPosition(this._tmpVec3);
+    obj.lookAt(camPos);
+  }
+
+  _updateCSS3DPanelFacing() {
+    if (this._cssPanelObj && this._cssPanelVisible) {
+      this._faceObjectAtCamera(this._cssPanelObj, this.camera);
+    }
+  }
+
+  /* ---------------- radius & visibility ---------------- */
+
   _refreshRadiusVisibility() {
     for (const state of this._tileStates.values()) {
       if (!state) continue;
@@ -424,74 +811,7 @@ export class BuildingManager {
     }
   }
 
-  // ——————————————————————————————————————————————————————————
-
-  setOrigin(lat, lon, { forceRefresh = false } = {}) {
-    const baseLat = this.tileManager?.origin?.lat ?? lat;
-    const baseLon = this.tileManager?.origin?.lon ?? lon;
-    const originChanged =
-      !this._hasOrigin ||
-      Math.abs((baseLat ?? 0) - (this.lat0 ?? Infinity)) > 1e-6 ||
-      Math.abs((baseLon ?? 0) - (this.lon0 ?? Infinity)) > 1e-6;
-
-    if (originChanged) {
-      this.lat0 = baseLat;
-      this.lon0 = baseLon;
-      if (this._hasOrigin) this._clearAllTiles();
-    }
-
-    this.lat = lat;
-    this.lon = lon;
-
-    if (!this._hasOrigin) {
-      this._hasOrigin = true;
-      this._clearAllTiles();
-      this._updateTiles(true);
-    } else if (forceRefresh) {
-      this._clearAllTiles();
-      this._currentCenter = null;
-      this._updateTiles(true);
-    }
-  }
-
-  update(dt = 0) {
-    if (!this._hasOrigin || !this.camera) return;
-
-    if (this._tileUpdateInterval <= 0) {
-      this._updateTiles();
-    } else {
-      this._tileUpdateTimer += dt;
-      if (this._tileUpdateTimer >= this._tileUpdateInterval) {
-        this._tileUpdateTimer = 0;
-        this._updateTiles();
-      }
-    }
-
-    this._drainBuildQueue(this._frameBudgetMs);
-    this._processMergeQueue();
-
-    this._resnapTimer += dt;
-    if (this._resnapTimer > this._resnapInterval) {
-      this._resnapTimer = 0;
-      this._queueResnapSweep();
-    }
-    this._drainResnapQueue(this._resnapFrameBudgetMs);
-
-    this._waterTime += dt;
-    for (const mat of this._waterMaterials) mat.uniforms.uTime.value = this._waterTime;
-
-    if (this._hoverGroup.visible) this._orientLabel(this.camera);
-  }
-
-  dispose() {
-    this.scene?.remove(this.group);
-    this.clearHover();
-    this._clearAllTiles();
-    this._edgeMaterial.dispose();
-    this._highlightEdgeMaterial.dispose();
-    this._stemMaterial.dispose();
-    this._pickMaterial.dispose();
-  }
+  /* ---------------- origin, tiles, fetching ---------------- */
 
   _updateTiles(force = false) {
     const anchor = this._resolveTrackingNode();
@@ -712,78 +1032,7 @@ export class BuildingManager {
     this._enqueueBuildJob(job);
   }
 
-  // ——————————————————————————————————————————————————————————
-  // BUILDINGS
-
-  _buildBuilding(flat, tags, id) {
-    const rawFootprint = flat.slice();
-    if (rawFootprint.length < 6) return null;
-
-    const height = this._chooseBuildingHeight(tags);
-    const extrusion = height + this.extensionHeight;
-
-    const baseline = this._lowestGround(rawFootprint) + this.extraDepth;
-    const groundBase = baseline - this.extraDepth;
-
-    // Wireframe (canonical reference)
-    const wireGeom = this._makeWireGeometry(rawFootprint, groundBase, extrusion);
-    const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
-    edges.castShadow = false;
-    edges.receiveShadow = false;
-
-    // Solid + picker: generated directly from same footprint, upright, no funny business
-    const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
-
-    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
-    pickMesh.position.set(0, baseline, 0);
-
-    const fillMat = this._buildingFillMaterial || (
-      this._buildingFillMaterial = new THREE.MeshBasicMaterial({
-        color: 0x333333,
-        transparent: true,
-        opacity: 0.5,
-        depthWrite: false,
-        //blending: THREE.SubtractiveBlending,
-        polygonOffset: true,
-        polygonOffsetFactor: 1,
-        polygonOffsetUnits: 1,
-        side: THREE.DoubleSide,
-      })
-    );
-    const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
-    solidMesh.position.set(0, baseline, 0);
-    solidMesh.renderOrder = 1;
-
-    const centroid = averagePoint(rawFootprint);
-    const address = formatAddress(tags);
-    const info = { id, address, rawFootprint, height: extrusion, baseHeight: groundBase, centroid, tags: { ...tags }, tile: null };
-
-    edges.userData.buildingInfo = info;
-    pickMesh.userData.buildingInfo = info;
-    solidMesh.userData.buildingInfo = info;
-
-    return { render: edges, solid: solidMesh, pick: pickMesh, info };
-  }
-
-  // Build a vertical prism from the 2D footprint that exactly overlays the wireframe
-  _makeSolidGeometry(footprint, height) {
-    const shape = new THREE.Shape();
-    for (let i = 0; i < footprint.length; i += 2) {
-      const x = footprint[i];
-      const z = footprint[i + 1];
-      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
-    }
-    shape.autoClose = true;
-
-    const geo = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
-    // rotate to XZ (Y up) then undo the Z mirror introduced by the rotation
-    geo.rotateX(-Math.PI / 2).scale(1, 1, -1);
-    geo.computeBoundingSphere();
-    geo.computeBoundingBox();
-    return geo;
-  }
-
-  // ——————————————————————————————————————————————————————————
+  /* ---------------- build & merge ---------------- */
 
   _enqueueMerge(tileKey) {
     if (this._pendingMergeTiles.has(tileKey)) return;
@@ -1060,80 +1309,74 @@ export class BuildingManager {
     return mergedGeom.getAttribute('position').count / 2;
   }
 
-  updateHover(raycaster, camera) {
-    if (!this._pickerRoot.children.length) {
-      this.clearHover();
-      return;
-    }
-    const intersects = raycaster.intersectObjects(this._pickerRoot.children, false);
-    if (!intersects.length) {
-      this.clearHover();
-      return;
-    }
+  /* ---------------- building/road/water creation ---------------- */
 
-    const hit = intersects[0];
-    const info = hit.object.userData.buildingInfo;
-    if (!info) {
-      this.clearHover();
-      return;
-    }
+  _buildBuilding(flat, tags, id) {
+    const rawFootprint = flat.slice();
+    if (rawFootprint.length < 6) return null;
 
-    this._showHover(info, hit.point, camera);
+    const height = this._chooseBuildingHeight(tags);
+    const extrusion = height + this.extensionHeight;
+
+    const baseline = this._lowestGround(rawFootprint) + this.extraDepth;
+    const groundBase = baseline - this.extraDepth;
+
+    // Wireframe (canonical reference)
+    const wireGeom = this._makeWireGeometry(rawFootprint, groundBase, extrusion);
+    const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
+    edges.castShadow = false;
+    edges.receiveShadow = false;
+
+    // Solid + picker: generated directly from same footprint
+    const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
+
+    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
+    pickMesh.position.set(0, baseline, 0);
+
+    const fillMat = this._buildingFillMaterial || (
+      this._buildingFillMaterial = new THREE.MeshBasicMaterial({
+        color: 0x333333,
+        transparent: true,
+        opacity: 0.5,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+        side: THREE.DoubleSide,
+      })
+    );
+    const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
+    solidMesh.position.set(0, baseline, 0);
+    solidMesh.renderOrder = 1;
+
+    const centroid = averagePoint(rawFootprint);
+    const address = formatAddress(tags);
+    const info = { id, address, rawFootprint, height: extrusion, baseHeight: groundBase, centroid, tags: { ...tags }, tile: null };
+
+    edges.userData.buildingInfo = info;
+    pickMesh.userData.buildingInfo = info;
+    solidMesh.userData.buildingInfo = info;
+
+    return { render: edges, solid: solidMesh, pick: pickMesh, info };
   }
 
-  clearHover() {
-    if (this._hoverEdges) {
-      this._hoverEdges.geometry.dispose();
-      this._hoverEdges.geometry = new THREE.BufferGeometry();
-      this._hoverEdges.visible = false;
+  _makeSolidGeometry(footprint, height) {
+    const shape = new THREE.Shape();
+    for (let i = 0; i < footprint.length; i += 2) {
+      const x = footprint[i];
+      const z = footprint[i + 1];
+      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
     }
-    if (this._hoverStem) {
-      this._hoverStem.geometry.dispose();
-      this._hoverStem.visible = false;
-    }
-    if (this._hoverLabel) this._hoverLabel.visible = false;
-    if (this._hoverGroup) this._hoverGroup.visible = false;
-    this._hoverInfo = null;
+    shape.autoClose = true;
+
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+    geo.rotateX(-Math.PI / 2).scale(1, 1, -1);
+    geo.computeBoundingSphere();
+    geo.computeBoundingBox();
+    return geo;
   }
 
-  _showHover(info, point, camera) {
-    this._ensureHoverArtifacts();
-
-    if (this._hoverInfo !== info) {
-      const highlightGeom = this._buildHighlightGeometry(info);
-      this._hoverEdges.geometry.dispose();
-      this._hoverEdges.geometry = highlightGeom;
-      this._hoverEdges.position.set(0, 0, 0);
-      const labelText = info.address || 'Unknown';
-      this._updateLabelText(labelText);
-      this._hoverInfo = info;
-      console.log(`[Buildings] hover ${info.id}: ${labelText}`);
-    }
-
-    this._hoverGroup.visible = true;
-    this._hoverEdges.visible = true;
-
-    const anchorTop = this._chooseAnchorTop(info, point);
-    const camPos = camera.getWorldPosition(this._tmpVec2);
-
-    const dir = camPos.clone().sub(anchorTop);
-    dir.y = 0;
-    if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
-    dir.normalize();
-    const stemLength = 2;
-    const offset = dir.multiplyScalar(stemLength);
-    const labelPos = anchorTop.clone().add(offset);
-    labelPos.y += stemLength;
-
-    const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
-    this._hoverStem.geometry.dispose();
-    this._hoverStem.geometry = stemGeom;
-    this._hoverStem.visible = true;
-
-    this._hoverLabel.position.copy(labelPos);
-    this._hoverLabel.visible = true;
-    this._hoverLabel.lookAt(camPos);
-  }
+  /* ---------------- resnap & hover visuals ---------------- */
 
   _ensureHoverArtifacts() {
     if (this._hoverEdges) return;
@@ -1143,6 +1386,7 @@ export class BuildingManager {
     this._hoverEdges.visible = false;
     this._hoverStem.visible = false;
 
+    // Canvas label infra remains (kept hidden when CSS3D panel is used)
     const canvas = document.createElement('canvas');
     canvas.width = 800;
     canvas.height = 400;
@@ -1150,7 +1394,7 @@ export class BuildingManager {
     const texture = new THREE.CanvasTexture(canvas);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
-    texture.generateMipmaps = false;               // avoids blurry downsizing
+    texture.generateMipmaps = false;
     texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
 
     const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
@@ -1223,34 +1467,27 @@ export class BuildingManager {
     return text ? text + E : E;
   }
 
-
   _updateLabelText(text) {
     if (!this._hoverLabelCtx || !this._hoverLabelTexture) return;
 
     const ctx = this._hoverLabelCtx;
     const canvas = this._hoverLabelCanvas;
 
-    // Hi-DPI crispness without going nuts
     const DPR = (typeof window !== 'undefined') ? Math.min(window.devicePixelRatio || 1, 2) : 1;
-    // If you didn’t change the base size above, you can scale it here instead:
-    // canvas.width = 512 * DPR; canvas.height = 256 * DPR;
 
-    // Style & layout knobs
     const PAD = 28 * DPR;
     const MAX_LINES = 3;
     const BASE_FONT = 64 * DPR;
     const MIN_FONT = 32 * DPR;
-    const LINE_GAP = 1.15;  // line-height multiplier
+    const LINE_GAP = 1.15;
     const RADIUS = 18 * DPR;
 
-    // Clear & draw background (rounded rectangle looks nicer)
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = 'rgba(18,18,18,0.82)';
     this._roundRect(ctx, PAD * 0.5, PAD * 0.5, canvas.width - PAD, canvas.height - PAD, RADIUS);
     ctx.fill();
 
-    // Fit text: shrink font until it fits in <= MAX_LINES, then ellipsize last line if necessary
     const maxTextWidth = canvas.width - PAD * 2;
     let fontSize = BASE_FONT;
     let lines = [];
@@ -1266,11 +1503,9 @@ export class BuildingManager {
 
     if (lines.length > MAX_LINES) {
       lines = lines.slice(0, MAX_LINES);
-      // Ellipsize the last line
       lines[MAX_LINES - 1] = this._ellipsize(ctx, lines[MAX_LINES - 1], maxTextWidth);
     }
 
-    // Vertical layout
     const lineHeight = fontSize * LINE_GAP;
     const totalHeight = lines.length * lineHeight;
     let y = (canvas.height - totalHeight) * 0.5 + lineHeight * 0.5;
@@ -1283,17 +1518,14 @@ export class BuildingManager {
 
     this._hoverLabelTexture.needsUpdate = true;
 
-    // Keep plane aspect correct: scale X and Y together based on canvas aspect and line count
     const aspect = canvas.width / canvas.height;
 
-    // Base geometry is 1.6 (w) x 0.6 (h). We choose a target world height that grows a bit with line count.
     const baseW = 1.6, baseH = 0.6;
-    const worldH = 0.55 + 0.12 * (lines.length - 1);  // 1 line ≈ 0.55, 2 lines ≈ 0.67, 3 lines ≈ 0.79
+    const worldH = 0.55 + 0.12 * (lines.length - 1);
     const worldW = worldH * aspect;
 
     this._hoverLabel.scale.set(worldW / baseW, worldH / baseH, 1);
   }
-
 
   _buildHighlightGeometry(info) {
     return this._makeWireGeometry(info.rawFootprint, info.baseHeight, info.height);
@@ -1322,6 +1554,8 @@ export class BuildingManager {
     if (!this._hoverLabel || !this._hoverLabel.visible) return;
     this._hoverLabel.lookAt(camera.getWorldPosition(this._tmpVec3));
   }
+
+  /* ---------------- resnap sweep ---------------- */
 
   _queueResnapSweep() {
     if (!this._tileStates.size) return;
@@ -1419,7 +1653,7 @@ export class BuildingManager {
       arr[i + 2] = z;
     }
     attr.needsUpdate = true;
-    if (this.roadLit) mesh.geometry.computeVertexNormals(); // skip for MeshBasicMaterial
+    if (this.roadLit) mesh.geometry.computeVertexNormals();
   }
 
   _resnapWater(mesh) {
@@ -1436,14 +1670,16 @@ export class BuildingManager {
     mesh.position.y = base;
   }
 
+  /* ---------------- roads/water/areas ---------------- */
+
   _buildRoad(flat, tags, id) {
     const geomData = this._makeRoadGeometry(flat);
     if (!geomData) return null;
     const { geo, basePos, center } = geomData;
 
     const mat = this.roadLit
-      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity:0.1, blending: THREE.NormalBlending })
-      : new THREE.MeshBasicMaterial({ color: this.roadColor }); // unlit = no normals
+      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity: 0.1, blending: THREE.NormalBlending })
+      : new THREE.MeshBasicMaterial({ color: this.roadColor });
 
     const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = !!this.roadShadows;
@@ -1591,7 +1827,7 @@ export class BuildingManager {
   _makeRoadGeometry(flat) {
     if (flat.length < 4) return null;
 
-    // 1) Adaptive / fixed resampling with coarser step
+    // 1) Adaptive / fixed resampling
     let line = this.roadAdaptive
       ? this._densifyLineAdaptive(flat, this.roadMinStep, this.roadMaxStep, this.roadAngleThresh)
       : this._densifyLine(flat, this.roadStep);
@@ -1603,7 +1839,6 @@ export class BuildingManager {
       for (let i = 0; i < line.length; i += 2 * stride) {
         filtered.push(line[i], line[i + 1]);
       }
-      // keep the last point
       const L = line.length;
       if (filtered[filtered.length - 2] !== line[L - 2] || filtered[filtered.length - 1] !== line[L - 1]) {
         filtered.push(line[L - 2], line[L - 1]);
@@ -1614,7 +1849,6 @@ export class BuildingManager {
     const segments = line.length / 2;
     if (segments < 2) return null;
 
-    // Heights (unchanged)
     const rawH = new Float32Array(segments);
     const smH = new Float32Array(segments);
     for (let i = 0, j = 0; i < segments; i++, j += 2) {
@@ -1649,7 +1883,6 @@ export class BuildingManager {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     geo.setIndex(idx);
-
     if (this.roadLit) geo.computeVertexNormals();
     geo.getAttribute('position').setUsage(THREE.DynamicDrawUsage);
 
@@ -1657,6 +1890,8 @@ export class BuildingManager {
     const centre = centres[Math.floor(centres.length / 2)] ?? { x: 0, z: 0 };
     return { geo, basePos, center: centre };
   }
+
+  /* ---------------- ground & coords ---------------- */
 
   _groundHeight(x, z) {
     if (this.tileManager && typeof this.tileManager.getHeightAt === 'function') {
@@ -1673,6 +1908,16 @@ export class BuildingManager {
     }
     return Number.isFinite(min) ? min : 0;
   }
+
+  _worldToLatLon(x, z) {
+    const { dLat, dLon } = metresPerDegree(this.lat0);
+    return {
+      lat: this.lat0 - z / dLat,
+      lon: this.lon0 + x / dLon,
+    };
+  }
+
+  /* ---------------- densify/smooth helpers ---------------- */
 
   _densifyPolygon(pts, step = 1.5) {
     const out = [];
@@ -1765,6 +2010,8 @@ export class BuildingManager {
       out[i] = count ? sum / count : src[i];
     }
   }
+
+  /* ---------------- tiles & cache utils ---------------- */
 
   _tileKeyForWorld(x, z) {
     const tx = Math.floor(x / this.tileSize);
