@@ -7,7 +7,7 @@ const UP = new THREE.Vector3(0, 1, 0);
 export class Locomotion {
   constructor(sceneMgr, input, orientationRef) {
     this.sceneMgr = sceneMgr; this.input = input; this.orientationRef = orientationRef || { ready: false };
-    this.baseSpeed = 2; this.runMul = 2.5; this._spd = 0;
+    this.baseSpeed = 2; this.runMul = 25; this._spd = 0;
     this.GRAV = 20;
     this.baseEye = 1.6; this.crouchEye = 0.9; this.jumpPeak = 2.4;
     this.eyeY = this.baseEye; this.vertVel = 0; this.jumpState = 'idle';

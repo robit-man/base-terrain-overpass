@@ -24,7 +24,7 @@ const HEX_DIRS = [
 ];
 
 export class TileManager {
-  constructor(scene, spacing = 10, tileRadius = 15, audio = null) {
+  constructor(scene, spacing = 10, tileRadius = 30, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.tiles = new Map(); this.origin = null;
@@ -36,11 +36,11 @@ export class TileManager {
     this.VISUAL_CREATE_BUDGET = 4;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 4;
-    this.RELAX_ALPHA = 1.0;
+    this.RELAX_ITERS_PER_FRAME = 0;
+    this.RELAX_ALPHA = 0.0;
     this.NORMALS_EVERY = 10;
     // keep relax cheap so fetching dominates
-    this.RELAX_FRAME_BUDGET_MS = 2.0;
+    this.RELAX_FRAME_BUDGET_MS = 0;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
