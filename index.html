@@ -30,7 +30,7 @@
 
         var txt = (el.textContent || "").trim().toUpperCase();
         if (txt === "VR NOT AVAILABLE" || txt.includes("VR NOT AVAILABLE") || txt === "VR NOT SUPPORTED" || txt.includes("VR NOT SUPPORTED") || txt === "WEBXR NOT AVAILABLE" || txt.includes("WEBXR NOT AVAILABLE")) {
-          el.remove();
+          //el.remove();
           return true;
         }
         return false;
@@ -129,7 +129,8 @@
 
   <!-- Modal overlay -->
   <div id="backdrop" aria-hidden="true"></div>
-  <aside id="menuPane" aria-label="World Control Center">
+  <div id="menuPane" aria-label="World Control Center">
+    <div class="wrapper">
     <header class="modal-header">
       <h2>Control Center</h2>
     </header>
@@ -223,7 +224,8 @@
       <div class="tiny" id="peerSummary">—</div>
       <div id="peerList" class="peer-list"></div>
     </section>
-  </aside>
+    </div>
+  </div>
 
   <!-- Entry points -->
   <script type="module" src="./js/app.js"></script>
