@@ -1,4 +1,4 @@
-// app.js — drop-in replacement
+// app.js — drop-in replacement with non-breaking optimizations
 import * as THREE from 'three';
 import { SceneManager } from './scene.js';
 import { Sensors, GeoButton } from './sensors.js';
@@ -28,7 +28,6 @@ const DEFAULT_TERRAIN_DATASET = 'mapzen';
 
 class App {
   constructor() {
-    // Force HTTPS for sensors & XR
     if (location.protocol !== 'https:') {
       location.href = 'https:' + window.location.href.substring(location.protocol.length);
       return;
@@ -36,6 +35,13 @@ class App {
 
     // Core systems
     this.sceneMgr = new SceneManager();
+
+    // === NEW: cap pixel ratio to avoid overdraw on HiDPI ===
+    try {
+      const pr = Math.min(window.devicePixelRatio || 1, 1.5);
+      this.sceneMgr.renderer.setPixelRatio(pr);
+    } catch {}
+
     this._poseStoredState = null;
     this._poseLatestState = null;
     this._poseSaveTimer = 0;
@@ -57,6 +63,16 @@ class App {
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
     this._hudGeoCached = { lat: null, lon: null };
+
+    // === NEW: throttling state (non-breaking) ===
+    this._hoverNextAllowedMs = 0;
+    this._pointerLastMoveMs = 0;
+    this._miniMapNextMs = 0;
+    this._lastHexUpdatePos = new THREE.Vector3(Infinity, Infinity, Infinity);
+    this._nextHexUpdateMs = 0;
+    this._nextBuildingsUpdateMs = 0;
+    this._hudGeoNextMs = 0;
+    this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -140,7 +156,7 @@ class App {
     // UI poller
     this._uiTimer = setInterval(() => this._updateLocalPoseUI(), 200);
 
-    // Avatars for both the local player and remote peers share the same factory promise.
+    // Avatars
     this.avatarFactoryPromise = AvatarFactory.load().catch((err) => {
       console.warn('[avatar] load failed', err);
       return null;
@@ -154,7 +170,7 @@ class App {
     );
     this.mesh = new Mesh(this);
 
-    // Local third-person avatar shell (hidden when true FPV or XR)
+    // Local avatar shell
     this.localAvatar = null;
     this.avatarFactoryPromise
       .then(factory => {
@@ -165,7 +181,7 @@ class App {
       })
       .catch(() => {});
 
-    // Third-person chase cam (we'll bypass it in mobile FPV)
+    // Third-person chase cam
     const sampleHeight = (x, z) => {
       const mgr = this.hexGridMgr;
       if (!mgr || typeof mgr.getHeightAt !== 'function') return NaN;
@@ -173,7 +189,7 @@ class App {
     };
     this.chase = new ChaseCam(this.sceneMgr, () => this.move.eyeHeight(), this.sensors?.orient ?? null, sampleHeight);
 
-    // Desktop pitch accumulator (mouse look). Camera carries pitch on desktop only.
+    // Desktop pitch accumulator
     this._pitch = 0;
     this._pitchMin = -Math.PI / 2 + 0.01;
     this._pitchMax = Math.PI / 2 - 0.01;
@@ -360,7 +376,6 @@ class App {
     }
 
     this._initPosePersistence();
-
     this.sceneMgr.renderer.setAnimationLoop(() => this._tick());
 
     window.addEventListener('keydown', (e) => {
@@ -1138,7 +1153,6 @@ class App {
   _enterMobileFPV() {
     if (this._mobileFPVOn) return;
 
-    // Ensure a Perspective camera mounted at the dolly origin (first-person)
     const oldCam = this.sceneMgr.camera;
     if (!(oldCam instanceof THREE.PerspectiveCamera)) {
       const cam = new THREE.PerspectiveCamera(75, oldCam.aspect || innerWidth / innerHeight, 0.05, 100000);
@@ -1154,7 +1168,6 @@ class App {
       oldCam.updateProjectionMatrix();
     }
 
-    // Lock chase boom to 0 (true first-person), and we’ll skip ChaseCam.update while FPV
     this.chase.targetBoom = 0.0;
     this.chase.boom = 0.0;
     this.chase.minBoom = 0.0;
@@ -1265,7 +1278,6 @@ class App {
   _updateLocalPoseUI() {
     const { dolly } = this.sceneMgr;
 
-    // Yaw/pitch read from dolly orientation (camera inherits dolly rotation in mobile FPV)
     const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
     const p = dolly.position;
 
@@ -1408,14 +1420,24 @@ class App {
 
     try {
       const stored = { ...pose, ts: Date.now() };
-      localStorage.setItem(PLAYER_POSE_KEY, JSON.stringify(stored));
-      this._poseStoredState = this._clonePoseSnapshot(pose);
-      this._poseLatestState = this._clonePoseSnapshot(pose);
-      this._poseDirty = false;
-      this._poseSaveTimer = 0;
-      this._poseRestored = true;
+      // === NEW: defer synchronous localStorage to idle to avoid jank ===
+      const write = () => {
+        try {
+          localStorage.setItem(PLAYER_POSE_KEY, JSON.stringify(stored));
+          this._poseStoredState = this._clonePoseSnapshot(pose);
+          this._poseLatestState = this._clonePoseSnapshot(pose);
+          this._poseDirty = false;
+          this._poseSaveTimer = 0;
+          this._poseRestored = true;
+        } catch {}
+      };
+      if ('requestIdleCallback' in window && !force) {
+        requestIdleCallback(write, { timeout: 1000 });
+      } else {
+        setTimeout(write, 0);
+      }
     } catch {
-      // Quota errors are non-fatal; we'll retry on the next interval.
+      // ignore
     }
   }
 
@@ -1498,6 +1520,9 @@ class App {
 
   /* ---------- Main loop ---------- */
   _tick() {
+    // === lightweight frame timing marks (shows in DevTools > Performance > Timings) ===
+    if (performance?.mark) performance.mark('tick-start');
+
     const dt = this.clock.getDelta();
     const currentTargetFps = this._perf.profile().targetFps;
     const fpsSample = dt > 0.5 ? currentTargetFps : (dt > 1e-4 ? 1 / dt : currentTargetFps);
@@ -1529,7 +1554,7 @@ class App {
         void ui.hudQos.offsetWidth;
         ui.hudQos.classList.add('flash');
       }
-    this._updateHudMeta(perfState);
+      this._updateHudMeta(perfState);
     }
 
     this._updateHudCompass();
@@ -1558,7 +1583,6 @@ class App {
     // === ORIENTATION / LOOK ===
     if (!xrOn) {
       if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-        // MOBILE FPV: direct 1:1 mapping from device → dolly with optional yaw offsets.
         const q = this._deviceQuatForFPV(this.sensors.orient);
         const compassOffset = this._getCompassYawOffset() || 0;
         const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
@@ -1568,18 +1592,14 @@ class App {
           q.multiply(yawQuat);
         }
         dolly.quaternion.copy(q);
-        // Enforce camera local zero so it precisely inherits dolly rotation
         camera.rotation.set(0, 0, 0);
         camera.up.set(0, 1, 0);
       } else {
-        // DESKTOP: yaw on dolly, pitch on camera (PointerLock injected into dolly.quaternion)
         const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
         const yawAbs = e.y;
         const pitchDelta = e.x; // pointer-lock delivered pitch delta through dolly.x
 
         this._pitch = THREE.MathUtils.clamp(this._pitch + pitchDelta, this._pitchMin, this._pitchMax);
-
-        // Keep body upright; camera carries pitch
         dolly.rotation.set(0, yawAbs, 0);
         camera.rotation.set(this._pitch, 0, 0);
         camera.up.set(0, 1, 0);
@@ -1589,7 +1609,7 @@ class App {
     const prevPos = this._tmpVec.copy(dolly.position);
     const baseGroundY = this.hexGridMgr.getHeightAt(prevPos.x, prevPos.z);
 
-    // Locomotion (eye height, jump, drag-move on mobile)
+    // Locomotion
     this.move.update(dt, baseGroundY, xrOn);
 
     const eyeHeight = this.move.eyeHeight();
@@ -1597,7 +1617,12 @@ class App {
 
     let allowedMove = desiredMove;
     if (this.physics?.isCharacterReady?.()) {
+      if (performance?.mark) performance.mark('phys-resolve-start');
       allowedMove = this.physics.resolveCharacterMovement(prevPos, eyeHeight, desiredMove);
+      if (performance?.mark) {
+        performance.mark('phys-resolve-end');
+        performance.measure('phys-resolve', 'phys-resolve-start', 'phys-resolve-end');
+      }
     }
     if (!allowedMove) {
       desiredMove.set(0, 0, 0);
@@ -1625,8 +1650,35 @@ class App {
 
     this._updateCompassDial();
 
-    this.hexGridMgr.update(dolly.position);
-    this.buildings?.update(dt);
+    // === NEW: throttle tile manager update (distance/time based) ===
+    const hexNow = performance.now ? performance.now() : Date.now();
+    const movedSq = this._lastHexUpdatePos.distanceToSquared(dolly.position);
+    const movedEnough = movedSq > 0.25 * 0.25; // > 0.25 m
+    const timeOk = hexNow >= this._nextHexUpdateMs;
+    if (movedEnough || timeOk) {
+      if (performance?.mark) performance.mark('hex-update-start');
+      this.hexGridMgr.update(dolly.position);
+      if (performance?.mark) {
+        performance.mark('hex-update-end');
+        performance.measure('hex-update', 'hex-update-start', 'hex-update-end');
+      }
+      this._lastHexUpdatePos.copy(dolly.position);
+      this._nextHexUpdateMs = hexNow + 100; // at most 10 Hz
+    }
+
+    // === NEW: throttle buildings update (time based) ===
+    const nowMs = hexNow;
+    if (nowMs >= this._nextBuildingsUpdateMs) {
+      if (performance?.mark) performance.mark('build-update-start');
+      this.buildings?.update(dt);
+      if (performance?.mark) {
+        performance.mark('build-update-end');
+        performance.measure('build-update', 'build-update-start', 'build-update-end');
+      }
+      // 33ms ~ 30 Hz; tweak as needed
+      this._nextBuildingsUpdateMs = nowMs + 33;
+    }
+
     this._updateBuildingHover(xrOn);
 
     const pos = dolly.position;
@@ -1634,7 +1686,7 @@ class App {
     dolly.position.y = groundY + eyeHeight;
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
 
-    // Local avatar drive & visibility
+    // Local avatar
     if (this.localAvatar) {
       const yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
       const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
@@ -1649,17 +1701,14 @@ class App {
       this.localAvatar.group.visible = !(xrOn || isFP);
     }
 
-    // Remote anims (jump arcs, stick resize)
+    // Remotes
     this.remotes.tick(dt);
 
-    // Camera boom/positioning:
-    //   - In mobile FPV, we skip ChaseCam.update entirely to avoid any rotation meddling.
-    //   - In XR or desktop (3rd-person), let it run normally.
     if (!this._mobileFPVOn || xrOn) {
       this.chase.update(dt, xrOn);
     }
 
-    // Pose broadcast (yaw-only quaternion so remotes stay upright)
+    // Pose broadcast
     const actualY = groundY + eyeHeight;
     const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
     const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, eSend.y, 0, 'YXZ'));
@@ -1673,20 +1722,42 @@ class App {
     }
     this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
 
+    if (performance?.mark) performance.mark('phys-update-start');
     this.physics?.update(dt);
+    if (performance?.mark) {
+      performance.mark('phys-update-end');
+      performance.measure('phys-update', 'phys-update-start', 'phys-update-end');
+    }
 
     this._poseMaybeSave(dt);
 
     const origin = this.hexGridMgr?.origin;
-    if (origin) {
+
+    // === NEW: throttle HUD geo conversion (expensive) ===
+    const hudNow = nowMs;
+    const movedHudSq = this._hudGeoLastPos.distanceToSquared(dolly.position);
+    if ((origin && (hudNow >= this._hudGeoNextMs || movedHudSq > 0.5 * 0.5))) {
       const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
       if (hudLatLon) this._updateHudGeo(hudLatLon);
+      this._hudGeoLastPos.copy(dolly.position);
+      this._hudGeoNextMs = hudNow + 200; // 5 Hz
     }
 
-    this.miniMap?.update();
+    // === NEW: throttle minimap updates (10 Hz) ===
+    if (nowMs >= this._miniMapNextMs) {
+      this.miniMap?.update();
+      this._miniMapNextMs = nowMs + 100; // 10 Hz
+    }
 
     // Render
+    if (performance?.mark) performance.mark('render-start');
     renderer.render(this.sceneMgr.scene, camera);
+    if (performance?.mark) {
+      performance.mark('render-end');
+      performance.measure('render', 'render-start', 'render-end');
+      performance.mark('tick-end');
+      performance.measure('frame', 'tick-start', 'tick-end');
+    }
   }
 
   _onPointerMove(e, dom) {
@@ -1696,8 +1767,10 @@ class App {
     this._pointerNdc.x = x * 2 - 1;
     this._pointerNdc.y = -(y * 2 - 1);
     this._pointerNdc.has = true;
+    this._pointerLastMoveMs = (performance && performance.now) ? performance.now() : Date.now(); // NEW
   }
 
+  // === NEW: throttled hover raycast ===
   _updateBuildingHover(xrOn) {
     if (!this.buildings) return;
     if (xrOn) {
@@ -1708,6 +1781,16 @@ class App {
       this.buildings.clearHover();
       return;
     }
+    const now = performance?.now ? performance.now() : Date.now();
+
+    // Only raycast if pointer moved in last 300ms and at most ~12.5Hz
+    if (now - this._pointerLastMoveMs > 300) {
+      this.buildings.clearHover();
+      return;
+    }
+    if (now < this._hoverNextAllowedMs) return;
+    this._hoverNextAllowedMs = now + 80; // ~12.5 Hz
+
     this._raycaster.setFromCamera(this._pointerNdc, this.sceneMgr.camera);
     this.buildings.updateHover(this._raycaster, this.sceneMgr.camera);
   }
@@ -1744,7 +1827,7 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const lift = eyeHeight + 3;
 
-    //this._testBall = this.physics.spawnTestBall({ origin, lift });
+    // this._testBall = this.physics.spawnTestBall({ origin, lift });
   }
 }
 

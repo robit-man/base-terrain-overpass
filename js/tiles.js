@@ -31,12 +31,12 @@ export class TileManager {
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
-    this.VISUAL_RING = 20;
+    this.VISUAL_RING = 10;
     // turbo: do not throttle per-frame visual tile creation
-    this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
+    this.VISUAL_CREATE_BUDGET = 4;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 12;
+    this.RELAX_ITERS_PER_FRAME = 4;
     this.RELAX_ALPHA = 1.0;
     this.NORMALS_EVERY = 10;
     // keep relax cheap so fetching dominates
@@ -69,7 +69,7 @@ export class TileManager {
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
       const sun = new THREE.DirectionalLight(0xffffff, .065);
-      sun.position.set(50, 100, 50); sun.castShadow = true; scene.add(sun);
+      sun.position.set(50, 100, 50); sun.castShadow = false; scene.add(sun);
       scene.userData._tmLightsAdded = true;
     }
 
@@ -118,7 +118,7 @@ export class TileManager {
 
     // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
-    this._backfillIntervalMs = 300; // was 2500
+    this._backfillIntervalMs = 1200; // was 2500
     this._periodicBackfill = setInterval(
       () => this._backfillMissing({ onlyIfRelayReady: true }),
       this._backfillIntervalMs
@@ -717,7 +717,7 @@ export class TileManager {
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
     geom.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, metalness: .01, roughness: .95, transparent: true, opacity: 0.5, color: 0x111111 });
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.FrontSide, metalness: .01, roughness: .95, transparent: true, opacity: 0.5, color: 0x111111 });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
     const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 0.05, transparent: true, color: this.VISUAL_WIREFRAME_COLOR }));
     wire.frustumCulled = false; wire.renderOrder = 1;

@@ -13,11 +13,11 @@ const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
 const CACHE_PREFIX = 'bm.tile';
 const CACHE_LIMIT = 320;
 const CACHE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
-const MERGE_BUDGET_MS = 6; // milliseconds per idle slice
-const BUILD_FRAME_BUDGET_MS = 2.0; // ms budget to spend per frame on feature builds
-const BUILD_IDLE_BUDGET_MS = 8.0; // ms budget when we have idle time available
+const MERGE_BUDGET_MS = 2; // milliseconds per idle slice
+const BUILD_FRAME_BUDGET_MS = 3.5; // ms budget to spend per frame on feature builds
+const BUILD_IDLE_BUDGET_MS = 4.0; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 2.0; // seconds between ground rescan passes
-const RESNAP_FRAME_BUDGET_MS = 1.5; // ms per frame allotted to resnap tiles
+const RESNAP_FRAME_BUDGET_MS = 0.8; // ms per frame allotted to resnap tiles
 const TARGET_FPS = 60;
 
 function averagePoint(flat) {
@@ -86,26 +86,25 @@ function formatAddress(tags = {}) {
     .join(', ');
   return text || 'Unknown address';
 }
-
 export class BuildingManager {
   constructor({
     scene,
     camera,
     tileManager,
-    radius = 12000,
+    radius = 2000,
     tileSize,
     color = 0x333333,
     roadWidth = 4,
-    roadOffset = 0.5,
+    roadOffset = 0.05,
     roadStep = 12,              // avg metres between samples (was hard-coded 1.25)
     roadAdaptive = true,       // adapt step on sharp turns
     roadMinStep = 4,           // smallest step on sharp curves
     roadMaxStep = 24,          // largest step on straights
     roadAngleThresh = 0.35,    // ~20°: angles above this count as “sharp”
-    roadMaxSegments = 200,     // hard cap: max centerline points per road
-    roadLit = true,           // unlit by default (faster)
+    roadMaxSegments = 100,     // hard cap: max centerline points per road
+    roadLit = false,           // unlit by default (faster)
     roadShadows = false,       // disable shadows on roads
-    roadColor = 0xaaaaaa,      // default color
+    roadColor = 0x333333,      // default color
     extraDepth = 0.1,
     extensionHeight = 2,
     maxConcurrentFetches = 1, // retained for API compatibility
@@ -215,7 +214,7 @@ export class BuildingManager {
     this._mergeBudgetMs = MERGE_BUDGET_MS;
     this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
     this._resnapInterval = RESNAP_INTERVAL;
-    this._tileUpdateInterval = 0; // seconds — 0 = every frame
+    this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
     this._tileUpdateTimer = 0;
     this._resnapTimer = 0;
     this._qosTargetFps = TARGET_FPS;
@@ -742,9 +741,9 @@ export class BuildingManager {
       this._buildingFillMaterial = new THREE.MeshBasicMaterial({
         color: 0x333333,
         transparent: true,
-        opacity: 0.9,
+        opacity: 0.5,
         depthWrite: false,
-        blending: THREE.SubtractiveBlending,
+        //blending: THREE.SubtractiveBlending,
         polygonOffset: true,
         polygonOffsetFactor: 1,
         polygonOffsetUnits: 1,
