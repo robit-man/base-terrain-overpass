@@ -641,6 +641,7 @@ input[type=text] {
     gap: 14px;
     backdrop-filter: blur(16px) saturate(150%);
 }
+canvas { touch-action: none; }
 
 #miniMapDock .mini-map-panel {
     filter: saturate(0)contrast(1.2)invert(1)brightness(1.2)contrast(0.8)opacity(0.5)

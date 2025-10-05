@@ -717,7 +717,7 @@ export class TileManager {
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
     geom.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.FrontSide, metalness: .01, roughness: .95, transparent: true, opacity: 0.5, color: 0x111111 });
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, metalness: .01, roughness: .95, transparent: true, opacity: 1, color: 0x111111 });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
     const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 0.05, transparent: true, color: this.VISUAL_WIREFRAME_COLOR }));
     wire.frustumCulled = false; wire.renderOrder = 1;
