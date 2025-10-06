@@ -44,7 +44,7 @@ const yawAssistToggle = document.getElementById('yawAssistToggle');
 const yawOffsetRange = document.getElementById('yawOffsetRange');
 const yawOffsetValue = document.getElementById('yawOffsetValue');
 const miniMapMove = document.getElementById('miniMapMove');
-const miniMapCenter = document.getElementById('miniMapCenter');
+const miniMapSnap = document.getElementById('miniMapSnap');
 const terrainRelayStatus = document.getElementById('terrainRelayStatus');
 const terrainRelayInput = document.getElementById('terrainRelayInput');
 const terrainDatasetInput = document.getElementById('terrainDatasetInput');
@@ -103,7 +103,7 @@ export const ui = {
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudLat, hudLon, hudNknStatus, hudTerrainStatus,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
-  miniMapMove, miniMapCenter,
+  miniMapMove, miniMapSnap,
   terrainRelayStatus, terrainRelayInput, terrainDatasetInput,
   terrainModeGeohash, terrainModeLatLng,
   openMenu, closeMenu

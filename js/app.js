@@ -283,7 +283,7 @@ class App {
       recenterBtn: document.getElementById('miniMapRecenter'),
       setBtn: document.getElementById('miniMapSet'),
       moveBtn: ui.miniMapMove,
-      centerBtn: ui.miniMapCenter,
+      snapBtn: ui.miniMapSnap,
       tileManager: this.hexGridMgr,
       getWorldPosition: () => this.sceneMgr?.dolly?.position,
       getHeadingDeg: () => {
@@ -293,6 +293,8 @@ class App {
         const deg = (Math.atan2(forward.x, forward.z) * 180) / Math.PI;
         return (deg + 360) % 360;
       },
+      getCompassHeadingRad: () => this.sensors?.headingRad,
+      isSnapActive: () => this.move?.isSnapActive?.() ?? false,
       getPeers: () => this._collectPeerLocations(),
       onCommitLocation: ({ lat, lon }) => {
         this._handleGpsUpdate({ lat, lon, source: 'manual' });
@@ -310,6 +312,7 @@ class App {
       onRequestTeleport: ({ lat, lon }) => {
         this._handleMiniMapTeleport({ lat, lon });
       },
+      onRequestSnap: ({ headingRad }) => this._snapToCompassHeading(headingRad),
     });
 
     this._terrainStatusEl = ui.terrainRelayStatus || null;
@@ -505,6 +508,13 @@ class App {
       teleport: true,
       force: true,
     });
+  }
+
+  _snapToCompassHeading(explicitHeadingRad = null) {
+    const heading = Number.isFinite(explicitHeadingRad) ? explicitHeadingRad : this.sensors?.headingRad;
+    if (!Number.isFinite(heading)) return false;
+    if (!this.move?.snapToHeading) return false;
+    return this.move.snapToHeading(heading);
   }
 
   _resetPlayerPosition() {

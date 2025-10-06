@@ -354,6 +354,25 @@ input[type=text] {
     background: #1d1d1d
 }
 
+.mini-map-action-stack button.armed {
+    animation: miniMapActionBlink 0.7s ease-in-out infinite alternate;
+    border-color: #ffb347;
+    color: #ffbd55;
+    background: rgba(255, 179, 71, 0.12);
+}
+
+.mini-map-action-stack button.busy {
+    border-color: #5ec8ff;
+    color: #9bdcff;
+    background: rgba(94, 200, 255, 0.12);
+    cursor: progress;
+}
+
+@keyframes miniMapActionBlink {
+    0% { box-shadow: 0 0 0px rgba(255, 179, 71, 0.0); opacity: 0.75; }
+    100% { box-shadow: 0 0 12px rgba(255, 179, 71, 0.55); opacity: 1; }
+}
+
 .mini-map-manual {
     display: flex;
     flex-wrap: wrap;

@@ -19,28 +19,34 @@ export class MiniMap {
     recenterBtn,
     setBtn,
     moveBtn,
-    centerBtn,
+    snapBtn,
     tileManager,
     getWorldPosition,
     getHeadingDeg,
+    getCompassHeadingRad,
+    isSnapActive,
     getPeers,
     onCommitLocation,
     onRequestAuto,
     onRequestTeleport,
+    onRequestSnap,
   } = {}) {
     this.mapContainer = mapContainer || null;
     this.statusEl = statusEl || null;
     this.recenterBtn = recenterBtn || null;
     this.setBtn = setBtn || null;
     this.moveBtn = moveBtn || null;
-    this.centerBtn = centerBtn || null;
+    this.snapBtn = snapBtn || null;
     this.tileManager = tileManager || null;
     this.getWorldPosition = typeof getWorldPosition === 'function' ? getWorldPosition : null;
     this.getHeadingDeg = typeof getHeadingDeg === 'function' ? getHeadingDeg : () => 0;
+    this.getCompassHeadingRad = typeof getCompassHeadingRad === 'function' ? getCompassHeadingRad : null;
+    this.isSnapActive = typeof isSnapActive === 'function' ? isSnapActive : null;
     this.getPeers = typeof getPeers === 'function' ? getPeers : null;
     this.onCommitLocation = typeof onCommitLocation === 'function' ? onCommitLocation : null;
     this.onRequestAuto = typeof onRequestAuto === 'function' ? onRequestAuto : null;
     this.onRequestTeleport = typeof onRequestTeleport === 'function' ? onRequestTeleport : null;
+    this.onRequestSnap = typeof onRequestSnap === 'function' ? onRequestSnap : null;
 
     this.followEnabled = true;
     this.userHasPanned = false;
@@ -52,6 +58,13 @@ export class MiniMap {
     this._autoFollowThreshold = 0.0001; // ≈10–12 m on Earth
     this._pendingHeadingDeg = null;
     this._headingCssCurrent = null;
+    this._pendingTeleport = null;
+    this._moveArmed = false;
+    this._longPressTimer = null;
+    this._longPressOrigin = null;
+    this._longPressMs = 550;
+    this._longPressTolerancePx = 14;
+    this._snapEngaged = false;
 
     this.map = null;
     this.playerMarker = null;
@@ -64,20 +77,17 @@ export class MiniMap {
       this._centerOnPlayer(true);
     });
 
-    this.centerBtn?.addEventListener('click', () => {
-      this._setFollow(true);
-      this._centerOnPlayer(true);
-    });
-
     this.setBtn?.addEventListener('click', () => {
       if (!this.viewCenter || !this.onCommitLocation) return;
       this.onCommitLocation({ lat: this.viewCenter.lat, lon: this.viewCenter.lon });
     });
 
     this.moveBtn?.addEventListener('click', () => this._handleMoveRequest());
+    this.snapBtn?.addEventListener('click', () => this._handleSnapRequest());
 
     this._updateFollowButton();
     this._updateMoveButton();
+    this._updateSnapButton();
   }
 
   _initMap() {
@@ -117,9 +127,79 @@ export class MiniMap {
       }
     });
 
+    const getContainerPoint = (ev) => {
+      if (ev?.containerPoint) return ev.containerPoint;
+      const orig = ev?.originalEvent;
+      if (!orig) return null;
+      const pick = (src) => {
+        if (!src) return null;
+        const rect = this.map.getContainer().getBoundingClientRect();
+        const x = src.clientX - rect.left;
+        const y = src.clientY - rect.top;
+        return window.L.point(x, y);
+      };
+
+      if (orig.touches && orig.touches.length) return pick(orig.touches[0]);
+      if (orig.changedTouches && orig.changedTouches.length) return pick(orig.changedTouches[0]);
+      if (typeof orig.clientX === 'number' && typeof orig.clientY === 'number') return pick(orig);
+      return null;
+    };
+
+    const getLatLng = (ev) => {
+      if (ev?.latlng) return ev.latlng;
+      const pt = getContainerPoint(ev);
+      if (!pt) return null;
+      try {
+        return this.map.containerPointToLatLng(pt);
+      } catch {
+        return null;
+      }
+    };
+
+    const cancelLongPress = () => {
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
+      this._longPressOrigin = null;
+    };
+
+    const armFromEvent = (ev) => {
+      const latlng = getLatLng(ev);
+      if (!latlng) return;
+      cancelLongPress();
+      this._armMoveTarget(latlng);
+    };
+
+    const scheduleLongPress = (ev) => {
+      if (!this.map) return;
+      cancelLongPress();
+      const latlng = getLatLng(ev);
+      if (!latlng) return;
+      const pt = getContainerPoint(ev);
+      this._longPressOrigin = { latlng, point: pt };
+      this._longPressTimer = setTimeout(() => {
+        this._longPressTimer = null;
+        this._longPressOrigin = null;
+        this._armMoveTarget(latlng);
+      }, this._longPressMs);
+    };
+
+    const handleMoveDuringPress = (ev) => {
+      if (!this._longPressTimer || !this._longPressOrigin) return;
+      const pt = getContainerPoint(ev);
+      if (!pt || !this._longPressOrigin.point) return;
+      const dx = pt.x - this._longPressOrigin.point.x;
+      const dy = pt.y - this._longPressOrigin.point.y;
+      if ((dx * dx + dy * dy) > (this._longPressTolerancePx * this._longPressTolerancePx)) {
+        cancelLongPress();
+      }
+    };
+
     this.map.on('movestart', () => {
       if (this.followEnabled) this._setFollow(false);
       this.userHasPanned = true;
+      cancelLongPress();
     });
 
     this.map.on('moveend', () => {
@@ -129,6 +209,25 @@ export class MiniMap {
     });
 
     this.map.on('zoomend', () => this._updateMoveButton());
+
+    this.map.on('mousedown', scheduleLongPress);
+    this.map.on('touchstart', scheduleLongPress);
+    this.map.on('pointerdown', scheduleLongPress);
+    this.map.on('mouseup', cancelLongPress);
+    this.map.on('touchend', cancelLongPress);
+    this.map.on('touchcancel', cancelLongPress);
+    this.map.on('pointerup', cancelLongPress);
+    this.map.on('pointercancel', cancelLongPress);
+    this.map.on('mouseout', cancelLongPress);
+    this.map.on('dragstart', cancelLongPress);
+    this.map.on('mousemove', handleMoveDuringPress);
+    this.map.on('touchmove', handleMoveDuringPress);
+    this.map.on('pointermove', handleMoveDuringPress);
+    this.map.on('contextmenu', (ev) => {
+      ev?.originalEvent?.preventDefault?.();
+      cancelLongPress();
+      armFromEvent(ev);
+    });
   }
 
   update() {
@@ -157,6 +256,7 @@ export class MiniMap {
 
     this._updatePeers();
     this._updateMoveButton();
+    this._updateSnapButton();
   }
 
   notifyLocationChange({ lat, lon, source, detail } = {}) {
@@ -185,6 +285,8 @@ export class MiniMap {
     const heading = this.getHeadingDeg ? this.getHeadingDeg() : null;
     if (Number.isFinite(heading)) this._applyPlayerHeading(heading);
     this._updateMoveButton();
+    this._updateSnapButton();
+    if (teleported) this._disarmMoveTarget(true);
   }
 
   forceRedraw() {
@@ -223,29 +325,63 @@ export class MiniMap {
   }
 
   _handleMoveRequest() {
-    if (!this.viewCenter || typeof this.onRequestTeleport !== 'function') return;
-    if (!Number.isFinite(this.viewCenter.lat) || !Number.isFinite(this.viewCenter.lon)) return;
-    if (this.moveBtn?.disabled) return;
-    this.onRequestTeleport({ lat: this.viewCenter.lat, lon: this.viewCenter.lon });
-    this.userHasPanned = false;
+    if (!this.moveBtn || this.moveBtn.disabled) return;
+    if (!this._pendingTeleport || typeof this.onRequestTeleport !== 'function') return;
+    const { lat, lon } = this._pendingTeleport;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    this.onRequestTeleport({ lat, lon });
     this.moveBtn?.blur?.();
-    this._updateMoveButton();
+    this._disarmMoveTarget(true);
+  }
+
+  _handleSnapRequest() {
+    if (!this.snapBtn || this.snapBtn.disabled) return;
+    if (typeof this.onRequestSnap !== 'function') return;
+    const headingRad = this.getCompassHeadingRad?.();
+    if (!Number.isFinite(headingRad)) return;
+    const res = this.onRequestSnap({ headingRad });
+    if (res && typeof res.then === 'function') {
+      this._snapEngaged = true;
+      res.finally(() => this._updateSnapButton());
+    } else if (res) {
+      this._snapEngaged = true;
+    } else {
+      this._snapEngaged = false;
+    }
+    this.snapBtn?.blur?.();
+    this._updateSnapButton();
   }
 
   _updateMoveButton() {
     if (!this.moveBtn) return;
-    const hasTarget = Boolean(
-      this.viewCenter &&
-      Number.isFinite(this.viewCenter.lat) &&
-      Number.isFinite(this.viewCenter.lon) &&
-      this.userHasPanned
-    );
-    this.moveBtn.disabled = !hasTarget;
-    this.moveBtn.setAttribute('aria-disabled', hasTarget ? 'false' : 'true');
-    if (hasTarget) {
-      this.moveBtn.title = `Teleport to ${this.viewCenter.lat.toFixed(5)}, ${this.viewCenter.lon.toFixed(5)}`;
+    const armed = !!(this._moveArmed && this._pendingTeleport);
+    this.moveBtn.disabled = !armed;
+    this.moveBtn.setAttribute('aria-disabled', armed ? 'false' : 'true');
+    this.moveBtn.classList.toggle('armed', armed);
+    if (armed) {
+      const { lat, lon } = this._pendingTeleport;
+      this.moveBtn.title = `Teleport to ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     } else {
-      this.moveBtn.title = 'Pan the mini-map to choose a destination';
+      this.moveBtn.title = 'Tap and hold on the mini-map to choose a destination';
+    }
+  }
+
+  _updateSnapButton() {
+    if (!this.snapBtn) return;
+    const heading = this.getCompassHeadingRad?.();
+    const headingReady = Number.isFinite(heading);
+    const snapActive = Boolean(this.isSnapActive?.());
+    if (snapActive) this._snapEngaged = true;
+    if (!snapActive && this._snapEngaged) this._snapEngaged = false;
+    const engaged = snapActive || this._snapEngaged;
+    this.snapBtn.classList.toggle('busy', engaged);
+    const disabled = !headingReady || engaged;
+    this.snapBtn.disabled = disabled;
+    this.snapBtn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+    if (headingReady) {
+      this.snapBtn.title = engaged ? 'Snapping to compass heading…' : 'Align view with compass heading';
+    } else {
+      this.snapBtn.title = 'Compass heading unavailable';
     }
   }
 
@@ -303,6 +439,25 @@ export class MiniMap {
       label += ` · ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     }
     this.statusEl.textContent = label;
+  }
+
+  _armMoveTarget(latlng) {
+    if (!latlng) return;
+    const entry = { lat: clampLat(latlng.lat), lon: clampLon(latlng.lng ?? latlng.lon) };
+    if (!Number.isFinite(entry.lat) || !Number.isFinite(entry.lon)) return;
+    this._pendingTeleport = entry;
+    this._moveArmed = true;
+    this._setFollow(false);
+    this.viewCenter = { ...entry };
+    this.userHasPanned = false;
+    this._updateMoveButton();
+  }
+
+  _disarmMoveTarget(silent = false) {
+    this._pendingTeleport = null;
+    this._moveArmed = false;
+    if (!silent) this.moveBtn?.blur?.();
+    this._updateMoveButton();
   }
 
   _maybeAutoFollow(latLon) {

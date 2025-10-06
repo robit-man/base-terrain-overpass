@@ -38,6 +38,10 @@ export class Locomotion {
     this._touchYawOffset = 0;
     this._lastAppliedTouchYaw = 0;
     this._touchYawRate = THREE.MathUtils.degToRad(180); // rad/s when swipe fully deflected
+    this._snapYawTarget = null;
+    this._snapYawActive = false;
+    this._snapYawEpsilon = THREE.MathUtils.degToRad(1.5);
+    this._tmpForward = new THREE.Vector3();
   }
 
   update(dt, groundY, xrPresenting) {
@@ -46,6 +50,7 @@ export class Locomotion {
     const isMobileDevice = isMobile;
     let mobileDx = 0;
     let mobileDy = 0;
+    let baseYaw = this._currentYaw();
     if (isMobileDevice) {
       mobileDx = THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
       mobileDy = THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
@@ -85,6 +90,25 @@ export class Locomotion {
         .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
       dol.quaternion.copy(q);
       this._lastAppliedTouchYaw = 0;
+      baseYaw = this._currentYaw();
+    }
+
+    if (isMobileDevice && !xrPresenting && this._snapYawTarget != null) {
+      baseYaw = this._currentYaw();
+      const desiredOffset = this._normalizeAngle(this._snapYawTarget - baseYaw);
+      const deltaOffset = desiredOffset - this._touchYawOffset;
+      const maxStep = this._touchYawRate * dt;
+      if (Math.abs(deltaOffset) <= this._snapYawEpsilon) {
+        this._touchYawOffset = desiredOffset;
+        this._snapYawTarget = null;
+        this._snapYawActive = false;
+      } else {
+        this._touchYawOffset += THREE.MathUtils.clamp(deltaOffset, -maxStep, maxStep);
+        this._touchYawOffset = this._normalizeAngle(this._touchYawOffset);
+        this._snapYawActive = true;
+      }
+    } else if (!this._snapYawTarget) {
+      this._snapYawActive = false;
     }
 
     if (isMobileDevice && !xrPresenting) {
@@ -132,6 +156,26 @@ export class Locomotion {
 
     // Snap to terrain + eye offset
     dol.position.y = (groundY ?? 0) + this.eyeY;
+  }
+
+  _currentYaw() {
+    if (!this.sceneMgr?.dolly) return 0;
+    const forward = this._tmpForward.set(0, 0, -1).applyQuaternion(this.sceneMgr.dolly.quaternion);
+    return Math.atan2(forward.x, -forward.z) || 0;
+  }
+
+  _normalizeAngle(radVal) {
+    return THREE.MathUtils.euclideanModulo(radVal + Math.PI, Math.PI * 2) - Math.PI;
+  }
+
+  snapToHeading(targetRad) {
+    if (!isMobile || !Number.isFinite(targetRad)) return false;
+    this._snapYawTarget = THREE.MathUtils.euclideanModulo(targetRad, Math.PI * 2);
+    return true;
+  }
+
+  isSnapActive() {
+    return this._snapYawTarget != null || this._snapYawActive;
   }
 
   _setupVRControllers() {
