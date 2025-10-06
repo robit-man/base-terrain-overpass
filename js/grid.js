@@ -60,3 +60,39 @@ export class UniformHexGrid {
   }
   get object() { return this.group; }
 }
+
+export class HexCenterPoint {
+  constructor(size = 100) {
+    this.radius = size / 2;
+    this._build();
+  }
+  _build() {
+    const geom = new THREE.BufferGeometry();
+    const pos = new Float32Array([0, 0, 0]);
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+
+    const cols = new Float32Array([1, 1, 1]);
+    geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
+
+    const mat = new THREE.PointsMaterial({
+      size: Math.max(0.8, this.radius * 0.05),
+      vertexColors: true,
+      sizeAttenuation: true,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    const points = new THREE.Points(geom, mat);
+    points.frustumCulled = false;
+    points.renderOrder = 3;
+
+    this.group = new THREE.Group();
+    this.group.add(points);
+
+    this.geometry = geom;
+    this.points = points;
+    this.mat = mat;
+  }
+  get object() { return this.group; }
+}

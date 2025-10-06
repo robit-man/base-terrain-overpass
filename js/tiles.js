@@ -1,6 +1,6 @@
 // tiles.js
 import * as THREE from 'three';
-import { UniformHexGrid } from './grid.js';
+import { UniformHexGrid, HexCenterPoint } from './grid.js';
 import { now } from './utils.js';
 import { worldToLatLon } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
@@ -32,8 +32,11 @@ export class TileManager {
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
     this.VISUAL_RING = 10;
+    this.FARFIELD_EXTRA = 10;
+    this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
     this.VISUAL_CREATE_BUDGET = 4;
+    this.FARFIELD_CREATE_BUDGET = 60;
 
     // ---- interactive (high-res) relaxation ----
     this.RELAX_ITERS_PER_FRAME = 20;
@@ -76,7 +79,10 @@ export class TileManager {
     this._baseLod = {
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
+      farfieldExtra: this.FARFIELD_EXTRA,
+      farfieldRing: this.FARFIELD_RING,
       visualCreateBudget: this.VISUAL_CREATE_BUDGET,
+      farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
     };
@@ -327,7 +333,7 @@ export class TileManager {
 
     tile.normTick = (tile.normTick + 1) % this.NORMALS_EVERY;
     if (tile.normTick === 0) {
-      tile.grid.geometry.computeVertexNormals();
+      if (tile.type !== 'farfield') tile.grid.geometry.computeVertexNormals();
       this._applyAllColorsGlobal(tile);
     }
   }
@@ -366,6 +372,16 @@ export class TileManager {
     }
     col.needsUpdate = true;
   }
+  _initFarfieldColors(tile) {
+    const col = this._ensureColorAttr(tile);
+    const arr = col.array;
+    for (let i = 0; i < tile.pos.count; i++) {
+      const o = 3 * i;
+      arr[o] = arr[o + 1] = arr[o + 2] = 1;
+    }
+    col.needsUpdate = true;
+    if (tile.grid?.mat) tile.grid.mat.color?.set?.(0xffffff);
+  }
   _updateGlobalFromValue(y) {
     let changed = false;
     if (y < this.GLOBAL_MIN_Y) { this.GLOBAL_MIN_Y = y; changed = true; }
@@ -380,6 +396,10 @@ export class TileManager {
     return this.LUM_MIN + t * (this.LUM_MAX - this.LUM_MIN);
   }
   _applyAllColorsGlobal(tile) {
+    if (tile.type === 'farfield') {
+      this._initFarfieldColors(tile);
+      return;
+    }
     this._ensureColorAttr(tile);
     const arr = tile.col.array, pos = tile.pos;
     for (let i = 0; i < pos.count; i++) {
@@ -483,9 +503,13 @@ export class TileManager {
     this._updateGlobalFromValue(height);
 
     if (!tile.col) this._ensureColorAttr(tile);
-    const l = this._lumFromYGlobal(height);
     const o = 3 * idx;
-    tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
+    if (tile.type === 'farfield') {
+      tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = 1;
+    } else {
+      const l = this._lumFromYGlobal(height);
+      tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
+    }
     tile.col.needsUpdate = true;
 
     if (this.audio) {
@@ -594,7 +618,7 @@ export class TileManager {
       const pos = tile.pos;
       for (let i = 0; i < data.y.length; i++) pos.setY(i, data.y[i]);
       pos.needsUpdate = true;
-      tile.grid.geometry.computeVertexNormals();
+      if (tile.type !== 'farfield') tile.grid.geometry.computeVertexNormals();
 
       tile.ready = new Uint8Array(tile.pos.count);
       tile.ready.fill(1);
@@ -755,6 +779,48 @@ export class TileManager {
       _queuedPhases: new Set()
     };
     this.tiles.set(id, tile);
+
+    if (!this._tryLoadTileFromCache(tile)) {
+      this._queuePopulate(tile, false);
+    }
+    return tile;
+  }
+
+  /* ---------------- creation: farfield tile (center point) ---------------- */
+
+  _addFarfieldTile(q, r) {
+    const id = `${q},${r}`;
+    if (this.tiles.has(id)) return this.tiles.get(id);
+
+    const far = new HexCenterPoint(this.tileRadius * 2);
+    far.group.name = `tile-far-${id}`;
+    const wp = this._axialWorld(q, r);
+    far.group.position.set(wp.x, 0, wp.z);
+    this.scene.add(far.group);
+
+    const pos = far.geometry.attributes.position;
+    const ready = new Uint8Array(pos.count);
+    const neighbors = Array.from({ length: pos.count }, () => []);
+    const colAttr = far.geometry.attributes.color;
+    if (colAttr) colAttr.setUsage(THREE.DynamicDrawUsage);
+
+    const tile = {
+      type: 'farfield',
+      grid: { group: far.group, points: far.points, geometry: far.geometry, mat: far.mat },
+      q, r,
+      pos,
+      neighbors,
+      ready,
+      fetched: new Set(),
+      populating: false,
+      unreadyCount: pos.count,
+      col: far.geometry.attributes.color,
+      _phase: { fullDone: false },
+      _queuedPhases: new Set()
+    };
+    this.tiles.set(id, tile);
+
+    this._initFarfieldColors(tile);
 
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
@@ -1113,7 +1179,7 @@ export class TileManager {
     if (!tile) return false;
     if (!Number.isFinite(tile.unreadyCount)) tile.unreadyCount = tile.pos.count;
 
-    if (tile.type === 'visual') {
+    if (tile.type === 'visual' || tile.type === 'farfield') {
       return !(tile._phase?.fullDone) || tile.unreadyCount > 0;
     }
     // interactive: any phase not done OR there are still unknowns
@@ -1138,7 +1204,7 @@ export class TileManager {
     if (!this._tileNeedsFetch(tile)) return;
     if (tile.populating) return;
 
-    if (tile.type === 'visual') {
+    if (tile.type === 'visual' || tile.type === 'farfield') {
       if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
       return;
     }
@@ -1217,8 +1283,8 @@ export class TileManager {
 
     // ---- choose indices for this phase ----
     let indices = null;
-    if (tile.type === 'visual') {
-      // visuals always fetch the full 7 verts
+    if (tile.type === 'visual' || tile.type === 'farfield') {
+      // visuals and farfield points fetch all available verts
       indices = Array.from({ length: count }, (_, i) => i);
     } else {
       if (phase === PHASE_SEED) {
@@ -1319,15 +1385,20 @@ export class TileManager {
       this._pinEdgesFromCorners(tile);  // creates/updates tile.locked
     }
 
-    // ---- blend / seal with pinned edges acting as anchors ----
-    this._nearestAnchorFill(tile);
-    this._smoothUnknowns(tile, 1);
-    this._sealEdgesCornerSafe(tile);
-    this._fixStuckZeros(tile, /*rimOnly=*/true);
+    if (tile.type === 'farfield') {
+      pos.needsUpdate = true;
+      this._applyAllColorsGlobal(tile);
+    } else {
+      // ---- blend / seal with pinned edges acting as anchors ----
+      this._nearestAnchorFill(tile);
+      this._smoothUnknowns(tile, 1);
+      this._sealEdgesCornerSafe(tile);
+      this._fixStuckZeros(tile, /*rimOnly=*/true);
 
-    pos.needsUpdate = true;
-    tile.grid.geometry.computeVertexNormals();
-    this._applyAllColorsGlobal(tile);
+      pos.needsUpdate = true;
+      tile.grid.geometry.computeVertexNormals();
+      this._applyAllColorsGlobal(tile);
+    }
 
     // ---- mark phase complete & chain next ----
     if (tile.type === 'interactive') {
@@ -1394,6 +1465,26 @@ export class TileManager {
     this._scheduleBackfill(0);
   }
 
+  _prewarmFarfieldRing(q0 = 0, r0 = 0) {
+    for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
+      const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
+      const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.VISUAL_RING) continue;
+        const id = `${q},${r}`;
+        if (!this.tiles.has(id)) {
+          this._addFarfieldTile(q, r);
+        } else {
+          const t = this.tiles.get(id);
+          this._queuePopulateIfNeeded(t, false);
+        }
+      }
+    }
+    this._scheduleBackfill(0);
+  }
+
   /* ---------------- per-frame: ensure LOD, relax, prune ---------------- */
 
   update(playerPos) {
@@ -1416,6 +1507,9 @@ export class TileManager {
           this._addInteractiveTile(q, r);
         } else if (cur.type === 'visual') {
           this._promoteVisualToInteractive(q, r);
+        } else if (cur.type === 'farfield') {
+          this._discardTile(id);
+          this._addInteractiveTile(q, r);
         }
       }
     }
@@ -1430,13 +1524,16 @@ export class TileManager {
         const q = q0 + dq, r = r0 + dr;
         const dist = this._hexDist(q, r, q0, r0);
         if (dist <= this.INTERACTIVE_RING) continue;
-        const had = this.tiles.has(`${q},${r}`);
-        if (!had) {
+        const id = `${q},${r}`;
+        const existing = this.tiles.get(id);
+        if (!existing) {
           this._addVisualTile(q, r);
           if (++created >= this.VISUAL_CREATE_BUDGET) break outer;
         } else {
-          const existing = this.tiles.get(`${q},${r}`);
-          if (dist <= this.INTERACTIVE_RING && existing.type === 'visual') {
+          if (existing.type === 'farfield') {
+            this._discardTile(id);
+            this._addVisualTile(q, r);
+          } else if (dist <= this.INTERACTIVE_RING && existing.type === 'visual') {
             this._promoteVisualToInteractive(q, r);
           } else if (existing) {
             this._queuePopulateIfNeeded(existing, false);
@@ -1445,17 +1542,57 @@ export class TileManager {
       }
     }
 
-    // 3) prune outside visual ring
-    for (const [id, t] of this.tiles) {
-      const dist = this._hexDist(t.q, t.r, q0, r0);
-      if (dist > this.VISUAL_RING) this._discardTile(id);
+    // 3) farfield outward with budget
+    let farCreated = 0;
+    farOuter:
+    for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
+      const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
+      const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.VISUAL_RING) continue;
+        const id = `${q},${r}`;
+        const existing = this.tiles.get(id);
+        if (!existing) {
+          this._addFarfieldTile(q, r);
+          if (++farCreated >= this.FARFIELD_CREATE_BUDGET) break farOuter;
+        } else if (existing.type !== 'farfield') {
+          this._discardTile(id);
+          this._addFarfieldTile(q, r);
+        } else {
+          this._queuePopulateIfNeeded(existing, false);
+        }
+      }
     }
 
-    // 4) relax
+    // 4) prune/downgrade rings
+    const toRemove = [];
+    const toFarfield = [];
+    for (const [id, t] of this.tiles) {
+      const dist = this._hexDist(t.q, t.r, q0, r0);
+      if (dist > this.FARFIELD_RING) {
+        toRemove.push(id);
+        continue;
+      }
+      if (dist > this.VISUAL_RING) {
+        if (t.type !== 'farfield') toFarfield.push({ q: t.q, r: t.r });
+        continue;
+      }
+    }
+
+    for (const id of toRemove) this._discardTile(id);
+    for (const { q, r } of toFarfield) {
+      const id = `${q},${r}`;
+      this._discardTile(id);
+      this._addFarfieldTile(q, r);
+    }
+
+    // 5) relax
     this._ensureRelaxList();
     this._drainRelaxQueue();
 
-    // 5) recolor sweep when global range changes
+    // 6) recolor sweep when global range changes
     if (this._globalDirty) {
       const t = now();
       if (t - this._lastRecolorAt > 100) {
@@ -1470,16 +1607,21 @@ export class TileManager {
     const id = `${q},${r}`;
     const cur = this.tiles.get(id);
     if (!cur) {
-      return want === 'interactive' ? this._addInteractiveTile(q, r)
-        : this._addVisualTile(q, r);
+      if (want === 'interactive') return this._addInteractiveTile(q, r);
+      if (want === 'visual') return this._addVisualTile(q, r);
+      if (want === 'farfield') return this._addFarfieldTile(q, r);
+      return null;
     }
     if (cur.type === want) return cur;
-    if (cur.type === 'visual' && want === 'interactive') {
-      return this._promoteVisualToInteractive(q, r);
+    if (want === 'interactive') {
+      if (cur.type === 'visual') return this._promoteVisualToInteractive(q, r);
+      this._discardTile(id);
+      return this._addInteractiveTile(q, r);
     }
     this._discardTile(id);
-    return want === 'interactive' ? this._addInteractiveTile(q, r)
-      : this._addVisualTile(q, r);
+    if (want === 'visual') return this._addVisualTile(q, r);
+    if (want === 'farfield') return this._addFarfieldTile(q, r);
+    return null;
   }
 
   /* ---------------- Origin & relay hooks ---------------- */
@@ -1499,9 +1641,11 @@ export class TileManager {
       this._resetAllTiles();
       this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
+      this._prewarmFarfieldRing(0, 0);
     } else if (immediate && !this.tiles.size) {
       this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
+      this._prewarmFarfieldRing(0, 0);
     }
 
     if (immediate && this.origin) {
@@ -1587,17 +1731,29 @@ export class TileManager {
 
     const baseInteractive = this._baseLod.interactiveRing;
     const baseVisual = this._baseLod.visualRing;
+    const baseFarfield = this._baseLod.farfieldRing;
+    const farfieldExtra = Number.isFinite(this._baseLod.farfieldExtra)
+      ? this._baseLod.farfieldExtra
+      : Math.max(1, baseFarfield - baseVisual);
 
     let ringChanged = false;
     if (this.INTERACTIVE_RING !== baseInteractive) { this.INTERACTIVE_RING = baseInteractive; ringChanged = true; }
     if (this.VISUAL_RING !== baseVisual) { this.VISUAL_RING = baseVisual; ringChanged = true; }
+    const targetFarfieldRing = this.VISUAL_RING + farfieldExtra;
+    if (this.FARFIELD_RING !== targetFarfieldRing) {
+      this.FARFIELD_RING = targetFarfieldRing;
+      this.FARFIELD_EXTRA = farfieldExtra;
+      ringChanged = true;
+    }
     if (ringChanged) {
       this._markRelaxListDirty();
       this._prewarmVisualRing(0, 0);
+      this._prewarmFarfieldRing(0, 0);
       this._scheduleBackfill(0);
     }
 
     this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
+    this.FARFIELD_CREATE_BUDGET = this._baseLod.farfieldCreateBudget;
 
     this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
     this.RELAX_FRAME_BUDGET_MS = 1.5 + quality * 1.5;
@@ -1606,6 +1762,8 @@ export class TileManager {
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
       visualCreateBudget: this.VISUAL_CREATE_BUDGET,
+      farfieldRing: this.FARFIELD_RING,
+      farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
     };
@@ -1649,7 +1807,8 @@ export class TileManager {
       tile.ready.fill(0);
       tile.fetched.clear();
       tile.unreadyCount = tile.pos.count;
-      this._initColorsNearBlack(tile);
+      if (tile.type === 'farfield') this._initFarfieldColors(tile);
+      else this._initColorsNearBlack(tile);
       tile.populating = false;
       tile._queuedPhases?.clear?.();
 

@@ -59,7 +59,7 @@ export class PhysicsEngine {
     if (this.helper) this.helper.update();
   }
 
-  spawnTestBall({ radius = 0.3, mass = 0.5, restitution = 0.5, color = 0x000000, origin = new THREE.Vector3(), lift = 3 } = {}) {
+  spawnTestBall({ radius = 0.2, mass = 0.5, restitution = 0.2, color = 0xffffff, origin = new THREE.Vector3(), lift = 3 } = {}) {
     if (!this.core) return null;
 
     const geometry = new THREE.SphereGeometry(radius, 24, 24);

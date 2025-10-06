@@ -22,7 +22,7 @@ export class ChaseCam {
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
-    this.maxBoom = 500.0;
+    this.maxBoom = 2500.0;
     this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
     this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
