@@ -137,10 +137,13 @@ export class BuildingManager {
     roadColor = 0x333333,
     extraDepth = 0.1,
     extensionHeight = 2,
+    inputEl = null,            // NEW
+    holdToOpenMs = 600,        // NEW (optional override)
+
     maxConcurrentFetches = 1, // retained for API compatibility
   } = {}) {
     this._duckScale = 0.10; // 10% of current size
-    this._duckPersistMs = 2000;
+    this._duckPersistMs = 0;
     this._duckHideTimer = null;
     this.scene = scene;
     this.camera = camera;
@@ -189,7 +192,24 @@ export class BuildingManager {
     this.physics = null;
 
     // ---------- CSS3D panel (DuckDuckGo) ----------
-    this._cssEnabled = true;
+    this._holdToOpenMs = holdToOpenMs;
+
+    this._cssEnabled = false;
+
+    // NEW: optionally pass the canvas (or container) so we can listen for pointer events
+    this._inputEl = inputEl || (typeof document !== 'undefined' ? document.querySelector('canvas') : null);
+
+    // only create CSS3D if explicitly re-enabled later
+    if (this._cssEnabled) this._ensureCSS3DLayer();
+
+    // NEW: press-and-hold wiring
+    this._pressTimer = null;
+    this._pressActive = false;
+    this._pressInfo = null;
+    this._pressDownPos = null;
+    this._pressMoveSlop = 8;      // px tolerance while holding
+    this._bindPressListeners();
+
     this._cssScene = null;
     this._cssRenderer = null;
     this._cssRootEl = null;
@@ -410,8 +430,8 @@ export class BuildingManager {
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
     // CSS3D panel orientation + render overlay
-    this._updateCSS3DPanelFacing();
-    if (this._cssRenderer && this._cssScene) {
+    if (this._cssEnabled && this._cssRenderer && this._cssScene) {
+      this._updateCSS3DPanelFacing();
       this._cssRenderer.render(this._cssScene, this.camera);
     }
   }
@@ -446,12 +466,12 @@ export class BuildingManager {
     }
     const intersects = raycaster.intersectObjects(this._pickerRoot.children, false);
     if (!intersects.length) {
-      this._scheduleDuckHide?.();
+      this.clearHover();
       return;
-    }this._cancelDuckHide?.();
+    }
 
-     this._cancelDuckHide?.();
-     const hit = intersects[0];
+    this._cancelDuckHide?.();
+    const hit = intersects[0];
     const info = hit.object.userData.buildingInfo;
     if (!info) {
       this.clearHover();
@@ -471,7 +491,10 @@ export class BuildingManager {
       this._hoverStem.geometry.dispose();
       this._hoverStem.visible = false;
     }
-    if (this._hoverLabel) this._hoverLabel.visible = false;
+    // position and show the canvas label
+    if (this._hoverLabel) {
+      this._hoverLabel.visible = false;
+    }
     if (this._hoverGroup) this._hoverGroup.visible = false;
     this._hoverInfo = null;
 
@@ -495,7 +518,7 @@ export class BuildingManager {
       this._hoverInfo = info;
       // console.log(`[Buildings] hover ${info.id}: ${labelText}`);
     }
-     this._setDuckQuery(info);
+    //this._setDuckQuery(info);
 
     this._hoverGroup.visible = true;
     this._hoverEdges.visible = true;
@@ -519,10 +542,72 @@ export class BuildingManager {
     this._hoverStem.visible = true;
 
     // (hide the old canvas label)
-    if (this._hoverLabel) this._hoverLabel.visible = false;
+    if (this._hoverLabel) {
+      this._hoverLabel.position.copy(labelPos);
+      this._hoverLabel.visible = true;
+    }
+  }
+  _bindPressListeners() {
+    if (!this._inputEl || typeof window === 'undefined') return;
+    const CLICK_MAX_MS = 350;
+    const onDown = (e) => {
+      if ((e.button ?? 0) !== 0) return; // left button only
+      if (!this._hoverInfo) return;
+      this._pressActive = true;
+      this._pressInfo = this._hoverInfo;
+      this._pressDownPos = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
+      this._pressDownTs = performance.now();
+    };
 
-    // CSS3D panel near the same label position
-    this._showDuckDuckGoPanel(info, labelPos, camera);
+    const cancel = () => {
+      this._pressActive = false;
+      this._pressInfo = null;
+    };
+
+    const onUp = (e) => {
+      if (!this._pressActive) return cancel();
+      if ((e.button ?? 0) !== 0) return cancel();
+      const dx = (e.clientX ?? 0) - (this._pressDownPos?.x ?? 0);
+      const dy = (e.clientY ?? 0) - (this._pressDownPos?.y ?? 0);
+      const moved2 = dx * dx + dy * dy;
+      const dt = performance.now() - (this._pressDownTs ?? 0);
+      const withinSlop = moved2 <= (this._pressMoveSlop * this._pressMoveSlop);
+      const sameTarget = this._hoverInfo && (this._hoverInfo === this._pressInfo);
+      if (withinSlop && sameTarget && dt <= CLICK_MAX_MS) {
+        this._openInfoLink(this._hoverInfo);
+      }
+      cancel();
+    };
+    const onLeave = cancel;
+    const onCancel = cancel;
+
+    const onMove = (e) => {
+      if (!this._pressActive || !this._pressDownPos) return;
+      const dx = (e.clientX ?? 0) - this._pressDownPos.x;
+      const dy = (e.clientY ?? 0) - this._pressDownPos.y;
+      if ((dx * dx + dy * dy) > (this._pressMoveSlop * this._pressMoveSlop)) cancel();
+    };
+
+    this._inputEl.addEventListener('pointerdown', onDown);
+    this._inputEl.addEventListener('pointerup', onUp);
+    this._inputEl.addEventListener('pointerleave', onLeave);
+    this._inputEl.addEventListener('pointercancel', onCancel);
+    this._inputEl.addEventListener('pointermove', onMove);
+
+    // Clean up on page hide/blur so timers don't leak
+    const onBlur = () => cancel();
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) cancel(); });
+  }
+
+  _openInfoLink(info) {
+    try {
+      const query = this._buildSearchQuery(info);                // uses your existing builder
+      const url = this._duckDuckGoUrlForQuery(query);            // uses your existing URL helper
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (e) {
+      // no-op if popups are blocked; you could log if desired
+    }
   }
 
   /* ---------- CSS3D integration ---------- */
@@ -596,55 +681,55 @@ export class BuildingManager {
     // Guarded so it’s safe if not created yet.
     if (this._duck?.group) this._duck.group.visible = false;
   }
-  
+
   _toDuckUrl(q) {
-  const encoded = encodeURIComponent(String(q || '').trim()).replace(/%20/g, '+');
-  return `https://duckduckgo.com/?q=${encoded}&ia=web`;
-}
-
-_buildSearchQuery(info) {
-  const parts = [];
-  if (info?.address) parts.push(info.address);
-  if (info?.tags?.name) parts.push(info.tags.name);
-  if (info?.tags?.amenity) parts.push(info.tags.amenity);
-  if (info?.tags?.shop) parts.push(info.tags.shop);
-  return parts.filter(Boolean).join(' ');
-}
-
-_setDuckQuery(target) {
-  // target can be a BuildingInfo object or a raw string
-  const query = (typeof target === 'string') ? target : this._buildSearchQuery(target);
-  const href = this._toDuckUrl(query);
-  const root = this._duck?.el || this._duck?.element || this._duck?.dom; // be flexible with your stored ref
-  if (!root) return;
-  const link = root.querySelector('a[data-role="ddg-link"]');
-  if (link) {
-    link.href = href;
-    link.title = `Open “${query}” on DuckDuckGo`;
+    const encoded = encodeURIComponent(String(q || '').trim()).replace(/%20/g, '+');
+    return `https://duckduckgo.com/?q=${encoded}&ia=web`;
   }
-}
+
+  _buildSearchQuery(info) {
+    const parts = [];
+    if (info?.address) parts.push(info.address);
+    if (info?.tags?.name) parts.push(info.tags.name);
+    if (info?.tags?.amenity) parts.push(info.tags.amenity);
+    if (info?.tags?.shop) parts.push(info.tags.shop);
+    return parts.filter(Boolean).join(' ');
+  }
+
+  _setDuckQuery(target) {
+    // target can be a BuildingInfo object or a raw string
+    const query = (typeof target === 'string') ? target : this._buildSearchQuery(target);
+    const href = this._toDuckUrl(query);
+    const root = this._duck?.el || this._duck?.element || this._duck?.dom; // be flexible with your stored ref
+    if (!root) return;
+    const link = root.querySelector('a[data-role="ddg-link"]');
+    if (link) {
+      link.href = href;
+      link.title = `Open “${query}” on DuckDuckGo`;
+    }
+  }
 
 
-_makeDuckDuckGoElement(urlOrQuery) {
-  const ddgEncode = (s) => encodeURIComponent(String(s || '').trim()).replace(/%20/g, '+');
-  const toMainDdgUrl = (q) => `https://duckduckgo.com/?q=${ddgEncode(q)}&ia=web`;
+  _makeDuckDuckGoElement(urlOrQuery) {
+    const ddgEncode = (s) => encodeURIComponent(String(s || '').trim()).replace(/%20/g, '+');
+    const toMainDdgUrl = (q) => `https://duckduckgo.com/?q=${ddgEncode(q)}&ia=web`;
 
-  const query = String(urlOrQuery || '').trim();
-  const href = toMainDdgUrl(query);
+    const query = String(urlOrQuery || '').trim();
+    const href = toMainDdgUrl(query);
 
-  const wrap = document.createElement('div');
-  wrap.style.display = 'inline-block';
-  wrap.style.pointerEvents = 'auto';
-  wrap.style.userSelect = 'none';
+    const wrap = document.createElement('div');
+    wrap.style.display = 'inline-block';
+    wrap.style.pointerEvents = 'auto';
+    wrap.style.userSelect = 'none';
 
-  const link = document.createElement('a');
-  link.setAttribute('data-role', 'ddg-link');            // <— important
-  link.href = href;
-  link.target = '_blank';
-  link.rel = 'noopener noreferrer';
-  link.textContent = 'expand';
-  link.title = `Open “${query}” on DuckDuckGo`;
-  link.style.cssText = `
+    const link = document.createElement('a');
+    link.setAttribute('data-role', 'ddg-link');            // <— important
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'expand';
+    link.title = `Open “${query}” on DuckDuckGo`;
+    link.style.cssText = `
     cursor: pointer;
     display: inline-block;
     background: #000;
@@ -656,21 +741,21 @@ _makeDuckDuckGoElement(urlOrQuery) {
     letter-spacing: .3px;
   `;
 
-  const stop = (e) => { e.stopPropagation(); };
-  ['pointerdown','click','wheel','touchstart'].forEach(t =>
-    link.addEventListener(t, stop, { capture: true })
-  );
+    const stop = (e) => { e.stopPropagation(); };
+    ['pointerdown', 'click', 'wheel', 'touchstart'].forEach(t =>
+      link.addEventListener(t, stop, { capture: true })
+    );
 
-  const cancelHide = () => this._cancelDuckHide?.();
-  const scheduleHide = () => this._scheduleDuckHide?.();
-  link.addEventListener('pointerenter', cancelHide, { capture: true });
-  link.addEventListener('pointerleave', scheduleHide, { capture: true });
-  wrap.addEventListener('pointerenter', cancelHide, { capture: true });
-  wrap.addEventListener('pointerleave', scheduleHide, { capture: true });
+    const cancelHide = () => this._cancelDuckHide?.();
+    const scheduleHide = () => this._scheduleDuckHide?.();
+    link.addEventListener('pointerenter', cancelHide, { capture: true });
+    link.addEventListener('pointerleave', scheduleHide, { capture: true });
+    wrap.addEventListener('pointerenter', cancelHide, { capture: true });
+    wrap.addEventListener('pointerleave', scheduleHide, { capture: true });
 
-  wrap.appendChild(link);
-  return wrap;
-}
+    wrap.appendChild(link);
+    return wrap;
+  }
 
 
 
@@ -711,50 +796,50 @@ _makeDuckDuckGoElement(urlOrQuery) {
     return `https://duckduckgo.com/?q=${encodeURIComponent(q)}&ia=web`;
   }
 
-_showDuckDuckGoPanel(info, worldPos, camera) {
-  if (!this._cssRenderer || !this._cssScene || !this._cssEnabled) return;
+  _showDuckDuckGoPanel(info, worldPos, camera) {
+    if (!this._cssRenderer || !this._cssScene || !this._cssEnabled) return;
 
-  const query = this._buildSearchQuery(info);
-  const queryKey = query;
-  const url = this._duckDuckGoUrlForQuery(query);
+    const query = this._buildSearchQuery(info);
+    const queryKey = query;
+    const url = this._duckDuckGoUrlForQuery(query);
 
-  if (!this._cssPanelObj) {
-    const el = this._makeDuckDuckGoElement(query);
-    const obj = new CSS3DObject(el);
-    this._cssScene.add(obj);
-    this._cssPanelObj = obj;
-    this._cssPanelQueryKey = queryKey;
+    if (!this._cssPanelObj) {
+      const el = this._makeDuckDuckGoElement(query);
+      const obj = new CSS3DObject(el);
+      this._cssScene.add(obj);
+      this._cssPanelObj = obj;
+      this._cssPanelQueryKey = queryKey;
 
-    // store a direct ref to the anchor for fast updates
-    this._cssPanelLink = el.querySelector('a[data-role="ddg-link"]') || null;
-  } else if (this._cssPanelQueryKey !== queryKey) {
-    // UPDATE THE ANCHOR (not an iframe)
-    if (this._cssPanelLink) {
-      this._cssPanelLink.href = url;
-      this._cssPanelLink.title = `Open “${query}” on DuckDuckGo`;
-    } else {
-      // fallback: re-query the element in case ref got lost
-      const link = this._cssPanelObj.element?.querySelector?.('a[data-role="ddg-link"]');
-      if (link) {
-        link.href = url;
-        link.title = `Open “${query}” on DuckDuckGo`;
-        this._cssPanelLink = link;
+      // store a direct ref to the anchor for fast updates
+      this._cssPanelLink = el.querySelector('a[data-role="ddg-link"]') || null;
+    } else if (this._cssPanelQueryKey !== queryKey) {
+      // UPDATE THE ANCHOR (not an iframe)
+      if (this._cssPanelLink) {
+        this._cssPanelLink.href = url;
+        this._cssPanelLink.title = `Open “${query}” on DuckDuckGo`;
+      } else {
+        // fallback: re-query the element in case ref got lost
+        const link = this._cssPanelObj.element?.querySelector?.('a[data-role="ddg-link"]');
+        if (link) {
+          link.href = url;
+          link.title = `Open “${query}” on DuckDuckGo`;
+          this._cssPanelLink = link;
+        }
       }
+      this._cssPanelQueryKey = queryKey;
     }
-    this._cssPanelQueryKey = queryKey;
+
+    // position/orient/scale
+    this._cssPanelObj.position.copy(worldPos);
+    this._faceObjectAtCamera(this._cssPanelObj, camera);
+    const camPos = camera.getWorldPosition(this._tmpVec3);
+    const d = camPos.distanceTo(worldPos);
+    const s = THREE.MathUtils.clamp(d * 0.0022, 0.6, 2.2);
+    this._cssPanelObj.scale.set(s, s, s);
+
+    this._cssPanelObj.visible = true;
+    this._cssPanelVisible = true;
   }
-
-  // position/orient/scale
-  this._cssPanelObj.position.copy(worldPos);
-  this._faceObjectAtCamera(this._cssPanelObj, camera);
-  const camPos = camera.getWorldPosition(this._tmpVec3);
-  const d = camPos.distanceTo(worldPos);
-  const s = THREE.MathUtils.clamp(d * 0.0022, 0.6, 2.2);
-  this._cssPanelObj.scale.set(s, s, s);
-
-  this._cssPanelObj.visible = true;
-  this._cssPanelVisible = true;
-}
 
 
   _hideDuckDuckGoPanel() {
@@ -1633,9 +1718,31 @@ _showDuckDuckGoPanel(info, worldPos, camera) {
       building.pick.position.y = baseline;
       building.pick.updateMatrixWorld(true);
     }
-    if (changed && this._hoverInfo === info) {
-      this.clearHover();
-    }
+ if (changed && this._hoverInfo === info) {
+   // Rebuild hover artifacts to match the new base/height
+   if (this._hoverEdges) {
+     const g = this._buildHighlightGeometry(info);
+     this._hoverEdges.geometry.dispose();
+     this._hoverEdges.geometry = g;
+   }
+   // Recompute stem + label position facing camera
+   const anchorTop = this._chooseAnchorTop(info);
+   const camPos = this.camera.getWorldPosition(this._tmpVec2);
+   const dir = camPos.clone().sub(anchorTop); dir.y = 0; if (dir.lengthSq() < 1e-6) dir.set(1,0,0); dir.normalize();
+   const stemLength = 2;
+   const labelPos = anchorTop.clone().addScaledVector(dir, stemLength); labelPos.y += stemLength;
+   const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
+   if (this._hoverStem) {
+     this._hoverStem.geometry.dispose();
+     this._hoverStem.geometry = stemGeom;
+     this._hoverStem.visible = true;
+   }
+   if (this._hoverLabel) {
+     this._hoverLabel.position.copy(labelPos);
+     this._hoverLabel.visible = true;
+   }
+   this._hoverGroup.visible = true;
+ }
     return changed;
   }
 

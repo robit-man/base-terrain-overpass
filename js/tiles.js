@@ -36,11 +36,11 @@ export class TileManager {
     this.VISUAL_CREATE_BUDGET = 4;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 0;
-    this.RELAX_ALPHA = 0.0;
+    this.RELAX_ITERS_PER_FRAME = 20;
+    this.RELAX_ALPHA = 0.2;
     this.NORMALS_EVERY = 10;
     // keep relax cheap so fetching dominates
-    this.RELAX_FRAME_BUDGET_MS = 0;
+    this.RELAX_FRAME_BUDGET_MS = 1;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
@@ -65,13 +65,6 @@ export class TileManager {
     this._relaxKeys = [];
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
-    this._spiralCache = new Map();
-    this._bootstrapInteractivePending = 0;
-    this._bootstrapOuterPending = 0;
-    this._bootstrapInteractiveReady = false;
-    this._bootstrapOuterReady = false;
-    this._bootstrapComplete = false;
-    this._deferredOuterTiles = new Set();
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -146,106 +139,6 @@ export class TileManager {
   _hexDist(q1, r1, q2, r2) {
     const dq = q1 - q2, dr = r1 - r2, ds = (-q1 - r1) - (-q2 - r2);
     return (Math.abs(dq) + Math.abs(dr) + Math.abs(ds)) / 2;
-  }
-
-  _getAxialSpiralOffsets(radius) {
-    const r = Math.max(0, radius | 0);
-    if (!this._spiralCache.has(r)) {
-      const offsets = [];
-      for (let dq = -r; dq <= r; dq++) {
-        const rMin = Math.max(-r, -dq - r);
-        const rMax = Math.min(r, -dq + r);
-        for (let dr = rMin; dr <= rMax; dr++) {
-          const dist = this._hexDist(0, 0, dq, dr);
-          offsets.push({ dq, dr, dist });
-        }
-      }
-      offsets.sort((a, b) => (a.dist - b.dist) || (a.dq - b.dq) || (a.dr - b.dr));
-      this._spiralCache.set(r, offsets);
-    }
-    return this._spiralCache.get(r) || [];
-  }
-
-  _flagBootstrapTile(tile, band) {
-    if (!tile || this._bootstrapComplete) return;
-    if (band !== 'interactive' && band !== 'outer') return;
-    if (tile._bootstrapBand && tile._bootstrapBand !== band) return;
-
-    tile._bootstrapBand = band;
-    if (tile._bootstrapFinished) return;
-
-    const done = tile._phase?.fullDone && tile.unreadyCount === 0;
-    if (done) {
-      this._onBootstrapTileFinished(tile);
-      return;
-    }
-
-    if (!tile._bootstrapPending) {
-      tile._bootstrapPending = true;
-      if (band === 'interactive') this._bootstrapInteractivePending++;
-      else this._bootstrapOuterPending++;
-    }
-  }
-
-  _onBootstrapTileFinished(tile) {
-    if (!tile || tile._bootstrapFinished) return;
-    if (tile._bootstrapBand === 'interactive') {
-      if (tile._bootstrapPending) {
-        this._bootstrapInteractivePending = Math.max(0, this._bootstrapInteractivePending - 1);
-      }
-    } else if (tile._bootstrapBand === 'outer') {
-      if (tile._bootstrapPending) {
-        this._bootstrapOuterPending = Math.max(0, this._bootstrapOuterPending - 1);
-      }
-    } else {
-      return;
-    }
-
-    tile._bootstrapPending = false;
-    tile._bootstrapFinished = true;
-    this._deferredOuterTiles.delete(tile);
-
-    if (!this._bootstrapInteractiveReady && this._bootstrapInteractivePending === 0) {
-      this._onBootstrapInteractiveReady();
-    }
-    if (!this._bootstrapOuterReady && this._bootstrapInteractiveReady && this._bootstrapOuterPending === 0) {
-      this._onBootstrapOuterReady();
-    }
-  }
-
-  _maybeCompleteBootstrapTile(tile) {
-    if (!tile || tile._bootstrapFinished) return;
-    if (!tile._bootstrapBand) return;
-    if (tile._phase?.fullDone && tile.unreadyCount === 0) {
-      this._onBootstrapTileFinished(tile);
-    }
-  }
-
-  _onBootstrapInteractiveReady() {
-    if (this._bootstrapInteractiveReady) return;
-    this._bootstrapInteractiveReady = true;
-    this._queueDeferredOuterVisuals();
-    if (this._bootstrapOuterPending === 0) this._onBootstrapOuterReady();
-  }
-
-  _onBootstrapOuterReady() {
-    if (this._bootstrapOuterReady) return;
-    this._bootstrapOuterReady = true;
-    this._bootstrapComplete = true;
-  }
-
-  _queueDeferredOuterVisuals() {
-    if (!this._deferredOuterTiles.size) return;
-    for (const tile of Array.from(this._deferredOuterTiles)) {
-      if (!tile || tile._bootstrapFinished) {
-        this._deferredOuterTiles.delete(tile);
-        continue;
-      }
-      tile._bootstrapDeferred = false;
-      this._queuePopulateIfNeeded(tile, false);
-    }
-    this._deferredOuterTiles.clear();
-    this._scheduleBackfill(0);
   }
 
   _getTile(q, r) { return this.tiles.get(`${q},${r}`) || null; }
@@ -833,15 +726,7 @@ export class TileManager {
     return { group, mesh, geometry: geom, mat, wireMat: wire.material };
   }
 
-  _addVisualTile(q, r, options = false) {
-    let priority = false;
-    let bootstrapBand = null;
-    if (typeof options === 'boolean') {
-      priority = options;
-    } else if (options && typeof options === 'object') {
-      priority = !!options.priority;
-      bootstrapBand = options.bootstrapBand || null;
-    }
+  _addVisualTile(q, r) {
     const id = `${q},${r}`;
     if (this.tiles.has(id)) return this.tiles.get(id);
 
@@ -871,21 +756,8 @@ export class TileManager {
     };
     this.tiles.set(id, tile);
 
-    const cached = this._tryLoadTileFromCache(tile);
-
-    const shouldDeferOuter = (bootstrapBand === 'outer') && !this._bootstrapInteractiveReady && !this._bootstrapComplete;
-    if (!cached) {
-      if (shouldDeferOuter) {
-        tile._bootstrapDeferred = true;
-        this._deferredOuterTiles.add(tile);
-      } else {
-        this._queuePopulate(tile, priority);
-      }
-    }
-
-    if (bootstrapBand === 'interactive' || bootstrapBand === 'outer') {
-      this._flagBootstrapTile(tile, bootstrapBand);
-      if (cached) this._maybeCompleteBootstrapTile(tile);
+    if (!this._tryLoadTileFromCache(tile)) {
+      this._queuePopulate(tile, false);
     }
     return tile;
   }
@@ -896,7 +768,6 @@ export class TileManager {
     const id = `${q},${r}`;
     const v = this.tiles.get(id);
     if (!v || v.type !== 'visual') return this._addInteractiveTile(q, r);
-    this._deferredOuterTiles.delete(v);
 
     const grid = new UniformHexGrid(this.spacing, this.tileRadius * 2);
     grid.group.name = `tile-${id}`;
@@ -1264,14 +1135,6 @@ export class TileManager {
 
   _queuePopulateIfNeeded(tile, priority = false) {
     if (!tile) return;
-    if (!this._bootstrapComplete && !this._bootstrapInteractiveReady && tile._bootstrapBand === 'outer') {
-      // defer outer-ring bootstrap fetches until the inner ring finishes
-      if (!tile._bootstrapDeferred) {
-        tile._bootstrapDeferred = true;
-        this._deferredOuterTiles.add(tile);
-      }
-      return;
-    }
     if (!this._tileNeedsFetch(tile)) return;
     if (tile.populating) return;
 
@@ -1290,21 +1153,8 @@ export class TileManager {
 
   _queuePopulatePhase(tile, phase, priority = false) {
     if (!tile) return;
+    if (this._isPhaseQueued(tile, phase)) return;
     const key = this._phaseKey(phase);
-    const existingIdx = this._populateQueue.findIndex(e => e.tile === tile && e.phase === phase);
-    if (existingIdx >= 0) {
-      if (priority) {
-        const existing = this._populateQueue.splice(existingIdx, 1)[0];
-        existing.priority = true;
-        this._populateQueue.unshift(existing);
-        this._drainPopulateQueue();
-      }
-      tile._queuedPhases?.add?.(key);
-      return;
-    }
-    if (tile._queuedPhases?.has(key)) {
-      return;
-    }
     tile._queuedPhases?.add(key);
     const entry = { tile, phase, priority: !!priority };
     if (priority) this._populateQueue.unshift(entry);
@@ -1497,8 +1347,6 @@ export class TileManager {
       tile._phase.fullDone = true;
       this._saveTileToCache(tile);
     }
-
-    this._maybeCompleteBootstrapTile(tile);
   }
 
 
@@ -1528,45 +1376,18 @@ export class TileManager {
   }
 
   _prewarmVisualRing(q0 = 0, r0 = 0) {
-    const offsets = this._getAxialSpiralOffsets(this.VISUAL_RING);
-    const inBootstrap = !this._bootstrapComplete;
-    for (const { dq, dr, dist } of offsets) {
-      const q = q0 + dq;
-      const r = r0 + dr;
-      const id = `${q},${r}`;
-      const priority = dist <= this.INTERACTIVE_RING;
-      if (!inBootstrap) {
-        const existing = this.tiles.get(id);
-        if (!existing) {
-          this._addVisualTile(q, r, { priority });
-        } else if (existing.type === 'visual') {
-          this._queuePopulateIfNeeded(existing, priority);
-        }
-        continue;
-      }
-      const band = dist <= this.INTERACTIVE_RING ? 'interactive' : 'outer';
-      const existing = this.tiles.get(id);
-      if (!existing) {
-        this._addVisualTile(q, r, { priority: band === 'interactive', bootstrapBand: band });
-        continue;
-      }
-      if (existing.type === 'interactive') continue;
-      this._flagBootstrapTile(existing, band);
-      this._maybeCompleteBootstrapTile(existing);
-      if (existing._bootstrapFinished) {
-        this._deferredOuterTiles.delete(existing);
-        continue;
-      }
-      if (band === 'interactive') {
-        this._queuePopulateIfNeeded(existing, true);
-      } else {
-        if (!this._bootstrapInteractiveReady && !this._bootstrapComplete) {
-          if (!existing._bootstrapDeferred) {
-            existing._bootstrapDeferred = true;
-            this._deferredOuterTiles.add(existing);
-          }
+    for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
+      const rMin = Math.max(-this.VISUAL_RING, -dq - this.VISUAL_RING);
+      const rMax = Math.min(this.VISUAL_RING, -dq + this.VISUAL_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.INTERACTIVE_RING) continue;
+        if (!this.tiles.has(`${q},${r}`)) {
+          this._addVisualTile(q, r);
         } else {
-          this._queuePopulateIfNeeded(existing, false);
+          const t = this.tiles.get(`${q},${r}`);
+          this._queuePopulateIfNeeded(t, false);
         }
       }
     }
@@ -1583,58 +1404,45 @@ export class TileManager {
     const rf = ((-1 / 3 * playerPos.x) + (Math.sqrt(3) / 3 * playerPos.z)) / a;
     const q0 = Math.round(qf), r0 = Math.round(rf);
 
-    // 1) ensure interactive footprint starts as visual and promote once ready
-    const interactiveOffsets = this._getAxialSpiralOffsets(this.INTERACTIVE_RING);
-    const toPromote = [];
-    for (const { dq, dr, dist } of interactiveOffsets) {
-      const q = q0 + dq;
-      const r = r0 + dr;
-      const id = `${q},${r}`;
-      let tile = this.tiles.get(id);
-      if (tile && tile.type === 'interactive') continue;
-      if (!tile) {
-        const bootstrapBand = this._bootstrapComplete ? null : 'interactive';
-        tile = this._addVisualTile(q, r, { priority: true, bootstrapBand });
-      } else if (!this._bootstrapComplete) {
-        this._flagBootstrapTile(tile, 'interactive');
+    // 1) interactive ring
+    for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
+      const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
+      const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const id = `${q},${r}`;
+        const cur = this.tiles.get(id);
+        if (!cur) {
+          this._addInteractiveTile(q, r);
+        } else if (cur.type === 'visual') {
+          this._promoteVisualToInteractive(q, r);
+        }
       }
-      if (!tile || tile.type !== 'visual') continue;
-      if (!this._bootstrapComplete) this._maybeCompleteBootstrapTile(tile);
-      this._queuePopulateIfNeeded(tile, true);
-      const ready = tile._phase?.fullDone && tile.unreadyCount === 0;
-      const isBootstrapInteractive = !this._bootstrapComplete && tile._bootstrapBand === 'interactive';
-      if (ready && !isBootstrapInteractive) {
-        toPromote.push({ tile, dist });
-      }
-    }
-    toPromote.sort((a, b) => (a.dist - b.dist) || (a.tile.q - b.tile.q) || (a.tile.r - b.tile.r));
-    for (const { tile } of toPromote) {
-      if (tile.type === 'visual') this._promoteVisualToInteractive(tile.q, tile.r);
     }
 
-    // 2) grow visual ring center-out, respecting budget
-    const visualOffsets = this._getAxialSpiralOffsets(this.VISUAL_RING);
+    // 2) visuals outward with budget
     let created = 0;
-    for (const { dq, dr, dist } of visualOffsets) {
-      if (dist <= this.INTERACTIVE_RING) continue;
-      const q = q0 + dq;
-      const r = r0 + dr;
-      const id = `${q},${r}`;
-      const existing = this.tiles.get(id);
-      if (existing) {
-        if (existing.type === 'visual') {
-          if (!this._bootstrapComplete) this._flagBootstrapTile(existing, 'outer');
-          if (!this._bootstrapComplete) this._maybeCompleteBootstrapTile(existing);
-          if (this._bootstrapComplete || this._bootstrapInteractiveReady) {
+    outer:
+    for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
+      const rMin = Math.max(-this.VISUAL_RING, -dq - this.VISUAL_RING);
+      const rMax = Math.min(this.VISUAL_RING, -dq + this.VISUAL_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.INTERACTIVE_RING) continue;
+        const had = this.tiles.has(`${q},${r}`);
+        if (!had) {
+          this._addVisualTile(q, r);
+          if (++created >= this.VISUAL_CREATE_BUDGET) break outer;
+        } else {
+          const existing = this.tiles.get(`${q},${r}`);
+          if (dist <= this.INTERACTIVE_RING && existing.type === 'visual') {
+            this._promoteVisualToInteractive(q, r);
+          } else if (existing) {
             this._queuePopulateIfNeeded(existing, false);
           }
         }
-        continue;
       }
-      if (created >= this.VISUAL_CREATE_BUDGET) continue;
-      const bootstrapBand = this._bootstrapComplete ? null : 'outer';
-      this._addVisualTile(q, r, { priority: false, bootstrapBand });
-      created++;
     }
 
     // 3) prune outside visual ring
@@ -1689,10 +1497,10 @@ export class TileManager {
 
     if (changed) {
       this._resetAllTiles();
-      this._ensureType(0, 0, 'visual');
+      this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
     } else if (immediate && !this.tiles.size) {
-      this._ensureType(0, 0, 'visual');
+      this._ensureType(0, 0, 'interactive');
       this._prewarmVisualRing(0, 0);
     }
 
@@ -1868,7 +1676,6 @@ export class TileManager {
       t.grid.mat?.dispose?.();
       t.grid.wireMat?.dispose?.();
     } catch { }
-    this._deferredOuterTiles.delete(t);
     this.tiles.delete(id);
     this._markRelaxListDirty();
   }
@@ -1886,12 +1693,6 @@ export class TileManager {
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
     this._lastHeight = 0;
-    this._bootstrapInteractivePending = 0;
-    this._bootstrapOuterPending = 0;
-    this._bootstrapInteractiveReady = false;
-    this._bootstrapOuterReady = false;
-    this._bootstrapComplete = false;
-    this._deferredOuterTiles.clear();
   }
 
   dispose() {
