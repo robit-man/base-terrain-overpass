@@ -127,6 +127,11 @@ export class MiniMap {
       }
     });
 
+    const mouseToLatLng = (src) => {
+      if (!src) return null;
+      try { return this.map.mouseEventToLatLng(src); } catch { return null; }
+    };
+
     const getContainerPoint = (ev) => {
       if (ev?.containerPoint) return ev.containerPoint;
       const orig = ev?.originalEvent;
@@ -147,6 +152,13 @@ export class MiniMap {
 
     const getLatLng = (ev) => {
       if (ev?.latlng) return ev.latlng;
+      const orig = ev?.originalEvent;
+      if (orig) {
+        const touchSrc = orig.touches?.length ? orig.touches[0]
+          : (orig.changedTouches?.length ? orig.changedTouches[0] : orig);
+        const viaMouse = mouseToLatLng(touchSrc);
+        if (viaMouse) return viaMouse;
+      }
       const pt = getContainerPoint(ev);
       if (!pt) return null;
       try {
@@ -223,6 +235,7 @@ export class MiniMap {
     this.map.on('mousemove', handleMoveDuringPress);
     this.map.on('touchmove', handleMoveDuringPress);
     this.map.on('pointermove', handleMoveDuringPress);
+    this.map.on('click', (ev) => armFromEvent(ev));
     this.map.on('contextmenu', (ev) => {
       ev?.originalEvent?.preventDefault?.();
       cancelLongPress();
@@ -360,8 +373,16 @@ export class MiniMap {
     this.moveBtn.classList.toggle('armed', armed);
     if (armed) {
       const { lat, lon } = this._pendingTeleport;
+      if (this.moveBtn) {
+        this.moveBtn.dataset.lat = lat.toFixed(5);
+        this.moveBtn.dataset.lon = lon.toFixed(5);
+      }
       this.moveBtn.title = `Teleport to ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     } else {
+      if (this.moveBtn) {
+        delete this.moveBtn.dataset.lat;
+        delete this.moveBtn.dataset.lon;
+      }
       this.moveBtn.title = 'Tap and hold on the mini-map to choose a destination';
     }
   }
@@ -448,6 +469,9 @@ export class MiniMap {
     this._pendingTeleport = entry;
     this._moveArmed = true;
     this._setFollow(false);
+    try {
+      this.map?.setView?.([entry.lat, entry.lon], this.map?.getZoom?.() ?? DEFAULT_CENTER.zoom, { animate: true });
+    } catch {}
     this.viewCenter = { ...entry };
     this.userHasPanned = false;
     this._updateMoveButton();
