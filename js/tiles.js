@@ -304,6 +304,7 @@ export class TileManager {
   }
   _relaxOnce(tile) {
     if (tile.type !== 'interactive') return false;
+    if (tile.relaxEnabled !== true) return false;
     if (tile.fetched.size === 0) return false;
     if (typeof tile.unreadyCount !== 'number') tile.unreadyCount = tile.pos.count;
     if (tile.unreadyCount === 0) return false;
@@ -638,6 +639,7 @@ export class TileManager {
         tile._phase.seedDone = true;
         tile._phase.edgeDone = true;
         tile._phase.fullDone = true;
+        tile.relaxEnabled = false;
       } else {
         tile._phase.fullDone = true;
       }
@@ -701,7 +703,8 @@ export class TileManager {
       unreadyCount: pos.count,
       _phase: { seedDone: false, edgeDone: false, fullDone: false },
       _queuedPhases: new Set(),
-      locked: new Uint8Array(pos.count)
+      locked: new Uint8Array(pos.count),
+      relaxEnabled: false
     };
     this._ensureTileBuffers(tile);
     this.tiles.set(id, tile);
@@ -871,7 +874,8 @@ export class TileManager {
       unreadyCount: pos.count,
       _phase: { seedDone: false, edgeDone: false, fullDone: false },
       _queuedPhases: new Set(),
-      locked: new Uint8Array(pos.count)
+      locked: new Uint8Array(pos.count),
+      relaxEnabled: false
     };
 
     // Seed heights from visual + neighbors, but corner-aware
@@ -1027,6 +1031,85 @@ export class TileManager {
 
     tile.locked = locked;
     pos.needsUpdate = true;
+  }
+
+  _projectInteractiveSeed(tile) {
+    if (!tile || tile.type !== 'interactive') return false;
+
+    const centerIdx = this._selectCenterIndex(tile);
+    const cornerIdx = this._selectCornerTipIndices(tile);
+    if (!Number.isInteger(centerIdx) || !cornerIdx || cornerIdx.length < 6) return false;
+    if (!tile.ready[centerIdx]) return false;
+
+    const pos = tile.pos;
+    const locked = tile.locked || new Uint8Array(pos.count);
+    const centerX = pos.getX(centerIdx);
+    const centerZ = pos.getZ(centerIdx);
+    const centerY = pos.getY(centerIdx);
+
+    const cornerSet = new Set(cornerIdx);
+    const triangles = [];
+    for (let i = 0; i < 6; i++) {
+      const idxA = cornerIdx[i];
+      const idxB = cornerIdx[(i + 1) % 6];
+      if (!tile.ready[idxA] || !tile.ready[idxB]) continue;
+
+      const ax = pos.getX(idxA) - centerX;
+      const az = pos.getZ(idxA) - centerZ;
+      const ay = pos.getY(idxA);
+      const bx = pos.getX(idxB) - centerX;
+      const bz = pos.getZ(idxB) - centerZ;
+      const by = pos.getY(idxB);
+      const denom = ax * bz - bx * az;
+      if (Math.abs(denom) < 1e-6) continue;
+
+      triangles.push({
+        idxA,
+        idxB,
+        ax,
+        az,
+        ay,
+        bx,
+        bz,
+        by,
+        denom
+      });
+    }
+
+    if (triangles.length === 0) return false;
+
+    let changed = false;
+    for (let i = 0; i < pos.count; i++) {
+      if (i === centerIdx) continue;
+      if (cornerSet.has(i)) continue;
+      if (tile.ready[i]) continue;
+      if (locked[i]) continue;
+
+      const px = pos.getX(i) - centerX;
+      const pz = pos.getZ(i) - centerZ;
+
+      let height = null;
+      for (const tri of triangles) {
+        const u = (px * tri.bz - tri.bx * pz) / tri.denom;
+        const v = (tri.ax * pz - px * tri.az) / tri.denom;
+        const w = 1 - u - v;
+        if (u >= -1e-5 && v >= -1e-5 && w >= -1e-5) {
+          height = w * centerY + u * tri.ay + v * tri.by;
+          break;
+        }
+      }
+
+      if (height == null) height = centerY;
+      pos.setY(i, height);
+      changed = true;
+    }
+
+    if (changed) {
+      pos.needsUpdate = true;
+      this._pullGeometryToBuffers(tile);
+    }
+
+    return changed;
   }
 
 
@@ -1380,13 +1463,22 @@ export class TileManager {
 
     await Promise.allSettled(queries);
 
-    // ---- enforce straight sides BEFORE any smoothing/filling ----
-    if (tile.type === 'interactive' && (phase === PHASE_SEED || phase === PHASE_EDGE)) {
-      this._pinEdgesFromCorners(tile);  // creates/updates tile.locked
+    let skipBlend = false;
+    if (tile.type === 'interactive') {
+      if (phase === PHASE_SEED) {
+        this._pinEdgesFromCorners(tile);
+        skipBlend = this._projectInteractiveSeed(tile);
+      } else if (phase === PHASE_EDGE) {
+        this._pinEdgesFromCorners(tile);
+      }
     }
 
     if (tile.type === 'farfield') {
       pos.needsUpdate = true;
+      this._applyAllColorsGlobal(tile);
+    } else if (skipBlend) {
+      pos.needsUpdate = true;
+      tile.grid.geometry.computeVertexNormals();
       this._applyAllColorsGlobal(tile);
     } else {
       // ---- blend / seal with pinned edges acting as anchors ----
@@ -1681,7 +1773,7 @@ export class TileManager {
     if (!this._relaxKeysDirty) return;
     this._relaxKeys = [];
     for (const [id, tile] of this.tiles.entries()) {
-      if (tile.type === 'interactive') this._relaxKeys.push(id);
+      if (tile.type === 'interactive' && tile.relaxEnabled === true) this._relaxKeys.push(id);
     }
     this._relaxCursor = this._relaxKeys.length ? this._relaxCursor % this._relaxKeys.length : 0;
     this._relaxKeysDirty = false;
@@ -1818,9 +1910,11 @@ export class TileManager {
 
       if (!tile.locked || tile.locked.length !== tile.pos.count) tile.locked = new Uint8Array(tile.pos.count);
       else tile.locked.fill(0);
+      if (tile.type === 'interactive') tile.relaxEnabled = false;
 
       this._queuePopulate(tile, tile.type === 'interactive');
     }
+    this._markRelaxListDirty();
     this._scheduleBackfill(0);
   }
 
