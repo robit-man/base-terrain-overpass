@@ -1676,7 +1676,7 @@ class App {
         performance.measure('build-update', 'build-update-start', 'build-update-end');
       }
       // 33ms ~ 30 Hz; tweak as needed
-      this._nextBuildingsUpdateMs = nowMs + 33;
+      this._nextBuildingsUpdateMs = nowMs + 12;
     }
 
     this._updateBuildingHover(xrOn);
@@ -1740,7 +1740,7 @@ class App {
       const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
       if (hudLatLon) this._updateHudGeo(hudLatLon);
       this._hudGeoLastPos.copy(dolly.position);
-      this._hudGeoNextMs = hudNow + 200; // 5 Hz
+      this._hudGeoNextMs = hudNow + 100; // 5 Hz
     }
 
     // === NEW: throttle minimap updates (10 Hz) ===
@@ -1783,11 +1783,11 @@ class App {
     }
     const now = performance?.now ? performance.now() : Date.now();
 
-    // Only raycast if pointer moved in last 300ms and at most ~12.5Hz
-    if (now - this._pointerLastMoveMs > 300) {
-      this.buildings.clearHover();
-      return;
-    }
+      // Only raycast if pointer moved in last 300ms and at most ~12.5Hz
+      if (now - this._pointerLastMoveMs > 3000) {
+        this.buildings.clearHover();
+        return;
+      }
     if (now < this._hoverNextAllowedMs) return;
     this._hoverNextAllowedMs = now + 80; // ~12.5 Hz
 

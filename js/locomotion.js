@@ -33,10 +33,27 @@ export class Locomotion {
       xr.addEventListener('sessionstart', this._onXRSessionStart);
       xr.addEventListener('sessionend', this._onXRSessionEnd);
     }
+
+    // --- Mobile swipe steering state ---
+    this._touchYawOffset = 0;
+    this._lastAppliedTouchYaw = 0;
+    this._touchYawRate = THREE.MathUtils.degToRad(180); // rad/s when swipe fully deflected
   }
 
   update(dt, groundY, xrPresenting) {
     const dol = this.sceneMgr.dolly;
+
+    const isMobileDevice = isMobile;
+    let mobileDx = 0;
+    let mobileDy = 0;
+    if (isMobileDevice) {
+      mobileDx = THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
+      mobileDy = THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
+      const yawDelta = mobileDx * this._touchYawRate * dt;
+      if (Math.abs(yawDelta) > 1e-5) {
+        this._touchYawOffset = THREE.MathUtils.euclideanModulo(this._touchYawOffset + yawDelta + Math.PI, Math.PI * 2) - Math.PI;
+      }
+    }
 
     // Jump / crouch state
     if (this.input.consumeJump() && this.jumpState === 'idle') {
@@ -61,37 +78,43 @@ export class Locomotion {
     }
 
     // Device orientation (mobile, non-XR)
-    if (isMobile && this.orientationRef.ready && !xrPresenting) {
+    if (isMobileDevice && this.orientationRef.ready && !xrPresenting) {
       const { a, b, g } = this.orientationRef;
       const euler = new THREE.Euler(rad(b || 0), rad(a || 0), rad(-(g || 0)), 'YXZ');
       const q = new THREE.Quaternion().setFromEuler(euler)
         .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
       dol.quaternion.copy(q);
+      this._lastAppliedTouchYaw = 0;
+    }
+
+    if (isMobileDevice && !xrPresenting) {
+      const yawDelta = this._touchYawOffset - this._lastAppliedTouchYaw;
+      if (Math.abs(yawDelta) > 1e-5) {
+        dol.rotateOnWorldAxis(UP, yawDelta);
+        this._lastAppliedTouchYaw = this._touchYawOffset;
+      }
     }
 
     // VR gamepads take over when XR is active
     if (xrPresenting) {
       this._updateXRGamepads(dt);
     }
-    // Mobile finger drag relative to view
-    else if (isMobile) {
-      const dx = THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
-      const dy = THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
-      if (dx || dy) {
+    // Mobile finger drag: forward thrust with yaw steering
+    else if (isMobileDevice) {
+      const forwardInput = -mobileDy;
+      if (Math.abs(forwardInput) > 1e-3) {
         const forward = new THREE.Vector3();
         this.sceneMgr.camera.getWorldDirection(forward);
-        forward.y = 0; if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+        forward.y = 0;
+        if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
         forward.normalize();
-        const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0)).normalize();
 
-        const moveVec = new THREE.Vector3()
-          .addScaledVector(right, dx)
-          .addScaledVector(forward, -dy)
-          .multiplyScalar(this.baseSpeed * this.runMul);
-
-        dol.position.addScaledVector(moveVec, dt);
-        this._spd = moveVec.length();
-      } else { this._spd = 0; }
+        const scalar = this.baseSpeed * this.runMul * forwardInput;
+        dol.position.addScaledVector(forward, scalar * dt);
+        this._spd = Math.abs(forwardInput) * this.baseSpeed * this.runMul;
+      } else {
+        this._spd = 0;
+      }
     }
     // Desktop fallback
     else {

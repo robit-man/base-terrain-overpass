@@ -121,7 +121,7 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 4000,
+    radius = 2000,
     tileSize,
     color = 0x333333,
     roadWidth = 4,

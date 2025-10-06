@@ -48,6 +48,10 @@ export class MiniMap {
     this.currentLatLon = null;
     this.viewCenter = null;
     this.peerMarkers = new Map();
+    this._lastFollowLatLon = null;
+    this._autoFollowThreshold = 0.0001; // ≈10–12 m on Earth
+    this._pendingHeadingDeg = null;
+    this._headingCssCurrent = null;
 
     this.map = null;
     this.playerMarker = null;
@@ -56,8 +60,8 @@ export class MiniMap {
     this._initMap();
 
     this.recenterBtn?.addEventListener('click', () => {
-      this._setFollow(!this.followEnabled);
-      if (this.followEnabled) this._centerOnPlayer(true);
+      this._setFollow(true);
+      this._centerOnPlayer(true);
     });
 
     this.centerBtn?.addEventListener('click', () => {
@@ -91,7 +95,27 @@ export class MiniMap {
     }).addTo(this.map);
 
     this.peerLayer = window.L.layerGroup().addTo(this.map);
-    this.playerMarker = window.L.marker([DEFAULT_CENTER.lat, DEFAULT_CENTER.lon]).addTo(this.map);
+    const icon = window.L.divIcon({
+      className: 'leaflet-div-icon minimap-player-icon',
+      html: '<div class="minimap-player-marker"></div>',
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+    });
+    this.playerMarker = window.L.marker([DEFAULT_CENTER.lat, DEFAULT_CENTER.lon], {
+      icon,
+      interactive: false,
+      keyboard: false,
+      bubblingMouseEvents: false,
+    }).addTo(this.map);
+    this.playerMarker.on('add', () => {
+      const pending = Number.isFinite(this._pendingHeadingDeg)
+        ? this._pendingHeadingDeg
+        : (typeof this.getHeadingDeg === 'function' ? this.getHeadingDeg() : null);
+      if (Number.isFinite(pending)) {
+        this._pendingHeadingDeg = null;
+        this._applyPlayerHeading(pending);
+      }
+    });
 
     this.map.on('movestart', () => {
       if (this.followEnabled) this._setFollow(false);
@@ -118,6 +142,7 @@ export class MiniMap {
 
     if (latLon) {
       this.currentLatLon = latLon;
+      this._maybeAutoFollow(latLon);
       if (this.playerMarker) this.playerMarker.setLatLng(toLeafletLatLng(latLon));
 
       if (this.followEnabled && this.map) {
@@ -126,6 +151,9 @@ export class MiniMap {
         this.viewCenter = { ...latLon };
       }
     }
+
+    const heading = this.getHeadingDeg ? this.getHeadingDeg() : 0;
+    this._applyPlayerHeading(heading);
 
     this._updatePeers();
     this._updateMoveButton();
@@ -154,6 +182,8 @@ export class MiniMap {
     }
 
     this._setStatus(this.activeSource, entry.lat, entry.lon);
+    const heading = this.getHeadingDeg ? this.getHeadingDeg() : null;
+    if (Number.isFinite(heading)) this._applyPlayerHeading(heading);
     this._updateMoveButton();
   }
 
@@ -178,6 +208,7 @@ export class MiniMap {
       if (this.currentLatLon) this.viewCenter = { ...this.currentLatLon };
       this._centerOnPlayer(true);
     }
+    this._lastFollowLatLon = this.currentLatLon ? { ...this.currentLatLon } : null;
     this._updateFollowButton();
     this._updateMoveButton();
   }
@@ -272,5 +303,53 @@ export class MiniMap {
       label += ` · ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     }
     this.statusEl.textContent = label;
+  }
+
+  _maybeAutoFollow(latLon) {
+    if (this.followEnabled) return;
+    if (!latLon) return;
+    if (!this._lastFollowLatLon) {
+      this._lastFollowLatLon = { ...latLon };
+      return;
+    }
+    const dLat = latLon.lat - this._lastFollowLatLon.lat;
+    const dLon = latLon.lon - this._lastFollowLatLon.lon;
+    const dist = Math.sqrt(dLat * dLat + dLon * dLon);
+    if (dist >= this._autoFollowThreshold) {
+      this._setFollow(true);
+    }
+  }
+
+  _applyPlayerHeading(deg) {
+    if (!Number.isFinite(deg)) return;
+    const markerEl = this.playerMarker?.getElement?.();
+    if (!markerEl) {
+      this._pendingHeadingDeg = deg;
+      return;
+    }
+
+    const marker = markerEl.querySelector('.minimap-player-marker');
+    if (!marker) return;
+
+    const normalized = ((deg % 360) + 360) % 360;
+    let target = normalized;
+    if (target > 180) target -= 360;
+    target = -target;
+
+    if (!Number.isFinite(this._headingCssCurrent)) {
+      this._headingCssCurrent = target;
+    } else {
+      let delta = target - this._headingCssCurrent;
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      this._headingCssCurrent += delta;
+    }
+
+    marker.style.transform = `rotate(${this._headingCssCurrent}deg)`;
+    if (this._headingCssCurrent > 720 || this._headingCssCurrent < -720) {
+      const wrapped = ((this._headingCssCurrent % 360) + 360) % 360;
+      this._headingCssCurrent = wrapped > 180 ? wrapped - 360 : wrapped;
+    }
+    this._pendingHeadingDeg = null;
   }
 }
