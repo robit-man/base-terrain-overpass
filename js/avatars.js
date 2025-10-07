@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+import { loadCharacterAnimationClips } from './character.js';
 
-const MODEL_URL = 'https://threejs.org/examples/models/gltf/Soldier.glb';
+//const MODEL_URL = 'https://threejs.org/examples/models/gltf/Soldier.glb';
+const MODEL_URL = '/models/Char.glb';
 
 function buildFallbackTemplate() {
   const root = new THREE.Group();
@@ -169,6 +171,9 @@ export class Avatar {
       if (v >= this.runOn) desired = 'Run';
       else if (v >= this.walkOn) desired = 'Walk';
     }
+    if (!this.actions[desired]) {
+      desired = ['Idle', 'Walk', 'Run'].find((name) => this.actions[name]) || desired;
+    }
     return desired;
   }
 
@@ -224,10 +229,10 @@ export class Avatar {
     if (desired !== this.current) this._transition(desired);
 
     // Tempo adaptation (no clip restart)
-    if (this.current === 'Walk') {
+    if (this.current === 'Walk' && this.actions.Walk) {
       const walkRef = 1.8; // m/s nominal
       this.actions.Walk.setEffectiveTimeScale(THREE.MathUtils.clamp(this._vSmooth / walkRef, 0.6, 1.6));
-    } else if (this.current === 'Run') {
+    } else if (this.current === 'Run' && this.actions.Run) {
       const runRef = 5.0;  // m/s nominal
       this.actions.Run.setEffectiveTimeScale(THREE.MathUtils.clamp(this._vSmooth / runRef, 0.7, 1.6));
     } else if (this.actions.Idle) {
@@ -257,12 +262,19 @@ export class AvatarFactory {
 
   static load() {
     if (this._promise) return this._promise;
-    this._promise = new Promise((resolve) => {
+    this._promise = (async () => {
       const loader = new GLTFLoader();
-      loader.load(MODEL_URL, (gltf) => {
+      try {
+        const gltf = await loader.loadAsync(MODEL_URL);
         const template = gltf.scene;
         const animations = gltf.animations || [];
-        const { Idle, Walk, Run } = clipsWithFallback(animations);
+        const external = await loadCharacterAnimationClips(loader, template).catch(() => ({ Idle: null, Walk: null, Run: null }));
+        const fallback = clipsWithFallback(animations);
+        const clips = {
+          Idle: external.Idle || fallback.Idle || null,
+          Walk: external.Walk || fallback.Walk || null,
+          Run: external.Run || fallback.Run || null,
+        };
 
         // bounds for foot alignment and height
         const bounds = new THREE.Box3().setFromObject(template);
@@ -270,15 +282,13 @@ export class AvatarFactory {
         const min = bounds.min; const height = size.y || 1.7;
         const footYOffset = -min.y;
 
-        const factory = new AvatarFactory(template, { Idle, Walk, Run }, footYOffset, height);
-        resolve(factory);
-      }, undefined, (err) => {
+        return new AvatarFactory(template, clips, footYOffset, height);
+      } catch (err) {
         console.warn('[avatar] gltf load failed, falling back to primitive avatar', err);
         const fallback = buildFallbackTemplate();
-        const factory = new AvatarFactory(fallback.template, { Idle: null, Walk: null, Run: null }, fallback.footYOffset, fallback.height);
-        resolve(factory);
-      });
-    });
+        return new AvatarFactory(fallback.template, { Idle: null, Walk: null, Run: null }, fallback.footYOffset, fallback.height);
+      }
+    })();
     return this._promise;
   }
 
@@ -293,6 +303,11 @@ export class AvatarFactory {
     // Deep clone preserves skinning and bone hierarchy
     const root = SkeletonUtils.clone(this.template);
     const mixer = new THREE.AnimationMixer(root);
-    return new Avatar(root, mixer, this.clips, this.footYOffset, this.height);
+    const clips = {
+      Idle: this.clips.Idle ? this.clips.Idle.clone() : null,
+      Walk: this.clips.Walk ? this.clips.Walk.clone() : null,
+      Run:  this.clips.Run  ? this.clips.Run.clone()  : null,
+    };
+    return new Avatar(root, mixer, clips, this.footYOffset, this.height);
   }
 }

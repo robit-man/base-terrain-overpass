@@ -60,6 +60,7 @@ export class TileManager {
     // ---- caching config ----
     this.CACHE_VER = 'v1';
     this._originCacheKey = 'na';
+    this._fetchPhase = 'interactive';
 
     this.ray = new THREE.Raycaster();
     this.DOWN = new THREE.Vector3(0, -1, 0);
@@ -644,6 +645,7 @@ export class TileManager {
         tile._phase.fullDone = true;
       }
 
+      if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
       return true;
     } catch { return false; }
   }
@@ -1269,6 +1271,40 @@ export class TileManager {
     return !(tile._phase?.seedDone && tile._phase?.edgeDone && tile._phase?.fullDone) || tile.unreadyCount > 0;
   }
 
+  _interactiveTilesPending(exclude = null) {
+    for (const tile of this.tiles.values()) {
+      if (tile === exclude) continue;
+      if (tile.type !== 'interactive') continue;
+      if (this._tileNeedsFetch(tile)) return true;
+    }
+    return false;
+  }
+
+  _visualTilesPending(exclude = null) {
+    for (const tile of this.tiles.values()) {
+      if (tile === exclude) continue;
+      if (tile.type !== 'visual') continue;
+      if (this._tileNeedsFetch(tile)) return true;
+    }
+    return false;
+  }
+
+  _tryAdvanceFetchPhase(exclude = null) {
+    if (this._fetchPhase === 'interactive') {
+      if (this._interactiveTilesPending(exclude)) return;
+      this._fetchPhase = 'visual';
+      this._markRelaxListDirty();
+      this._scheduleBackfill(0);
+      return;
+    }
+    if (this._fetchPhase === 'visual') {
+      if (this._visualTilesPending(exclude)) return;
+      this._fetchPhase = 'farfield';
+      this._scheduleBackfill(0);
+      return;
+    }
+  }
+
   _phaseKey(phase) {
     return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
   }
@@ -1286,6 +1322,8 @@ export class TileManager {
     if (!tile) return;
     if (!this._tileNeedsFetch(tile)) return;
     if (tile.populating) return;
+    if (tile.type === 'visual' && this._fetchPhase === 'interactive') return;
+    if (tile.type === 'farfield' && this._fetchPhase !== 'farfield') return;
 
     if (tile.type === 'visual' || tile.type === 'farfield') {
       if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
@@ -1335,6 +1373,19 @@ export class TileManager {
 
       const { tile, phase } = next;
       if (!tile) continue;
+
+      if (tile.type === 'visual' && this._fetchPhase === 'interactive') {
+        const k = this._phaseKey(phase);
+        tile._queuedPhases?.delete(k);
+        tile.populating = false;
+        continue;
+      }
+      if (tile.type === 'farfield' && this._fetchPhase !== 'farfield') {
+        const k = this._phaseKey(phase);
+        tile._queuedPhases?.delete(k);
+        tile.populating = false;
+        continue;
+      }
 
       if (tile.populating) {
         this._populateQueue.push(next);
@@ -1510,6 +1561,7 @@ export class TileManager {
       tile._phase.fullDone = true;
       this._saveTileToCache(tile);
     }
+    if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
   }
 
 
@@ -1527,9 +1579,26 @@ export class TileManager {
 
     if (onlyIfRelayReady && !(this._relayStatus?.text === 'connected' || this._relayStatus?.level === 'ok')) return;
 
+    const phase = this._fetchPhase;
     const entries = [...this.tiles.values()]
       .filter(t => this._tileNeedsFetch(t) && !t.populating && !this._isPhaseQueued(t, PHASE_SEED) && !this._isPhaseQueued(t, PHASE_EDGE) && !this._isPhaseQueued(t, PHASE_FULL))
-      .map(t => ({ t, priority: (t.type === 'interactive' ? 0 : 1), d: this._hexDist(t.q, t.r, 0, 0) }))
+      .map(t => {
+        let priority = 2;
+        if (phase === 'interactive') {
+          if (t.type === 'interactive') priority = 0;
+          else if (t.type === 'visual') priority = 1;
+          else priority = 2;
+        } else if (phase === 'visual') {
+          if (t.type === 'interactive') priority = 0;
+          else if (t.type === 'visual') priority = 1;
+          else priority = 2;
+        } else { // farfield phase
+          if (t.type === 'interactive') priority = 0;
+          else if (t.type === 'visual') priority = 1;
+          else priority = 2;
+        }
+        return { t, priority, d: this._hexDist(t.q, t.r, 0, 0) };
+      })
       .sort((a, b) => (a.priority - b.priority) || (a.d - b.d));
 
     for (const { t } of entries) {
@@ -1914,6 +1983,7 @@ export class TileManager {
 
       this._queuePopulate(tile, tile.type === 'interactive');
     }
+    this._fetchPhase = 'interactive';
     this._markRelaxListDirty();
     this._scheduleBackfill(0);
   }
@@ -1946,6 +2016,7 @@ export class TileManager {
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
     this._lastHeight = 0;
+    this._fetchPhase = 'interactive';
   }
 
   dispose() {
