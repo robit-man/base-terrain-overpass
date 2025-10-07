@@ -1982,12 +1982,21 @@ class App {
     dolly.position.y = groundY + eyeHeight;
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
 
+    const locomotionWorldYaw = xrOn && typeof this.move?.getXRWorldYaw === 'function'
+      ? this.move.getXRWorldYaw()
+      : null;
+    const locomotionHeadHeight = xrOn && typeof this.move?.getXRHeadHeight === 'function'
+      ? this.move.getXRHeadHeight()
+      : null;
+
     if (this.localAvatar) {
       measure('avatar.local', () => {
-        const yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
+        let yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
+        if (Number.isFinite(locomotionWorldYaw)) yawOnly = locomotionWorldYaw;
         const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
-        const baseEyeHeight = this.move.baseEyeHeight?.() ?? eyeHeight;
-        const jumpLift = Math.max(0, eyeHeight - baseEyeHeight);
+        const effectiveEyeHeight = Number.isFinite(locomotionHeadHeight) ? locomotionHeadHeight : eyeHeight;
+        const baseEyeHeight = this.move.baseEyeHeight?.() ?? effectiveEyeHeight;
+        const jumpLift = Math.max(0, effectiveEyeHeight - baseEyeHeight);
         this.localAvatar.setPosition(pos.x, groundY + jumpLift, pos.z);
         this.localAvatar.setQuaternion(qYaw);
         this.localAvatar.setSpeed(this.move.speed());
@@ -2004,9 +2013,10 @@ class App {
     if (!this._mobileFPVOn || xrOn) measure('chase.update', () => this.chase.update(dt, xrOn));
 
     measure('mesh.sendPose', () => {
-      const actualY = groundY + eyeHeight;
       const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
-      const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, eSend.y, 0, 'YXZ'));
+      let sendYaw = eSend.y;
+      if (Number.isFinite(locomotionWorldYaw)) sendYaw = locomotionWorldYaw;
+      const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, sendYaw, 0, 'YXZ'));
       const jumpEvt = this.move.popJumpStarted();
       if (jumpEvt && this.physics?.suspendCharacterSnap) {
         const hangTime = this.move?.jumpHangTime?.() ?? 0;
@@ -2016,6 +2026,8 @@ class App {
         this.physics.suspendCharacterSnap(resumeDelay);
       }
       const crouchActive = this.move.isCrouching?.() ?? false;
+      const effectiveEyeHeight = Number.isFinite(locomotionHeadHeight) ? locomotionHeadHeight : eyeHeight;
+      const actualY = groundY + effectiveEyeHeight;
       this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt, crouchActive);
     });
 

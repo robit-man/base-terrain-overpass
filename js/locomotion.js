@@ -28,11 +28,15 @@ export class Locomotion {
     this._lastHeadRelativeYaw = 0;
     this._bodyYaw = 0;
     this._worldYaw = 0;
+    this._vrJumpRequested = false;
+    this._vrCrouchActive = false;
+    this._headHeight = this.baseEye;
 
     this._onXRSessionStart = () => {
       this._lastHeadRelativeYaw = 0;
       this._bodyYaw = 0;
       this._worldYaw = 0;
+      this._headHeight = this.baseEye;
       if (this.sceneMgr?.dolly) {
         this.sceneMgr.dolly.rotation.y = 0;
         this.sceneMgr.dolly.quaternion.setFromEuler(new THREE.Euler(0, 0, 0, 'YXZ'));
@@ -45,6 +49,9 @@ export class Locomotion {
       this._lastHeadRelativeYaw = 0;
       this._bodyYaw = 0;
       this._worldYaw = 0;
+      this._vrJumpRequested = false;
+      this._vrCrouchActive = false;
+      this._headHeight = this.baseEye;
     };
     const xr = this.sceneMgr.renderer?.xr;
     if (xr?.addEventListener) {
@@ -78,8 +85,11 @@ export class Locomotion {
       }
     }
 
+    const jumpRequested = this.input.consumeJump() || this._consumeVrJump();
+    const crouchInput = this.input.m.crouch || this._vrCrouchActive;
+
     // Jump / crouch state
-    if (this.input.consumeJump() && this.jumpState === 'idle') {
+    if (jumpRequested && this.jumpState === 'idle') {
       const h = this.jumpPeak - this.baseEye;
       this.vertVel = Math.sqrt(2 * this.GRAV * h);
       this._pendingHangTime = (2 * this.vertVel) / this.GRAV;
@@ -96,7 +106,7 @@ export class Locomotion {
         this._pendingHangTime = 0;
       }
     } else {
-      const target = this.input.m.crouch ? this.crouchEye : this.baseEye;
+      const target = crouchInput ? this.crouchEye : this.baseEye;
       this.eyeY += (target - this.eyeY) * Math.min(1, this.CROUCH_EASE * dt);
     }
 
@@ -186,23 +196,16 @@ export class Locomotion {
     const before = new THREE.Vector3();
     const after = new THREE.Vector3();
 
-    // Where is the head *now* (world space)?
     viewCam.getWorldPosition(before);
-
-    // Rotate rig in world space about Y
     this.sceneMgr.dolly.rotateOnWorldAxis(UP, yawDelta);
     this.sceneMgr.dolly.updateMatrixWorld?.(true);
-
-    // Where did the head end up after that rotation?
     viewCam.getWorldPosition(after);
 
-    // Shift dolly so the head stays exactly where it was (pure in-place spin)
-    before.sub(after);         // delta we need to compensate
-    before.y = 0;              // yaw only
+    before.sub(after);
+    before.y = 0;
     this.sceneMgr.dolly.position.add(before);
     this.sceneMgr.dolly.updateMatrixWorld?.(true);
   }
-
 
   _currentYaw() {
     if (!this.sceneMgr?.dolly) return 0;
@@ -346,9 +349,9 @@ export class Locomotion {
 
     const xrCamera = renderer.xr.getCamera(this.sceneMgr.camera);
     const viewCam = xrCamera?.cameras?.[0] || xrCamera;
-    const viewForward = this._tmpHeadFlat;
-    const headForwardValid = this._extractFlatForward(viewCam, viewForward) ||
-      this._extractFlatForward(this.sceneMgr.camera, viewForward);
+    const headForward = this._tmpHeadFlat;
+    const headForwardValid = this._extractFlatForward(viewCam, headForward) ||
+      this._extractFlatForward(this.sceneMgr.camera, headForward);
 
     const bodyForward = this._tmpForward.set(0, 0, -1).applyQuaternion(this.sceneMgr.dolly.quaternion);
     bodyForward.y = 0;
@@ -358,15 +361,19 @@ export class Locomotion {
     const bodyYaw = Math.atan2(bodyForward.x, -bodyForward.z);
     this._bodyYaw = this._normalizeAngle(bodyYaw);
 
-    let relativeYaw = 0;
+    let finalYaw = bodyYaw;
     if (headForwardValid) {
-      const headYaw = Math.atan2(viewForward.x, -viewForward.z);
-      relativeYaw = this._normalizeAngle(headYaw - bodyYaw);
-      this._vrForward.copy(viewForward).normalize();
+      finalYaw = Math.atan2(headForward.x, -headForward.z);
+      this._lastHeadRelativeYaw = this._normalizeAngle(finalYaw - bodyYaw);
+      this._vrForward.copy(headForward).normalize();
     } else {
+      this._lastHeadRelativeYaw = 0;
       this._vrForward.copy(bodyForward);
+      this._headHeight = this.baseEye;
     }
-    this._lastHeadRelativeYaw = relativeYaw;
+
+    this._worldYaw = this._normalizeAngle(finalYaw);
+    if (this._vrCrouchActive) this._headHeight = this.crouchEye;
 
     this._vrRight.crossVectors(this._vrForward, UP);
     if (this._vrRight.lengthSq() < 1e-6) this._vrRight.set(1, 0, 0);
@@ -388,10 +395,12 @@ export class Locomotion {
       this._pulseHaptics(leftPad, Math.abs(leftAxes.vertical) * runScale);
     }
 
-    if (rightAxes.vertical) {
-      moveVec.addScaledVector(this._vrForward, rightAxes.vertical * this.baseSpeed * runScale);
-      moved = true;
-      this._pulseHaptics(rightPad, Math.abs(rightAxes.vertical) * runScale);
+    const verticalLook = rightAxes.vertical;
+    if (Math.abs(verticalLook) > this._vrAxisDeadzone) {
+      if (verticalLook > 0) this._queueVrJump();
+      if (verticalLook < 0) this._setVrCrouch(true);
+    } else {
+      this._setVrCrouch(false);
     }
 
     if (moved) {
@@ -400,8 +409,6 @@ export class Locomotion {
     } else {
       this._spd = 0;
     }
-
-    this._worldYaw = Math.atan2(this._vrForward.x, -this._vrForward.z);
   }
 
   _pulseHaptics(gamepad, intensity, duration = 50) {
@@ -447,8 +454,12 @@ export class Locomotion {
   }
 
   speed() { return this._spd; }
-  eyeHeight() { return this.eyeY; }
-  isCrouching() { return !!this.input?.m?.crouch; }
+  eyeHeight() {
+    const xrPresent = this.sceneMgr?.renderer?.xr?.isPresenting;
+    if (xrPresent) return 0;
+    return this.eyeY;
+  }
+  isCrouching() { return !!(this.input?.m?.crouch || this._vrCrouchActive); }
   isJumping() { return this.jumpState === 'jumping'; }
   popJumpStarted() { const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
   jumpHangTime() { return this._pendingHangTime || 0; }
@@ -465,6 +476,34 @@ export class Locomotion {
     const lenSq = target.lengthSq();
     if (lenSq < 1e-6) return false;
     target.multiplyScalar(1 / Math.sqrt(lenSq));
+    const posY = e[13];
+    if (Number.isFinite(posY)) {
+      const baseY = this.sceneMgr?.dolly?.position?.y ?? 0;
+      this._headHeight = Math.max(0, posY - baseY);
+    }
     return true;
+  }
+
+  _queueVrJump() {
+    if (this._vrJumpRequested) return;
+    if (this.jumpState !== 'idle') return;
+    this._vrJumpRequested = true;
+  }
+
+  _consumeVrJump() {
+    const flagged = this._vrJumpRequested;
+    this._vrJumpRequested = false;
+    return flagged;
+  }
+
+  _setVrCrouch(active) {
+    const state = !!active;
+    if (this._vrCrouchActive === state) return;
+    this._vrCrouchActive = state;
+    if (this.input?.m) this.input.m.crouch = state;
+  }
+
+  getXRHeadHeight() {
+    return this._headHeight;
   }
 }
