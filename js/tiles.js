@@ -30,6 +30,7 @@ export class TileManager {
     this.tiles = new Map(); this.origin = null;
     this._perfLogNext = 0;
     this._perfUpdateNext = 0;
+    this._nextFarfieldLog = 0;
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
@@ -42,11 +43,11 @@ export class TileManager {
     this.FARFIELD_BATCH_SIZE = 48;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 20;
+    this.RELAX_ITERS_PER_FRAME = 0;
     this.RELAX_ALPHA = 0.2;
     this.NORMALS_EVERY = 10;
     // keep relax cheap so fetching dominates
-    this.RELAX_FRAME_BUDGET_MS = 1;
+    this.RELAX_FRAME_BUDGET_MS = 0;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
@@ -885,6 +886,21 @@ export class TileManager {
     this.tiles.set(id, tile);
 
     this._initFarfieldColors(tile);
+
+    if (tile.grid?.points?.material) {
+      const mat = tile.grid.points.material;
+      mat.transparent = false;
+      mat.opacity = 1;
+      mat.sizeAttenuation = false;
+      mat.size = Math.max(0.5, this.tileRadius * 0.03);
+      if (mat.color && typeof mat.color.setHex === 'function') mat.color.setHex(0x8aa0c0);
+      mat.needsUpdate = true;
+    }
+
+    if (!this._nextFarfieldLog || this._nowMs() >= this._nextFarfieldLog) {
+      console.log('[tiles.farfield] add', { id, points: tile.pos.count });
+      this._nextFarfieldLog = this._nowMs() + 2000;
+    }
 
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
@@ -2158,6 +2174,12 @@ export class TileManager {
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
     };
+  }
+
+  _nowMs() {
+    return (typeof performance !== 'undefined' && typeof performance.now === 'function')
+      ? performance.now()
+      : Date.now();
   }
 
   /* ---------------- Queries & controls ---------------- */

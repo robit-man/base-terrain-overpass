@@ -121,20 +121,20 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 2000,
+    radius = 160,
     tileSize,
     color = 0x333333,
-    roadWidth = 4,
+    roadWidth = 3,
     roadOffset = 0.05,
-    roadStep = 12,
-    roadAdaptive = true,
-    roadMinStep = 4,
-    roadMaxStep = 24,
+    roadStep = 14,
+    roadAdaptive = false,
+    roadMinStep = 12,
+    roadMaxStep = 28,
     roadAngleThresh = 0.35,
-    roadMaxSegments = 100,
+    roadMaxSegments = 36,
     roadLit = false,
     roadShadows = false,
-    roadColor = 0x333333,
+    roadColor = 0x202020,
     extraDepth = 0.1,
     extensionHeight = 2,
     inputEl = null,            // NEW
@@ -208,6 +208,14 @@ export class BuildingManager {
     this._pressInfo = null;
     this._pressDownPos = null;
     this._pressMoveSlop = 8;      // px tolerance while holding
+
+    // Debug / diagnostics
+    this._debugEnabled = true;
+    this._debugLogIntervalMs = 1500;
+    this._nextBuildLogMs = 0;
+    this._nextMergeLogMs = 0;
+    this._nextResnapLogMs = 0;
+    this._nextRoadLogMs = 0;
     this._bindPressListeners();
 
     this._cssScene = null;
@@ -282,6 +290,18 @@ export class BuildingManager {
 
     // Init CSS3D (non-invasive overlay)
     this._ensureCSS3DLayer();
+  }
+
+  _nowMs() {
+    return (typeof performance !== 'undefined' && typeof performance.now === 'function')
+      ? performance.now()
+      : Date.now();
+  }
+
+  _debugLog(tag, payload = {}, force = false) {
+    if (!this._debugEnabled) return;
+    if (!force && payload?.durationMs != null && payload.durationMs < 1) return;
+    console.log(`[buildings.${tag}]`, payload);
   }
 
   /* ---------------- public API ---------------- */
@@ -1156,9 +1176,7 @@ export class BuildingManager {
     const frameBudget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : this._frameBudgetMs;
     if (frameBudget <= 0) return;
 
-    const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
-      ? performance.now()
-      : Date.now();
+    const now = () => this._nowMs();
     const start = now();
     const hasDeadline = deadline && typeof deadline.timeRemaining === 'function';
     const timeRemaining = () => {
@@ -1166,6 +1184,9 @@ export class BuildingManager {
       const idleLeft = hasDeadline ? deadline.timeRemaining() : Infinity;
       return Math.min(budgetLeft, idleLeft);
     };
+
+    let iterations = 0;
+    let featuresProcessed = 0;
 
     while (timeRemaining() > 0) {
       if (!this._activeBuildJob) this._activeBuildJob = this._nextBuildJob();
@@ -1178,7 +1199,11 @@ export class BuildingManager {
         continue;
       }
 
+      const before = job.featureIndex;
       const progressed = this._advanceBuildJob(job, timeRemaining);
+      const after = job.featureIndex;
+      if (after > before) featuresProcessed += (after - before);
+      iterations++;
       if (!progressed) break;
 
       if (job.done || job.featureIndex >= job.features.length) {
@@ -1188,6 +1213,25 @@ export class BuildingManager {
       }
 
       if (timeRemaining() <= 0) break;
+    }
+
+    if (this._debugEnabled) {
+      const duration = now() - start;
+      const nowMs = now();
+      const shouldLog = duration > frameBudget * 0.6 || nowMs >= this._nextBuildLogMs;
+      if (shouldLog) {
+        const active = this._activeBuildJob;
+        this._debugLog('drainBuildQueue', {
+          durationMs: duration,
+          frameBudgetMs: frameBudget,
+          queueLength: this._buildQueue.length,
+          activeTile: active?.tileKey || null,
+          remainingFeatures: active ? (active.features.length - active.featureIndex) : 0,
+          iterations,
+          featuresProcessed,
+        });
+        this._nextBuildLogMs = nowMs + this._debugLogIntervalMs;
+      }
     }
   }
 
@@ -1325,14 +1369,27 @@ export class BuildingManager {
     const job = this._activeMerge;
     if (!job) return;
 
-    const start = performance.now();
+    const start = this._nowMs();
+    let updated = 0;
     while (job.index < job.sources.length) {
       const b = job.sources[job.index++];
       if (!b.render) continue;
       b.render.updateMatrixWorld(true);
-      const elapsed = performance.now() - start;
+      updated++;
+      const elapsed = this._nowMs() - start;
       if (elapsed > this._mergeBudgetMs) break;
       if (deadline && typeof deadline.timeRemaining === 'function' && deadline.timeRemaining() < 1) break;
+    }
+
+    const duration = this._nowMs() - start;
+    if (this._debugEnabled && (duration > this._mergeBudgetMs * 0.8 || this._nowMs() >= this._nextMergeLogMs)) {
+      this._debugLog('merge.tick', {
+        durationMs: duration,
+        updated,
+        remaining: job.sources.length - job.index,
+        tileKey: job.tileKey,
+      });
+      this._nextMergeLogMs = this._nowMs() + this._debugLogIntervalMs;
     }
 
     if (job.index < job.sources.length) {
@@ -1347,6 +1404,7 @@ export class BuildingManager {
 
   _finalizeMerge(job) {
     const { tileKey, state, sources } = job;
+    const start = this._nowMs();
 
     for (const building of sources) {
       if (!building.render) continue;
@@ -1356,7 +1414,15 @@ export class BuildingManager {
     }
 
     const segCount = this._rebuildMergedTile(tileKey, state);
-    console.log(`[Buildings] merged ${state.buildings.length} wireframes into ${segCount} segments for ${tileKey}`);
+    const duration = this._nowMs() - start;
+    if (this._debugEnabled) {
+      this._debugLog('merge.finalize', {
+        durationMs: duration,
+        tileKey,
+        buildings: state.buildings.length,
+        segments: segCount,
+      });
+    }
   }
 
   _rebuildMergedTile(tileKey, state) {
@@ -1657,10 +1723,9 @@ export class BuildingManager {
       : this._resnapFrameBudgetMs;
     if (effectiveBudget <= 0) return;
 
-    const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
-      ? performance.now()
-      : Date.now();
+    const now = () => this._nowMs();
     const start = now();
+    let processed = 0;
 
     while (this._resnapIndex < this._resnapQueue.length) {
       const elapsed = now() - start;
@@ -1670,11 +1735,25 @@ export class BuildingManager {
       const state = this._tileStates.get(tileKey);
       if (!state) continue;
       this._resnapTile(tileKey, state);
+      processed++;
     }
 
     if (this._resnapIndex >= this._resnapQueue.length) {
       this._resnapQueue = [];
       this._resnapIndex = 0;
+    }
+
+    if (this._debugEnabled) {
+      const duration = now() - start;
+      const nowMs = now();
+      if (duration > effectiveBudget * 0.8 || nowMs >= this._nextResnapLogMs) {
+        this._debugLog('resnap', {
+          durationMs: duration,
+          processed,
+          remaining: this._resnapQueue.length - this._resnapIndex,
+        });
+        this._nextResnapLogMs = nowMs + this._debugLogIntervalMs;
+      }
     }
   }
 
@@ -1797,6 +1876,15 @@ export class BuildingManager {
     mesh.userData.basePos = basePos;
     mesh.userData.center = center;
     mesh.visible = this._isInsideRadius(center);
+
+    if (this._debugEnabled && this._nowMs() >= this._nextRoadLogMs) {
+      this._debugLog('road.mesh', {
+        osmId: id,
+        vertices: geo.attributes.position?.count || 0,
+        material: this.roadLit ? 'standard' : 'basic',
+      }, true);
+      this._nextRoadLogMs = this._nowMs() + this._debugLogIntervalMs;
+    }
     return mesh;
   }
 
@@ -1934,6 +2022,8 @@ export class BuildingManager {
   _makeRoadGeometry(flat) {
     if (flat.length < 4) return null;
 
+    const start = this._nowMs();
+
     // 1) Adaptive / fixed resampling
     let line = this.roadAdaptive
       ? this._densifyLineAdaptive(flat, this.roadMinStep, this.roadMaxStep, this.roadAngleThresh)
@@ -1995,6 +2085,22 @@ export class BuildingManager {
 
     const basePos = new Float32Array(pos);
     const centre = centres[Math.floor(centres.length / 2)] ?? { x: 0, z: 0 };
+
+    if (this._debugEnabled) {
+      const duration = this._nowMs() - start;
+      const vertexCount = pos.length / 3;
+      if (duration > 2 || this._nowMs() >= this._nextRoadLogMs) {
+        this._debugLog('road.build', {
+          durationMs: duration,
+          points: segments,
+          vertices: vertexCount,
+          adaptive: this.roadAdaptive,
+          capped: segments >= this.roadMaxSegments,
+        });
+        this._nextRoadLogMs = this._nowMs() + this._debugLogIntervalMs;
+      }
+    }
+
     return { geo, basePos, center: centre };
   }
 

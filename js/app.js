@@ -18,6 +18,80 @@ import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
 import { PerformanceTuner } from './performance.js';
 
+class PerfLogger {
+  constructor({ slowFrameMs = 33, reportIntervalMs = 2000, labelLimit = 6 } = {}) {
+    this.slowFrameMs = slowFrameMs;
+    this.reportIntervalMs = reportIntervalMs;
+    this.labelLimit = Math.max(1, labelLimit | 0);
+    this._now = (typeof performance !== 'undefined' && performance.now)
+      ? () => performance.now()
+      : () => Date.now();
+    this._nextReportAt = 0;
+    this._active = new Map();
+    this._records = [];
+    this._frameStart = 0;
+    this._maxByLabel = new Map();
+  }
+
+  frameStart() {
+    this._frameStart = this._now();
+    this._records.length = 0;
+    this._active.clear();
+  }
+
+  begin(label) {
+    if (!label) return;
+    this._active.set(label, this._now());
+  }
+
+  end(label) {
+    if (!label) return 0;
+    const start = this._active.get(label);
+    if (start == null) return 0;
+    const duration = this._now() - start;
+    this._active.delete(label);
+    this._records.push([label, duration]);
+    const prev = this._maxByLabel.get(label) || 0;
+    if (duration > prev) this._maxByLabel.set(label, duration);
+    return duration;
+  }
+
+  measure(label, fn) {
+    this.begin(label);
+    try {
+      return fn();
+    } finally {
+      this.end(label);
+    }
+  }
+
+  frameEnd() {
+    const end = this._now();
+    const frameDuration = end - this._frameStart;
+    const shouldLog = frameDuration > this.slowFrameMs || end >= this._nextReportAt;
+    if (shouldLog) {
+      const merged = [...this._records];
+      merged.sort((a, b) => b[1] - a[1]);
+      const top = merged
+        .slice(0, this.labelLimit)
+        .map(([label, dur]) => `${label}:${dur.toFixed(2)}ms`)
+        .join(' | ') || 'no sections';
+      let peaks = '';
+      if (this._maxByLabel.size) {
+        const peakList = [...this._maxByLabel.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, this.labelLimit)
+          .map(([label, dur]) => `${label}≤${dur.toFixed(1)}ms`)
+          .join(' | ');
+        if (peakList) peaks = ` | peaks ${peakList}`;
+      }
+      console.log(`[perf] frame ${frameDuration.toFixed(2)}ms | top ${top}${peaks}`);
+      this._nextReportAt = end + this.reportIntervalMs;
+    }
+    return frameDuration;
+  }
+}
+
 const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 const RAD = THREE.MathUtils.degToRad;
 const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
@@ -73,9 +147,7 @@ class App {
     this._nextBuildingsUpdateMs = 0;
     this._hudGeoNextMs = 0;
     this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
-    this._perfLogIntervalMs = 2000;
-    this._perfFrameThreshold = 40;
-    this._perfNextLogMs = 0;
+    this._perfLogger = new PerfLogger({ slowFrameMs: 33, reportIntervalMs: 2000, labelLimit: 6 });
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -1534,18 +1606,22 @@ class App {
 
   /* ---------- Main loop ---------- */
   _tick() {
-    // === lightweight frame timing marks (shows in DevTools > Performance > Timings) ===
     if (performance?.mark) performance.mark('tick-start');
-    const perfNowFn = performance?.now ? () => performance.now() : () => Date.now();
-    const frameStartMs = perfNowFn();
+
+    const logger = this._perfLogger;
+    if (logger?.frameStart) logger.frameStart();
+    const measure = logger ? (label, fn) => logger.measure(label, fn) : (label, fn) => fn();
+    const begin = logger ? (label) => logger.begin(label) : () => {};
+    const end = logger ? (label) => logger.end(label) : () => 0;
 
     const dt = this.clock.getDelta();
     const currentTargetFps = this._perf.profile().targetFps;
     const fpsSample = dt > 0.5 ? currentTargetFps : (dt > 1e-4 ? 1 / dt : currentTargetFps);
-    const perfState = this._perf.sample({ dt, fps: fpsSample });
+    const perfState = measure('perf.sample', () => this._perf.sample({ dt, fps: fpsSample }));
+
     if (perfState.qualityChanged || perfState.hudReady) {
-      const tileSummary = this.hexGridMgr?.applyPerfProfile?.(perfState) || null;
-      const buildingSummary = this.buildings?.applyPerfProfile?.(perfState) || null;
+      const tileSummary = measure('tiles.applyProfile', () => this.hexGridMgr?.applyPerfProfile?.(perfState) || null);
+      const buildingSummary = measure('buildings.applyProfile', () => this.buildings?.applyPerfProfile?.(perfState) || null);
       if (tileSummary) this._perfSnapshots.tiles = tileSummary;
       if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
     }
@@ -1556,15 +1632,12 @@ class App {
         this._terrainStatusEl.textContent = relayStatus.text || 'idle';
         this._terrainStatusEl.dataset.state = relayStatus.level || 'info';
       }
-      if (this._hudTerrainDot) {
-        applyHudStatusDot(this._hudTerrainDot, relayStatus.level || '');
-      }
-      if (this._hudTerrainLabel) {
-        this._hudTerrainLabel.title = relayStatus.text || 'Terrain relay idle';
-      }
+      if (this._hudTerrainDot) applyHudStatusDot(this._hudTerrainDot, relayStatus.level || '');
+      if (this._hudTerrainLabel) this._hudTerrainLabel.title = relayStatus.text || 'Terrain relay idle';
     }
 
     if (perfState.hudReady) {
+      begin('hud.update');
       if (ui.hudFps) ui.hudFps.textContent = Math.round(perfState.smoothedFps);
       if (ui.hudQos) {
         ui.hudQos.textContent = this._formatPerfLabel(perfState);
@@ -1573,9 +1646,10 @@ class App {
         ui.hudQos.classList.add('flash');
       }
       this._updateHudMeta(perfState);
+      end('hud.update');
     }
 
-    this._updateHudCompass();
+    measure('hud.compass', () => this._updateHudCompass());
 
     if (this._compassYawConfidence > 0) {
       const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -1592,55 +1666,56 @@ class App {
     const { dolly, camera, renderer } = this.sceneMgr;
     const xrOn = renderer.xr.isPresenting;
 
-    // One-time switch to FPV when mobile sensors are authorized & present
     if (this._mobileFPVArmed && this.sensors?.orient?.ready && !xrOn) {
-      this._enterMobileFPV();
+      measure('mobile.fpvEnter', () => this._enterMobileFPV());
       this._mobileFPVArmed = false;
     }
 
-    // === ORIENTATION / LOOK ===
     if (!xrOn) {
-      if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-        const q = this._deviceQuatForFPV(this.sensors.orient);
-        const compassOffset = this._getCompassYawOffset() || 0;
-        const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
-        const totalOffset = this._wrapAngle(compassOffset + manualOffset);
-        if (Math.abs(totalOffset) > 1e-4) {
-          const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), totalOffset);
-          q.multiply(yawQuat);
+      measure('orientation', () => {
+        if (this._mobileFPVOn && this.sensors?.orient?.ready) {
+          const q = this._deviceQuatForFPV(this.sensors.orient);
+          const compassOffset = this._getCompassYawOffset() || 0;
+          const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
+          const totalOffset = this._wrapAngle(compassOffset + manualOffset);
+          if (Math.abs(totalOffset) > 1e-4) {
+            const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), totalOffset);
+            q.multiply(yawQuat);
+          }
+          dolly.quaternion.copy(q);
+          camera.rotation.set(0, 0, 0);
+          camera.up.set(0, 1, 0);
+        } else {
+          const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
+          const yawAbs = e.y;
+          const pitchDelta = e.x;
+          this._pitch = THREE.MathUtils.clamp(this._pitch + pitchDelta, this._pitchMin, this._pitchMax);
+          dolly.rotation.set(0, yawAbs, 0);
+          camera.rotation.set(this._pitch, 0, 0);
+          camera.up.set(0, 1, 0);
         }
-        dolly.quaternion.copy(q);
-        camera.rotation.set(0, 0, 0);
-        camera.up.set(0, 1, 0);
-      } else {
-        const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
-        const yawAbs = e.y;
-        const pitchDelta = e.x; // pointer-lock delivered pitch delta through dolly.x
-
-        this._pitch = THREE.MathUtils.clamp(this._pitch + pitchDelta, this._pitchMin, this._pitchMax);
-        dolly.rotation.set(0, yawAbs, 0);
-        camera.rotation.set(this._pitch, 0, 0);
-        camera.up.set(0, 1, 0);
-      }
+      });
     }
 
+    begin('movement');
     const prevPos = this._tmpVec.copy(dolly.position);
-    const baseGroundY = this.hexGridMgr.getHeightAt(prevPos.x, prevPos.z);
+    const baseGroundY = measure('height.base', () => this.hexGridMgr.getHeightAt(prevPos.x, prevPos.z));
 
-    // Locomotion
     this.move.update(dt, baseGroundY, xrOn);
 
     const eyeHeight = this.move.eyeHeight();
     const desiredMove = this._tmpVec2.copy(dolly.position).sub(prevPos);
-
     let allowedMove = desiredMove;
     if (this.physics?.isCharacterReady?.()) {
-      if (performance?.mark) performance.mark('phys-resolve-start');
-      allowedMove = this.physics.resolveCharacterMovement(prevPos, eyeHeight, desiredMove);
-      if (performance?.mark) {
-        performance.mark('phys-resolve-end');
-        performance.measure('phys-resolve', 'phys-resolve-start', 'phys-resolve-end');
-      }
+      allowedMove = measure('physics.resolveMove', () => {
+        if (performance?.mark) performance.mark('phys-resolve-start');
+        const resolved = this.physics.resolveCharacterMovement(prevPos, eyeHeight, desiredMove);
+        if (performance?.mark) {
+          performance.mark('phys-resolve-end');
+          performance.measure('phys-resolve', 'phys-resolve-start', 'phys-resolve-end');
+        }
+        return resolved;
+      });
     }
     if (!allowedMove) {
       desiredMove.set(0, 0, 0);
@@ -1657,153 +1732,123 @@ class App {
     }
 
     const finalPos = this._tmpVec3.copy(prevPos).add(allowedMove);
-    let groundY = this.hexGridMgr.getHeightAt(finalPos.x, finalPos.z);
+    let groundY = measure('height.locomotion', () => this.hexGridMgr.getHeightAt(finalPos.x, finalPos.z));
     finalPos.y = groundY + eyeHeight;
-
     dolly.position.copy(finalPos);
 
-    if (this._mobileNav?.active) {
-      this._updateMobileAutopilot(dt);
-    }
-
+    if (this._mobileNav?.active) this._updateMobileAutopilot(dt);
     this._updateCompassDial();
+    end('movement');
 
-    // === NEW: throttle tile manager update (distance/time based) ===
     const hexNow = performance.now ? performance.now() : Date.now();
     const movedSq = this._lastHexUpdatePos.distanceToSquared(dolly.position);
-    const movedEnough = movedSq > 0.25 * 0.25; // > 0.25 m
+    const movedEnough = movedSq > 0.25 * 0.25;
     const timeOk = hexNow >= this._nextHexUpdateMs;
     if (movedEnough || timeOk) {
       if (performance?.mark) performance.mark('hex-update-start');
-      const hexStartMs = perfNowFn();
-      this.hexGridMgr.update(dolly.position);
-      const hexDuration = perfNowFn() - hexStartMs;
-      if (hexDuration > 5) console.log(`[perf] tiles.update ${hexDuration.toFixed(2)}ms`);
+      measure('tiles.update', () => this.hexGridMgr.update(dolly.position));
       if (performance?.mark) {
         performance.mark('hex-update-end');
         performance.measure('hex-update', 'hex-update-start', 'hex-update-end');
       }
       this._lastHexUpdatePos.copy(dolly.position);
-      this._nextHexUpdateMs = hexNow + 100; // at most 10 Hz
+      this._nextHexUpdateMs = hexNow + 100;
     }
 
-    // === NEW: throttle buildings update (time based) ===
     const nowMs = hexNow;
     if (nowMs >= this._nextBuildingsUpdateMs) {
       if (performance?.mark) performance.mark('build-update-start');
-      const buildStartMs = perfNowFn();
-      this.buildings?.update(dt);
-      const buildDuration = perfNowFn() - buildStartMs;
-      if (buildDuration > 5) console.log(`[perf] buildings.update ${buildDuration.toFixed(2)}ms`);
+      measure('buildings.update', () => this.buildings?.update(dt));
       if (performance?.mark) {
         performance.mark('build-update-end');
         performance.measure('build-update', 'build-update-start', 'build-update-end');
       }
-      // 33ms ~ 30 Hz; tweak as needed
       this._nextBuildingsUpdateMs = nowMs + 12;
     }
 
-    this._updateBuildingHover(xrOn);
+    measure('hover.update', () => this._updateBuildingHover(xrOn));
 
     const pos = dolly.position;
-    groundY = this.hexGridMgr.getHeightAt(pos.x, pos.z);
+    groundY = measure('height.final', () => this.hexGridMgr.getHeightAt(pos.x, pos.z));
     dolly.position.y = groundY + eyeHeight;
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
 
-    // Local avatar
     if (this.localAvatar) {
-      const yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
-      const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
-      const baseEyeHeight = this.move.baseEyeHeight?.() ?? eyeHeight;
-      const jumpLift = Math.max(0, eyeHeight - baseEyeHeight);
-      this.localAvatar.setPosition(pos.x, groundY + jumpLift, pos.z);
-      this.localAvatar.setQuaternion(qYaw);
-      this.localAvatar.setSpeed(this.move.speed());
-      this.localAvatar.setCrouch(this.move.isCrouching?.() ?? false);
-      const airborne = (this.move.isJumping?.() ?? false) || jumpLift > 0.02;
-      this.localAvatar.setAirborne(airborne);
-      this.localAvatar.update(dt);
-
-      const isFP = this._mobileFPVOn || this.chase.isFirstPerson?.();
-      this.localAvatar.group.visible = !(xrOn || isFP);
+      measure('avatar.local', () => {
+        const yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
+        const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
+        const baseEyeHeight = this.move.baseEyeHeight?.() ?? eyeHeight;
+        const jumpLift = Math.max(0, eyeHeight - baseEyeHeight);
+        this.localAvatar.setPosition(pos.x, groundY + jumpLift, pos.z);
+        this.localAvatar.setQuaternion(qYaw);
+        this.localAvatar.setSpeed(this.move.speed());
+        this.localAvatar.setCrouch(this.move.isCrouching?.() ?? false);
+        const airborne = (this.move.isJumping?.() ?? false) || jumpLift > 0.02;
+        this.localAvatar.setAirborne(airborne);
+        this.localAvatar.update(dt);
+        const isFP = this._mobileFPVOn || this.chase.isFirstPerson?.();
+        this.localAvatar.group.visible = !(xrOn || isFP);
+      });
     }
 
-    // Remotes
-    const remotesStartMs = perfNowFn();
-    this.remotes.tick(dt);
-    const remotesDuration = perfNowFn() - remotesStartMs;
-    if (remotesDuration > 5) console.log(`[perf] remotes.tick ${remotesDuration.toFixed(2)}ms`);
+    measure('remotes.tick', () => this.remotes.tick(dt));
+    if (!this._mobileFPVOn || xrOn) measure('chase.update', () => this.chase.update(dt, xrOn));
 
-    if (!this._mobileFPVOn || xrOn) {
-      const chaseStartMs = perfNowFn();
-      this.chase.update(dt, xrOn);
-      const chaseDuration = perfNowFn() - chaseStartMs;
-      if (chaseDuration > 5) console.log(`[perf] chase.update ${chaseDuration.toFixed(2)}ms`);
-    }
+    measure('mesh.sendPose', () => {
+      const actualY = groundY + eyeHeight;
+      const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
+      const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, eSend.y, 0, 'YXZ'));
+      const jumpEvt = this.move.popJumpStarted();
+      if (jumpEvt && this.physics?.suspendCharacterSnap) {
+        const hangTime = this.move?.jumpHangTime?.() ?? 0;
+        const resumeDelay = Number.isFinite(hangTime) && hangTime > 0
+          ? THREE.MathUtils.clamp(hangTime * 0.55, 0.2, 0.8)
+          : 0.35;
+        this.physics.suspendCharacterSnap(resumeDelay);
+      }
+      this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
+    });
 
-    // Pose broadcast
-    const actualY = groundY + eyeHeight;
-    const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
-    const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, eSend.y, 0, 'YXZ'));
-    const jumpEvt = this.move.popJumpStarted();
-    if (jumpEvt && this.physics?.suspendCharacterSnap) {
-      const hangTime = this.move?.jumpHangTime?.() ?? 0;
-      const resumeDelay = Number.isFinite(hangTime) && hangTime > 0
-        ? THREE.MathUtils.clamp(hangTime * 0.55, 0.2, 0.8)
-        : 0.35;
-      this.physics.suspendCharacterSnap(resumeDelay);
-    }
-    this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
+    measure('physics.update', () => {
+      if (performance?.mark) performance.mark('phys-update-start');
+      this.physics?.update(dt);
+      if (performance?.mark) {
+        performance.mark('phys-update-end');
+        performance.measure('phys-update', 'phys-update-start', 'phys-update-end');
+      }
+    });
 
-    if (performance?.mark) performance.mark('phys-update-start');
-    const physicsStartMs = perfNowFn();
-    this.physics?.update(dt);
-    const physicsDuration = perfNowFn() - physicsStartMs;
-    if (physicsDuration > 5) console.log(`[perf] physics.update ${physicsDuration.toFixed(2)}ms`);
-    if (performance?.mark) {
-      performance.mark('phys-update-end');
-      performance.measure('phys-update', 'phys-update-start', 'phys-update-end');
-    }
-
-    this._poseMaybeSave(dt);
+    measure('pose.saveMaybe', () => this._poseMaybeSave(dt));
 
     const origin = this.hexGridMgr?.origin;
-
-    // === NEW: throttle HUD geo conversion (expensive) ===
     const hudNow = nowMs;
     const movedHudSq = this._hudGeoLastPos.distanceToSquared(dolly.position);
     if ((origin && (hudNow >= this._hudGeoNextMs || movedHudSq > 0.5 * 0.5))) {
-      const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
-      if (hudLatLon) this._updateHudGeo(hudLatLon);
+      measure('hud.geo', () => {
+        const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
+        if (hudLatLon) this._updateHudGeo(hudLatLon);
+      });
       this._hudGeoLastPos.copy(dolly.position);
-      this._hudGeoNextMs = hudNow + 100; // 5 Hz
+      this._hudGeoNextMs = hudNow + 100;
     }
 
-    // === NEW: throttle minimap updates (10 Hz) ===
     if (nowMs >= this._miniMapNextMs) {
-      const miniStartMs = perfNowFn();
-      this.miniMap?.update();
-      const miniDuration = perfNowFn() - miniStartMs;
-      if (miniDuration > 5) console.log(`[perf] minimap.update ${miniDuration.toFixed(2)}ms`);
-      this._miniMapNextMs = nowMs + 100; // 10 Hz
+      measure('minimap.update', () => this.miniMap?.update());
+      this._miniMapNextMs = nowMs + 100;
     }
 
-    // Render
-    if (performance?.mark) performance.mark('render-start');
-    const renderStartMs = perfNowFn();
-    renderer.render(this.sceneMgr.scene, camera);
-    const renderDuration = perfNowFn() - renderStartMs;
-    if (renderDuration > 8) console.log(`[perf] renderer.render ${renderDuration.toFixed(2)}ms`);
-    if (performance?.mark) {
-      performance.mark('render-end');
-      performance.measure('render', 'render-start', 'render-end');
-      performance.mark('tick-end');
-      performance.measure('frame', 'tick-start', 'tick-end');
-    }
-    const frameDuration = perfNowFn() - frameStartMs;
-    if (frameDuration > 40) {
-      console.log(`[perf] frame total ${frameDuration.toFixed(2)}ms`);
-    }
+    measure('renderer.render', () => {
+      if (performance?.mark) performance.mark('render-start');
+      renderer.render(this.sceneMgr.scene, camera);
+      if (performance?.mark) {
+        performance.mark('render-end');
+        performance.measure('render', 'render-start', 'render-end');
+        performance.mark('tick-end');
+        performance.measure('frame', 'tick-start', 'tick-end');
+      }
+    });
+
+    logger?.frameEnd?.();
   }
 
   _onPointerMove(e, dom) {
