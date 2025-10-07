@@ -148,6 +148,8 @@ class App {
     this._hudGeoNextMs = 0;
     this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._perfLogger = new PerfLogger({ slowFrameMs: 33, reportIntervalMs: 2000, labelLimit: 6 });
+    this._sunUpdateNextMs = 0;
+    this._sunOrigin = null;
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -1626,6 +1628,9 @@ class App {
       if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
     }
 
+    const originForSun = this.hexGridMgr?.origin;
+    if (originForSun) this._maybeUpdateSun(originForSun);
+
     const relayStatus = this.hexGridMgr?.getRelayStatus?.();
     if (relayStatus) {
       if (this._terrainStatusEl) {
@@ -1849,6 +1854,18 @@ class App {
     });
 
     logger?.frameEnd?.();
+  }
+
+  _maybeUpdateSun(origin) {
+    const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const hasOrigin = !!this._sunOrigin;
+    const latChanged = !hasOrigin || Math.abs(origin.lat - this._sunOrigin.lat) > 1e-4;
+    const lonChanged = !hasOrigin || Math.abs(origin.lon - this._sunOrigin.lon) > 1e-4;
+    if (latChanged || lonChanged || nowMs >= this._sunUpdateNextMs) {
+      this.sceneMgr.updateSun({ lat: origin.lat, lon: origin.lon, date: new Date() });
+      this._sunOrigin = { lat: origin.lat, lon: origin.lon };
+      this._sunUpdateNextMs = nowMs + 60000;
+    }
   }
 
   _onPointerMove(e, dom) {
