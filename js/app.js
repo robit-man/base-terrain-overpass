@@ -100,6 +100,7 @@ const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
 const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
 const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
 const PLAYER_POSE_KEY = 'xr.playerPose.v1';
+const DEBUG_STATE_KEY = 'xr.debugMode.v1';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
 
 class App {
@@ -190,6 +191,7 @@ class App {
     if (storedGpsLock != null) this._gpsLockEnabled = storedGpsLock;
     const storedCompass = this._loadCompassPref();
     if (storedCompass != null) this._compassEnabled = storedCompass;
+    this._debugMode = this._loadDebugPref();
 
     if (ui.yawOffsetRange) {
       ui.yawOffsetRange.addEventListener('input', () => {
@@ -300,6 +302,7 @@ class App {
     this._tmpVec4 = new THREE.Vector3();
     this._tmpVec5 = new THREE.Vector3();
     this._tmpVec6 = new THREE.Vector3();
+    this._tmpCamForward = new THREE.Vector3();
     this._tmpQuat = new THREE.Quaternion();
     this._tmpQuat2 = new THREE.Quaternion();
     this._tmpEuler = new THREE.Euler();
@@ -340,6 +343,19 @@ class App {
           source: 'hud-reckon',
         });
       });
+    }
+
+    if (ui.hudDebugToggle) {
+      ui.hudDebugToggle.addEventListener('click', () => {
+        this._debugMode = !this._debugMode;
+        this._storeDebugPref(this._debugMode);
+        this._syncDebugUI();
+        this._applyDebugMode();
+      });
+    }
+
+    if (ui.hudReset) {
+      ui.hudReset.addEventListener('click', () => this._handleResetRequest());
     }
 
     if (ui.yawAssistToggle) {
@@ -401,6 +417,9 @@ class App {
     this._terrainStatusEl = ui.terrainRelayStatus || null;
     this._hudTerrainDot = ui.hudStatusTerrainDot || null;
     this._hudTerrainLabel = ui.hudStatusTerrainLabel || null;
+
+    this._syncDebugUI();
+    this._applyDebugMode();
 
     const relayInput = ui.terrainRelayInput;
     const datasetInput = ui.terrainDatasetInput;
@@ -794,6 +813,57 @@ class App {
     } catch {
       return null;
     }
+  }
+
+  _syncDebugUI() {
+    if (!ui.hudDebugToggle) return;
+    const on = !!this._debugMode;
+    ui.hudDebugToggle.classList.toggle('on', on);
+    ui.hudDebugToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+    ui.hudDebugToggle.textContent = on ? 'Debug: On' : 'Debug: Off';
+    ui.hudDebugToggle.title = on ? 'Debug visuals enabled' : 'Show debug visuals';
+  }
+
+  _applyDebugMode() {
+    const on = !!this._debugMode;
+    document.body?.classList?.toggle('debug-mode', on);
+    if (on) {
+      console.info('[debug] Debug mode enabled');
+    }
+  }
+
+  _storeDebugPref(enabled) {
+    try {
+      localStorage.setItem(DEBUG_STATE_KEY, enabled ? '1' : '0');
+    } catch { /* ignore quota */ }
+  }
+
+  _loadDebugPref() {
+    try {
+      const raw = localStorage.getItem(DEBUG_STATE_KEY);
+      if (raw == null) return false;
+      return raw === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  _handleResetRequest() {
+    try {
+      const keepKeys = new Set([DEBUG_STATE_KEY]);
+      const purge = [];
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i);
+        if (key && !keepKeys.has(key)) purge.push(key);
+      }
+      for (const key of purge) {
+        try { localStorage.removeItem(key); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+
+    try { sessionStorage.clear(); } catch { /* ignore */ }
+
+    location.reload();
   }
 
   _storeCompassPref(enabled) {
@@ -1256,12 +1326,28 @@ class App {
     const dolly = this.sceneMgr?.dolly;
     if (!dolly) return;
 
-    const forward = this._headingWorld.copy(this._headingBasis).applyQuaternion(dolly.quaternion);
-    const headingRad = Math.atan2(forward.x, -forward.z);
-    this._compassDial.rotation.set(0, headingRad, 0);
+    const renderer = this.sceneMgr?.renderer;
+    let worldYaw = null;
+
+    if (renderer?.xr?.isPresenting && typeof this.move?.getXRWorldYaw === 'function') {
+      const yaw = this.move.getXRWorldYaw();
+      if (Number.isFinite(yaw)) worldYaw = yaw;
+    }
+
+    if (worldYaw == null) {
+      const forward = this._tmpCamForward;
+      this.sceneMgr.camera.getWorldDirection(forward);
+      forward.y = 0;
+      if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+      forward.normalize();
+      worldYaw = Math.atan2(forward.x, -forward.z);
+    }
+
+    const dialYaw = worldYaw;
+    this._compassDial.rotation.set(0, dialYaw, 0);
 
     if (this._compassReadoutSprite?.userData?.updateText) {
-      const headingDeg = (THREE.MathUtils.radToDeg(headingRad) + 360) % 360;
+      const headingDeg = (THREE.MathUtils.radToDeg(worldYaw) + 360) % 360;
       const rounded = Math.round(headingDeg);
       if (this._compassReadoutValue == null || Math.abs(this._compassReadoutValue - rounded) >= 1) {
         this._compassReadoutValue = rounded;

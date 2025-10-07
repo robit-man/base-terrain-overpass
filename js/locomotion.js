@@ -19,15 +19,33 @@ export class Locomotion {
     this._vrMoveVec = new THREE.Vector3();
     this._vrForward = new THREE.Vector3();
     this._vrRight = new THREE.Vector3();
-    this._vrHeadQuat = new THREE.Quaternion();
+    this._tmpHeadFlat = new THREE.Vector3();
     this._vrRunScalar = 1;
     this._vrControllersReady = false;
     this._controllerFactory = null;
     this._controller1 = null; this._controller2 = null;
     this._controllerGrip1 = null; this._controllerGrip2 = null;
+    this._lastHeadRelativeYaw = 0;
+    this._bodyYaw = 0;
+    this._worldYaw = 0;
 
-    this._onXRSessionStart = () => this._setupVRControllers();
-    this._onXRSessionEnd = () => this._teardownVRControllers();
+    this._onXRSessionStart = () => {
+      this._lastHeadRelativeYaw = 0;
+      this._bodyYaw = 0;
+      this._worldYaw = 0;
+      if (this.sceneMgr?.dolly) {
+        this.sceneMgr.dolly.rotation.y = 0;
+        this.sceneMgr.dolly.quaternion.setFromEuler(new THREE.Euler(0, 0, 0, 'YXZ'));
+        this.sceneMgr.dolly.updateMatrixWorld?.(true);
+      }
+      this._setupVRControllers();
+    };
+    this._onXRSessionEnd = () => {
+      this._teardownVRControllers();
+      this._lastHeadRelativeYaw = 0;
+      this._bodyYaw = 0;
+      this._worldYaw = 0;
+    };
     const xr = this.sceneMgr.renderer?.xr;
     if (xr?.addEventListener) {
       xr.addEventListener('sessionstart', this._onXRSessionStart);
@@ -143,7 +161,7 @@ export class Locomotion {
     // Desktop fallback
     else {
       const fwd = new THREE.Vector3(); this.sceneMgr.camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
-      const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0));
+      const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
       let mx = 0, mz = 0; const m = this.input.m;
       if (m.f) mz++; if (m.b) mz--; if (m.l) mx--; if (m.r) mx++;
       if (mx || mz) {
@@ -157,6 +175,34 @@ export class Locomotion {
     // Snap to terrain + eye offset
     dol.position.y = (groundY ?? 0) + this.eyeY;
   }
+
+  _rotateRigAroundHead(yawDelta) {
+    const renderer = this.sceneMgr?.renderer;
+    if (!renderer?.xr) return;
+    const xrCamera = renderer.xr.getCamera(this.sceneMgr.camera);
+    const viewCam = xrCamera?.cameras?.[0] || xrCamera;
+    if (!viewCam?.getWorldPosition) return;
+
+    const before = new THREE.Vector3();
+    const after = new THREE.Vector3();
+
+    // Where is the head *now* (world space)?
+    viewCam.getWorldPosition(before);
+
+    // Rotate rig in world space about Y
+    this.sceneMgr.dolly.rotateOnWorldAxis(UP, yawDelta);
+    this.sceneMgr.dolly.updateMatrixWorld?.(true);
+
+    // Where did the head end up after that rotation?
+    viewCam.getWorldPosition(after);
+
+    // Shift dolly so the head stays exactly where it was (pure in-place spin)
+    before.sub(after);         // delta we need to compensate
+    before.y = 0;              // yaw only
+    this.sceneMgr.dolly.position.add(before);
+    this.sceneMgr.dolly.updateMatrixWorld?.(true);
+  }
+
 
   _currentYaw() {
     if (!this.sceneMgr?.dolly) return 0;
@@ -295,33 +341,36 @@ export class Locomotion {
 
     const yawDelta = rightAxes.horizontal ? -rightAxes.horizontal * this._vrTurnSpeed * dtClamped : 0;
     if (yawDelta) {
-      this.sceneMgr.dolly.rotation.y += yawDelta;
-      this.sceneMgr.dolly.updateMatrixWorld?.(true);
+      this._rotateRigAroundHead(yawDelta);
     }
 
     const xrCamera = renderer.xr.getCamera(this.sceneMgr.camera);
     const viewCam = xrCamera?.cameras?.[0] || xrCamera;
-    if (viewCam?.getWorldQuaternion) {
-      viewCam.getWorldQuaternion(this._vrHeadQuat);
+    const viewForward = this._tmpHeadFlat;
+    const headForwardValid = this._extractFlatForward(viewCam, viewForward) ||
+      this._extractFlatForward(this.sceneMgr.camera, viewForward);
+
+    const bodyForward = this._tmpForward.set(0, 0, -1).applyQuaternion(this.sceneMgr.dolly.quaternion);
+    bodyForward.y = 0;
+    if (bodyForward.lengthSq() < 1e-6) bodyForward.set(0, 0, -1);
+    bodyForward.normalize();
+
+    const bodyYaw = Math.atan2(bodyForward.x, -bodyForward.z);
+    this._bodyYaw = this._normalizeAngle(bodyYaw);
+
+    let relativeYaw = 0;
+    if (headForwardValid) {
+      const headYaw = Math.atan2(viewForward.x, -viewForward.z);
+      relativeYaw = this._normalizeAngle(headYaw - bodyYaw);
+      this._vrForward.copy(viewForward).normalize();
     } else {
-      this._vrHeadQuat.copy(this.sceneMgr.camera.quaternion);
+      this._vrForward.copy(bodyForward);
     }
+    this._lastHeadRelativeYaw = relativeYaw;
 
-    this._vrForward.set(0, 0, -1).applyQuaternion(this._vrHeadQuat);
-    this._vrForward.y = 0;
-    if (this._vrForward.lengthSq() < 1e-6) {
-      this._vrForward.set(0, 0, -1).applyQuaternion(this.sceneMgr.dolly.quaternion);
-      this._vrForward.y = 0;
-    }
-    this._vrForward.normalize();
-
-    this._vrRight.set(1, 0, 0).applyQuaternion(this._vrHeadQuat);
-    this._vrRight.y = 0;
-    if (this._vrRight.lengthSq() < 1e-6) {
-      this._vrRight.set(1, 0, 0).applyQuaternion(this.sceneMgr.dolly.quaternion);
-      this._vrRight.y = 0;
-    }
-    this._vrRight.normalize();
+    this._vrRight.crossVectors(this._vrForward, UP);
+    if (this._vrRight.lengthSq() < 1e-6) this._vrRight.set(1, 0, 0);
+    else this._vrRight.normalize();
 
     const accel = Math.min(1, 6 * dtClamped);
     const targetRun = wantsRun ? this.runMul : 1;
@@ -351,6 +400,8 @@ export class Locomotion {
     } else {
       this._spd = 0;
     }
+
+    this._worldYaw = Math.atan2(this._vrForward.x, -this._vrForward.z);
   }
 
   _pulseHaptics(gamepad, intensity, duration = 50) {
@@ -359,7 +410,7 @@ export class Locomotion {
     const actuator = (actuators && actuators[0]) || gamepad.vibrationActuator;
     if (!actuator || typeof actuator.pulse !== 'function') return;
     const level = THREE.MathUtils.clamp(intensity, 0, 1);
-    try { actuator.pulse(level, duration); } catch (_) {}
+    try { actuator.pulse(level, duration); } catch (_) { }
   }
 
   _isStickPressed(gamepad, handedness) {
@@ -383,11 +434,37 @@ export class Locomotion {
     return false;
   }
 
-  speed(){ return this._spd; }
-  eyeHeight(){ return this.eyeY; }
-  isCrouching(){ return !!this.input?.m?.crouch; }
-  isJumping(){ return this.jumpState === 'jumping'; }
-  popJumpStarted(){ const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
-  jumpHangTime(){ return this._pendingHangTime || 0; }
-  baseEyeHeight(){ return this.baseEye; }
+  getXRWorldYaw() {
+    return Number.isFinite(this._worldYaw) ? this._normalizeAngle(this._worldYaw) : null;
+  }
+
+  getXRRelativeHeadYaw() {
+    return this._lastHeadRelativeYaw || 0;
+  }
+
+  getXRBodyYaw() {
+    return this._bodyYaw || 0;
+  }
+
+  speed() { return this._spd; }
+  eyeHeight() { return this.eyeY; }
+  isCrouching() { return !!this.input?.m?.crouch; }
+  isJumping() { return this.jumpState === 'jumping'; }
+  popJumpStarted() { const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
+  jumpHangTime() { return this._pendingHangTime || 0; }
+  baseEyeHeight() { return this.baseEye; }
+
+  _extractFlatForward(source, target) {
+    if (!source) return false;
+    source.updateMatrixWorld?.(true);
+    const mat = source.matrixWorld;
+    if (!mat) return false;
+    const e = mat.elements;
+    target.set(-e[8], -e[9], -e[10]);
+    target.y = 0;
+    const lenSq = target.lengthSq();
+    if (lenSq < 1e-6) return false;
+    target.multiplyScalar(1 / Math.sqrt(lenSq));
+    return true;
+  }
 }

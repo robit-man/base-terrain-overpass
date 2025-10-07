@@ -697,6 +697,27 @@ input[type=text] {
     transform: none;
 }
 
+#perfHud .hud-reckon.debug {
+    border-color: rgba(255, 196, 126, 0.55);
+    background: linear-gradient(180deg, rgba(255, 196, 126, 0.25), rgba(150, 86, 18, 0.4));
+}
+
+#perfHud .hud-reckon.debug.on {
+    border-color: rgba(255, 205, 150, 0.9);
+    background: linear-gradient(180deg, rgba(255, 196, 126, 0.45), rgba(150, 86, 18, 0.6));
+}
+
+#perfHud .hud-reckon.reset {
+    border-color: rgba(255, 122, 122, 0.65);
+    background: linear-gradient(180deg, rgba(255, 122, 122, 0.2), rgba(150, 34, 34, 0.38));
+}
+
+#perfHud .hud-reckon.reset:hover:not(:disabled) {
+    background: linear-gradient(180deg, rgba(255, 122, 122, 0.3), rgba(150, 34, 34, 0.48));
+    border-color: rgba(255, 122, 122, 0.85);
+    box-shadow: 0 8px 18px rgba(150, 34, 34, 0.35);
+}
+
 #perfHud .hud-metric-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
