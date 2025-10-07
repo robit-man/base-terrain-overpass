@@ -6,6 +6,7 @@ import { Input } from './input.js';
 import { AudioEngine } from './audio.js';
 import { TileManager } from './tiles.js';
 import { ipLocate, latLonToWorld, worldToLatLon } from './geolocate.js';
+import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
@@ -93,6 +94,7 @@ class PerfLogger {
 }
 
 const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+const hasGeolocation = typeof navigator !== 'undefined' && 'geolocation' in navigator;
 const RAD = THREE.MathUtils.degToRad;
 const MANUAL_LOCATION_KEY = 'xr.manualLocation.v1';
 const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
@@ -136,7 +138,7 @@ class App {
     this._perfSnapshots = { tiles: null, buildings: null };
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
-    this._hudGeoCached = { lat: null, lon: null };
+    this._hudGeoCached = { lat: null, lon: null, hash: null };
 
     // === NEW: throttling state (non-breaking) ===
     this._hoverNextAllowedMs = 0;
@@ -183,7 +185,7 @@ class App {
     this._compassYawConfidence = 0;
     this._compassLastUpdate = 0;
     this._compassEnabled = true;
-    this._gpsLockEnabled = true;
+    this._gpsLockEnabled = isMobile;
     const storedGpsLock = this._loadGpsLockPref();
     if (storedGpsLock != null) this._gpsLockEnabled = storedGpsLock;
     const storedCompass = this._loadCompassPref();
@@ -226,7 +228,7 @@ class App {
       lastLatLon: null
     } : null;
 
-    if (isMobile && 'geolocation' in navigator) {
+    if (isMobile && hasGeolocation) {
       this._initMobileTracking();
     }
 
@@ -320,21 +322,23 @@ class App {
     if (ui.gpsLockToggle) {
       const gpsToggle = ui.gpsLockToggle;
       gpsToggle.checked = this._gpsLockEnabled;
-      gpsToggle.disabled = !('geolocation' in navigator);
+      gpsToggle.disabled = !hasGeolocation;
       gpsToggle.addEventListener('change', () => {
-        this._gpsLockEnabled = !!gpsToggle.checked;
-        this._storeGpsLockPref(this._gpsLockEnabled);
-        if (!this._gpsLockEnabled && this._mobileNav) {
-          this._mobileNav.active = false;
-          this._mobileNav.initialized = false;
-          this._mobileNav.velocity?.set?.(0, 0, 0);
-          this._compassYawOffset = 0;
-          this._compassYawConfidence = 0;
-          this._compassLastUpdate = 0;
-        }
-        if (this._gpsLockEnabled && this._lastAutoLocation) {
-          this._handleGpsUpdate({ ...this._lastAutoLocation, force: true });
-        }
+        this._applyGpsLock(!!gpsToggle.checked, {
+          forceRecenter: gpsToggle.checked,
+          source: 'settings-toggle',
+        });
+      });
+    }
+
+    if (ui.hudGpsReckon) {
+      if (!hasGeolocation) ui.hudGpsReckon.disabled = true;
+      ui.hudGpsReckon.addEventListener('click', () => {
+        const enable = !this._gpsLockEnabled;
+        this._applyGpsLock(enable, {
+          forceRecenter: enable,
+          source: 'hud-reckon',
+        });
       });
     }
 
@@ -391,6 +395,8 @@ class App {
       },
       onRequestSnap: ({ headingRad }) => this._snapToCompassHeading(headingRad),
     });
+
+    this._syncGpsLockUI();
 
     this._terrainStatusEl = ui.terrainRelayStatus || null;
     this._hudTerrainDot = ui.hudStatusTerrainDot || null;
@@ -715,6 +721,45 @@ class App {
     return true;
   }
 
+  _applyGpsLock(enabled, { forceRecenter = false } = {}) {
+    const next = !!enabled;
+    const prev = this._gpsLockEnabled;
+    if (next !== prev) {
+      this._gpsLockEnabled = next;
+      this._storeGpsLockPref(this._gpsLockEnabled);
+      if (!this._gpsLockEnabled && this._mobileNav) {
+        this._mobileNav.active = false;
+        this._mobileNav.initialized = false;
+        this._mobileNav.velocity?.set?.(0, 0, 0);
+      }
+    }
+
+    this._syncGpsLockUI();
+
+    if (this._gpsLockEnabled && this._lastAutoLocation && (forceRecenter || (next !== prev && this._gpsLockEnabled))) {
+      this._handleGpsUpdate({
+        ...this._lastAutoLocation,
+        force: true,
+        preserveManual: false,
+      });
+    }
+  }
+
+  _syncGpsLockUI() {
+    if (ui.gpsLockToggle) ui.gpsLockToggle.checked = this._gpsLockEnabled;
+    if (ui.hudGpsReckon) {
+      const btn = ui.hudGpsReckon;
+      btn.disabled = !hasGeolocation;
+      btn.classList.toggle('on', this._gpsLockEnabled);
+      btn.setAttribute('aria-pressed', this._gpsLockEnabled ? 'true' : 'false');
+      btn.dataset.state = this._gpsLockEnabled ? 'on' : 'off';
+      btn.textContent = 'Reckon';
+      btn.title = this._gpsLockEnabled
+        ? 'GPS lock active — tap to release'
+        : 'Tap to lock world to GPS';
+    }
+  }
+
   _storeManualLocation(lat, lon) {
     try {
       localStorage.setItem(MANUAL_LOCATION_KEY, JSON.stringify({ lat, lon }));
@@ -768,7 +813,7 @@ class App {
   }
 
   _initMobileTracking() {
-    if (!('geolocation' in navigator)) return;
+    if (!hasGeolocation) return;
     try {
       this._geoWatchId = navigator.geolocation.watchPosition(
         (pos) => this._handleGeoWatch(pos),
@@ -1354,10 +1399,23 @@ class App {
   _updateHudGeo({ lat, lon } = {}) {
     if (!ui.hudLat || !ui.hudLon) return;
 
-    const latLabel = Number.isFinite(lat) ? lat.toFixed(5) : '--';
-    const lonLabel = Number.isFinite(lon) ? lon.toFixed(5) : '--';
-    const latTitle = Number.isFinite(lat) ? `Latitude ${lat.toFixed(7)}` : 'Latitude unavailable';
-    const lonTitle = Number.isFinite(lon) ? `Longitude ${lon.toFixed(7)}` : 'Longitude unavailable';
+    const latOk = Number.isFinite(lat);
+    const lonOk = Number.isFinite(lon);
+    const latLabel = latOk ? lat.toFixed(5) : '--';
+    const lonLabel = lonOk ? lon.toFixed(5) : '--';
+    const latTitle = latOk ? `Latitude ${lat.toFixed(7)}` : 'Latitude unavailable';
+    const lonTitle = lonOk ? `Longitude ${lon.toFixed(7)}` : 'Longitude unavailable';
+
+    let geohashValue = '--';
+    if (latOk && lonOk) {
+      try {
+        const spacing = this.hexGridMgr?.spacing ?? 10;
+        const precision = pickGeohashPrecision(spacing);
+        geohashValue = geohashEncode(lat, lon, precision);
+      } catch {
+        geohashValue = '--';
+      }
+    }
 
     if (this._hudGeoCached.lat !== latLabel) {
       ui.hudLat.textContent = latLabel;
@@ -1369,6 +1427,12 @@ class App {
       ui.hudLon.textContent = lonLabel;
       ui.hudLon.title = lonTitle;
       this._hudGeoCached.lon = lonLabel;
+    }
+
+    if (ui.hudGeohash && this._hudGeoCached.hash !== geohashValue) {
+      ui.hudGeohash.textContent = geohashValue;
+      ui.hudGeohash.title = geohashValue !== '--' ? `Geohash ${geohashValue}` : 'Geohash unavailable';
+      this._hudGeoCached.hash = geohashValue;
     }
   }
 

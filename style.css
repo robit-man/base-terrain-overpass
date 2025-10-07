@@ -654,6 +654,49 @@ input[type=text] {
     color: #fdfdfd;
 }
 
+#perfHud .hud-reckon {
+    display: block;
+    width: 100%;
+    margin-top: 12px;
+    padding: 0.9rem 1rem;
+    border-radius: 14px;
+    border: 1px solid rgba(126, 214, 255, 0.45);
+    background: linear-gradient(180deg, rgba(110, 231, 255, 0.18), rgba(46, 98, 150, 0.35));
+    color: #eef9ff;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+#perfHud .hud-reckon:hover:not(:disabled) {
+    background: linear-gradient(180deg, rgba(110, 231, 255, 0.28), rgba(46, 98, 150, 0.45));
+    border-color: rgba(126, 214, 255, 0.7);
+    box-shadow: 0 8px 18px rgba(46, 98, 150, 0.35);
+    transform: translateY(-1px);
+}
+
+#perfHud .hud-reckon.on {
+    background: linear-gradient(180deg, rgba(110, 231, 255, 0.4), rgba(46, 98, 150, 0.55));
+    border-color: rgba(126, 214, 255, 0.9);
+    color: #ffffff;
+    box-shadow: 0 10px 22px rgba(110, 231, 255, 0.35);
+}
+
+#perfHud .hud-reckon:focus-visible {
+    outline: 2px solid rgba(126, 214, 255, 0.9);
+    outline-offset: 4px;
+}
+
+#perfHud .hud-reckon:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+    transform: none;
+}
+
 #perfHud .hud-metric-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
