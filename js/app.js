@@ -9,7 +9,7 @@ import { ipLocate, latLonToWorld, worldToLatLon } from './geolocate.js';
 import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
-import { ui } from './ui.js';
+import { ui, applyHudStatusDot } from './ui.js';
 import { deg } from './utils.js';
 import { AvatarFactory } from './avatars.js';
 import { ChaseCam } from './chasecam.js';
@@ -316,7 +316,8 @@ class App {
     });
 
     this._terrainStatusEl = ui.terrainRelayStatus || null;
-    this._hudTerrainStatusEl = ui.hudTerrainStatus || null;
+    this._hudTerrainDot = ui.hudStatusTerrainDot || null;
+    this._hudTerrainLabel = ui.hudStatusTerrainLabel || null;
 
     const relayInput = ui.terrainRelayInput;
     const datasetInput = ui.terrainDatasetInput;
@@ -1550,9 +1551,11 @@ class App {
         this._terrainStatusEl.textContent = relayStatus.text || 'idle';
         this._terrainStatusEl.dataset.state = relayStatus.level || 'info';
       }
-      if (this._hudTerrainStatusEl) {
-        this._hudTerrainStatusEl.textContent = relayStatus.text || 'idle';
-        this._hudTerrainStatusEl.dataset.state = relayStatus.level || 'info';
+      if (this._hudTerrainDot) {
+        applyHudStatusDot(this._hudTerrainDot, relayStatus.level || '');
+      }
+      if (this._hudTerrainLabel) {
+        this._hudTerrainLabel.title = relayStatus.text || 'Terrain relay idle';
       }
     }
 
@@ -1785,27 +1788,32 @@ class App {
 
   // === NEW: throttled hover raycast ===
   _updateBuildingHover(xrOn) {
-    if (!this.buildings) return;
+    const hasBuildings = !!this.buildings;
+    const hasRemotes = !!this.remotes;
+    if (!hasBuildings && !hasRemotes) return;
     if (xrOn) {
-      this.buildings.clearHover();
+      this.buildings?.clearHover();
+      this.remotes?.clearHover();
       return;
     }
     if (!this._pointerNdc.has) {
-      this.buildings.clearHover();
+      this.buildings?.clearHover();
+      this.remotes?.clearHover();
       return;
     }
     const now = performance?.now ? performance.now() : Date.now();
 
-      // Only raycast if pointer moved in last 300ms and at most ~12.5Hz
-      if (now - this._pointerLastMoveMs > 3000) {
-        this.buildings.clearHover();
-        return;
-      }
+    if (now - this._pointerLastMoveMs > 3000) {
+      this.buildings?.clearHover();
+      this.remotes?.clearHover();
+      return;
+    }
     if (now < this._hoverNextAllowedMs) return;
     this._hoverNextAllowedMs = now + 80; // ~12.5 Hz
 
     this._raycaster.setFromCamera(this._pointerNdc, this.sceneMgr.camera);
-    this.buildings.updateHover(this._raycaster, this.sceneMgr.camera);
+    this.buildings?.updateHover(this._raycaster, this.sceneMgr.camera);
+    this.remotes?.updateHover(this._raycaster);
   }
 
   _setupPhysics() {

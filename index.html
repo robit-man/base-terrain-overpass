@@ -66,56 +66,64 @@
 </head>
 
 <body>
+  <div id="toastHost" aria-live="polite" aria-atomic="false"></div>
   <div id="perfHud" aria-live="polite" aria-expanded="false" role="button" tabindex="0" title="Open control center">
     <div class="hud-shell" id="hudDetail">
-      <div class="hud-topline">
+      <div class="hud-heading-row">
         <div class="hud-compass" aria-hidden="true">
           <span class="hud-compass-needle" id="hudCompassNeedle"></span>
         </div>
         <div class="hud-heading-block">
-          <span class="hud-label">Heading</span>
+          <span class="hud-heading-label">Heading</span>
           <span class="hud-heading" id="hudHeadingText">--°</span>
         </div>
         <div class="hud-fps-block">
-          <span class="hud-label">FPS</span>
-          <span class="hud-fps" id="hudFps">60</span>
+          <span class="hud-block-label">FPS</span>
+          <span class="hud-block-value" id="hudFps">60</span>
         </div>
       </div>
-      <div class="hud-metrics">
+
+      <div class="hud-status-stack">
+        <div class="hud-status-item" id="hudStatusNkn">
+          <span class="hud-status-dot dot" id="hudStatusNknDot" aria-hidden="true"></span>
+          <span class="hud-status-label" id="hudStatusNknLabel">NKN</span>
+        </div>
+        <div class="hud-status-item" id="hudStatusTerrain">
+          <span class="hud-status-dot dot" id="hudStatusTerrainDot" aria-hidden="true"></span>
+          <span class="hud-status-label" id="hudStatusTerrainLabel">Terrain</span>
+        </div>
+        <div class="hud-status-item" id="hudStatusSignal">
+          <span class="hud-status-dot dot" id="hudStatusSigDot" aria-hidden="true"></span>
+          <span class="hud-status-label" id="hudStatusSigLabel">Signal</span>
+        </div>
+      </div>
+
+      <div class="hud-block">
+        <span class="hud-block-label">Peers online</span>
+        <span class="hud-block-value" id="hudPeerCount">0</span>
+      </div>
+
+      <div class="hud-metric-grid">
         <div class="hud-metric">
-          <span class="hud-label">Quality</span>
+          <span class="hud-block-label">LOD</span>
           <span class="hud-qos" id="hudQos">LOD 100% · High</span>
         </div>
         <div class="hud-metric">
-          <span class="hud-label">Tiles</span>
-          <span class="hud-value" id="hudDetailTiles">2 / 10</span>
+          <span class="hud-block-label">Tiles</span>
+          <span class="hud-block-value" id="hudDetailTiles">—</span>
         </div>
         <div class="hud-metric">
-          <span class="hud-label">Build</span>
-          <span class="hud-value" id="hudDetailBuild">2.0ms / 3.0ms</span>
+          <span class="hud-block-label">Build</span>
+          <span class="hud-block-value" id="hudDetailBuild">—</span>
         </div>
         <div class="hud-metric">
-          <span class="hud-label">Radius</span>
-          <span class="hud-value" id="hudDetailRadius">800m</span>
-        </div>
-        <div class="hud-metric">
-          <span class="hud-label">NKN</span>
-          <span class="hud-value" id="hudNknStatus">—</span>
-        </div>
-        <div class="hud-metric">
-          <span class="hud-label">Terrain</span>
-          <span class="hud-value" id="hudTerrainStatus">idle</span>
+          <span class="hud-block-label">Radius</span>
+          <span class="hud-block-value" id="hudDetailRadius">—</span>
         </div>
       </div>
-      <div class="hud-geo">
-        <div class="hud-geo-item">
-          <span class="hud-label">Lat</span>
-          <span class="hud-value" id="hudLat">--</span>
-        </div>
-        <div class="hud-geo-item">
-          <span class="hud-label">Lon</span>
-          <span class="hud-value" id="hudLon">--</span>
-        </div>
+      <div class="hud-block">
+        <span class="hud-block-label">Orientation</span>
+        <span class="hud-block-value" id="hudEuler">--</span>
       </div>
     </div>
   </div>
@@ -124,6 +132,24 @@
     <div class="mini-map-action-stack" aria-label="Mini map actions">
       <button id="miniMapMove" type="button" aria-label="Teleport to selected mini map location">Move</button>
       <button id="miniMapSnap" type="button" aria-label="Snap view to device compass heading">Snap</button>
+    </div>
+    <div class="mini-map-info" aria-live="polite">
+      <div class="mini-map-info-row">
+        <span class="mini-map-info-label">Geohash</span>
+        <span class="mini-map-info-value" id="hudGeohash">--</span>
+      </div>
+      <div class="mini-map-info-row">
+        <span class="mini-map-info-label">Lat</span>
+        <span class="mini-map-info-value" id="hudLat">--</span>
+      </div>
+      <div class="mini-map-info-row">
+        <span class="mini-map-info-label">Lon</span>
+        <span class="mini-map-info-value" id="hudLon">--</span>
+      </div>
+      <div class="mini-map-info-row">
+        <span class="mini-map-info-label">Alt</span>
+        <span class="mini-map-info-value" id="hudAltitude">--</span>
+      </div>
     </div>
   </div>
 
@@ -145,6 +171,12 @@
       <div class="tiny" id="txtSigMeta">—</div>
       <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
       <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
+      <label for="displayNameInput">Display name</label>
+      <div class="input-row">
+        <input id="displayNameInput" type="text" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Choose how others see you" />
+        <button id="displayNameSave" type="button">Save</button>
+      </div>
+      <p class="tiny">Pick a short prefix shown to other players instead of your full NKN address.</p>
       <div class="kv">terrain: <span class="mono" id="terrainRelayStatus">idle</span></div>
     </section>
 
@@ -225,6 +257,17 @@
       <div class="tiny" id="peerSummary">—</div>
       <div id="peerList" class="peer-list"></div>
     </section>
+    </div>
+  </div>
+
+  <div id="nameModal" aria-hidden="true">
+    <div class="name-modal-shell">
+      <h2>Choose a display name</h2>
+      <p>This name will appear above your avatar and for other players. You can change it later from the control center.</p>
+      <input id="nameModalInput" type="text" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Enter a short name" />
+      <div class="name-modal-actions">
+        <button id="nameModalSave" type="button">Save</button>
+      </div>
     </div>
   </div>
 

@@ -1,6 +1,6 @@
 // mesh.js
 import * as THREE from 'three';
-import { ui, setNkn, setSig, setSigMeta } from './ui.js';
+import { ui, setNkn, setSig, setSigMeta, pushToast } from './ui.js';
 import { createDiscovery } from './nats.js';
 import { latLonToWorld, worldToLatLon } from './geolocate.js';
 import { now, fmtAgo, isHex64, shortHex, rad, deg } from './utils.js';
@@ -53,6 +53,10 @@ export class Mesh {
     this.teleportInbox = new Map();  // pub -> { ts, status, respondedAt?, reason? }
     this.teleportOutbox = new Map(); // pub -> { ts, status, respondedAt?, reason?, dest? }
 
+    this.aliases = new Map();
+    this._joinAnnouncements = new Set();
+    this.displayName = this._sanitizeAlias(localStorage.getItem('NKN_NAME_PREFIX') || '');
+
     // Sessions (ncp-js)
     this.sessions = new Map();   // pub -> session
 
@@ -75,6 +79,16 @@ export class Mesh {
 
     this._loadBook();
     this._bootstrapFromBook(); // populate peers/addrPool/knownIds up-front
+    if (ui.displayNameInput) ui.displayNameInput.value = this.displayName;
+    if (ui.displayNameSave) ui.displayNameSave.addEventListener('click', () => this.setDisplayName(ui.displayNameInput.value));
+    if (ui.displayNameInput) {
+      ui.displayNameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          this.setDisplayName(ui.displayNameInput.value);
+        }
+      });
+    }
 
     setInterval(() => {
       if (ui.poseHzEl) ui.poseHzEl.textContent = String(this.hzCount);
@@ -202,7 +216,7 @@ export class Mesh {
       const targets = new Set([...ids].map(id => addrFrom(id, pub)));
       (p.addrs || []).forEach(a => { if (isAddr(a.addr)) targets.add(a.addr); });
 
-      const hello = JSON.stringify({ type: 'hello', from: this.selfPub, ts: t });
+      const hello = JSON.stringify(this._helloEnvelope(t));
       const ask = JSON.stringify({ type: 'peers_req', from: this.selfPub, ts: t });
 
       for (const to of targets) {
@@ -222,6 +236,75 @@ export class Mesh {
     if (ui.poseRateEl) ui.poseRateEl.textContent = ((bytes * 8) / 5000).toFixed(1);
   }
   _noteBytes(str) { try { const b = (new TextEncoder()).encode(str).length; this.byteWindow.push({ t: now(), bytes: b }); } catch { } }
+
+  setDisplayName(name) {
+    const sanitized = this._sanitizeAlias(name);
+    const previous = this.displayName;
+    this.displayName = sanitized;
+    if (ui.displayNameInput && ui.displayNameInput.value !== sanitized) {
+      ui.displayNameInput.value = sanitized;
+    }
+    if (sanitized) {
+      localStorage.setItem('NKN_NAME_PREFIX', sanitized);
+    } else {
+      localStorage.removeItem('NKN_NAME_PREFIX');
+    }
+    if (this.selfPub) {
+      this._applyAlias(this.selfPub, sanitized);
+    }
+    if (sanitized !== previous) {
+      this._broadcastAlias();
+    }
+  }
+
+  _sanitizeAlias(raw) {
+    if (raw == null) return '';
+    const cleaned = String(raw).replace(/[\n\r\t]+/g, ' ').trim();
+    const stripped = cleaned.replace(/[^a-zA-Z0-9._ \-]/g, '');
+    return stripped.slice(0, 24).trim();
+  }
+
+  _aliasFor(pub) {
+    const key = (pub || '').toLowerCase();
+    const alias = this.aliases.get(key);
+    if (alias && alias.length) return alias;
+    if (isHex64(key)) return shortHex(key, 8, 6);
+    return shortHex(pub || key || 'peer', 8, 6);
+  }
+
+  _applyAlias(pub, alias) {
+    if (!pub) return;
+    const key = pub.toLowerCase();
+    const norm = this._sanitizeAlias(alias);
+    const prev = this.aliases.get(key) || '';
+    if (norm) this.aliases.set(key, norm);
+    else this.aliases.delete(key);
+    if (prev === (norm || '')) return;
+    this.app?.remotes?.setAlias(key, norm);
+    this._renderPeers();
+  }
+
+  _broadcastAlias() {
+    if (!this.client || !this.selfPub) return;
+    const payload = { type: 'alias', from: this.selfPub, alias: this.displayName || '' };
+    this._blast(payload);
+  }
+
+  _helloEnvelope(ts = now()) {
+    if (!this.selfPub) return { type: 'hello', from: '', ts };
+    const msg = { type: 'hello', from: this.selfPub, ts };
+    if (this.displayName) msg.alias = this.displayName;
+    return msg;
+  }
+
+  _announceJoin(pub) {
+    if (!pub || this._isSelf(pub)) return;
+    const key = pub.toLowerCase();
+    if (this._joinAnnouncements.has(key)) return;
+    this._joinAnnouncements.add(key);
+    const label = this._aliasFor(pub);
+    pushToast?.(`${label} joined!`);
+  }
 
   /* ───────── Signaller config ───────── */
 
@@ -423,7 +506,7 @@ export class Mesh {
   _fireDiscoveryHello(pub) {
     if (!this.client || !this.selfPub) return;
     const t = now();
-    const hello = JSON.stringify({ type: 'hello', from: this.selfPub, ts: t });
+    const hello = JSON.stringify(this._helloEnvelope(t));
     const ask = JSON.stringify({ type: 'peers_req', from: this.selfPub, ts: t });
     const targets = this._bestAddrs(pub);
     for (const to of targets) {
@@ -490,11 +573,14 @@ export class Mesh {
         if (ui.myPub) ui.myPub.textContent = this.selfPub || '—';
         setNkn('NKN: connected', 'ok');
 
+        this._applyAlias(this.selfPub, this.displayName);
+
         this._initDiscovery();
 
         // Announce & request peers to *all known targets* (includes bootstrapped addrs)
-        this._blast({ type: 'hello', from: this.selfPub, ts: now() });
+        this._blast(this._helloEnvelope(now()));
         this._blast({ type: 'peers_req', from: this.selfPub, ts: now() });
+        this._broadcastAlias();
 
         // Also proactively probe book once
         this._probeBookIfNeeded();
@@ -526,11 +612,14 @@ export class Mesh {
           if (this._isSelf(msg.from)) return;              // <-- avoid self-remote
           const pub = msg.from.toLowerCase();
           this._touchPeer(pub, t);
-          this.app.remotes.ensure(pub);
+          const alias = this._sanitizeAlias(msg.alias || '');
+          this.app.remotes.ensure(pub, alias || this._aliasFor(pub));
+          this._applyAlias(pub, alias);
           this._saveBookSoon();
 
           // ★ Auto-snapshot back to greeter
           this._sendPoseSnapshotTo(pub).catch(() => { });
+          this._announceJoin(pub);
           return;
         }
 
@@ -566,13 +655,16 @@ export class Mesh {
             ids.forEach(id => this._idSet(pub).add(id));
             if (it.addr && isAddr(it.addr)) this.peers.get(pub).addr = it.addr;
 
+            const alias = this._sanitizeAlias(it.alias || '');
+            this._applyAlias(pub, alias);
+
             // Ensure candidate addrs exist in pool
             for (const id of this._idSet(pub)) {
               const a = addrFrom(id, pub);
               if (!this.addrPool.has(a)) this.addrPool.set(a, {});
             }
 
-            this.app.remotes.ensure(pub);
+            this.app.remotes.ensure(pub, this._aliasFor(pub));
 
             // ★ Auto-snapshot to each discovered peer
             this._sendPoseSnapshotTo(pub).catch(() => { });
@@ -592,6 +684,14 @@ export class Mesh {
             this._touchPeer(pub, t);
             this._sendPoseSnapshotTo(pub).catch(() => { });
           }
+          return;
+        }
+
+        if (msg.type === 'alias' && msg.from) {
+          if (this._isSelf(msg.from)) return;
+          const pub = msg.from.toLowerCase();
+          this._touchPeer(pub, t);
+          this._applyAlias(pub, msg.alias || '');
           return;
         }
 
@@ -800,7 +900,7 @@ export class Mesh {
       const dot = document.createElement('span'); const online = this._online(pub);
       dot.className = 'dot ' + (online ? 'ok' : 'warn');
       const left = document.createElement('div');
-      const name = document.createElement('div'); name.className = 'name'; name.textContent = shortHex(pub, 8, 6);
+      const name = document.createElement('div'); name.className = 'name'; name.textContent = this._aliasFor(pub);
       const meta = document.createElement('div'); meta.className = 'meta';
       const ago = ent.lastTs ? fmtAgo(t - (ent.lastTs || t)) + ' ago' : '—';
       meta.textContent = online ? (`online • ${ago}`) : (`last ${ago}`);
@@ -827,6 +927,7 @@ export class Mesh {
       if (ui.peerList) ui.peerList.appendChild(row);
     }
     let online = 0; for (const pub of this.peers.keys()) if (this._online(pub)) online++;
+    if (ui.hudPeerCount) ui.hudPeerCount.textContent = String(online);
     if (ui.peerSummary) {
       const parts = [`${this.peers.size} peers`, `${online}/${this.addrPool.size} addrs online`];
       if (pendingIncoming > 0) parts.push(`${pendingIncoming} teleport request${pendingIncoming > 1 ? 's' : ''}`);
@@ -1083,7 +1184,8 @@ export class Mesh {
   _sendRoster(to) {
     const items = [];
     for (const [pub, ent] of this.peers.entries()) {
-      items.push({ pub, ids: [...this._idSet(pub)], addr: ent.addr || null, last: ent.lastTs || 0 });
+      const alias = this.aliases.get(pub) || '';
+      items.push({ pub, ids: [...this._idSet(pub)], addr: ent.addr || null, last: ent.lastTs || 0, alias: alias || undefined });
     }
     this._sendRaw(to, JSON.stringify({ type: 'peers', items, ts: now() }));
   }
