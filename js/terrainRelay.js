@@ -28,7 +28,33 @@ export class TerrainRelay {
     this.selfPub = null;
     this._pending = new Map();
     this._statusText = 'idle';
+    this._statusLevel = 'info';
     this._waiters = new Set();
+    this._metrics = {
+      success: 0,
+      failure: 0,
+      totalRequests: 0,
+      consecutiveFailures: 0,
+      lastDurationMs: null,
+      avgDurationMs: null,
+      lastSuccessAt: null,
+      lastFailureAt: null,
+      lastError: null,
+      lastErrorAt: null,
+      lastStatus: null,
+      retries: 0,
+      timeouts: 0,
+      inflight: 0,
+      maxInflight: 0,
+      heartbeatOk: 0,
+      heartbeatFail: 0,
+      lastHeartbeatMs: null,
+      lastHeartbeatAt: null,
+      lastHeartbeatError: null,
+      lastHeartbeatErrorAt: null,
+    };
+    this._heartbeatTimer = null;
+    this._healthLast = null;
   }
 
   setRelayAddress(addr) {
@@ -44,8 +70,116 @@ export class TerrainRelay {
   }
 
   _emitStatus(text, level = 'info') {
+    if (this._statusText === text && this._statusLevel === level) return;
     this._statusText = text;
+    this._statusLevel = level;
     if (this._onStatus) this._onStatus(text, level);
+  }
+
+  _nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  }
+
+  _recordSuccess(durationMs, { kind = 'query', status = null, info = null } = {}) {
+    const m = this._metrics;
+    if (kind === 'query') {
+      m.success += 1;
+      m.totalRequests += 1;
+      if (Number.isFinite(durationMs)) {
+        m.lastDurationMs = durationMs;
+        m.avgDurationMs = m.avgDurationMs == null ? durationMs : (m.avgDurationMs * 0.85) + (durationMs * 0.15);
+      }
+      if (status != null) m.lastStatus = status;
+      m.lastSuccessAt = Date.now();
+      m.lastError = null;
+      m.lastErrorAt = null;
+      m.consecutiveFailures = 0;
+      this._updateStatus();
+    } else if (kind === 'heartbeat') {
+      if (Number.isFinite(durationMs)) m.lastHeartbeatMs = durationMs;
+      const now = Date.now();
+      m.lastHeartbeatAt = now;
+      m.heartbeatOk += 1;
+      m.lastHeartbeatError = null;
+      m.lastHeartbeatErrorAt = null;
+      this._healthLast = { at: now, info: info || null };
+      this._updateStatus();
+    }
+  }
+
+  _recordFailure(err, { kind = 'query' } = {}) {
+    const m = this._metrics;
+    const message = err?.message ? String(err.message) : (typeof err === 'string' ? err : 'terrain relay error');
+    if (kind === 'heartbeat') {
+      const now = Date.now();
+      m.heartbeatFail += 1;
+      m.lastHeartbeatError = message;
+      m.lastHeartbeatErrorAt = now;
+      this._emitStatus(`terrain relay heartbeat degraded (${message})`, 'warn');
+      return;
+    }
+
+    m.failure += 1;
+    m.totalRequests += 1;
+    m.consecutiveFailures += 1;
+    const now = Date.now();
+    m.lastFailureAt = now;
+    m.lastError = message;
+    m.lastErrorAt = now;
+    if (/timeout/i.test(message)) m.timeouts += 1;
+    const level = m.consecutiveFailures > 3 ? 'error' : 'warn';
+    this._emitStatus(`terrain relay degraded · fail ${m.consecutiveFailures} (${message})`, level);
+  }
+
+  _updateStatus() {
+    if (!this.connected) return;
+    const m = this._metrics;
+    const total = m.totalRequests || (m.success + m.failure);
+    const parts = [
+      'connected',
+      `ok ${m.success}/${total || 0}`,
+      `fail ${m.failure}`,
+    ];
+    if (Number.isFinite(m.lastDurationMs)) parts.push(`last ${m.lastDurationMs.toFixed(0)}ms`);
+    if (Number.isFinite(m.avgDurationMs)) parts.push(`avg ${m.avgDurationMs.toFixed(0)}ms`);
+    if (m.inflight > 0) parts.push(`inflight ${m.inflight}`);
+    if (m.heartbeatFail > 0 && (!m.heartbeatOk || m.heartbeatOk < m.heartbeatFail)) {
+      parts.push(`hb fail ${m.heartbeatFail}`);
+    }
+    const summary = parts.join(' · ');
+    const level = m.consecutiveFailures > 0 ? (m.consecutiveFailures > 3 ? 'error' : 'warn') : 'ok';
+    this._emitStatus(summary, level);
+  }
+
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    const run = () => this._performHeartbeat().catch(() => {});
+    this._heartbeatTimer = setInterval(run, 20000);
+    run();
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  async _performHeartbeat() {
+    if (!this.relayAddress || !this.connected) return;
+    const payload = { type: 'health', ts: Date.now() };
+    const start = this._nowMs();
+    try {
+      const reply = await this._sendWithReply(this.relayAddress, payload, 6000, this.client);
+      const dur = this._nowMs() - start;
+      if (reply && (reply.type === 'health.response' || reply.status === 'ok')) {
+        this._recordSuccess(dur, { kind: 'heartbeat', info: reply });
+      } else {
+        throw new Error('invalid heartbeat reply');
+      }
+    } catch (err) {
+      this._recordFailure(err, { kind: 'heartbeat' });
+    }
   }
 
   async ensureClient() {
@@ -58,7 +192,12 @@ export class TerrainRelay {
       this.connected = true;
       this.selfAddr = client.addr || null;
       try { this.selfPub = client.getPublicKey?.() || null; } catch { this.selfPub = null; }
+      if (typeof client.onClose === 'function') {
+        client.onClose(() => this._handleClose());
+      }
       this._emitStatus('connected', 'ok');
+      this._startHeartbeat();
+      this._updateStatus();
       return client;
     }
 
@@ -92,6 +231,8 @@ export class TerrainRelay {
       this.selfAddr = mc.addr || null;
       try { this.selfPub = mc.getPublicKey?.() || null; } catch { this.selfPub = null; }
       this._emitStatus('connected', 'ok');
+      this._startHeartbeat();
+      this._updateStatus();
       this._flushWaiters(mc);
     });
 
@@ -100,6 +241,7 @@ export class TerrainRelay {
     mc.onClose?.(() => {
       this.connected = false;
       this._emitStatus('disconnected', 'warn');
+      this._stopHeartbeat();
     });
 
     this._internalClient = mc;
@@ -173,17 +315,56 @@ export class TerrainRelay {
 
   async queryBatch(dest, payload, timeoutMs = 45000) {
     const mc = await this.ensureClient();
-    const reply = await this._sendWithReply(dest, payload, timeoutMs, mc);
-    if (reply && reply.type === 'http.response') {
-      if (reply.body_b64) {
-        try { return JSON.parse(atob(reply.body_b64)); } catch { return null; }
+    const m = this._metrics;
+    m.inflight += 1;
+    if (m.inflight > m.maxInflight) m.maxInflight = m.inflight;
+
+    const maxAttempts = 3;
+    let attempt = 0;
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const attemptStart = this._nowMs();
+        let reply;
+        try {
+          reply = await this._sendWithReply(dest, payload, timeoutMs, mc);
+        } catch (err) {
+          const message = err?.message ? String(err.message) : String(err || 'error');
+          if (/timeout/i.test(message)) m.timeouts += 1;
+          if (attempt < maxAttempts - 1) {
+            m.retries += 1;
+            await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+            attempt += 1;
+            continue;
+          }
+          this._recordFailure(err);
+          throw err;
+        }
+
+        const duration = this._nowMs() - attemptStart;
+        const status = (reply && typeof reply.status === 'number') ? reply.status : null;
+        if (status != null) m.lastStatus = status;
+
+        if (reply && reply.type === 'http.response' && typeof status === 'number' && status >= 400) {
+          this._recordFailure(new Error(`status ${status}`));
+        } else {
+          this._recordSuccess(duration, { kind: 'query', status });
+        }
+
+        if (reply && reply.type === 'http.response') {
+          if (reply.body_b64) {
+            try { return JSON.parse(atob(reply.body_b64)); } catch { return null; }
+          }
+          if (reply.body && typeof reply.body === 'string') {
+            try { return JSON.parse(reply.body); } catch { return null; }
+          }
+          if (reply.body && typeof reply.body === 'object') return reply.body;
+        }
+        return reply;
       }
-      if (reply.body && typeof reply.body === 'string') {
-        try { return JSON.parse(reply.body); } catch { return null; }
-      }
-      if (reply.body && typeof reply.body === 'object') return reply.body;
+    } finally {
+      m.inflight = Math.max(0, m.inflight - 1);
     }
-    return reply;
   }
 
   async _waitForReady(client, timeoutMs = 20000) {
@@ -225,5 +406,24 @@ export class TerrainRelay {
       try { waiter(client); } catch { /* noop */ }
     }
     this._waiters.clear();
+  }
+
+  getHealth() {
+    const metrics = { ...this._metrics };
+    return {
+      connected: this.connected,
+      address: this.relayAddress || null,
+      dataset: this.dataset,
+      clientAddr: this.selfAddr || null,
+      status: { text: this._statusText, level: this._statusLevel },
+      metrics,
+      heartbeat: this._healthLast,
+    };
+  }
+
+  _handleClose() {
+    this.connected = false;
+    this._stopHeartbeat();
+    this._emitStatus('disconnected', 'warn');
   }
 }

@@ -141,6 +141,8 @@ export class Remotes {
     if (!ent) return;
     const x = pose.p[0], y = pose.p[1], z = pose.p[2];
 
+    ent.avatar.setCrouch(!!pose.c);
+
     const geoEye = Number.isFinite(geo?.eye) ? Number(geo.eye) : null;
     const groundYRaw = Number.isFinite(y)
       ? (Number.isFinite(geoEye) ? y - geoEye : y - 1.6)

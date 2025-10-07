@@ -1265,6 +1265,15 @@ class App {
   }
 
   /* ---------- UI ---------- */
+  _formatAgo(tsMs) {
+    if (!Number.isFinite(tsMs)) return 'n/a';
+    const delta = Math.max(0, Date.now() - tsMs);
+    if (delta < 2000) return `${(delta / 1000).toFixed(1)}s ago`;
+    if (delta < 60000) return `${Math.round(delta / 1000)}s ago`;
+    if (delta < 3600000) return `${Math.round(delta / 60000)}m ago`;
+    return `${Math.round(delta / 3600000)}h ago`;
+  }
+
   _formatPerfLabel(perfState) {
     const pct = Math.round(THREE.MathUtils.clamp(perfState?.quality ?? 1, 0, 1.05) * 100);
     const level = perfState?.level ? perfState.level.charAt(0).toUpperCase() + perfState.level.slice(1) : 'Adaptive';
@@ -1633,12 +1642,57 @@ class App {
 
     const relayStatus = this.hexGridMgr?.getRelayStatus?.();
     if (relayStatus) {
+      let relayTooltip = relayStatus.text || 'Terrain relay idle';
+      const metrics = relayStatus.metrics || null;
+      const pipeline = relayStatus.pipeline || null;
+      const heartbeat = relayStatus.heartbeat || null;
+      if (metrics) {
+        const total = metrics.totalRequests ?? (metrics.success + metrics.failure);
+        const last = Number.isFinite(metrics.lastDurationMs) ? `${metrics.lastDurationMs.toFixed(0)}ms` : '—';
+        const avg = Number.isFinite(metrics.avgDurationMs) ? `${metrics.avgDurationMs.toFixed(0)}ms` : '—';
+        const inflight = metrics.inflight ?? 0;
+        const retries = metrics.retries ?? 0;
+        const timeouts = metrics.timeouts ?? 0;
+        const lastSuccessAgo = metrics.lastSuccessAt ? this._formatAgo(metrics.lastSuccessAt) : 'never';
+        const lastFailureAgo = metrics.lastFailureAt ? this._formatAgo(metrics.lastFailureAt) : 'never';
+        const lines = [
+          relayStatus.text || 'Terrain relay',
+          `queries · ok ${metrics.success}/${total || 0} · fail ${metrics.failure}`,
+          `duration · last ${last} · avg ${avg}`,
+          `inflight ${inflight} · retries ${retries} · timeouts ${timeouts}`,
+          `last success ${lastSuccessAgo} · last failure ${lastFailureAgo}`,
+        ];
+        if (metrics.lastError) lines.push(`last error · ${metrics.lastError}`);
+        relayTooltip = lines.join('\n');
+      }
+      if (pipeline) {
+        const pending = pipeline.pending || {};
+        const queued = pipeline.queued || {};
+        const phase = pipeline.phase || 'interactive';
+        const inflightPipeline = Number.isFinite(pipeline.inflight) ? pipeline.inflight : 0;
+        const queueDepth = Number.isFinite(pipeline.queue) ? pipeline.queue : 0;
+        const deferredCount = Number.isFinite(pipeline.deferredInteractive) ? pipeline.deferredInteractive : 0;
+        const secondPass = pipeline.interactiveSecondPass ? 'yes' : 'no';
+        const phaseLine = `pipeline · ${phase} · inflight ${inflightPipeline} · queue ${queueDepth}`;
+        const pendingLine = `pending · I ${pending.interactive ?? 0} · V ${pending.visual ?? 0} · F ${pending.farfield ?? 0}`;
+        const queuedLine = `queued · I ${queued.interactive ?? 0} · V ${queued.visual ?? 0} · F ${queued.farfield ?? 0}`;
+        const deferredLine = `interactive backlog · deferred ${deferredCount} · second pass ${secondPass}`;
+        relayTooltip += `\n${phaseLine}\n${pendingLine}\n${queuedLine}\n${deferredLine}`;
+      }
+      if (heartbeat?.at) {
+        const ageMs = Date.now() - heartbeat.at;
+        const ageLabel = ageMs >= 0 ? `${(ageMs / 1000).toFixed(1)}s ago` : 'n/a';
+        const hbDur = Number.isFinite(metrics?.lastHeartbeatMs) ? `${metrics.lastHeartbeatMs.toFixed(0)}ms` : 'n/a';
+        relayTooltip += `\nheartbeat · ${ageLabel} · ${hbDur}`;
+      }
       if (this._terrainStatusEl) {
         this._terrainStatusEl.textContent = relayStatus.text || 'idle';
         this._terrainStatusEl.dataset.state = relayStatus.level || 'info';
+        this._terrainStatusEl.dataset.connected = relayStatus.connected ? 'true' : 'false';
+        this._terrainStatusEl.title = relayTooltip;
       }
       if (this._hudTerrainDot) applyHudStatusDot(this._hudTerrainDot, relayStatus.level || '');
-      if (this._hudTerrainLabel) this._hudTerrainLabel.title = relayStatus.text || 'Terrain relay idle';
+      if (this._hudTerrainLabel) this._hudTerrainLabel.title = relayTooltip;
     }
 
     if (perfState.hudReady) {
@@ -1811,7 +1865,8 @@ class App {
           : 0.35;
         this.physics.suspendCharacterSnap(resumeDelay);
       }
-      this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
+      const crouchActive = this.move.isCrouching?.() ?? false;
+      this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt, crouchActive);
     });
 
     measure('physics.update', () => {

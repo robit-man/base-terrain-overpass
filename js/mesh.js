@@ -756,7 +756,8 @@ export class Mesh {
           const poseOut = {
             p: Array.isArray(pose.p) ? pose.p.map(v => Number(v)) : [0, 0, 0],
             q: Array.isArray(pose.q) ? pose.q.map(v => Number(v)) : [0, 0, 0, 1],
-            j: pose.j ? 1 : 0
+            j: pose.j ? 1 : 0,
+            c: pose.c ? 1 : 0
           };
 
           let geoNorm = null;
@@ -788,7 +789,7 @@ export class Mesh {
             }
           }
 
-          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, geo: geoNorm });
+          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm });
           this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
             console.warn('[remotes] update failed', err);
           });
@@ -1211,23 +1212,25 @@ export class Mesh {
    * Send pose at up to 60 fps. Tight thresholds; jumpEvent forces immediate send.
    * Expect q to be yaw-only (we keep bodies upright), as provided by app.js.
    */
-  async sendPoseIfChanged(p, q, yOverride, jumpEvent = false) {
+  async sendPoseIfChanged(p, q, yOverride, jumpEvent = false, crouchActive = false) {
     const t = now();
 
     // 60 fps gate
     if (!jumpEvent && (t - (this._lastSendAt || 0)) < this.MIN_INTERVAL_MS) return;
 
-    if (!this._posePrev) this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], t: 0 };
+    const crouchFlag = crouchActive ? 1 : 0;
+    if (!this._posePrev) this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], c: crouchFlag, t: 0 };
     const prev = this._posePrev;
 
     const posDelta = Math.hypot(p.x - prev.p[0], p.y - prev.p[1], p.z - prev.p[2]);
     const dot = prev.q[0] * q.x + prev.q[1] * q.y + prev.q[2] * q.z + prev.q[3] * q.w;
     const ang = 2 * Math.acos(Math.min(1, Math.abs(dot)));
 
-    const changed = posDelta > this.POS_EPS || ang > this.ANG_EPS || jumpEvent;
+    const crouchChanged = (prev.c ?? 0) !== crouchFlag;
+    const changed = posDelta > this.POS_EPS || ang > this.ANG_EPS || jumpEvent || crouchChanged;
     if (!changed) return;
 
-    this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], t };
+    this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], c: crouchFlag, t };
 
     const y = Number.isFinite(yOverride) ? yOverride : p.y;
     const payload = {
@@ -1237,7 +1240,8 @@ export class Mesh {
       pose: {
         p: [+p.x.toFixed(3), +y.toFixed(3), +p.z.toFixed(3)],
         q: [+q.x.toFixed(4), +q.y.toFixed(4), +q.z.toFixed(4), +q.w.toFixed(4)],
-        j: jumpEvent ? 1 : 0
+        j: jumpEvent ? 1 : 0,
+        c: crouchFlag
       }
     };
 

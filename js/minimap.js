@@ -65,6 +65,8 @@ export class MiniMap {
     this._longPressMs = 550;
     this._longPressTolerancePx = 14;
     this._snapEngaged = false;
+    this._autoFollowSuspendedUntil = 0;
+    this._manualOverrideActive = false;
 
     this.map = null;
     this.playerMarker = null;
@@ -73,8 +75,7 @@ export class MiniMap {
     this._initMap();
 
     this.recenterBtn?.addEventListener('click', () => {
-      this._setFollow(true);
-      this._centerOnPlayer(true);
+      this._setFollow(true, { triggerAuto: true, resetManual: true });
     });
 
     this.setBtn?.addEventListener('click', () => {
@@ -278,10 +279,16 @@ export class MiniMap {
     const entry = { lat: clampLat(lat), lon: clampLon(lon) };
     this.currentLatLon = entry;
     this.activeSource = source || this.activeSource;
+    const teleported = detail?.teleport === true;
+    if (source === 'manual' || detail?.manual === true || teleported) {
+      this._manualOverrideActive = true;
+      this._suspendAutoFollow(teleported ? 25000 : 15000);
+      this._lastFollowLatLon = { ...entry };
+    } else if (source && source !== 'manual') {
+      this._manualOverrideActive = false;
+    }
 
     if (this.playerMarker) this.playerMarker.setLatLng(toLeafletLatLng(entry));
-
-    const teleported = detail?.teleport === true;
     if (this.map) {
       if (this.followEnabled || teleported) {
         const zoom = this.map.getZoom() || DEFAULT_CENTER.zoom;
@@ -314,14 +321,22 @@ export class MiniMap {
     return { lat: clampLat(ll.lat), lon: clampLon(ll.lon) };
   }
 
-  _setFollow(enabled) {
+  _setFollow(enabled, { triggerAuto = true, resetManual = false } = {}) {
     if (this.followEnabled === enabled) return;
     this.followEnabled = !!enabled;
     if (this.followEnabled) {
       this.userHasPanned = false;
-      if (typeof this.onRequestAuto === 'function') this.onRequestAuto();
       if (this.currentLatLon) this.viewCenter = { ...this.currentLatLon };
       this._centerOnPlayer(true);
+      if (triggerAuto && typeof this.onRequestAuto === 'function') {
+        this._manualOverrideActive = false;
+        this.onRequestAuto();
+      } else if (resetManual) {
+        this._manualOverrideActive = false;
+      }
+      this._suspendAutoFollow(1000);
+    } else {
+      this._suspendAutoFollow(2000);
     }
     this._lastFollowLatLon = this.currentLatLon ? { ...this.currentLatLon } : null;
     this._updateFollowButton();
@@ -342,6 +357,8 @@ export class MiniMap {
     if (!this._pendingTeleport || typeof this.onRequestTeleport !== 'function') return;
     const { lat, lon } = this._pendingTeleport;
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    this._manualOverrideActive = true;
+    this._suspendAutoFollow(20000);
     this.onRequestTeleport({ lat, lon });
     this.moveBtn?.blur?.();
     this._disarmMoveTarget(true);
@@ -446,6 +463,13 @@ export class MiniMap {
     }
   }
 
+  _suspendAutoFollow(ms = 10000) {
+    const now = Date.now();
+    const extend = Math.max(0, ms);
+    const target = now + extend;
+    if (target > this._autoFollowSuspendedUntil) this._autoFollowSuspendedUntil = target;
+  }
+
   _setStatus(source, lat, lon) {
     if (!this.statusEl) return;
     let label = 'Location pending';
@@ -468,6 +492,7 @@ export class MiniMap {
     if (!Number.isFinite(entry.lat) || !Number.isFinite(entry.lon)) return;
     this._pendingTeleport = entry;
     this._moveArmed = true;
+    this._suspendAutoFollow(12000);
     this._setFollow(false);
     try {
       this.map?.setView?.([entry.lat, entry.lon], this.map?.getZoom?.() ?? DEFAULT_CENTER.zoom, { animate: true });
@@ -487,6 +512,9 @@ export class MiniMap {
   _maybeAutoFollow(latLon) {
     if (this.followEnabled) return;
     if (!latLon) return;
+    const now = Date.now();
+    if (this._manualOverrideActive) return;
+    if (now < this._autoFollowSuspendedUntil) return;
     if (!this._lastFollowLatLon) {
       this._lastFollowLatLon = { ...latLon };
       return;
@@ -495,7 +523,8 @@ export class MiniMap {
     const dLon = latLon.lon - this._lastFollowLatLon.lon;
     const dist = Math.sqrt(dLat * dLat + dLon * dLon);
     if (dist >= this._autoFollowThreshold) {
-      this._setFollow(true);
+      const triggerAuto = this.activeSource !== 'manual';
+      this._setFollow(true, { triggerAuto });
     }
   }
 

@@ -21,10 +21,11 @@ POST /forward   -> {dest, locations:[{lat,lng},...], dataset?}  (builds elev.que
 """
 
 from __future__ import annotations
-import os, sys, subprocess, json, time, uuid, threading, base64, shutil, socket, ssl, re
+import os, sys, subprocess, json, time, uuid, threading, base64, shutil, socket, ssl, re, math
 from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone, timedelta
+from collections import deque
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0) Minimal re-exec into a local venv (create once, then fast-start)
@@ -207,6 +208,138 @@ NKN_RPC_ADDRS       = [s.strip() for s in os.getenv("NKN_RPC_ADDRS","").split(",
 TLS_DIR             = SCRIPT_DIR / "tls"
 TLS_DIR.mkdir(exist_ok=True, parents=True)
 
+class ForwarderMetrics:
+    def __init__(self):
+        self.lock = threading.Lock()
+        now = time.time()
+        self.started_at = now
+        self.forward_total = 0
+        self.forward_success = 0
+        self.forward_failure = 0
+        self.forward_timeouts = 0
+        self.forward_inflight = 0
+        self.forward_max_inflight = 0
+        self.forward_last_status = None
+        self.forward_last_duration_ms = None
+        self.forward_duration_samples = deque(maxlen=200)
+        self.forward_duration_sum = 0.0
+        self.last_forward_at = None
+        self.last_forward_success_at = None
+        self.last_forward_error_at = None
+        self.last_forward_error = None
+        self.dm_total = 0
+        self.dm_health = 0
+        self.dm_query = 0
+        self.dm_invalid = 0
+        self.last_health_at = None
+        self.last_health_payload = None
+        self.sidecar_errors = 0
+        self.last_sidecar_error = None
+        self.last_sidecar_error_at = None
+
+    def start_forward(self):
+        with self.lock:
+            self.forward_total += 1
+            self.forward_inflight += 1
+            if self.forward_inflight > self.forward_max_inflight:
+                self.forward_max_inflight = self.forward_inflight
+            self.last_forward_at = time.time()
+
+    def finish_forward(self, duration_ms: float, ok: bool, status: Optional[int] = None, error: Optional[Exception] = None):
+        now = time.time()
+        with self.lock:
+            self.forward_inflight = max(0, self.forward_inflight - 1)
+            if duration_ms is not None:
+                clamped = max(0.0, float(duration_ms))
+                self.forward_last_duration_ms = clamped
+                self.forward_duration_samples.append(clamped)
+                self.forward_duration_sum += clamped
+            if status is not None:
+                self.forward_last_status = int(status)
+            if ok:
+                self.forward_success += 1
+                self.last_forward_success_at = now
+            else:
+                self.forward_failure += 1
+                if error:
+                    msg = str(error)
+                    self.last_forward_error = msg
+                    if 'timeout' in msg.lower():
+                        self.forward_timeouts += 1
+                else:
+                    self.last_forward_error = None
+                self.last_forward_error_at = now
+
+    def record_dm(self, kind: str, ok: bool = True):
+        with self.lock:
+            self.dm_total += 1
+            if kind == 'health':
+                self.dm_health += 1
+                self.last_health_at = time.time()
+            elif kind == 'query':
+                if ok:
+                    self.dm_query += 1
+                else:
+                    self.dm_invalid += 1
+            elif not ok:
+                self.dm_invalid += 1
+
+    def record_health_payload(self, payload: Dict[str, Any]):
+        with self.lock:
+            self.last_health_payload = payload
+            self.last_health_at = time.time()
+
+    def note_sidecar_error(self, message: str):
+        with self.lock:
+            self.sidecar_errors += 1
+            self.last_sidecar_error = message
+            self.last_sidecar_error_at = time.time()
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        with self.lock:
+            durations = list(self.forward_duration_samples)
+            avg_ms = (sum(durations) / len(durations)) if durations else 0.0
+            p95_ms = 0.0
+            if durations:
+                ordered = sorted(durations)
+                idx = min(len(ordered) - 1, max(0, int(math.ceil(len(ordered) * 0.95)) - 1))
+                p95_ms = ordered[idx]
+            return {
+                "uptime_s": round(now - self.started_at, 3),
+                "forward": {
+                    "total": self.forward_total,
+                    "success": self.forward_success,
+                    "failure": self.forward_failure,
+                    "timeouts": self.forward_timeouts,
+                    "inflight": self.forward_inflight,
+                    "max_inflight": self.forward_max_inflight,
+                    "avg_ms": round(avg_ms, 3),
+                    "p95_ms": round(p95_ms, 3),
+                    "last_duration_ms": self.forward_last_duration_ms,
+                    "last_status": self.forward_last_status,
+                    "last_request_ts": int(self.last_forward_at * 1000) if self.last_forward_at else None,
+                    "last_success_ts": int(self.last_forward_success_at * 1000) if self.last_forward_success_at else None,
+                    "last_error": self.last_forward_error,
+                    "last_error_ts": int(self.last_forward_error_at * 1000) if self.last_forward_error_at else None,
+                },
+                "dm": {
+                    "total": self.dm_total,
+                    "health": self.dm_health,
+                    "query": self.dm_query,
+                    "invalid": self.dm_invalid,
+                    "last_health_ts": int(self.last_health_at * 1000) if self.last_health_at else None,
+                },
+                "sidecar": {
+                    "errors": self.sidecar_errors,
+                    "last_error": self.last_sidecar_error,
+                    "last_error_ts": int(self.last_sidecar_error_at * 1000) if self.last_sidecar_error_at else None,
+                },
+                "last_health_payload": self.last_health_payload,
+            }
+
+METRICS = ForwarderMetrics()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) Small logging, rate limit, semaphore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,14 +451,20 @@ def _http_elev_query(locations: Any, dataset: Optional[str]) -> Dict[str, Any]:
     ds = (dataset or ELEV_DATASET).strip() or ELEV_DATASET
     url = f"{ELEV_BASE}/v1/{ds}?locations={requests.utils.quote(loc_q, safe='|,')}"
     t0 = _now_ms()
+    METRICS.start_forward()
+    status_code = None
     try:
         resp = requests.get(url, timeout=ELEV_TIMEOUT_MS/1000.0)
         dur = _now_ms() - t0
+        status_code = resp.status_code
         body = resp.content or b""
         headers = {str(k): str(v) for k, v in resp.headers.items()}
+        METRICS.finish_forward(dur, True, status=status_code)
         return {"status": resp.status_code, "headers": headers, "body_b64": base64.b64encode(body).decode(), "duration_ms": dur}
     except Exception as e:
-        return {"status": 502, "headers": {"content-type":"application/json"}, "body_b64": base64.b64encode(json.dumps({"error": f"upstream failure: {e}"}).encode()).decode(), "duration_ms": 0}
+        dur = _now_ms() - t0
+        METRICS.finish_forward(dur, False, status=status_code, error=e)
+        return {"status": 502, "headers": {"content-type":"application/json"}, "body_b64": base64.b64encode(json.dumps({"error": f"upstream failure: {e}"}).encode()).decode(), "duration_ms": dur}
 
 def _handle_incoming_dm(src: str, payload_b64: str):
     try:
@@ -342,6 +481,21 @@ def _handle_incoming_dm(src: str, payload_b64: str):
             fut.set_result(msg)
         return
 
+    if t == "health":
+        reply = {
+            "id": mid or uuid.uuid4().hex,
+            "type": "health.response",
+            "status": "ok",
+            "forwarder": sidecar.addr,
+            "time": datetime.utcnow().isoformat() + "Z",
+            "metrics": METRICS.snapshot(),
+            "dm_pending": len(_pending),
+        }
+        METRICS.record_dm("health")
+        METRICS.record_health_payload(reply)
+        sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
+        return
+
     if t in ("elev.query", "http.request"):
         # Forward to OpenTopo and reply to src with same id
         if t == "elev.query":
@@ -355,6 +509,7 @@ def _handle_incoming_dm(src: str, payload_b64: str):
                         "body_b64": base64.b64encode(json.dumps({"error": str(e)}).encode()).decode(),
                         "duration_ms": 0}
             reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
+            METRICS.record_dm("query", ok=isinstance(resp.get("status"), int) and resp["status"] < 500)
             sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
             return
 
@@ -363,12 +518,14 @@ def _handle_incoming_dm(src: str, payload_b64: str):
             method = str(msg.get("method","GET")).upper()
             url    = str(msg.get("url","")).strip()
             if method != "GET" or not url.startswith("/v1/"):
+                METRICS.record_dm("query", ok=False)
                 body = base64.b64encode(json.dumps({"error":"only GET /v1/<dataset>?locations=... supported"}).encode()).decode()
                 sidecar.send(src, base64.b64encode(json.dumps({"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
                 return
             # Extract dataset and locations; pass to OpenTopo
             m = re.match(r"^/v1/([^?]+)\?locations=(.+)$", url)
             if not m:
+                METRICS.record_dm("query", ok=False)
                 body = base64.b64encode(json.dumps({"error":"missing locations"}).encode()).decode()
                 sidecar.send(src, base64.b64encode(json.dumps({"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
                 return
@@ -382,6 +539,7 @@ def _handle_incoming_dm(src: str, payload_b64: str):
                         "body_b64": base64.b64encode(json.dumps({"error": str(e)}).encode()).decode(),
                         "duration_ms": 0}
             reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
+            METRICS.record_dm("query", ok=isinstance(resp.get("status"), int) and resp["status"] < 500)
             sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
             return
 
@@ -393,6 +551,7 @@ def _event_loop():
             _handle_incoming_dm(obj.get("src"), obj.get("payload_b64") or "")
         elif ev == "error":
             log(f"Sidecar error: {obj.get('message')}", "ERR")
+            METRICS.note_sidecar_error(str(obj.get("message")))
         elif ev == "ready":
             log(f"My NKN address: {obj.get('addr')}", "INFO")
 
@@ -423,7 +582,9 @@ def _rate_guard():
 def healthz():
     return jsonify({
         "ok": True, "addr": sidecar.addr, "elev_base": ELEV_BASE, "dataset": ELEV_DATASET,
-        "ts": int(time.time()*1000)
+        "ts": int(time.time()*1000),
+        "dm_pending": len(_pending),
+        "metrics": METRICS.snapshot(),
     })
 
 @app.post("/forward")

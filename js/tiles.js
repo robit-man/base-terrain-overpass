@@ -101,7 +101,14 @@ export class TileManager {
     this.relayAddress = DEFAULT_TERRAIN_RELAY;
     this.relayDataset = DEFAULT_TERRAIN_DATASET;
     this.relayTimeoutMs = 45000;
-    this._relayStatus = { text: 'idle', level: 'info' };
+    this._relayStatus = {
+      text: 'idle',
+      level: 'info',
+      connected: false,
+      metrics: null,
+      heartbeat: null,
+      address: this.relayAddress,
+    };
     this._relayWasConnected = false;
 
     this.terrainRelay = new TerrainRelay({
@@ -1401,7 +1408,7 @@ export class TileManager {
     this._interactiveSecondPass = true;
     this._fetchPhase = 'interactive-final';
     console.log('[tiles] interactive second pass activated');
-    this._releaseDeferredInteractivePhases();
+    this._primePhaseWork('interactive-final');
   }
 
   _releaseDeferredInteractivePhases() {
@@ -1424,6 +1431,7 @@ export class TileManager {
     if (this._fetchPhase === 'interactive') {
       if (this._interactiveTilesPending(exclude)) return;
       this._fetchPhase = 'visual';
+      this._primePhaseWork('visual');
       this._markRelaxListDirty();
       this._scheduleBackfill(0);
       return;
@@ -1431,6 +1439,7 @@ export class TileManager {
     if (this._fetchPhase === 'visual') {
       if (this._visualTilesPending(exclude)) return;
       this._fetchPhase = 'farfield';
+      this._primePhaseWork('farfield');
       this._scheduleBackfill(0);
       return;
     }
@@ -1439,6 +1448,66 @@ export class TileManager {
       this._activateInteractiveSecondPass();
       return;
     }
+  }
+
+  _primePhaseWork(phase) {
+    const wantVisual = phase === 'visual' || phase === 'farfield' || phase === 'interactive-final';
+    const wantFarfield = phase === 'farfield' || phase === 'interactive-final';
+
+    if (phase === 'interactive') {
+      for (const tile of this.tiles.values()) {
+        if (tile.type !== 'interactive') continue;
+        if (tile._phase?.seedDone) continue;
+        this._queuePopulatePhase(tile, PHASE_SEED, true);
+      }
+      return;
+    }
+
+    if (wantVisual) {
+      for (const tile of this.tiles.values()) {
+        if (tile.type !== 'visual') continue;
+        if (!this._tileNeedsFetch(tile)) continue;
+        this._queuePopulatePhase(tile, PHASE_FULL, true);
+      }
+    }
+
+    if (wantFarfield) {
+      for (const tile of this.tiles.values()) {
+        if (tile.type !== 'farfield') continue;
+        if (!this._tileNeedsFetch(tile)) continue;
+        this._queuePopulatePhase(tile, PHASE_FULL, true);
+      }
+    }
+
+    if (phase === 'interactive-final') {
+      this._releaseDeferredInteractivePhases();
+    }
+  }
+
+  _collectPipelineStats() {
+    const stats = {
+      phase: this._fetchPhase,
+      queue: this._populateQueue.length,
+      inflight: this._populateInflight,
+      totals: { interactive: 0, visual: 0, farfield: 0 },
+      pending: { interactive: 0, visual: 0, farfield: 0 },
+      queued: { interactive: 0, visual: 0, farfield: 0 },
+      deferredInteractive: this._deferredInteractive.size,
+      interactiveSecondPass: this._interactiveSecondPass,
+    };
+
+    for (const tile of this.tiles.values()) {
+      const type = tile.type;
+      if (!(type in stats.totals)) stats.totals[type] = 0;
+      if (!(type in stats.pending)) stats.pending[type] = 0;
+      if (!(type in stats.queued)) stats.queued[type] = 0;
+
+      stats.totals[type] += 1;
+      if (this._tileNeedsFetch(tile)) stats.pending[type] += 1;
+      if (tile._queuedPhases?.size) stats.queued[type] += tile._queuedPhases.size;
+    }
+
+    return stats;
   }
 
   _phaseKey(phase) {
@@ -1497,6 +1566,7 @@ export class TileManager {
       tile._phase.seedDone = true;
       if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_EDGE);
       else this._deferredInteractive.add(tile);
+      if (this._fetchPhase === 'interactive') this._tryAdvanceFetchPhase(tile);
     } else if (phase === PHASE_EDGE) {
       tile._phase.edgeDone = true;
       if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_FULL);
@@ -2122,15 +2192,36 @@ export class TileManager {
   }
 
   _onRelayStatus(text, level) {
-    this._relayStatus = { text, level };
-    const isConnected = (text === 'connected' || level === 'ok');
-    if (isConnected) {
-      this.MAX_CONCURRENT_POPULATES = 12;
-      this.RATE_QPS = 12; this.RATE_BPS = 256 * 1024;
-    } else {
+    const health = typeof this.terrainRelay?.getHealth === 'function' ? this.terrainRelay.getHealth() : null;
+    const metrics = health?.metrics || null;
+    const isConnected = !!(health?.connected || text === 'connected' || level === 'ok');
+
+    this._relayStatus = {
+      text,
+      level,
+      connected: !!health?.connected,
+      address: health?.address || this.relayAddress || null,
+      metrics,
+      heartbeat: health?.heartbeat || null,
+    };
+
+    const consecutive = metrics?.consecutiveFailures ?? 0;
+    const heartbeatFail = metrics?.heartbeatFail ?? 0;
+
+    if (!isConnected) {
+      this.MAX_CONCURRENT_POPULATES = 4;
+      this.RATE_QPS = 4; this.RATE_BPS = 96 * 1024;
+    } else if (consecutive >= 6 || heartbeatFail > 2) {
+      this.MAX_CONCURRENT_POPULATES = 4;
+      this.RATE_QPS = 4; this.RATE_BPS = 96 * 1024;
+    } else if (consecutive > 0 || heartbeatFail > 0) {
       this.MAX_CONCURRENT_POPULATES = 6;
       this.RATE_QPS = 6; this.RATE_BPS = 128 * 1024;
+    } else {
+      this.MAX_CONCURRENT_POPULATES = 12;
+      this.RATE_QPS = 12; this.RATE_BPS = 256 * 1024;
     }
+
     if (isConnected && !this._relayWasConnected) {
       this._relayWasConnected = true;
       this._scheduleBackfill(0);
@@ -2278,6 +2369,7 @@ export class TileManager {
   setRelayAddress(addr) {
     this.relayAddress = (addr || '').trim();
     this.terrainRelay?.setRelayAddress(this.relayAddress);
+    if (this._relayStatus) this._relayStatus.address = this.relayAddress || null;
     this._scheduleBackfill(0);
   }
 
@@ -2293,7 +2385,10 @@ export class TileManager {
     this._scheduleBackfill(0);
   }
 
-  getRelayStatus() { return this._relayStatus; }
+  getRelayStatus() {
+    const pipeline = this._collectPipelineStats();
+    return { ...this._relayStatus, pipeline };
+  }
 
   refreshTiles() {
     for (const tile of this.tiles.values()) {
