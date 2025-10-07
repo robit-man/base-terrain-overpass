@@ -710,6 +710,11 @@ export class TileManager {
       tile.fetched = new Set();
       tile.populating = false;
       tile.unreadyCount = 0;
+      if (tile._retryCounts) {
+        if ('seed' in tile._retryCounts) tile._retryCounts.seed = 0;
+        if ('edge' in tile._retryCounts) tile._retryCounts.edge = 0;
+        if ('full' in tile._retryCounts) tile._retryCounts.full = 0;
+      }
 
       this._ensureTileBuffers(tile);
       this._pullGeometryToBuffers(tile);
@@ -742,7 +747,105 @@ export class TileManager {
         q: tile.q, r: tile.r, y
       };
       localStorage.setItem(this._cacheKey(tile), JSON.stringify(payload));
+      if (tile.type === 'interactive') {
+        try { localStorage.removeItem(this._seedCacheKey(tile)); } catch { /* ignore */ }
+      }
     } catch { /* ignore quota */ }
+  }
+
+  _seedCacheKey(tile) {
+    const originKey = this._originCacheKey || 'na';
+    const datasetKey = (this.relayDataset || '').replace(/[^a-z0-9._-]/gi, '').slice(0, 40);
+    return `tileSeed:${this.CACHE_VER}:${originKey}:${this.spacing}:${this.tileRadius}:${datasetKey}:${this.relayMode}:${tile.q},${tile.r}`;
+  }
+
+  _saveInteractiveSeed(tile) {
+    if (!tile || tile.type !== 'interactive') return;
+    if (!tile._phase?.seedDone || tile._phase?.edgeDone) return;
+    if (!tile.fetched || tile.fetched.size === 0) return;
+    try {
+      const pos = tile.pos;
+      const y = new Array(pos.count);
+      for (let i = 0; i < pos.count; i++) y[i] = +pos.getY(i).toFixed(2);
+      const samples = Array.from(tile.fetched).map((idx) => ({
+        i: idx,
+        y: +pos.getY(idx).toFixed(2),
+      }));
+      if (!samples.length) return;
+      const payload = {
+        v: this.CACHE_VER,
+        phase: 'seed',
+        type: 'interactive',
+        spacing: this.spacing,
+        tileRadius: this.tileRadius,
+        q: tile.q,
+        r: tile.r,
+        y,
+        samples,
+      };
+      localStorage.setItem(this._seedCacheKey(tile), JSON.stringify(payload));
+    } catch { /* ignore */ }
+  }
+
+  _tryLoadInteractiveSeed(tile) {
+    if (!tile || tile.type !== 'interactive') return false;
+    try {
+      const raw = localStorage.getItem(this._seedCacheKey(tile));
+      if (!raw) return false;
+
+      const data = JSON.parse(raw);
+      if (!data || data.phase !== 'seed') return false;
+      if (data.spacing !== this.spacing || data.tileRadius !== this.tileRadius) return false;
+      if (!Array.isArray(data.y) || data.y.length !== tile.pos.count) return false;
+
+      const pos = tile.pos;
+      for (let i = 0; i < data.y.length; i++) pos.setY(i, data.y[i]);
+      pos.needsUpdate = true;
+      tile.grid.geometry.computeVertexNormals?.();
+
+      const ready = tile.ready;
+      if (ready && ready.length === pos.count) ready.fill(0);
+      else tile.ready = new Uint8Array(pos.count);
+
+      tile.fetched?.clear?.();
+      if (!tile.fetched) tile.fetched = new Set();
+
+      let readyCount = 0;
+      if (Array.isArray(data.samples)) {
+        for (const sample of data.samples) {
+          const idx = Number(sample?.i);
+          const val = Number(sample?.y);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= pos.count) continue;
+          if (!Number.isFinite(val)) continue;
+          tile.ready[idx] = 1;
+          tile.fetched.add(idx);
+          readyCount += 1;
+        }
+      }
+      if (readyCount === 0) return false;
+
+      tile.unreadyCount = Math.max(0, pos.count - readyCount);
+      tile.populating = false;
+      if (!tile._phase) tile._phase = {};
+      tile._phase.seedDone = true;
+      tile._phase.edgeDone = false;
+      tile._phase.fullDone = false;
+      tile.relaxEnabled = false;
+      if (tile._retryCounts) {
+        tile._retryCounts.seed = 0;
+        if ('edge' in tile._retryCounts) tile._retryCounts.edge = 0;
+        if ('full' in tile._retryCounts) tile._retryCounts.full = 0;
+      }
+
+      this._ensureTileBuffers(tile);
+      this._pullGeometryToBuffers(tile);
+      this._updateGlobalFromArray(data.y);
+      this._applyAllColorsGlobal(tile);
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /* ---------------- creation: interactive tile ---------------- */
@@ -785,6 +888,7 @@ export class TileManager {
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
       relaxEnabled: false,
+      _retryCounts: { seed: 0, edge: 0, full: 0 },
       wire
     };
     this._ensureTileBuffers(tile);
@@ -794,7 +898,14 @@ export class TileManager {
     this._markRelaxListDirty();
 
     if (!this._tryLoadTileFromCache(tile)) {
-      this._queuePopulate(tile, true);
+      if (this._tryLoadInteractiveSeed(tile)) {
+        this._deferredInteractive.add(tile);
+        this._markRelaxListDirty();
+        this._scheduleBackfill(0);
+        this._tryAdvanceFetchPhase(tile);
+      } else {
+        this._queuePopulate(tile, true);
+      }
     }
     return tile;
   }
@@ -874,6 +985,7 @@ export class TileManager {
       col: low.geometry.attributes.color,
       _phase: { fullDone: false },
       _queuedPhases: new Set(),
+      _retryCounts: { full: 0 },
       wire
     };
     this.tiles.set(id, tile);
@@ -914,7 +1026,8 @@ export class TileManager {
       unreadyCount: pos.count,
       col: far.geometry.attributes.color,
       _phase: { fullDone: false },
-      _queuedPhases: new Set()
+      _queuedPhases: new Set(),
+      _retryCounts: { full: 0 }
     };
     this.tiles.set(id, tile);
 
@@ -1514,6 +1627,25 @@ export class TileManager {
     return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
   }
 
+  _phaseName(phase) {
+    return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
+  }
+
+  _registerPhaseRetry(tile, phase) {
+    if (!tile) return false;
+    if (!tile._retryCounts) tile._retryCounts = { seed: 0, edge: 0, full: 0 };
+    const key = this._phaseName(phase);
+    const cap = key === 'seed' ? 4 : 3;
+    tile._retryCounts[key] = (tile._retryCounts[key] || 0) + 1;
+    return tile._retryCounts[key] <= cap;
+  }
+
+  _resetPhaseRetry(tile, phase) {
+    if (!tile || !tile._retryCounts) return;
+    const key = this._phaseName(phase);
+    tile._retryCounts[key] = 0;
+  }
+
   _isPhaseQueued(tile, phase) {
     const key = this._phaseKey(phase);
     if (tile._queuedPhases?.has(key)) return true;
@@ -1566,6 +1698,7 @@ export class TileManager {
       tile._phase.seedDone = true;
       if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_EDGE);
       else this._deferredInteractive.add(tile);
+      this._saveInteractiveSeed(tile);
       if (this._fetchPhase === 'interactive') this._tryAdvanceFetchPhase(tile);
     } else if (phase === PHASE_EDGE) {
       tile._phase.edgeDone = true;
@@ -1739,6 +1872,23 @@ export class TileManager {
     });
 
     await Promise.allSettled(queries);
+
+    const missing = Array.isArray(indices)
+      ? indices.filter((idx) => tile.ready[idx] !== 1)
+      : [];
+    if (missing.length) {
+      const allowRetry = this._registerPhaseRetry(tile, phase);
+      if (allowRetry) {
+        const key = this._phaseKey(phase);
+        tile._queuedPhases?.delete(key);
+        console.warn(`[tiles] retry ${this._phaseName(phase)} tile ${tile.q},${tile.r} · missing ${missing.length}`);
+        this._queuePopulatePhase(tile, phase, true);
+        return;
+      }
+      console.warn(`[tiles] exhausted retries for ${this._phaseName(phase)} tile ${tile.q},${tile.r} · unresolved ${missing.length}`);
+    } else {
+      this._resetPhaseRetry(tile, phase);
+    }
 
     let skipBlend = false;
     if (tile.type === 'interactive') {
@@ -1919,8 +2069,22 @@ export class TileManager {
 
     for (const tile of tiles) {
       tile.populating = false;
-      tile._phase.fullDone = true;
-      if (!this._tileNeedsFetch(tile)) {
+      if (tile.unreadyCount > 0) {
+        const allowRetry = this._registerPhaseRetry(tile, PHASE_FULL);
+        if (allowRetry) {
+          tile._queuedPhases?.delete('full');
+          console.warn(`[tiles] retry farfield tile ${tile.q},${tile.r} · pending ${tile.unreadyCount}`);
+          this._queuePopulatePhase(tile, PHASE_FULL, true);
+          continue;
+        }
+        console.warn(`[tiles] exhausted farfield retries tile ${tile.q},${tile.r} · remaining ${tile.unreadyCount}`);
+      } else {
+        this._resetPhaseRetry(tile, PHASE_FULL);
+      }
+
+      const done = tile.unreadyCount === 0;
+      tile._phase.fullDone = done;
+      if (done) {
         this._saveTileToCache(tile);
       } else {
         this._queuePopulate(tile, false);
