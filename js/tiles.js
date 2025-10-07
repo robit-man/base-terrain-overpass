@@ -31,6 +31,8 @@ export class TileManager {
     this._perfLogNext = 0;
     this._perfUpdateNext = 0;
     this._nextFarfieldLog = 0;
+    this._deferredInteractive = new Set();
+    this._interactiveSecondPass = false;
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
@@ -43,11 +45,11 @@ export class TileManager {
     this.FARFIELD_BATCH_SIZE = 48;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 0;
+    this.RELAX_ITERS_PER_FRAME = 20;
     this.RELAX_ALPHA = 0.2;
     this.NORMALS_EVERY = 10;
     // keep relax cheap so fetching dominates
-    this.RELAX_FRAME_BUDGET_MS = 0;
+    this.RELAX_FRAME_BUDGET_MS = 1;
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
@@ -1346,7 +1348,8 @@ export class TileManager {
     for (const tile of this.tiles.values()) {
       if (tile === exclude) continue;
       if (tile.type !== 'interactive') continue;
-      if (this._tileNeedsFetch(tile)) return true;
+      if (!tile._phase?.seedDone) return true;
+      if (this._interactiveSecondPass && this._tileNeedsFetch(tile)) return true;
     }
     return false;
   }
@@ -1358,6 +1361,39 @@ export class TileManager {
       if (this._tileNeedsFetch(tile)) return true;
     }
     return false;
+  }
+
+  _farfieldTilesPending(exclude = null) {
+    for (const tile of this.tiles.values()) {
+      if (tile === exclude) continue;
+      if (tile.type !== 'farfield') continue;
+      if (this._tileNeedsFetch(tile) || tile.populating) return true;
+    }
+    return false;
+  }
+
+  _activateInteractiveSecondPass() {
+    if (this._interactiveSecondPass) return;
+    this._interactiveSecondPass = true;
+    this._fetchPhase = 'interactive-final';
+    console.log('[tiles] interactive second pass activated');
+    this._releaseDeferredInteractivePhases();
+  }
+
+  _releaseDeferredInteractivePhases() {
+    if (!this._deferredInteractive.size) return;
+    for (const tile of this._deferredInteractive) {
+      if (!tile || tile.type !== 'interactive') continue;
+      if (!tile._phase?.seedDone) continue;
+      if (!tile._phase.edgeDone && !this._isPhaseQueued(tile, PHASE_EDGE)) {
+        this._queuePopulatePhase(tile, PHASE_EDGE);
+        continue;
+      }
+      if (tile._phase.edgeDone && !tile._phase.fullDone && !this._isPhaseQueued(tile, PHASE_FULL)) {
+        this._queuePopulatePhase(tile, PHASE_FULL);
+      }
+    }
+    this._deferredInteractive.clear();
   }
 
   _tryAdvanceFetchPhase(exclude = null) {
@@ -1372,6 +1408,11 @@ export class TileManager {
       if (this._visualTilesPending(exclude)) return;
       this._fetchPhase = 'farfield';
       this._scheduleBackfill(0);
+      return;
+    }
+    if (this._fetchPhase === 'farfield') {
+      if (this._farfieldTilesPending(exclude)) return;
+      this._activateInteractiveSecondPass();
       return;
     }
   }
@@ -1400,9 +1441,15 @@ export class TileManager {
       if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
       return;
     }
-    if (!tile._phase.seedDone) this._queuePopulatePhase(tile, PHASE_SEED, priority);
-    else if (!tile._phase.edgeDone) this._queuePopulatePhase(tile, PHASE_EDGE, priority);
-    else if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
+    if (!tile._phase.seedDone) {
+      this._queuePopulatePhase(tile, PHASE_SEED, priority);
+    } else if (!this._interactiveSecondPass) {
+      this._deferredInteractive.add(tile);
+    } else if (!tile._phase.edgeDone) {
+      this._queuePopulatePhase(tile, PHASE_EDGE, priority);
+    } else if (!tile._phase.fullDone) {
+      this._queuePopulatePhase(tile, PHASE_FULL, priority);
+    }
   }
 
   _queuePopulate(tile, priority = false) {
@@ -1418,6 +1465,24 @@ export class TileManager {
     if (priority) this._populateQueue.unshift(entry);
     else this._populateQueue.push(entry);
     this._drainPopulateQueue();
+  }
+
+  _handleInteractivePhaseCompletion(tile, phase) {
+    if (!tile || tile.type !== 'interactive') return;
+    if (phase === PHASE_SEED) {
+      tile._phase.seedDone = true;
+      if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_EDGE);
+      else this._deferredInteractive.add(tile);
+    } else if (phase === PHASE_EDGE) {
+      tile._phase.edgeDone = true;
+      if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_FULL);
+      else this._deferredInteractive.add(tile);
+    } else {
+      tile._phase.fullDone = true;
+      this._deferredInteractive.delete(tile);
+      if (tile.locked) tile.locked.fill(0);
+      this._saveTileToCache(tile);
+    }
   }
 
   async _acquireNetBudget(bytes) {
@@ -1525,21 +1590,12 @@ export class TileManager {
     // If truly nothing to do in this phase, mark + chain forward immediately
     if (!indices || indices.length === 0) {
       if (tile.type === 'interactive') {
-        if (phase === PHASE_SEED) {
-          tile._phase.seedDone = true;
-          this._queuePopulatePhase(tile, PHASE_EDGE);
-        } else if (phase === PHASE_EDGE) {
-          tile._phase.edgeDone = true;
-          this._queuePopulatePhase(tile, PHASE_FULL);
-        } else {
-          tile._phase.fullDone = true;
-          if (tile.locked) tile.locked.fill(0);
-          this._saveTileToCache(tile);
-        }
+        this._handleInteractivePhaseCompletion(tile, phase);
       } else {
         tile._phase.fullDone = true;
         this._saveTileToCache(tile);
       }
+      if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
       return;
     }
 
@@ -1618,18 +1674,7 @@ export class TileManager {
 
     // ---- mark phase complete & chain next ----
     if (tile.type === 'interactive') {
-      if (phase === PHASE_SEED) {
-        tile._phase.seedDone = true;
-        this._queuePopulatePhase(tile, PHASE_EDGE);
-      } else if (phase === PHASE_EDGE) {
-        tile._phase.edgeDone = true;
-        this._queuePopulatePhase(tile, PHASE_FULL);
-      } else {
-        tile._phase.fullDone = true;
-        // release pins after full pass; remaining locks will be overwritten as samples land
-        if (tile.locked) tile.locked.fill(0);
-        this._saveTileToCache(tile);
-      }
+      this._handleInteractivePhaseCompletion(tile, phase);
     } else {
       tile._phase.fullDone = true;
       this._saveTileToCache(tile);
@@ -2270,6 +2315,7 @@ export class TileManager {
       t.grid.mat?.dispose?.();
       t.wire?.material?.dispose?.();
     } catch { }
+    this._deferredInteractive.delete(t);
     this.tiles.delete(id);
     this._markRelaxListDirty();
   }
@@ -2288,6 +2334,8 @@ export class TileManager {
     this._relaxKeysDirty = true;
     this._lastHeight = 0;
     this._fetchPhase = 'interactive';
+    this._deferredInteractive.clear();
+    this._interactiveSecondPass = false;
   }
 
   dispose() {
