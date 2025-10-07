@@ -73,6 +73,9 @@ class App {
     this._nextBuildingsUpdateMs = 0;
     this._hudGeoNextMs = 0;
     this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
+    this._perfLogIntervalMs = 2000;
+    this._perfFrameThreshold = 40;
+    this._perfNextLogMs = 0;
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -1533,6 +1536,8 @@ class App {
   _tick() {
     // === lightweight frame timing marks (shows in DevTools > Performance > Timings) ===
     if (performance?.mark) performance.mark('tick-start');
+    const perfNowFn = performance?.now ? () => performance.now() : () => Date.now();
+    const frameStartMs = perfNowFn();
 
     const dt = this.clock.getDelta();
     const currentTargetFps = this._perf.profile().targetFps;
@@ -1670,7 +1675,10 @@ class App {
     const timeOk = hexNow >= this._nextHexUpdateMs;
     if (movedEnough || timeOk) {
       if (performance?.mark) performance.mark('hex-update-start');
+      const hexStartMs = perfNowFn();
       this.hexGridMgr.update(dolly.position);
+      const hexDuration = perfNowFn() - hexStartMs;
+      if (hexDuration > 5) console.log(`[perf] tiles.update ${hexDuration.toFixed(2)}ms`);
       if (performance?.mark) {
         performance.mark('hex-update-end');
         performance.measure('hex-update', 'hex-update-start', 'hex-update-end');
@@ -1683,7 +1691,10 @@ class App {
     const nowMs = hexNow;
     if (nowMs >= this._nextBuildingsUpdateMs) {
       if (performance?.mark) performance.mark('build-update-start');
+      const buildStartMs = perfNowFn();
       this.buildings?.update(dt);
+      const buildDuration = perfNowFn() - buildStartMs;
+      if (buildDuration > 5) console.log(`[perf] buildings.update ${buildDuration.toFixed(2)}ms`);
       if (performance?.mark) {
         performance.mark('build-update-end');
         performance.measure('build-update', 'build-update-start', 'build-update-end');
@@ -1718,10 +1729,16 @@ class App {
     }
 
     // Remotes
+    const remotesStartMs = perfNowFn();
     this.remotes.tick(dt);
+    const remotesDuration = perfNowFn() - remotesStartMs;
+    if (remotesDuration > 5) console.log(`[perf] remotes.tick ${remotesDuration.toFixed(2)}ms`);
 
     if (!this._mobileFPVOn || xrOn) {
+      const chaseStartMs = perfNowFn();
       this.chase.update(dt, xrOn);
+      const chaseDuration = perfNowFn() - chaseStartMs;
+      if (chaseDuration > 5) console.log(`[perf] chase.update ${chaseDuration.toFixed(2)}ms`);
     }
 
     // Pose broadcast
@@ -1739,7 +1756,10 @@ class App {
     this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt);
 
     if (performance?.mark) performance.mark('phys-update-start');
+    const physicsStartMs = perfNowFn();
     this.physics?.update(dt);
+    const physicsDuration = perfNowFn() - physicsStartMs;
+    if (physicsDuration > 5) console.log(`[perf] physics.update ${physicsDuration.toFixed(2)}ms`);
     if (performance?.mark) {
       performance.mark('phys-update-end');
       performance.measure('phys-update', 'phys-update-start', 'phys-update-end');
@@ -1761,18 +1781,28 @@ class App {
 
     // === NEW: throttle minimap updates (10 Hz) ===
     if (nowMs >= this._miniMapNextMs) {
+      const miniStartMs = perfNowFn();
       this.miniMap?.update();
+      const miniDuration = perfNowFn() - miniStartMs;
+      if (miniDuration > 5) console.log(`[perf] minimap.update ${miniDuration.toFixed(2)}ms`);
       this._miniMapNextMs = nowMs + 100; // 10 Hz
     }
 
     // Render
     if (performance?.mark) performance.mark('render-start');
+    const renderStartMs = perfNowFn();
     renderer.render(this.sceneMgr.scene, camera);
+    const renderDuration = perfNowFn() - renderStartMs;
+    if (renderDuration > 8) console.log(`[perf] renderer.render ${renderDuration.toFixed(2)}ms`);
     if (performance?.mark) {
       performance.mark('render-end');
       performance.measure('render', 'render-start', 'render-end');
       performance.mark('tick-end');
       performance.measure('frame', 'tick-start', 'tick-end');
+    }
+    const frameDuration = perfNowFn() - frameStartMs;
+    if (frameDuration > 40) {
+      console.log(`[perf] frame total ${frameDuration.toFixed(2)}ms`);
     }
   }
 

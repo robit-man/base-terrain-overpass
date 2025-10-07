@@ -28,6 +28,8 @@ export class TileManager {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.tiles = new Map(); this.origin = null;
+    this._perfLogNext = 0;
+    this._perfUpdateNext = 0;
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
@@ -1858,6 +1860,7 @@ export class TileManager {
 
   update(playerPos) {
     if (!this.origin) return;
+    const startMs = performance?.now ? performance.now() : Date.now();
 
     const a = this.tileRadius;
     const qf = (2 / 3 * playerPos.x) / a;
@@ -1969,6 +1972,13 @@ export class TileManager {
         this._globalDirty = false;
         this._lastRecolorAt = t;
       }
+    }
+
+    const dt = (performance?.now ? performance.now() : Date.now()) - startMs;
+    const nowMs = performance?.now ? performance.now() : Date.now();
+    if ((!this._perfUpdateNext || nowMs >= this._perfUpdateNext) && dt > 5) {
+      console.log(`[tiles.update] tiles=${this.tiles.size} duration=${dt.toFixed(2)}ms`);
+      this._perfUpdateNext = nowMs + 2000;
     }
   }
 
@@ -2153,14 +2163,25 @@ export class TileManager {
   /* ---------------- Queries & controls ---------------- */
 
   getHeightAt(x, z) {
+    const t0 = performance?.now ? performance.now() : Date.now();
     const tmp = new THREE.Vector3(x, 10000, z);
     const meshes = [];
     for (const t of this.tiles.values()) if (t.type === 'interactive') meshes.push(t.grid.mesh);
     if (meshes.length === 0) return this._lastHeight;
     this.ray.set(tmp, this.DOWN);
     const hit = this.ray.intersectObjects(meshes, true);
-    if (hit.length) { this._lastHeight = hit[0].point.y; return this._lastHeight; }
-    return this._lastHeight;
+    let result = this._lastHeight;
+    if (hit.length) {
+      result = hit[0].point.y;
+      this._lastHeight = result;
+    }
+    const dt = (performance?.now ? performance.now() : Date.now()) - t0;
+    const now = performance?.now ? performance.now() : Date.now();
+    if ((!this._perfLogNext || now >= this._perfLogNext) && dt > 2) {
+      console.log(`[tiles.getHeightAt] meshes=${meshes.length} hit=${hit.length > 0} duration=${dt.toFixed(2)}ms`);
+      this._perfLogNext = now + 2000;
+    }
+    return result;
   }
 
   setRelayAddress(addr) {
