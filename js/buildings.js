@@ -259,7 +259,7 @@ export class BuildingManager {
 
     this._waterTime = 0;
 
-    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xa7adb7, transparent: true, opacity: 0.45 });
     this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 1 });
     this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 0.9 });
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
@@ -302,6 +302,20 @@ export class BuildingManager {
     if (!this._debugEnabled) return;
     if (!force && payload?.durationMs != null && payload.durationMs < 1) return;
     console.log(`[buildings.${tag}]`, payload);
+  }
+
+  _elevationColor(elevation) {
+    const min = Number.isFinite(this.tileManager?.GLOBAL_MIN_Y) ? this.tileManager.GLOBAL_MIN_Y : elevation;
+    const max = Number.isFinite(this.tileManager?.GLOBAL_MAX_Y) ? this.tileManager.GLOBAL_MAX_Y : elevation + 1;
+    const span = Math.max(1e-6, max - min);
+    const t = THREE.MathUtils.clamp((elevation - min) / span, 0, 1);
+    const low = { r: 0.18, g: 0.2, b: 0.24 };
+    const high = { r: 0.82, g: 0.86, b: 0.9 };
+    return new THREE.Color(
+      low.r + (high.r - low.r) * t,
+      low.g + (high.g - low.g) * t,
+      low.b + (high.b - low.b) * t,
+    );
   }
 
   /* ---------------- public API ---------------- */
@@ -1484,21 +1498,21 @@ export class BuildingManager {
     const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
     pickMesh.position.set(0, baseline, 0);
 
-    const fillMat = this._buildingFillMaterial || (
-      this._buildingFillMaterial = new THREE.MeshBasicMaterial({
-        color: 0x333333,
-        transparent: true,
-        opacity: 0.5,
-        depthWrite: false,
-        polygonOffset: true,
-        polygonOffsetFactor: 1,
-        polygonOffsetUnits: 1,
-        side: THREE.DoubleSide,
-      })
-    );
+    const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
+    const fillMat = new THREE.MeshStandardMaterial({
+      color: fillColor.clone(),
+      metalness: 0.12,
+      roughness: 0.7,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+    });
     const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
+    solidMesh.castShadow = true;
+    solidMesh.receiveShadow = true;
 
     const centroid = averagePoint(rawFootprint);
     const address = formatAddress(tags);
@@ -1791,6 +1805,8 @@ export class BuildingManager {
     if (building.solid) {
       building.solid.position.y = baseline;
       building.solid.updateMatrixWorld(true);
+      const color = this._elevationColor(groundBase + info.height * 0.5);
+      building.solid.material?.color?.copy?.(color);
       this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
     }
     if (building.pick) {
@@ -1830,6 +1846,8 @@ export class BuildingManager {
     const base = mesh.userData.basePos;
     if (!attr || !base) return;
     const arr = attr.array;
+    let sumY = 0;
+    let count = 0;
     for (let i = 0; i < arr.length; i += 3) {
       const x = base[i];
       const z = base[i + 2];
@@ -1837,9 +1855,16 @@ export class BuildingManager {
       arr[i] = x;
       arr[i + 1] = h + this.roadOffset + this.roadHeightOffset;
       arr[i + 2] = z;
+      sumY += arr[i + 1];
+      count++;
     }
     attr.needsUpdate = true;
     if (this.roadLit) mesh.geometry.computeVertexNormals();
+
+    if (count > 0) {
+      const avg = sumY / count;
+      mesh.material?.color?.copy?.(this._elevationColor(avg));
+    }
   }
 
   _resnapWater(mesh) {
@@ -1861,15 +1886,21 @@ export class BuildingManager {
   _buildRoad(flat, tags, id) {
     const geomData = this._makeRoadGeometry(flat);
     if (!geomData) return null;
-    const { geo, basePos, center } = geomData;
+    const { geo, basePos, center, avgHeight } = geomData;
 
-    const mat = this.roadLit
-      ? new THREE.MeshStandardMaterial({ color: this.roadColor, metalness: 0.4, roughness: 0.85, transparent: true, opacity: 0.1, blending: THREE.NormalBlending })
-      : new THREE.MeshBasicMaterial({ color: this.roadColor });
+    const mat = new THREE.MeshStandardMaterial({
+      color: this.roadColor,
+      metalness: 0.25,
+      roughness: 0.9,
+      side: THREE.DoubleSide,
+    });
+    if (Number.isFinite(avgHeight)) {
+      mat.color.copy(this._elevationColor(avgHeight));
+    }
 
     const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = !!this.roadShadows;
-    mesh.receiveShadow = !!this.roadShadows;
+    mesh.receiveShadow = true;
 
     mesh.userData.type = 'road';
     mesh.userData.osmId = id;
@@ -2085,6 +2116,7 @@ export class BuildingManager {
 
     const basePos = new Float32Array(pos);
     const centre = centres[Math.floor(centres.length / 2)] ?? { x: 0, z: 0 };
+    const avgY = centres.reduce((acc, v) => acc + v.y, 0) / Math.max(1, centres.length);
 
     if (this._debugEnabled) {
       const duration = this._nowMs() - start;
@@ -2101,7 +2133,7 @@ export class BuildingManager {
       }
     }
 
-    return { geo, basePos, center: centre };
+    return { geo, basePos, center: centre, avgHeight: avgY };
   }
 
   /* ---------------- ground & coords ---------------- */
@@ -2354,6 +2386,7 @@ export class BuildingManager {
         this.physics?.unregisterStaticMesh(building.solid);
         this.group.remove(building.solid);
         building.solid.geometry?.dispose?.();
+        building.solid.material?.dispose?.();
         building.solid = null;
       }
       if (building.pick) {

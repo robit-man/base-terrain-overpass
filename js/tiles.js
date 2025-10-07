@@ -60,8 +60,8 @@ export class TileManager {
     this._lastRecolorAt = 0;
 
     // ---- wireframe colors ----
-    this.VISUAL_WIREFRAME_COLOR = 0xffffff;
-    this.INTERACTIVE_WIREFRAME_COLOR = 0xffffff;
+    this.VISUAL_WIREFRAME_COLOR = 0xb5bcc6;
+    this.INTERACTIVE_WIREFRAME_COLOR = 0xb5bcc6;
 
     // ---- caching config ----
     this.CACHE_VER = 'v1';
@@ -429,7 +429,8 @@ export class TileManager {
     const col = this._ensureColorAttr(tile);
     const arr = col.array;
     for (let i = 0; i < tile.pos.count; i++) {
-      const o = 3 * i; arr[o] = arr[o + 1] = arr[o + 2] = this.LUM_MIN;
+      const o = 3 * i;
+      arr[o] = arr[o + 1] = arr[o + 2] = 0.1;
     }
     col.needsUpdate = true;
   }
@@ -438,7 +439,7 @@ export class TileManager {
     const arr = col.array;
     for (let i = 0; i < tile.pos.count; i++) {
       const o = 3 * i;
-      arr[o] = arr[o + 1] = arr[o + 2] = 1;
+      arr[o] = arr[o + 1] = arr[o + 2] = 0.2;
     }
     col.needsUpdate = true;
     if (tile.grid?.mat) tile.grid.mat.color?.set?.(0xffffff);
@@ -456,19 +457,36 @@ export class TileManager {
     const t = THREE.MathUtils.clamp((y - minY) / (maxY - minY), 0, 1);
     return this.LUM_MIN + t * (this.LUM_MAX - this.LUM_MIN);
   }
+  _colorFromNormalized(t) {
+    const low = { r: 0.18, g: 0.2, b: 0.24 };
+    const high = { r: 0.82, g: 0.86, b: 0.9 };
+    return {
+      r: low.r + (high.r - low.r) * t,
+      g: low.g + (high.g - low.g) * t,
+      b: low.b + (high.b - low.b) * t,
+    };
+  }
+  _normalizedHeight(y) {
+    const minY = this.GLOBAL_MIN_Y;
+    const maxY = this.GLOBAL_MAX_Y;
+    if (!Number.isFinite(minY) || !Number.isFinite(maxY) || maxY - minY < 1e-6) return 0;
+    return THREE.MathUtils.clamp((y - minY) / (maxY - minY), 0, 1);
+  }
   _applyAllColorsGlobal(tile) {
-    if (tile.type === 'farfield') {
-      this._initFarfieldColors(tile);
-      return;
-    }
     this._ensureColorAttr(tile);
-    const arr = tile.col.array, pos = tile.pos;
+    const arr = tile.col.array;
+    const pos = tile.pos;
     for (let i = 0; i < pos.count; i++) {
-      const l = this._lumFromYGlobal(pos.getY(i));
+      const y = pos.getY(i);
+      const t = this._normalizedHeight(y);
+      const color = this._colorFromNormalized(t);
       const o = 3 * i;
-      arr[o] = arr[o + 1] = arr[o + 2] = l / 10;
+      arr[o] = color.r;
+      arr[o + 1] = color.g;
+      arr[o + 2] = color.b;
     }
     tile.col.needsUpdate = true;
+    if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
   }
 
   _collectTileLatLon(tile) {
@@ -565,13 +583,12 @@ export class TileManager {
 
     if (!tile.col) this._ensureColorAttr(tile);
     const o = 3 * idx;
-    if (tile.type === 'farfield') {
-      tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = 1;
-    } else {
-      const l = this._lumFromYGlobal(height);
-      tile.col.array[o] = tile.col.array[o + 1] = tile.col.array[o + 2] = l;
-    }
+    const color = this._colorFromNormalized(this._normalizedHeight(height));
+    tile.col.array[o] = color.r;
+    tile.col.array[o + 1] = color.g;
+    tile.col.array[o + 2] = color.b;
     tile.col.needsUpdate = true;
+    if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
 
     if (this.audio) {
       const wx = tile.grid.group.position.x + tile.pos.getX(idx);
@@ -801,8 +818,15 @@ export class TileManager {
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
     geom.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.BackSide, metalness: .05, roughness: .05, transparent: true, opacity: 1, color: 0x000000 });
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      side: THREE.BackSide,
+      metalness: 0.05,
+      roughness: 0.75,
+    });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
 
     const group = new THREE.Group(); group.add(mesh);
     return { group, mesh, geometry: geom, mat };
