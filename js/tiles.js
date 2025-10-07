@@ -37,6 +37,7 @@ export class TileManager {
     // turbo: do not throttle per-frame visual tile creation
     this.VISUAL_CREATE_BUDGET = 4;
     this.FARFIELD_CREATE_BUDGET = 60;
+    this.FARFIELD_BATCH_SIZE = 48;
 
     // ---- interactive (high-res) relaxation ----
     this.RELAX_ITERS_PER_FRAME = 20;
@@ -84,6 +85,7 @@ export class TileManager {
       farfieldRing: this.FARFIELD_RING,
       visualCreateBudget: this.VISUAL_CREATE_BUDGET,
       farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
     };
@@ -146,6 +148,58 @@ export class TileManager {
   _hexDist(q1, r1, q2, r2) {
     const dq = q1 - q2, dr = r1 - r2, ds = (-q1 - r1) - (-q2 - r2);
     return (Math.abs(dq) + Math.abs(dr) + Math.abs(ds)) / 2;
+  }
+
+  _interactiveWireFade(dist) {
+    if (!Number.isFinite(this.INTERACTIVE_RING) || this.INTERACTIVE_RING <= 0) return 0;
+    const t = THREE.MathUtils.clamp(dist / Math.max(1, this.INTERACTIVE_RING), 0, 1);
+    const smooth = THREE.MathUtils.smoothstep(0, 1, t);
+    return THREE.MathUtils.clamp(smooth * 0.55, 0, 0.55);
+  }
+
+  _visualWireFade(dist) {
+    const span = Math.max(1, this.VISUAL_RING - this.INTERACTIVE_RING);
+    const t = THREE.MathUtils.clamp((dist - this.INTERACTIVE_RING) / span, 0, 1);
+    const smooth = THREE.MathUtils.smoothstep(0, 1, t);
+    return THREE.MathUtils.clamp(0.20 + smooth * 0.75, 0, 0.95);
+  }
+
+  _makeDisintegratingWireMaterial(color, fade = 0.5) {
+    const mat = new THREE.MeshBasicMaterial({
+      color,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.82,
+      depthWrite: false
+    });
+
+    mat.userData.uFade = THREE.MathUtils.clamp(fade, 0.0, 0.99);
+    mat.userData.uTileRadius = this.tileRadius;
+
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uFade = { value: mat.userData.uFade };
+      shader.uniforms.uTileRadius = { value: mat.userData.uTileRadius };
+
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\n varying vec3 vWorldPos;\n varying vec3 vLocalPos;\n')
+        .replace('#include <project_vertex>', '#include <project_vertex>\n vLocalPos = position;\n vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;\n');
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\n varying vec3 vWorldPos;\n varying vec3 vLocalPos;\n uniform float uFade;\n uniform float uTileRadius;\n float hash13(vec3 p) {\n   p = fract(p * 0.3183099 + vec3(0.1,0.3,0.7));\n   p += dot(p, p.yzx + 19.19);\n   return fract((p.x + p.y) * p.z);\n }\n')
+        .replace('#include <output_fragment>', 'float radial = clamp(length(vLocalPos.xz) / max(uTileRadius, 1e-3), 0.0, 1.0);\n vec3 hashInput = vec3(floor(vWorldPos.x * 0.35), floor(vWorldPos.z * 0.35), 0.0);\n float noise = hash13(hashInput);\n float radialBoost = mix(0.05, 0.55, radial);\n float fragFade = clamp(uFade + radialBoost * uFade + radial * 0.15, 0.0, 0.975);\n if (noise < fragFade) discard;\n #include <output_fragment>');
+
+      mat.userData.shader = shader;
+    };
+
+    mat.onBeforeRender = () => {
+      if (mat.userData.shader) {
+        mat.userData.shader.uniforms.uFade.value = mat.userData.uFade;
+        mat.userData.shader.uniforms.uTileRadius.value = mat.userData.uTileRadius;
+      }
+    };
+
+    mat.customProgramCacheKey = () => `disintegrating-${color}`;
+    return mat;
   }
 
   _getTile(q, r) { return this.tiles.get(`${q},${r}`) || null; }
@@ -674,18 +728,13 @@ export class TileManager {
     grid.group.position.set(wp.x, 0, wp.z);
     this.scene.add(grid.group);
 
-    // overlay wireframe for interactive tiles (custom color)
-    const wire = new THREE.Mesh(
-      grid.geometry,
-      new THREE.MeshBasicMaterial({
-        wireframe: true,
-        transparent: true,
-        opacity: 0.03,
-        color: this.INTERACTIVE_WIREFRAME_COLOR
-      })
-    );
+    const dist = this._hexDist(q, r, 0, 0);
+    const interactiveFade = this._interactiveWireFade(dist);
+    const wireMat = this._makeDisintegratingWireMaterial(this.INTERACTIVE_WIREFRAME_COLOR, interactiveFade);
+    const wire = new THREE.Mesh(grid.geometry, wireMat);
     wire.frustumCulled = false; wire.renderOrder = 1;
     grid.group.add(wire);
+    grid.wire = wire;
 
     const pos = grid.geometry.attributes.position;
     const neighbors = this._buildAdjacency(grid.geometry.getIndex(), pos.count);
@@ -706,7 +755,8 @@ export class TileManager {
       _phase: { seedDone: false, edgeDone: false, fullDone: false },
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
-      relaxEnabled: false
+      relaxEnabled: false,
+      wire
     };
     this._ensureTileBuffers(tile);
     this.tiles.set(id, tile);
@@ -748,11 +798,9 @@ export class TileManager {
 
     const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.BackSide, metalness: .05, roughness: .05, transparent: true, opacity: 1, color: 0x000000 });
     const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
-    const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, opacity: 0.05, transparent: true, color: this.VISUAL_WIREFRAME_COLOR }));
-    wire.frustumCulled = false; wire.renderOrder = 1;
 
-    const group = new THREE.Group(); group.add(mesh, wire);
-    return { group, mesh, geometry: geom, mat, wireMat: wire.material };
+    const group = new THREE.Group(); group.add(mesh);
+    return { group, mesh, geometry: geom, mat };
   }
 
   _addVisualTile(q, r) {
@@ -769,9 +817,17 @@ export class TileManager {
     const ready = new Uint8Array(pos.count);
     const neighbors = this._buildAdjacency(low.geometry.getIndex(), pos.count);
 
+    const dist = this._hexDist(q, r, 0, 0);
+    const visualFade = this._visualWireFade(dist);
+    const wireMat = this._makeDisintegratingWireMaterial(this.VISUAL_WIREFRAME_COLOR, visualFade);
+    const wire = new THREE.Mesh(low.geometry, wireMat);
+    wire.frustumCulled = false; wire.renderOrder = 1;
+    low.group.add(wire);
+    low.wire = wire;
+
     const tile = {
       type: 'visual',
-      grid: { group: low.group, mesh: low.mesh, geometry: low.geometry, mat: low.mat, wireMat: low.wireMat },
+      grid: { group: low.group, mesh: low.mesh, geometry: low.geometry, mat: low.mat },
       q, r,
       pos,
       neighbors,
@@ -781,7 +837,8 @@ export class TileManager {
       unreadyCount: pos.count,
       col: low.geometry.attributes.color,
       _phase: { fullDone: false },
-      _queuedPhases: new Set()
+      _queuedPhases: new Set(),
+      wire
     };
     this.tiles.set(id, tile);
 
@@ -845,18 +902,13 @@ export class TileManager {
     grid.group.position.copy(v.grid.group.position);
     this.scene.add(grid.group);
 
-    // overlay wireframe for interactive
-    const wire = new THREE.Mesh(
-      grid.geometry,
-      new THREE.MeshBasicMaterial({
-        wireframe: true,
-        transparent: true,
-        opacity: 0.02,
-        color: this.INTERACTIVE_WIREFRAME_COLOR
-      })
-    );
+    const dist = this._hexDist(q, r, 0, 0);
+    const interactiveFade = this._interactiveWireFade(dist);
+    const wireMat = this._makeDisintegratingWireMaterial(this.INTERACTIVE_WIREFRAME_COLOR, interactiveFade);
+    const wire = new THREE.Mesh(grid.geometry, wireMat);
     wire.frustumCulled = false; wire.renderOrder = 1;
     grid.group.add(wire);
+    grid.wire = wire;
 
     const pos = grid.geometry.attributes.position;
     const neighbors = this._buildAdjacency(grid.geometry.getIndex(), pos.count);
@@ -877,7 +929,8 @@ export class TileManager {
       _phase: { seedDone: false, edgeDone: false, fullDone: false },
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
-      relaxEnabled: false
+      relaxEnabled: false,
+      wire
     };
 
     // Seed heights from visual + neighbors, but corner-aware
@@ -908,7 +961,7 @@ export class TileManager {
       this.scene.remove(v.grid.group);
       v.grid.geometry?.dispose?.();
       v.grid.mat?.dispose?.();
-      v.grid.wireMat?.dispose?.();
+      v.wire?.material?.dispose?.();
     } catch { }
 
     // Seal edges with corner-safe snapping and relax inner corner band
@@ -1411,14 +1464,19 @@ export class TileManager {
     if (!tile || !this.origin) { if (tile) tile.populating = false; return; }
     if (!this.relayAddress) { tile.populating = false; return; }
 
+    if (tile.type === 'farfield') {
+      await this._populateFarfieldBatch(tile);
+      return;
+    }
+
     const pos = tile.pos;
     const count = pos.count;
     if (!Number.isFinite(count) || count === 0) { tile.populating = false; return; }
 
     // ---- choose indices for this phase ----
     let indices = null;
-    if (tile.type === 'visual' || tile.type === 'farfield') {
-      // visuals and farfield points fetch all available verts
+    if (tile.type === 'visual') {
+      // visuals fetch the full 7 verts
       indices = Array.from({ length: count }, (_, i) => i);
     } else {
       if (phase === PHASE_SEED) {
@@ -1524,10 +1582,7 @@ export class TileManager {
       }
     }
 
-    if (tile.type === 'farfield') {
-      pos.needsUpdate = true;
-      this._applyAllColorsGlobal(tile);
-    } else if (skipBlend) {
+    if (skipBlend) {
       pos.needsUpdate = true;
       tile.grid.geometry.computeVertexNormals();
       this._applyAllColorsGlobal(tile);
@@ -1562,6 +1617,159 @@ export class TileManager {
       this._saveTileToCache(tile);
     }
     if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
+  }
+
+  _gatherFarfieldBatch(primary) {
+    const target = Math.max(1, Math.floor(this.FARFIELD_BATCH_SIZE) || 1);
+    const batch = [];
+    const include = (tile) => {
+      if (!tile) return false;
+      if (batch.includes(tile)) return false;
+      if (!this._tileNeedsFetch(tile)) return false;
+      if (tile.populating) return false;
+      tile.populating = true;
+      tile._queuedPhases?.delete?.('full');
+      batch.push(tile);
+      return true;
+    };
+
+    include(primary);
+
+    if (batch.length < target) {
+      for (const entry of this._populateQueue) {
+        if (batch.length >= target) break;
+        const tile = entry.tile;
+        if (!tile || tile.type !== 'farfield') continue;
+        include(tile);
+      }
+    }
+
+    if (batch.length < target) {
+      for (const tile of this.tiles.values()) {
+        if (batch.length >= target) break;
+        if (tile === primary) continue;
+        if (tile.type !== 'farfield') continue;
+        include(tile);
+      }
+    }
+
+    if (batch.length > 1) {
+      const set = new Set(batch);
+      this._populateQueue = this._populateQueue.filter(entry => !set.has(entry.tile));
+    }
+
+    return batch;
+  }
+
+  async _populateFarfieldBatch(primary) {
+    const tiles = this._gatherFarfieldBatch(primary);
+    if (!tiles.length) { if (primary) primary.populating = false; return; }
+
+    const latLonAll = [];
+    const refs = [];
+    for (const tile of tiles) {
+      const latLon = this._collectTileLatLon(tile);
+      const ready = tile.ready;
+      for (let i = 0; i < latLon.length; i++) {
+        if (ready && ready[i]) continue;
+        latLonAll.push(latLon[i]);
+        refs.push({ tile, index: i });
+      }
+    }
+
+    if (!latLonAll.length) {
+      for (const tile of tiles) {
+        tile.populating = false;
+        tile._phase.fullDone = true;
+        this._saveTileToCache(tile);
+        this._tryAdvanceFetchPhase(tile);
+      }
+      return;
+    }
+
+    const mode = this.relayMode;
+    const precision = pickGeohashPrecision(this.spacing);
+    const indices = latLonAll.map((_, i) => i);
+    const geohashes = mode === 'geohash'
+      ? latLonAll.map(({ lat, lng }) => geohashEncode(lat, lng, precision))
+      : null;
+
+    const batches = (mode === 'geohash')
+      ? this._indicesToBatchesGeohash(indices, geohashes, precision)
+      : this._indicesToBatchesLatLng(indices, latLonAll);
+
+    const geohashMap = geohashes ? new Map() : null;
+    if (geohashMap) {
+      geohashes.forEach((gh, i) => {
+        if (!geohashMap.has(gh)) geohashMap.set(gh, []);
+        geohashMap.get(gh).push(i);
+      });
+    }
+    const latLngMap = geohashes ? null : new Map();
+    if (latLngMap) {
+      latLonAll.forEach(({ lat, lng }, i) => {
+        const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+        if (!latLngMap.has(key)) latLngMap.set(key, []);
+        latLngMap.get(key).push(i);
+      });
+    }
+
+    const applyIdx = (idx, height) => {
+      if (idx == null) return;
+      const ref = refs[idx];
+      if (!ref || !Number.isFinite(height)) return;
+      this._applySample(ref.tile, ref.index, height);
+    };
+
+    const requests = batches.map((batch) => {
+      const payload = { type: 'elev.query', dataset: this.relayDataset };
+      if (mode === 'geohash') {
+        payload.geohashes = batch.items;
+        payload.enc = 'geohash';
+        payload.prec = precision;
+      } else {
+        payload.locations = batch.items;
+      }
+
+      const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
+      return this._acquireNetBudget(approxBytes).then(() =>
+        this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs)
+          .then((json) => {
+            const results = json?.results || [];
+            for (const res of results) {
+              let idx = null;
+              if (mode === 'geohash') {
+                const key = res.geohash || res.hash;
+                const list = key ? geohashMap?.get(key) : null;
+                if (list && list.length) idx = list.shift();
+              } else if (res.location) {
+                const { lat, lng } = res.location;
+                const key = `${(+lat).toFixed(6)},${(+lng).toFixed(6)}`;
+                const list = latLngMap?.get(key);
+                if (list && list.length) idx = list.shift();
+              }
+              if (idx == null) continue;
+              const height = Number(res.elevation);
+              if (!Number.isFinite(height)) continue;
+              applyIdx(idx, height);
+            }
+          })
+          .catch(() => { /* ignore errors; will retry via backfill */ })
+      );
+    });
+
+    await Promise.allSettled(requests);
+
+    for (const tile of tiles) {
+      tile.populating = false;
+      tile._phase.fullDone = true;
+      if (!this._tileNeedsFetch(tile)) {
+        this._saveTileToCache(tile);
+      } else {
+        this._queuePopulate(tile, false);
+      }
+      this._tryAdvanceFetchPhase(tile);
+    }
   }
 
 
@@ -1893,6 +2101,7 @@ export class TileManager {
     const baseInteractive = this._baseLod.interactiveRing;
     const baseVisual = this._baseLod.visualRing;
     const baseFarfield = this._baseLod.farfieldRing;
+    const baseFarfieldBatch = this._baseLod.farfieldBatchSize || this.FARFIELD_BATCH_SIZE;
     const farfieldExtra = Number.isFinite(this._baseLod.farfieldExtra)
       ? this._baseLod.farfieldExtra
       : Math.max(1, baseFarfield - baseVisual);
@@ -1915,9 +2124,19 @@ export class TileManager {
 
     this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
     this.FARFIELD_CREATE_BUDGET = this._baseLod.farfieldCreateBudget;
+    this.FARFIELD_BATCH_SIZE = Math.max(1, Math.round(baseFarfieldBatch));
 
     this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
     this.RELAX_FRAME_BUDGET_MS = 1.5 + quality * 1.5;
+
+    for (const tile of this.tiles.values()) {
+      if (!tile?.wire?.material?.userData) continue;
+      const dist = this._hexDist(tile.q, tile.r, 0, 0);
+      let fade = tile.wire.material.userData.uFade;
+      if (tile.type === 'interactive') fade = this._interactiveWireFade(dist);
+      else if (tile.type === 'visual') fade = this._visualWireFade(dist);
+      tile.wire.material.userData.uFade = fade;
+    }
 
     return {
       interactiveRing: this.INTERACTIVE_RING,
@@ -1925,6 +2144,7 @@ export class TileManager {
       visualCreateBudget: this.VISUAL_CREATE_BUDGET,
       farfieldRing: this.FARFIELD_RING,
       farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
     };
@@ -1981,6 +2201,14 @@ export class TileManager {
       else tile.locked.fill(0);
       if (tile.type === 'interactive') tile.relaxEnabled = false;
 
+      if (tile.wire?.material?.userData) {
+        const dist = this._hexDist(tile.q, tile.r, 0, 0);
+        const fade = tile.type === 'interactive'
+          ? this._interactiveWireFade(dist)
+          : (tile.type === 'visual' ? this._visualWireFade(dist) : tile.wire.material.userData.uFade);
+        tile.wire.material.userData.uFade = fade;
+      }
+
       this._queuePopulate(tile, tile.type === 'interactive');
     }
     this._fetchPhase = 'interactive';
@@ -1997,7 +2225,7 @@ export class TileManager {
     try {
       t.grid.geometry?.dispose?.();
       t.grid.mat?.dispose?.();
-      t.grid.wireMat?.dispose?.();
+      t.wire?.material?.dispose?.();
     } catch { }
     this.tiles.delete(id);
     this._markRelaxListDirty();

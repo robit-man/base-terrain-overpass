@@ -385,6 +385,8 @@ export class Locomotion {
 
   speed(){ return this._spd; }
   eyeHeight(){ return this.eyeY; }
+  isCrouching(){ return !!this.input?.m?.crouch; }
+  isJumping(){ return this.jumpState === 'jumping'; }
   popJumpStarted(){ const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
   jumpHangTime(){ return this._pendingHangTime || 0; }
   baseEyeHeight(){ return this.baseEye; }

@@ -1,10 +1,10 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
-import { loadCharacterAnimationClips } from './character.js';
+import { loadCharacterAnimationClips, deriveClipsFromAnimations, CHARACTER_CLIP_KEYS } from './character.js';
 
 //const MODEL_URL = 'https://threejs.org/examples/models/gltf/Soldier.glb';
-const MODEL_URL = '/models/Char.glb';
+const MODEL_URL = '/models/Character.glb';
 
 function buildFallbackTemplate() {
   const root = new THREE.Group();
@@ -57,23 +57,46 @@ function buildFallbackTemplate() {
   return { template: root, footYOffset, height };
 }
 
-function byName(animations, name) {
-  const n = (name || '').toLowerCase();
-  return animations.find(c => (c.name || '').toLowerCase() === n) || null;
-}
-
-function clipsWithFallback(anims) {
-  // Example Soldier.glb ordering: [0]=Idle, [1]=Run, [3]=Walk (index 2 is often T-Pose/unused)
-  const Idle = byName(anims, 'Idle') || anims[0];
-  const Run  = byName(anims, 'Run')  || anims[1] || anims.find(a => /run/i.test(a.name));
-  const Walk = byName(anims, 'Walk') || anims[3] || anims.find(a => /walk/i.test(a.name));
-  return { Idle, Walk, Run };
-}
-
 // exp smoothing factor per (rate, dt)
 function smoothAlpha(ratePerSec, dt) {
   return 1 - Math.exp(-Math.max(0, ratePerSec) * Math.max(0, dt));
 }
+
+const PRIMARY_STATE_KEYS = [
+  'Idle',
+  'WalkForward',
+  'WalkBackward',
+  'WalkLeft',
+  'WalkRight',
+  'Sprint',
+  'CrouchIdle',
+  'CrouchForward',
+  'CrouchBackward',
+  'CrouchLeft',
+  'CrouchRight',
+  'Fall'
+];
+
+const STATE_ALIASES = {
+  Walk: 'WalkForward',
+  Run: 'Sprint'
+};
+
+const STATE_SPEED_REF = {
+  WalkForward: 1.8,
+  WalkBackward: 1.6,
+  WalkLeft: 1.4,
+  WalkRight: 1.4,
+  Sprint: 5.0,
+  CrouchForward: 1.1,
+  CrouchBackward: 1.1,
+  CrouchLeft: 1.0,
+  CrouchRight: 1.0
+};
+
+const DIRECTION_THRESHOLD = 0.25;
+const IDLE_SPEED_THRESHOLD = 0.12;
+const RUN_SPEED_THRESHOLD = 3.4;
 
 export class Avatar {
   constructor(root, mixer, clips, footYOffset, height) {
@@ -95,40 +118,54 @@ export class Avatar {
         if (obj.material && 'metalness' in obj.material) {
           obj.material.metalness = 0.2;
           obj.material.roughness = 0.6;
-          obj.material.wireframe = true;
+          obj.material.wireframe = false;
         }
       }
     });
 
     // Build actions
-    this.actions = {
-      Idle: clips.Idle ? mixer.clipAction(clips.Idle) : null,
-      Walk: clips.Walk ? mixer.clipAction(clips.Walk) : null,
-      Run:  clips.Run  ? mixer.clipAction(clips.Run)  : null
+    this.actions = {};
+    this._stateOrder = [];
+    const registerAction = (state, clip) => {
+      if (!clip || this.actions[state]) return;
+      const action = mixer.clipAction(clip);
+      action.enabled = true;
+      action.setEffectiveTimeScale(1);
+      action.setEffectiveWeight(0);
+      action.loop = state === 'Fall' ? THREE.LoopOnce : THREE.LoopRepeat;
+      action.clampWhenFinished = state === 'Fall';
+      this.actions[state] = action;
+      this._stateOrder.push(state);
     };
-    for (const k of Object.keys(this.actions)) {
-      const a = this.actions[k];
-      if (!a) continue;
-      a.enabled = true;
-      a.setEffectiveTimeScale(1);
-      a.setEffectiveWeight(0);
-      a.clampWhenFinished = false;
-      a.loop = THREE.LoopRepeat;
+    const gatherClipForState = (state) => {
+      if (clips[state]) return clips[state];
+      for (const [alias, target] of Object.entries(STATE_ALIASES)) {
+        if (target === state && clips[alias]) return clips[alias];
+      }
+      return null;
+    };
+    for (const state of PRIMARY_STATE_KEYS) {
+      const clip = gatherClipForState(state);
+      if (clip) registerAction(state, clip);
     }
 
-    // Start playing (avoid T-pose)
-    const start = this.actions.Idle || this.actions.Walk || this.actions.Run;
-    if (start) start.setEffectiveWeight(1).play();
-    this.current = start === this.actions.Idle ? 'Idle' : (start === this.actions.Walk ? 'Walk' : 'Run');
+    const startState = this._chooseAvailable(['Idle', 'CrouchIdle', 'WalkForward', 'Sprint', 'Walk']);
+    if (startState && this.actions[startState]) {
+      this.actions[startState].setEffectiveWeight(1).play();
+    }
+    this.current = startState || null;
+
+    this._isCrouch = false;
+    this._airborneManual = false;
+    this._airborneAuto = false;
+    this._lastPos = new THREE.Vector3();
+    this._velWorld = new THREE.Vector3();
+    this._velLocal = new THREE.Vector3();
+    this._invQuat = new THREE.Quaternion();
+    this._hasPrevPos = false;
 
     // Transition & motion tuning
     this.fadeDuration = 0.5;      // matches demo controls.fadeDuration
-
-    // HYSTERESIS: prevents flapping at boundaries
-    this.walkOn  = 0.12;  // enter Walk above this
-    this.walkOff = 0.08;  // leave Walk below this
-    this.runOn   = 4.20;  // enter Run above this
-    this.runOff  = 3.40;  // leave Run below this
 
     // Speed smoothing (EMA)
     this._vTarget = 0;           // raw setSpeed
@@ -148,7 +185,20 @@ export class Avatar {
 
   setPosition(x, y, z) {
     this.baseY = y;
-    this.group.position.set(x, y + this.jumpYOffset, z);
+    const newY = y + this.jumpYOffset;
+    this.group.position.set(x, newY, z);
+    if (!this._hasPrevPos) {
+      this._lastPos.set(x, newY, z);
+      this._hasPrevPos = true;
+    } else {
+      const dx = x - this._lastPos.x;
+      const dy = newY - this._lastPos.y;
+      const dz = z - this._lastPos.z;
+      const distSq = dx * dx + dy * dy + dz * dz;
+      if (distSq > 25) {
+        this._lastPos.set(x, newY, z);
+      }
+    }
   }
 
   /**
@@ -159,22 +209,74 @@ export class Avatar {
     this._vTarget = speed;
   }
 
-  /** Decide Idle/Walk/Run using hysteresis on the *smoothed* speed. */
-  _decideState(v) {
-    let desired = this.current || 'Idle';
-    if (this.current === 'Run') {
-      if (v <= this.runOff) desired = (v <= this.walkOff) ? 'Idle' : 'Walk';
-    } else if (this.current === 'Walk') {
-      if (v >= this.runOn) desired = 'Run';
-      else if (v <= this.walkOff) desired = 'Idle';
-    } else { // Idle
-      if (v >= this.runOn) desired = 'Run';
-      else if (v >= this.walkOn) desired = 'Walk';
+  setCrouch(active) {
+    this._isCrouch = !!active;
+  }
+
+  setAirborne(active) {
+    this._airborneManual = !!active;
+  }
+
+  _chooseAvailable(candidates = []) {
+    for (const name of candidates) {
+      const mapped = STATE_ALIASES[name] || name;
+      if (this.actions[mapped]) return mapped;
     }
-    if (!this.actions[desired]) {
-      desired = ['Idle', 'Walk', 'Run'].find((name) => this.actions[name]) || desired;
+    for (const state of this._stateOrder) {
+      if (this.actions[state]) return state;
     }
-    return desired;
+    return this.current && this.actions[this.current] ? this.current : null;
+  }
+
+  _selectState({ speed, forward, strafe, airborne }) {
+    if (airborne && this.actions.Fall) {
+      return 'Fall';
+    }
+
+    const absForward = Math.abs(forward);
+    const absStrafe = Math.abs(strafe);
+    const primaryForward = absForward >= absStrafe;
+
+    if (speed < IDLE_SPEED_THRESHOLD) {
+      return this._isCrouch
+        ? this._chooseAvailable(['CrouchIdle', 'Idle'])
+        : this._chooseAvailable(['Idle', 'CrouchIdle', 'WalkForward']);
+    }
+
+    if (this._isCrouch) {
+      if (primaryForward) {
+        if (forward > DIRECTION_THRESHOLD) return this._chooseAvailable(['CrouchForward', 'CrouchIdle']);
+        if (forward < -DIRECTION_THRESHOLD) return this._chooseAvailable(['CrouchBackward', 'CrouchIdle']);
+      } else {
+        if (strafe > DIRECTION_THRESHOLD) return this._chooseAvailable(['CrouchRight', 'CrouchForward', 'CrouchIdle']);
+        if (strafe < -DIRECTION_THRESHOLD) return this._chooseAvailable(['CrouchLeft', 'CrouchForward', 'CrouchIdle']);
+      }
+      return this._chooseAvailable(['CrouchIdle', 'Idle']);
+    }
+
+    if (primaryForward) {
+      if (forward > DIRECTION_THRESHOLD) {
+        if (speed >= RUN_SPEED_THRESHOLD) {
+          return this._chooseAvailable(['Sprint', 'Run', 'WalkForward', 'Walk']);
+        }
+        return this._chooseAvailable(['WalkForward', 'Walk', 'Sprint']);
+      }
+      if (forward < -DIRECTION_THRESHOLD) {
+        return this._chooseAvailable(['WalkBackward', 'WalkForward', 'Walk']);
+      }
+    } else {
+      if (strafe > DIRECTION_THRESHOLD) {
+        return this._chooseAvailable(['WalkRight', 'WalkForward', 'Walk']);
+      }
+      if (strafe < -DIRECTION_THRESHOLD) {
+        return this._chooseAvailable(['WalkLeft', 'WalkForward', 'Walk']);
+      }
+    }
+
+    if (speed >= RUN_SPEED_THRESHOLD) {
+      return this._chooseAvailable(['Sprint', 'Run', 'WalkForward', 'Walk']);
+    }
+    return this._chooseAvailable(['WalkForward', 'Walk', 'Idle']);
   }
 
   /** Do a demo-style, phase-synced transition using public APIs. */
@@ -217,26 +319,59 @@ export class Avatar {
     if (this.jumpState !== 'idle') return;
     this.vertVel = Math.sqrt(2 * this.GRAV * this.JUMP_H);
     this.jumpState = 'jumping';
+    this._airborneAuto = true;
   }
 
   update(dt) {
-    // Smooth speed towards target
+    // Smooth speed towards target (external hint)
     const a = smoothAlpha(this._vRate, dt);
     this._vSmooth += (this._vTarget - this._vSmooth) * a;
 
-    // Pick state using hysteresis on smoothed speed
-    const desired = this._decideState(this._vSmooth);
-    if (desired !== this.current) this._transition(desired);
+    // Measure velocity from motion
+    const invDt = 1 / Math.max(dt, 1e-5);
+    if (!this._hasPrevPos) {
+      this._lastPos.copy(this.group.position);
+      this._hasPrevPos = true;
+    }
+    this._velWorld.set(
+      (this.group.position.x - this._lastPos.x) * invDt,
+      (this.group.position.y - this._lastPos.y) * invDt,
+      (this.group.position.z - this._lastPos.z) * invDt
+    );
+    this._lastPos.copy(this.group.position);
+
+    const horizontalSpeed = Math.hypot(this._velWorld.x, this._velWorld.z);
+
+    this._velLocal.set(this._velWorld.x, 0, this._velWorld.z);
+    if (this._velLocal.lengthSq() > 1e-6) {
+      this._invQuat.copy(this.group.quaternion).invert();
+      this._velLocal.applyQuaternion(this._invQuat);
+    } else {
+      this._velLocal.set(0, 0, 0);
+    }
+    const forward = -this._velLocal.z;
+    const strafe = this._velLocal.x;
+
+    const airborneFlag = this._airborneManual || this._airborneAuto || this.jumpState !== 'idle' || this.jumpYOffset > 0;
+    const desired = this._selectState({
+      speed: Math.max(this._vSmooth, horizontalSpeed),
+      forward,
+      strafe,
+      airborne: airborneFlag
+    });
+    if (desired && desired !== this.current) this._transition(desired);
 
     // Tempo adaptation (no clip restart)
-    if (this.current === 'Walk' && this.actions.Walk) {
-      const walkRef = 1.8; // m/s nominal
-      this.actions.Walk.setEffectiveTimeScale(THREE.MathUtils.clamp(this._vSmooth / walkRef, 0.6, 1.6));
-    } else if (this.current === 'Run' && this.actions.Run) {
-      const runRef = 5.0;  // m/s nominal
-      this.actions.Run.setEffectiveTimeScale(THREE.MathUtils.clamp(this._vSmooth / runRef, 0.7, 1.6));
-    } else if (this.actions.Idle) {
-      this.actions.Idle.setEffectiveTimeScale(1);
+    if (this.current && this.actions[this.current]) {
+      const ref = STATE_SPEED_REF[this.current];
+      if (ref) {
+        const scaleSource = Math.max(horizontalSpeed, this._vSmooth);
+        this.actions[this.current].setEffectiveTimeScale(
+          THREE.MathUtils.clamp(scaleSource / ref, 0.6, 1.6)
+        );
+      } else {
+        this.actions[this.current].setEffectiveTimeScale(1);
+      }
     }
 
     // Jump arc
@@ -253,6 +388,12 @@ export class Avatar {
     // Maintain y = base + jump
     this.group.position.y = this.baseY + this.jumpYOffset;
 
+    if (this.jumpState !== 'idle' || this.jumpYOffset > 1e-3) {
+      this._airborneAuto = true;
+    } else if (!this._airborneManual) {
+      this._airborneAuto = false;
+    }
+
     if (this.mixer) this.mixer.update(dt);
   }
 }
@@ -267,14 +408,26 @@ export class AvatarFactory {
       try {
         const gltf = await loader.loadAsync(MODEL_URL);
         const template = gltf.scene;
+        template.rotation.y = Math.PI;
+        template.updateMatrixWorld(true);
         const animations = gltf.animations || [];
-        const external = await loadCharacterAnimationClips(loader, template).catch(() => ({ Idle: null, Walk: null, Run: null }));
-        const fallback = clipsWithFallback(animations);
-        const clips = {
-          Idle: external.Idle || fallback.Idle || null,
-          Walk: external.Walk || fallback.Walk || null,
-          Run: external.Run || fallback.Run || null,
-        };
+        const derived = deriveClipsFromAnimations(animations);
+        let clipMap = {};
+        try {
+          clipMap = await loadCharacterAnimationClips(loader, template, animations);
+        } catch (err) {
+          console.warn('[avatar] retargeted clip load failed, using native clips', err);
+          clipMap = {};
+        }
+
+        const merged = {};
+        const baseKeys = new Set([...CHARACTER_CLIP_KEYS, 'Walk', 'Run']);
+        for (const key of baseKeys) {
+          merged[key] = clipMap[key] || derived[key] || null;
+        }
+        for (const [key, value] of Object.entries(clipMap)) {
+          if (merged[key] == null) merged[key] = value;
+        }
 
         // bounds for foot alignment and height
         const bounds = new THREE.Box3().setFromObject(template);
@@ -282,11 +435,15 @@ export class AvatarFactory {
         const min = bounds.min; const height = size.y || 1.7;
         const footYOffset = -min.y;
 
-        return new AvatarFactory(template, clips, footYOffset, height);
+        return new AvatarFactory(template, merged, footYOffset, height);
       } catch (err) {
         console.warn('[avatar] gltf load failed, falling back to primitive avatar', err);
         const fallback = buildFallbackTemplate();
-        return new AvatarFactory(fallback.template, { Idle: null, Walk: null, Run: null }, fallback.footYOffset, fallback.height);
+        const emptyClips = {};
+        for (const key of CHARACTER_CLIP_KEYS) emptyClips[key] = null;
+        emptyClips.Walk = null;
+        emptyClips.Run = null;
+        return new AvatarFactory(fallback.template, emptyClips, fallback.footYOffset, fallback.height);
       }
     })();
     return this._promise;
@@ -303,11 +460,10 @@ export class AvatarFactory {
     // Deep clone preserves skinning and bone hierarchy
     const root = SkeletonUtils.clone(this.template);
     const mixer = new THREE.AnimationMixer(root);
-    const clips = {
-      Idle: this.clips.Idle ? this.clips.Idle.clone() : null,
-      Walk: this.clips.Walk ? this.clips.Walk.clone() : null,
-      Run:  this.clips.Run  ? this.clips.Run.clone()  : null,
-    };
+    const clips = {};
+    for (const [key, clip] of Object.entries(this.clips || {})) {
+      clips[key] = clip ? clip.clone() : null;
+    }
     return new Avatar(root, mixer, clips, this.footYOffset, this.height);
   }
 }

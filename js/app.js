@@ -1705,6 +1705,9 @@ class App {
       this.localAvatar.setPosition(pos.x, groundY + jumpLift, pos.z);
       this.localAvatar.setQuaternion(qYaw);
       this.localAvatar.setSpeed(this.move.speed());
+      this.localAvatar.setCrouch(this.move.isCrouching?.() ?? false);
+      const airborne = (this.move.isJumping?.() ?? false) || jumpLift > 0.02;
+      this.localAvatar.setAirborne(airborne);
       this.localAvatar.update(dt);
 
       const isFP = this._mobileFPVOn || this.chase.isFirstPerson?.();
