@@ -364,6 +364,8 @@ class App {
     this._tmpQuat = new THREE.Quaternion();
     this._tmpQuat2 = new THREE.Quaternion();
     this._tmpEuler = new THREE.Euler();
+    this._tmpHeadBodyQuat = new THREE.Quaternion();
+    this._tmpHeadBodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
 
@@ -2377,23 +2379,70 @@ class App {
     const locomotionWorldYaw = xrOn && typeof this.move?.getXRWorldYaw === 'function'
       ? this.move.getXRWorldYaw()
       : null;
-    const locomotionHeadHeight = xrOn && typeof this.move?.getXRHeadHeight === 'function'
+    const locomotionBodyYaw = xrOn && typeof this.move?.getXRBodyYaw === 'function'
+      ? this.move.getXRBodyYaw()
+      : null;
+    let locomotionHeadHeight = xrOn && typeof this.move?.getXRHeadHeight === 'function'
       ? this.move.getXRHeadHeight()
       : null;
-    const locomotionHeadYaw = xrOn && typeof this.move?.getXRRelativeHeadYaw === 'function'
-      ? this.move.getXRRelativeHeadYaw()
-      : null;
-    const locomotionHeadPitch = xrOn && typeof this.move?.getXRHeadPitch === 'function'
-      ? this.move.getXRHeadPitch()
-      : null;
-    const locomotionHeadRoll = xrOn && typeof this.move?.getXRHeadRoll === 'function'
-      ? this.move.getXRHeadRoll()
-      : null;
+    let locomotionHeadYaw = null;
+    let locomotionHeadPitch = null;
+    let locomotionHeadRoll = null;
+    if (xrOn && typeof this.move?.getXRHeadBodyQuaternion === 'function') {
+      const headQuatBody = this.move.getXRHeadBodyQuaternion(this._tmpHeadBodyQuat);
+      if (headQuatBody) {
+        const headEuler = this._tmpHeadBodyEuler;
+        headEuler.setFromQuaternion(headQuatBody, 'YXZ');
+        const rawYaw = this._wrapAngle(headEuler.y);
+        const rawPitch = headEuler.x;
+        const rawRoll = headEuler.z;
+        const pitchLimit = THREE.MathUtils.degToRad(80);
+        const rollLimit = THREE.MathUtils.degToRad(55);
+        locomotionHeadYaw = this._wrapAngle(-rawYaw);
+        locomotionHeadPitch = THREE.MathUtils.clamp(-rawPitch, -pitchLimit, pitchLimit);
+        locomotionHeadRoll = THREE.MathUtils.clamp(-rawRoll, -rollLimit, rollLimit);
+      }
+    }
+    if (locomotionHeadYaw == null && xrOn && typeof this.move?.getXRRelativeHeadYaw === 'function') {
+      locomotionHeadYaw = this.move.getXRRelativeHeadYaw();
+    }
+    if (locomotionHeadPitch == null && xrOn && typeof this.move?.getXRHeadPitch === 'function') {
+      locomotionHeadPitch = this.move.getXRHeadPitch();
+    }
+    if (locomotionHeadRoll == null && xrOn && typeof this.move?.getXRHeadRoll === 'function') {
+      locomotionHeadRoll = this.move.getXRHeadRoll();
+    }
+    if (!xrOn) {
+      const camera = this.sceneMgr?.camera;
+      if (camera && dolly) {
+        camera.updateMatrixWorld?.(true);
+        dolly.updateMatrixWorld?.(true);
+        camera.getWorldQuaternion(this._tmpQuat);
+        this._tmpQuat2.copy(dolly.quaternion);
+        this._tmpHeadBodyQuat.copy(this._tmpQuat2).invert().multiply(this._tmpQuat);
+        const headEuler = this._tmpHeadBodyEuler.setFromQuaternion(this._tmpHeadBodyQuat, 'YXZ');
+        const pitchLimit = THREE.MathUtils.degToRad(80);
+        const rollLimit = THREE.MathUtils.degToRad(55);
+        if (!Number.isFinite(locomotionHeadYaw)) {
+          locomotionHeadYaw = this._wrapAngle(headEuler.y);
+        }
+        if (!Number.isFinite(locomotionHeadPitch)) {
+          locomotionHeadPitch = THREE.MathUtils.clamp(-headEuler.x, -pitchLimit, pitchLimit);
+        }
+        if (!Number.isFinite(locomotionHeadRoll)) {
+          locomotionHeadRoll = THREE.MathUtils.clamp(headEuler.z, -rollLimit, rollLimit);
+        }
+      }
+      if (!Number.isFinite(locomotionHeadHeight)) {
+        locomotionHeadHeight = eyeHeight;
+      }
+    }
 
     if (this.localAvatar) {
       measure('avatar.local', () => {
         let yawOnly = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
-        if (Number.isFinite(locomotionWorldYaw)) yawOnly = locomotionWorldYaw;
+        if (Number.isFinite(locomotionBodyYaw)) yawOnly = locomotionBodyYaw;
+        else if (Number.isFinite(locomotionWorldYaw)) yawOnly = locomotionWorldYaw;
         const qYaw = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yawOnly, 0, 'YXZ'));
         const effectiveEyeHeight = Number.isFinite(locomotionHeadHeight) ? locomotionHeadHeight : eyeHeight;
         const baseEyeHeight = this.move.baseEyeHeight?.() ?? effectiveEyeHeight;
@@ -2416,7 +2465,8 @@ class App {
     measure('mesh.sendPose', () => {
       const eSend = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
       let sendYaw = eSend.y;
-      if (Number.isFinite(locomotionWorldYaw)) sendYaw = locomotionWorldYaw;
+      if (Number.isFinite(locomotionBodyYaw)) sendYaw = locomotionBodyYaw;
+      else if (Number.isFinite(locomotionWorldYaw)) sendYaw = locomotionWorldYaw;
       const qSend = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, sendYaw, 0, 'YXZ'));
       const jumpEvt = this.move.popJumpStarted();
       if (jumpEvt && this.physics?.suspendCharacterSnap) {
@@ -2432,13 +2482,14 @@ class App {
       let poseExtras = null;
       const headYawValid = Number.isFinite(locomotionHeadYaw);
       const headPitchValid = Number.isFinite(locomotionHeadPitch);
-      const xrHeadActive = xrOn && headYawValid && headPitchValid;
-      if (xrHeadActive || this._xrPoseActive) {
-        const xrPayload = { active: xrHeadActive ? 1 : 0 };
-        if (xrHeadActive) {
-          xrPayload.headYaw = locomotionHeadYaw;
-          xrPayload.headPitch = locomotionHeadPitch;
-          if (Number.isFinite(locomotionHeadRoll)) xrPayload.headRoll = locomotionHeadRoll;
+      const headRollValid = Number.isFinite(locomotionHeadRoll);
+      const headPayloadActive = headYawValid || headPitchValid || headRollValid;
+      if (headPayloadActive || this._xrPoseActive) {
+        const xrPayload = { active: headPayloadActive ? 1 : 0 };
+        if (headPayloadActive) {
+          xrPayload.headYaw = headYawValid ? locomotionHeadYaw : 0;
+          xrPayload.headPitch = headPitchValid ? locomotionHeadPitch : 0;
+          xrPayload.headRoll = headRollValid ? locomotionHeadRoll : 0;
           if (Number.isFinite(locomotionHeadHeight)) xrPayload.headHeight = locomotionHeadHeight;
         } else {
           xrPayload.headYaw = 0;
@@ -2447,7 +2498,7 @@ class App {
         }
         poseExtras = { xr: xrPayload };
       }
-      this._xrPoseActive = xrHeadActive;
+      this._xrPoseActive = headPayloadActive;
       this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt, crouchActive, poseExtras);
     });
 

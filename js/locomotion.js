@@ -16,6 +16,9 @@ export class Locomotion {
 
     this._vrAxisDeadzone = 0.2;
     this._vrTurnSpeed = THREE.MathUtils.degToRad(110);
+    this._vrFollowStart = THREE.MathUtils.degToRad(20);
+    this._vrFollowSnap = THREE.MathUtils.degToRad(65);
+    this._vrFollowMaxRate = THREE.MathUtils.degToRad(220);
     this._vrMoveVec = new THREE.Vector3();
     this._vrForward = new THREE.Vector3();
     this._vrRight = new THREE.Vector3();
@@ -36,7 +39,9 @@ export class Locomotion {
     this._xrHeadPoseReady = false;
 
     this._tmpHeadQuat = new THREE.Quaternion();
+    this._tmpBodyQuat = new THREE.Quaternion();
     this._tmpHeadEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+    this._headQuatBody = new THREE.Quaternion();
 
     this._onXRSessionStart = () => {
       this._lastHeadRelativeYaw = 0;
@@ -46,6 +51,7 @@ export class Locomotion {
       this._headPitch = 0;
       this._headRoll = 0;
       this._xrHeadPoseReady = false;
+      this._headQuatBody.identity();
       if (this.sceneMgr?.dolly) {
         this.sceneMgr.dolly.rotation.y = 0;
         this.sceneMgr.dolly.quaternion.setFromEuler(new THREE.Euler(0, 0, 0, 'YXZ'));
@@ -64,6 +70,7 @@ export class Locomotion {
       this._headPitch = 0;
       this._headRoll = 0;
       this._xrHeadPoseReady = false;
+      this._headQuatBody.identity();
     };
     const xr = this.sceneMgr.renderer?.xr;
     if (xr?.addEventListener) {
@@ -315,6 +322,8 @@ export class Locomotion {
     if (!session) {
       this._spd = 0;
       this._xrHeadPoseReady = false;
+      this._headQuatBody.identity();
+      this._lastHeadRelativeYaw = 0;
       this._headPitch = 0;
       this._headRoll = 0;
       return;
@@ -350,9 +359,15 @@ export class Locomotion {
         leftAxes.vertical = vertical;
         leftPad = gamepad;
       } else {
-        if (!leftPad) leftPad = gamepad;
-        leftAxes.horizontal = horizontal;
-        leftAxes.vertical = vertical;
+        if (!leftPad) {
+          leftPad = gamepad;
+          leftAxes.horizontal = horizontal;
+          leftAxes.vertical = vertical;
+        } else {
+          rightPad = gamepad;
+          rightAxes.horizontal = horizontal;
+          rightAxes.vertical = vertical;
+        }
       }
 
       const runBtn = buttons[1];
@@ -378,48 +393,85 @@ export class Locomotion {
       headQuatValid = true;
     }
 
-    if (headQuatValid) {
-      headEuler.setFromQuaternion(headQuat, 'YXZ');
-      const pitchLimit = THREE.MathUtils.degToRad(80);
-      const rollLimit = THREE.MathUtils.degToRad(55);
-      this._headPitch = THREE.MathUtils.clamp(headEuler.x, -pitchLimit, pitchLimit);
-      this._headRoll = THREE.MathUtils.clamp(headEuler.z, -rollLimit, rollLimit);
-    } else {
-      this._headPitch = 0;
-      this._headRoll = 0;
-    }
-
     const headForward = this._tmpHeadFlat;
     const headForwardValid = this._extractFlatForward(viewCam, headForward) ||
       this._extractFlatForward(this.sceneMgr.camera, headForward);
 
-    const bodyForward = this._tmpForward.set(0, 0, -1).applyQuaternion(this.sceneMgr.dolly.quaternion);
+    const dolly = this.sceneMgr?.dolly;
+    const bodyQuat = dolly?.quaternion || null;
+    const bodyForward = this._tmpForward.set(0, 0, -1);
+    if (bodyQuat) bodyForward.applyQuaternion(bodyQuat);
     bodyForward.y = 0;
     if (bodyForward.lengthSq() < 1e-6) bodyForward.set(0, 0, -1);
     bodyForward.normalize();
 
-    const bodyYaw = Math.atan2(bodyForward.x, -bodyForward.z);
-    this._bodyYaw = this._normalizeAngle(bodyYaw);
+    let bodyYaw = Math.atan2(bodyForward.x, -bodyForward.z);
+    let headPoseReady = headQuatValid && !!bodyQuat;
+    let headYawLocal = 0;
+    let headPitchLocal = 0;
+    let headRollLocal = 0;
+    let payloadYaw = 0;
+    let payloadPitch = 0;
+    let payloadRoll = 0;
 
-    let finalYaw = bodyYaw;
-    if (headForwardValid) {
-      finalYaw = Math.atan2(headForward.x, -headForward.z);
-      this._lastHeadRelativeYaw = this._normalizeAngle(finalYaw - bodyYaw);
-      this._vrForward.copy(headForward).normalize();
+    if (headPoseReady) {
+      const bodyInv = this._tmpBodyQuat.copy(bodyQuat).invert();
+      this._headQuatBody.copy(bodyInv).multiply(headQuat);
+      headEuler.setFromQuaternion(this._headQuatBody, 'YXZ');
+      headYawLocal = this._normalizeAngle(headEuler.y);
+      headPitchLocal = headEuler.x;
+      headRollLocal = headEuler.z;
+
+      const rotated = this._applyVrBodyFollow({
+        delta: headYawLocal,
+        bodyYaw,
+        headYawWorld: this._normalizeAngle(bodyYaw + headYawLocal),
+        dt: dtClamped
+      });
+
+      if (rotated) {
+        bodyForward.set(0, 0, -1).applyQuaternion(bodyQuat);
+        bodyForward.y = 0;
+        if (bodyForward.lengthSq() < 1e-6) bodyForward.set(0, 0, -1);
+        bodyForward.normalize();
+        bodyYaw = Math.atan2(bodyForward.x, -bodyForward.z);
+
+        const updatedBodyInv = this._tmpBodyQuat.copy(bodyQuat).invert();
+        this._headQuatBody.copy(updatedBodyInv).multiply(headQuat);
+        headEuler.setFromQuaternion(this._headQuatBody, 'YXZ');
+        headYawLocal = this._normalizeAngle(headEuler.y);
+        headPitchLocal = headEuler.x;
+        headRollLocal = headEuler.z;
+      }
     } else {
-      this._lastHeadRelativeYaw = 0;
-      this._vrForward.copy(bodyForward);
+      this._headQuatBody.identity();
+      headYawLocal = 0;
+      headPitchLocal = 0;
+      headRollLocal = 0;
+    }
+
+    payloadYaw = this._normalizeAngle(-headYawLocal);
+    payloadPitch = -headPitchLocal;
+    payloadRoll = -headRollLocal;
+
+    const pitchLimit = THREE.MathUtils.degToRad(80);
+    const rollLimit = THREE.MathUtils.degToRad(55);
+    this._headPitch = headPoseReady ? THREE.MathUtils.clamp(payloadPitch, -pitchLimit, pitchLimit) : 0;
+    this._headRoll = headPoseReady ? THREE.MathUtils.clamp(payloadRoll, -rollLimit, rollLimit) : 0;
+
+    this._bodyYaw = this._normalizeAngle(bodyYaw);
+    this._worldYaw = this._bodyYaw;
+    this._lastHeadRelativeYaw = headPoseReady ? payloadYaw : 0;
+    this._xrHeadPoseReady = headPoseReady;
+
+    if (!headForwardValid) {
       this._headHeight = this.baseEye;
     }
-
-    this._xrHeadPoseReady = headForwardValid && headQuatValid;
-    if (!this._xrHeadPoseReady) {
-      this._headPitch = 0;
-      this._headRoll = 0;
-    }
-
-    this._worldYaw = this._normalizeAngle(finalYaw);
     if (this._vrCrouchActive) this._headHeight = this.crouchEye;
+
+    this._vrForward.copy(bodyForward);
+    if (this._vrForward.lengthSq() < 1e-6) this._vrForward.set(0, 0, -1);
+    else this._vrForward.normalize();
 
     this._vrRight.crossVectors(this._vrForward, UP);
     if (this._vrRight.lengthSq() < 1e-6) this._vrRight.set(1, 0, 0);
@@ -455,6 +507,28 @@ export class Locomotion {
     } else {
       this._spd = 0;
     }
+  }
+
+  _applyVrBodyFollow({ delta, bodyYaw, headYawWorld, dt }) {
+    if (!Number.isFinite(delta) || !Number.isFinite(bodyYaw) || !Number.isFinite(dt)) return false;
+    const absDelta = Math.abs(delta);
+    if (absDelta < this._vrFollowStart) return false;
+
+    if (Number.isFinite(headYawWorld) && absDelta >= this._vrFollowSnap) {
+      const snapDelta = this._normalizeAngle(headYawWorld - bodyYaw);
+      if (Math.abs(snapDelta) > 1e-4) {
+        this._rotateRigAroundHead(snapDelta);
+        return true;
+      }
+      return false;
+    }
+
+    const maxStep = this._vrFollowMaxRate * dt;
+    if (maxStep <= 0) return false;
+    const step = THREE.MathUtils.clamp(delta, -maxStep, maxStep);
+    if (Math.abs(step) <= 1e-4) return false;
+    this._rotateRigAroundHead(step);
+    return true;
   }
 
   _pulseHaptics(gamepad, intensity, duration = 50) {
@@ -504,6 +578,15 @@ export class Locomotion {
     return this._xrHeadPoseReady ? this._headRoll : null;
   }
 
+  getXRHeadBodyQuaternion(target = null) {
+    if (!this._xrHeadPoseReady) return null;
+    if (target && typeof target.copy === 'function') {
+      target.copy(this._headQuatBody);
+      return target;
+    }
+    return this._headQuatBody.clone();
+  }
+
   getXRBodyYaw() {
     return Number.isFinite(this._bodyYaw) ? this._normalizeAngle(this._bodyYaw) : null;
   }
@@ -537,8 +620,10 @@ export class Locomotion {
     target.multiplyScalar(1 / Math.sqrt(lenSq));
     const posY = e[13];
     if (Number.isFinite(posY)) {
-      const baseY = this.sceneMgr?.dolly?.position?.y ?? 0;
-      this._headHeight = Math.max(0, posY - baseY);
+      const dollyY = this.sceneMgr?.dolly?.position?.y ?? 0;
+      const baseEye = Number.isFinite(this.eyeY) ? this.eyeY : this.baseEye;
+      const groundY = dollyY - (Number.isFinite(baseEye) ? baseEye : 0);
+      this._headHeight = Math.max(0, posY - groundY);
     }
     return true;
   }
