@@ -69,90 +69,97 @@
 <body>
   <div id="toastHost" aria-live="polite" aria-atomic="false"></div>
   <div id="perfHud" aria-live="polite" aria-expanded="false" role="button" tabindex="0" title="Open control center">
-    <div class="hud-shell" id="hudDetail">
-      <div class="hud-heading-row">
+    <div class="hud-overlay" id="hudDetail">
+      <div class="hud-topline">
         <div class="hud-compass" aria-hidden="true">
           <span class="hud-compass-needle" id="hudCompassNeedle"></span>
         </div>
-        <div class="hud-heading-block">
-          <span class="hud-heading-label">Heading</span>
-          <span class="hud-heading" id="hudHeadingText">--°</span>
-        </div>
-        <div class="hud-fps-block">
-          <span class="hud-block-label">FPS</span>
-          <span class="hud-block-value" id="hudFps">60</span>
-        </div>
-      </div>
-
-      <div class="hud-status-stack">
-        <div class="hud-status-item" id="hudStatusNkn">
-          <span class="hud-status-dot dot" id="hudStatusNknDot" aria-hidden="true"></span>
-          <span class="hud-status-label" id="hudStatusNknLabel">NKN</span>
-        </div>
-        <div class="hud-status-item" id="hudStatusTerrain">
-          <span class="hud-status-dot dot" id="hudStatusTerrainDot" aria-hidden="true"></span>
-          <span class="hud-status-label" id="hudStatusTerrainLabel">Terrain</span>
-        </div>
-        <div class="hud-status-item" id="hudStatusSignal">
-          <span class="hud-status-dot dot" id="hudStatusSigDot" aria-hidden="true"></span>
-          <span class="hud-status-label" id="hudStatusSigLabel">Signal</span>
+        <div class="hud-metric-group">
+          <div class="hud-metric">
+            <span class="hud-metric-value" id="hudHeadingText">--°</span>
+            <span class="hud-metric-label">Heading</span>
+          </div>
+          <div class="hud-metric">
+            <span class="hud-metric-value" id="hudFps">60</span>
+            <span class="hud-metric-label">FPS</span>
+          </div>
+          <div class="hud-metric">
+            <span class="hud-metric-value" id="hudPeerCount">0</span>
+            <span class="hud-metric-label">Peers</span>
+          </div>
         </div>
       </div>
 
-      <div class="hud-block">
-        <span class="hud-block-label">Peers online</span>
-        <span class="hud-block-value" id="hudPeerCount">0</span>
+      <div class="hud-status-row">
+        <div class="hud-status-chip" id="hudStatusNkn">
+          <span class="hud-status-dot" id="hudStatusNknDot" aria-hidden="true"></span>
+          <span class="hud-status-text" id="hudStatusNknLabel">NKN</span>
+        </div>
+        <div class="hud-status-chip" id="hudStatusTerrain">
+          <span class="hud-status-dot" id="hudStatusTerrainDot" aria-hidden="true"></span>
+          <span class="hud-status-text" id="hudStatusTerrainLabel">Terrain</span>
+        </div>
+        <div class="hud-status-chip" id="hudStatusSignal">
+          <span class="hud-status-dot" id="hudStatusSigDot" aria-hidden="true"></span>
+          <span class="hud-status-text" id="hudStatusSigLabel">Signal</span>
+        </div>
       </div>
 
-      <div class="hud-metric-grid">
-        <div class="hud-metric">
-          <span class="hud-block-label">LOD</span>
-          <span class="hud-qos" id="hudQos">LOD 100% · High</span>
+      <div class="hud-chip-row">
+        <span class="hud-chip" id="hudQos">LOD 100% · High</span>
+        <span class="hud-chip" id="hudEuler">--</span>
+      </div>
+
+      <div class="hud-info-grid">
+        <div class="hud-info-item">
+          <span class="hud-info-label">Tiles</span>
+          <span class="hud-info-value mono" id="hudDetailTiles">—</span>
         </div>
-        <div class="hud-metric">
-          <span class="hud-block-label">Tiles</span>
-          <span class="hud-block-value" id="hudDetailTiles">—</span>
+        <div class="hud-info-item">
+          <span class="hud-info-label">Build</span>
+          <span class="hud-info-value mono" id="hudDetailBuild">—</span>
         </div>
-        <div class="hud-metric">
-          <span class="hud-block-label">Build</span>
-          <span class="hud-block-value" id="hudDetailBuild">—</span>
-        </div>
-        <div class="hud-metric">
-          <span class="hud-block-label">Radius</span>
-          <span class="hud-block-value" id="hudDetailRadius">—</span>
+        <div class="hud-info-item">
+          <span class="hud-info-label">Radius</span>
+          <span class="hud-info-value mono" id="hudDetailRadius">—</span>
         </div>
       </div>
-      <div class="hud-block">
-        <span class="hud-block-label">Orientation</span>
-        <span class="hud-block-value" id="hudEuler">--</span>
+
+      <div class="hud-actions">
+        <button id="hudGpsReckon" type="button" class="hud-button" aria-pressed="false" title="Toggle GPS lock">GPS</button>
+        <button id="hudDebugToggle" type="button" class="hud-button" aria-pressed="false" title="Toggle debug overlay">Debug</button>
+        <button id="hudReset" type="button" class="hud-button" title="Clear caches and reload">Reset</button>
       </div>
-      <button id="hudGpsReckon" type="button" class="hud-reckon" aria-pressed="false" title="Toggle GPS lock">Reckon</button>
-      <button id="hudDebugToggle" type="button" class="hud-reckon debug" aria-pressed="false" title="Toggle debug overlay">Debug: Off</button>
-      <button id="hudReset" type="button" class="hud-reckon reset" title="Clear caches and reload">Reset</button>
     </div>
   </div>
+
   <div id="miniMapDock">
-    <div id="miniMapMap" class="mini-map-panel" aria-label="Mini map preview"></div>
-    <div class="mini-map-action-stack" aria-label="Mini map actions">
-      <button id="miniMapMove" type="button" aria-label="Teleport to selected mini map location">Move</button>
-      <button id="miniMapSnap" type="button" aria-label="Snap view to device compass heading">Snap</button>
-    </div>
-    <div class="mini-map-info" aria-live="polite">
-      <div class="mini-map-info-row">
-        <span class="mini-map-info-label">Geohash</span>
-        <span class="mini-map-info-value" id="hudGeohash">--</span>
-      </div>
-      <div class="mini-map-info-row">
-        <span class="mini-map-info-label">Lat</span>
-        <span class="mini-map-info-value" id="hudLat">--</span>
-      </div>
-      <div class="mini-map-info-row">
-        <span class="mini-map-info-label">Lon</span>
-        <span class="mini-map-info-value" id="hudLon">--</span>
-      </div>
-      <div class="mini-map-info-row">
-        <span class="mini-map-info-label">Alt</span>
-        <span class="mini-map-info-value" id="hudAltitude">--</span>
+    <div class="mini-map-shell">
+      <div id="miniMapMap" class="mini-map-panel mini-map-canvas" aria-label="Mini map preview"></div>
+      <div class="mini-map-overlay" aria-live="polite">
+        <div class="mini-map-coords">
+          <div class="mini-map-field">
+            <span class="mini-map-label">Geohash</span>
+            <span class="mini-map-value mono" id="hudGeohash">--</span>
+          </div>
+          <div class="mini-map-field">
+            <span class="mini-map-label">Lat</span>
+            <span class="mini-map-value mono" id="hudLat">--</span>
+          </div>
+          <div class="mini-map-field">
+            <span class="mini-map-label">Lon</span>
+            <span class="mini-map-value mono" id="hudLon">--</span>
+          </div>
+          <div class="mini-map-field">
+            <span class="mini-map-label">Alt</span>
+            <span class="mini-map-value mono" id="hudAltitude">--</span>
+          </div>
+        </div>
+        <div class="mini-map-actions" aria-label="Mini map actions">
+          <button id="miniMapMove" type="button" class="mini-map-button" aria-label="Teleport to selected mini map location">Move</button>
+          <button id="miniMapSnap" type="button" class="mini-map-button" aria-label="Snap view to device compass heading">Snap</button>
+        </div>
+        <div class="mini-map-status tiny" id="miniMapStatus">Determining location…</div>
       </div>
     </div>
   </div>
@@ -166,114 +173,132 @@
       <button id="closeButton" type="button" aria-label="Close Control Center">&times;</button>
     </header>
 
-    <section class="modal-section">
-      <h3 class="section-title">Network</h3>
-      <div class="status-grid">
-        <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
-        <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
+    <div class="control-tabs" id="controlTabs">
+      <div class="control-tablist" role="tablist" aria-label="Control center sections">
+        <button class="control-tab is-active" role="tab" aria-selected="true" aria-controls="tab-overview" data-tab="overview">Overview</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-navigation" data-tab="navigation">Navigation</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-networking" data-tab="networking">Networking</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-diagnostics" data-tab="diagnostics">Diagnostics</button>
       </div>
-      <div class="tiny" id="txtSigMeta">—</div>
-      <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
-      <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
-      <label for="displayNameInput">Display name</label>
-      <div class="input-row">
-        <input id="displayNameInput" type="text" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Choose how others see you" />
-        <button id="displayNameSave" type="button">Save</button>
-      </div>
-      <p class="tiny">Pick a short prefix shown to other players instead of your full NKN address.</p>
-      <div class="kv">terrain: <span class="mono" id="terrainRelayStatus">idle</span></div>
-    </section>
+      <div class="control-tabpanels">
+        <div class="tab-panel is-active" id="tab-overview" role="tabpanel" data-tab-panel="overview">
+          <section class="modal-section">
+            <h3 class="section-title">Network</h3>
+            <div class="status-grid">
+              <span class="kv"><span class="dot" id="dotNkn"></span><b id="txtNkn">NKN: connecting…</b></span>
+              <span class="kv"><span class="dot" id="dotSig"></span><b id="txtSig">Mesh: discovering…</b></span>
+            </div>
+            <div class="tiny" id="txtSigMeta">—</div>
+            <div class="kv">addr: <span class="mono" id="myAddr">—</span></div>
+            <div class="kv">pub: <span class="mono" id="myPub">—</span></div>
+            <label for="displayNameInput">Display name</label>
+            <div class="input-row">
+              <input id="displayNameInput" type="text" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Choose how others see you" />
+              <button id="displayNameSave" type="button">Save</button>
+            </div>
+            <p class="tiny">Pick a short prefix shown to other players instead of your full NKN address.</p>
+            <div class="kv">terrain: <span class="mono" id="terrainRelayStatus">idle</span></div>
+          </section>
 
-    <section class="modal-section">
-      <h3 class="section-title">Terrain Relay</h3>
-      <label for="terrainRelayInput">Relay address</label>
-      <input id="terrainRelayInput" type="text" class="mono" spellcheck="false" placeholder="forwarder.… or pubkey" />
-      <label for="terrainDatasetInput">Dataset</label>
-      <input id="terrainDatasetInput" type="text" value="mapzen" />
-      <div class="choice-row" role="radiogroup" aria-label="Terrain query mode">
-        <label><input type="radio" name="terrainMode" id="terrainModeGeohash" value="geohash" checked /> Geohash</label>
-        <label><input type="radio" name="terrainMode" id="terrainModeLatLng" value="latlng" /> Lat/Lng</label>
-      </div>
-      <p class="modal-note">Override the relay or dataset used for terrain sampling. Updates apply to new tiles immediately.</p>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Navigation &amp; Sensors</h3>
-      <div class="button-row">
-        <button id="request" type="button">Enable Sensors</button>
-        <button id="geo" type="button">Enable Geolocation</button>
-      </div>
-      <div class="mini-map-controls">
-        <button id="miniMapRecenter" type="button">Follow: On</button>
-        <button id="miniMapSet" type="button">Set Location</button>
-        <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
-      </div>
-      <div class="slider-row">
-        <label for="yawOffsetRange">Yaw Offset <span id="yawOffsetValue">0°</span></label>
-        <input id="yawOffsetRange" type="range" min="-180" max="180" value="0" step="1" />
-      </div>
-      <label class="toggle-row" for="gpsLockToggle">
-        <input id="gpsLockToggle" type="checkbox" checked />
-        <span class="toggle-text">
-          <span class="toggle-title">Lock world to GPS</span>
-          <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling geolocation.</span>
-        </span>
-      </label>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Location</h3>
-      <div class="mini-map-manual">
-        <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
-        <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
-        <button id="miniMapApply" type="button">Apply Manual</button>
-      </div>
-      <div id="miniMapStatus" class="tiny">Determining location…</div>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Pose TX</h3>
-      <div class="row">
-        <span class="kv">Hz: <b id="poseHz">0</b></span>
-        <span class="kv">Sent: <b id="poseSent">0</b></span>
-        <span class="kv">Dropped: <b id="poseDrop">0</b></span>
-        <span class="kv">Rate: <b id="poseRate">0.0</b> <span class="tiny">kbps</span></span>
-      </div>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Local Pose</h3>
-      <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
-      <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
-      <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Wallet</h3>
-      <button id="nuke" title="Hard reset identity & caches">
-        <span class="sub">NUKE CREDENTIALS — hard reset identity & caches</span>
-      </button>
-      <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>
-    </section>
-
-    <section class="modal-section">
-      <h3 class="section-title">Peers</h3>
-      <div class="tiny" id="peerSummary">—</div>
-      <div id="peerList" class="peer-list"></div>
-    </section>
-
-    <section class="modal-section debug-only" id="processLeaderboardSection">
-      <h3 class="section-title">Process Leaderboard</h3>
-      <div id="processLeaderboard" class="process-leaderboard">
-        <div class="process-header">
-          <div class="tiny">Sorted by average latency</div>
-          <button id="processReset" type="button" class="process-reset" title="Clear collected metrics">Reset Metrics</button>
+          <section class="modal-section">
+            <h3 class="section-title">Local Pose</h3>
+            <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+          </section>
         </div>
-        <div id="processCards" class="process-cards"></div>
-        <canvas id="processGraph" width="480" height="240" aria-label="Process metrics over time"></canvas>
-        <div id="processEmptyState" class="process-empty tiny">Metrics will appear after debug mode collects activity.</div>
+
+        <div class="tab-panel" id="tab-navigation" role="tabpanel" data-tab-panel="navigation" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Terrain Relay</h3>
+            <label for="terrainRelayInput">Relay address</label>
+            <input id="terrainRelayInput" type="text" class="mono" spellcheck="false" placeholder="forwarder.… or pubkey" />
+            <label for="terrainDatasetInput">Dataset</label>
+            <input id="terrainDatasetInput" type="text" value="mapzen" />
+            <div class="choice-row" role="radiogroup" aria-label="Terrain query mode">
+              <label><input type="radio" name="terrainMode" id="terrainModeGeohash" value="geohash" checked /> Geohash</label>
+              <label><input type="radio" name="terrainMode" id="terrainModeLatLng" value="latlng" /> Lat/Lng</label>
+            </div>
+            <p class="modal-note">Override the relay or dataset used for terrain sampling. Updates apply to new tiles immediately.</p>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Navigation &amp; Sensors</h3>
+            <div class="button-row">
+              <button id="request" type="button">Enable Sensors</button>
+              <button id="geo" type="button">Enable Geolocation</button>
+            </div>
+            <div class="mini-map-controls">
+              <button id="miniMapRecenter" type="button">Follow: On</button>
+              <button id="miniMapSet" type="button">Set Location</button>
+              <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
+            </div>
+            <div class="slider-row">
+              <label for="yawOffsetRange">Yaw Offset <span id="yawOffsetValue">0°</span></label>
+              <input id="yawOffsetRange" type="range" min="-180" max="180" value="0" step="1" />
+            </div>
+            <label class="toggle-row" for="gpsLockToggle">
+              <input id="gpsLockToggle" type="checkbox" checked />
+              <span class="toggle-text">
+                <span class="toggle-title">Lock world to GPS</span>
+                <span class="tiny">Phones follow your live position. Desktop users can turn this off after enabling geolocation.</span>
+              </span>
+            </label>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Location</h3>
+            <div class="mini-map-manual">
+              <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
+              <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
+              <button id="miniMapApply" type="button">Apply Manual</button>
+            </div>
+            <div id="miniMapStatus" class="tiny">Determining location…</div>
+          </section>
+        </div>
+
+        <div class="tab-panel" id="tab-networking" role="tabpanel" data-tab-panel="networking" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Pose TX</h3>
+            <div class="row">
+              <span class="kv">Hz: <b id="poseHz">0</b></span>
+              <span class="kv">Sent: <b id="poseSent">0</b></span>
+              <span class="kv">Dropped: <b id="poseDrop">0</b></span>
+              <span class="kv">Rate: <b id="poseRate">0.0</b> <span class="tiny">kbps</span></span>
+            </div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Peers</h3>
+            <div class="tiny" id="peerSummary">—</div>
+            <div id="peerList" class="peer-list"></div>
+          </section>
+        </div>
+
+        <div class="tab-panel" id="tab-diagnostics" role="tabpanel" data-tab-panel="diagnostics" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Wallet</h3>
+            <button id="nuke" title="Hard reset identity &amp; caches">
+              <span class="sub">NUKE CREDENTIALS — hard reset identity &amp; caches</span>
+            </button>
+            <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>
+          </section>
+
+          <section class="modal-section debug-only" id="processLeaderboardSection">
+            <h3 class="section-title">Process Leaderboard</h3>
+            <div id="processLeaderboard" class="process-leaderboard">
+              <div class="process-header">
+                <div class="tiny">Sorted by average latency</div>
+                <button id="processReset" type="button" class="process-reset" title="Clear collected metrics">Reset Metrics</button>
+              </div>
+              <div id="processCards" class="process-cards"></div>
+              <canvas id="processGraph" width="480" height="240" aria-label="Process metrics over time"></canvas>
+              <div id="processEmptyState" class="process-empty tiny">Metrics will appear after debug mode collects activity.</div>
+            </div>
+          </section>
+        </div>
       </div>
-    </section>
+    </div>
     </div>
   </div>
 

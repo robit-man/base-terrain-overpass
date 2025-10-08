@@ -32,7 +32,7 @@ class PerfLogger {
     this._records = [];
     this._frameStart = 0;
     this._maxByLabel = new Map();
-    this.historyLimit = 120;
+    this.historyLimit = 3600;
     this._historyByLabel = new Map();
     this._statsByLabel = new Map();
     this._frameCounter = 0;
@@ -208,6 +208,7 @@ class App {
       redrawInterval: 750,
       persistInterval: 4000,
     };
+    this._uiTheme = null;
     this._sunUpdateNextMs = 0;
     this._sunOrigin = null;
 
@@ -477,6 +478,7 @@ class App {
 
     this._syncDebugUI();
     this._applyDebugMode();
+    this._updateUiThemeBySun();
     this._initProcessLeaderboard();
 
     const relayInput = ui.terrainRelayInput;
@@ -830,7 +832,7 @@ class App {
       btn.classList.toggle('on', this._gpsLockEnabled);
       btn.setAttribute('aria-pressed', this._gpsLockEnabled ? 'true' : 'false');
       btn.dataset.state = this._gpsLockEnabled ? 'on' : 'off';
-      btn.textContent = 'Reckon';
+      btn.textContent = 'GPS';
       btn.title = this._gpsLockEnabled
         ? 'GPS lock active — tap to release'
         : 'Tap to lock world to GPS';
@@ -878,7 +880,8 @@ class App {
     const on = !!this._debugMode;
     ui.hudDebugToggle.classList.toggle('on', on);
     ui.hudDebugToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
-    ui.hudDebugToggle.textContent = on ? 'Debug: On' : 'Debug: Off';
+    ui.hudDebugToggle.dataset.state = on ? 'on' : 'off';
+    ui.hudDebugToggle.textContent = 'Debug';
     ui.hudDebugToggle.title = on ? 'Debug visuals enabled' : 'Show debug visuals';
   }
 
@@ -889,6 +892,32 @@ class App {
       console.info('[debug] Debug mode enabled');
     }
     this._updateProcessLeaderboardVisibility();
+  }
+
+  _updateUiThemeBySun(forceAltitude = null) {
+    let altitude = Number.isFinite(forceAltitude) ? forceAltitude : null;
+    if (!Number.isFinite(altitude) && Number.isFinite(this.sceneMgr?.currentSunAltitude)) {
+      altitude = this.sceneMgr.currentSunAltitude;
+    }
+    if (!Number.isFinite(altitude)) {
+      if (!this._uiTheme) {
+        this._uiTheme = 'night';
+        document.body.classList.toggle('theme-day', false);
+        document.body.classList.toggle('theme-twilight', false);
+        document.body.classList.toggle('theme-night', true);
+      }
+      return;
+    }
+    let theme = 'night';
+    if (altitude > 0.1) theme = 'day';
+    else if (altitude > -0.3) theme = 'twilight';
+
+    if (this._uiTheme === theme) return;
+    this._uiTheme = theme;
+
+    document.body.classList.toggle('theme-day', theme === 'day');
+    document.body.classList.toggle('theme-night', theme === 'night');
+    document.body.classList.toggle('theme-twilight', theme === 'twilight');
   }
 
   _initProcessLeaderboard() {
@@ -1058,6 +1087,9 @@ class App {
       return;
     }
 
+    const longestHistory = stats.reduce((max, stat) => Math.max(max, Array.isArray(stat.history) ? stat.history.length : 0), 0);
+    const approxSeconds = longestHistory / (this._perf?.targetFps || 60);
+
     let maxValue = frameBudget;
     stats.forEach((stat) => {
       if (!Array.isArray(stat.history)) return;
@@ -1079,6 +1111,14 @@ class App {
     ctx.font = '12px Rajdhani, sans-serif';
     ctx.fillText('Frame budget', padding + 6, Math.max(12, baselineY - 6));
 
+    if (approxSeconds > 0.1) {
+      const horizonText = approxSeconds >= 60
+        ? `~${(approxSeconds / 60).toFixed(1)} min window`
+        : `~${approxSeconds.toFixed(0)} s window`;
+      const metricsWidth = ctx.measureText(horizonText).width;
+      ctx.fillText(horizonText, drawWidth - padding - metricsWidth, padding + 4);
+    }
+
     stats.slice(0, 5).forEach((stat, index) => {
       const history = Array.isArray(stat.history) ? stat.history : [];
       if (!history.length) return;
@@ -1087,13 +1127,28 @@ class App {
       ctx.lineWidth = 1.8;
       ctx.beginPath();
       const len = history.length;
-      history.forEach((value, i) => {
-        const normVal = Number.isFinite(value) ? value : 0;
-        const x = padding + (len > 1 ? (i / (len - 1)) * (drawWidth - padding * 2) : 0);
-        const y = drawHeight - padding - (normVal / maxValue) * (drawHeight - padding * 2);
+      const maxPoints = Math.max(120, Math.floor((drawWidth - padding * 2) / 2));
+      const step = Math.max(1, Math.ceil(len / maxPoints));
+      const sampleCount = Math.ceil(len / step);
+      for (let i = 0; i < sampleCount; i += 1) {
+        const start = i * step;
+        const end = Math.min(start + step, len);
+        let sum = 0;
+        let count = 0;
+        for (let j = start; j < end; j += 1) {
+          const val = history[j];
+          if (Number.isFinite(val)) {
+            sum += val;
+            count += 1;
+          }
+        }
+        const avgVal = count ? sum / count : 0;
+        const position = sampleCount > 1 ? (i / (sampleCount - 1)) : 0;
+        const x = padding + position * (drawWidth - padding * 2);
+        const y = drawHeight - padding - (avgVal / maxValue) * (drawHeight - padding * 2);
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
-      });
+      }
       ctx.stroke();
     });
 
@@ -2448,6 +2503,7 @@ class App {
       this.sceneMgr.updateSun({ lat: origin.lat, lon: origin.lon, date: new Date() });
       this._sunOrigin = { lat: origin.lat, lon: origin.lon };
       this._sunUpdateNextMs = nowMs + 60000;
+      this._updateUiThemeBySun();
     }
   }
 

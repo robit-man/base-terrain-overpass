@@ -63,6 +63,8 @@ export class Mesh {
     // stats
     this.hzCount = 0; this.sent = 0; this.dropped = 0;
     this.byteWindow = [];
+    this._pendingMessages = [];
+    this._pendingMessagesLimit = 128;
 
     // 60 fps pose send target
     this.TARGET_HZ = 30;
@@ -112,6 +114,240 @@ export class Mesh {
 
     // Re-probe book periodically when signaller seems unhealthy
     this._bookProbeTimer = setInterval(() => this._probeBookIfNeeded(), BOOK_PROBE_MS);
+  }
+
+  _handleIncomingMessage(src, text) {
+    if (typeof text !== 'string') return;
+    if (!this.selfPub) {
+      if (this._pendingMessages.length >= this._pendingMessagesLimit) this._pendingMessages.shift();
+      this._pendingMessages.push({ src, text });
+      return;
+    }
+    this._processMessage(src, text);
+  }
+
+  _flushPendingMessages() {
+    if (!this.selfPub || !this._pendingMessages.length) return;
+    const pending = this._pendingMessages.splice(0, this._pendingMessages.length);
+    for (const entry of pending) {
+      this._processMessage(entry.src, entry.text);
+    }
+  }
+
+  _processMessage(src, text) {
+    if (typeof text !== 'string' || !text.trim().startsWith('{')) return;
+
+    if (src) {
+      const m = /^([a-z0-9_-]+)\.([0-9a-f]{64})$/i.exec(src);
+      if (m) {
+        const id = m[1];
+        const pub = m[2].toLowerCase();
+        this._idSet(pub).add(id);
+        const info = this.addrPool.get(src) || {};
+        info.lastMsg = now();
+        this.addrPool.set(src, info);
+        this._saveBookSoon();
+      }
+    }
+
+    let msg = null;
+    try { msg = JSON.parse(text); } catch { return; }
+    const t = now();
+
+    if (msg.type === 'hello' && msg.from) {
+      if (this._isSelf(msg.from)) return;
+      const pub = msg.from.toLowerCase();
+      this._touchPeer(pub, t);
+      const alias = this._sanitizeAlias(msg.alias || '');
+      this.app.remotes.ensure(pub, alias || this._aliasFor(pub));
+      this._applyAlias(pub, alias);
+      this._saveBookSoon();
+      this._sendPoseSnapshotTo(pub).catch(() => { });
+      this._announceJoin(pub);
+      return;
+    }
+
+    if (msg.type === 'hb') {
+      this._sendRaw(src, JSON.stringify({ type: 'hb_ack', from: this.selfPub, t_client: msg.t_client }));
+      if (msg.from) this._touchPeer(msg.from.toLowerCase(), t);
+      return;
+    }
+
+    if (msg.type === 'hb_ack' && typeof msg.t_client === 'number') {
+      const rtt = Math.max(0, now() - msg.t_client);
+      const m = this.addrPool.get(src) || {};
+      m.lastAck = now(); m.rttMs = rtt;
+      this.addrPool.set(src, m);
+
+      const sigAddr = isHex64(this.signallerHex) ? `signal.${this.signallerHex}` : '';
+      if (src === sigAddr) {
+        this._signallerLatencyMs = rtt;
+        this._updateDiscoveryUi();
+      }
+
+      this._saveBookSoon();
+      return;
+    }
+
+    if (msg.type === 'peers' && Array.isArray(msg.items)) {
+      for (const it of msg.items) {
+        const pub = (it.pub || '').toLowerCase(); if (!pub || pub === this.selfPub) continue;
+        this._touchPeer(pub, t);
+        const ids = Array.isArray(it.ids) ? it.ids : [];
+        ids.forEach(id => this._idSet(pub).add(id));
+        if (it.addr && isAddr(it.addr)) this.peers.get(pub).addr = it.addr;
+
+        const alias = this._sanitizeAlias(it.alias || '');
+        this._applyAlias(pub, alias);
+
+        for (const id of this._idSet(pub)) {
+          const a = addrFrom(id, pub);
+          if (!this.addrPool.has(a)) this.addrPool.set(a, {});
+        }
+
+        this.app.remotes.ensure(pub, this._aliasFor(pub));
+        this._sendPoseSnapshotTo(pub).catch(() => { });
+      }
+      this._renderPeers();
+      this._saveBookSoon();
+      return;
+    }
+
+    if (msg.type === 'peers_req') {
+      this._sendRoster(src);
+      if (msg.from && /^[0-9a-f]{64}$/i.test(msg.from)) {
+        const pub = msg.from.toLowerCase();
+        this._touchPeer(pub, t);
+        this._sendPoseSnapshotTo(pub).catch(() => { });
+      }
+      return;
+    }
+
+    if (msg.type === 'alias' && msg.from) {
+      if (this._isSelf(msg.from)) return;
+      const pub = msg.from.toLowerCase();
+      this._touchPeer(pub, t);
+      this._applyAlias(pub, msg.alias || '');
+      return;
+    }
+
+    if (msg.type === 'teleport_req' && msg.from) {
+      if (!this.selfPub) return;
+      const target = (msg.to || this.selfPub).toLowerCase();
+      if (target !== this.selfPub) return;
+      const from = msg.from.toLowerCase();
+      this._touchPeer(from, t);
+      const msgTs = Number(msg.ts);
+      const entry = this.teleportInbox.get(from) || {};
+      entry.ts = Number.isFinite(msgTs) ? msgTs : t;
+      entry.status = 'pending';
+      entry.respondedAt = undefined;
+      entry.reason = undefined;
+      this.teleportInbox.set(from, entry);
+      this._renderPeers();
+      return;
+    }
+
+    if (msg.type === 'teleport_rsp' && msg.from) {
+      if (!this.selfPub) return;
+      const target = (msg.to || this.selfPub).toLowerCase();
+      if (target !== this.selfPub) return;
+      const from = msg.from.toLowerCase();
+      this._touchPeer(from, t);
+      const msgTs = Number(msg.ts);
+      const entry = this.teleportOutbox.get(from) || { ts: Number.isFinite(msgTs) ? msgTs : t };
+      if (!Number.isFinite(entry.ts)) entry.ts = Number.isFinite(msgTs) ? msgTs : t;
+      entry.respondedAt = t;
+      entry.reason = msg.reason || null;
+
+      if (msg.accepted) {
+        if (msg.dest) {
+          entry.status = 'accepted';
+          entry.dest = msg.dest;
+          const applied = this.app.applyTeleportArrival?.(msg.dest, from);
+          if (applied === false) {
+            entry.status = 'error';
+            entry.reason = 'teleport failed';
+          }
+        } else {
+          entry.status = 'unavailable';
+          entry.reason = entry.reason || 'no destination provided';
+        }
+      } else {
+        entry.status = msg.reason === 'unavailable' ? 'unavailable' : 'rejected';
+      }
+
+      this.teleportOutbox.set(from, entry);
+      this._renderPeers();
+      return;
+    }
+
+    if (msg.type === 'pose' && msg.from && Array.isArray(msg.pose?.p) && Array.isArray(msg.pose?.q)) {
+      if (this._isSelf(msg.from)) return;
+      const pub = msg.from.toLowerCase();
+      this._touchPeer(pub, t);
+      const info = { rtt: this.addrPool.get(src)?.rttMs ?? null, age: fmtAgo(now() - msg.ts) };
+      const pose = msg.pose;
+
+      const poseOut = {
+        p: Array.isArray(pose.p) ? pose.p.map(v => Number(v)) : [0, 0, 0],
+        q: Array.isArray(pose.q) ? pose.q.map(v => Number(v)) : [0, 0, 0, 1],
+        j: pose.j ? 1 : 0,
+        c: pose.c ? 1 : 0
+      };
+
+      if (pose.xr && typeof pose.xr === 'object') {
+        const xrIn = pose.xr;
+        const xrOut = {
+          active: xrIn.active != null ? (Number(xrIn.active) ? 1 : 0) : 1
+        };
+        const yawVal = Number(xrIn.headYaw);
+        if (Number.isFinite(yawVal)) xrOut.headYaw = yawVal;
+        const pitchVal = Number(xrIn.headPitch);
+        if (Number.isFinite(pitchVal)) xrOut.headPitch = pitchVal;
+        const rollVal = Number(xrIn.headRoll);
+        if (Number.isFinite(rollVal)) xrOut.headRoll = rollVal;
+        const heightVal = Number(xrIn.headHeight);
+        if (Number.isFinite(heightVal)) xrOut.headHeight = heightVal;
+        poseOut.xr = xrOut;
+      }
+
+      let geoNorm = null;
+      if (msg.geo) {
+        const lat = Number(msg.geo.lat);
+        const lon = Number(msg.geo.lon);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          geoNorm = { lat, lon };
+          const eyeVal = Number(msg.geo.eye);
+          if (Number.isFinite(eyeVal)) geoNorm.eye = eyeVal;
+          const groundVal = Number(msg.geo.ground);
+          if (Number.isFinite(groundVal)) geoNorm.ground = groundVal;
+        }
+      }
+
+      if (geoNorm) {
+        const w = this._geoToWorld(geoNorm.lat, geoNorm.lon);
+        if (w) {
+          poseOut.p[0] = +w.x.toFixed(3);
+          poseOut.p[2] = +w.z.toFixed(3);
+
+          const localGround = this._localGroundAt(w.x, w.z);
+          const eye = Number.isFinite(geoNorm.eye)
+            ? geoNorm.eye
+            : (Number.isFinite(geoNorm.ground) && Number.isFinite(poseOut.p[1]) ? (poseOut.p[1] - geoNorm.ground) : null);
+          if (Number.isFinite(localGround) && Number.isFinite(eye)) {
+            poseOut.p[1] = +(localGround + eye).toFixed(3);
+          }
+        }
+      }
+
+      this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm, xr: poseOut.xr || null });
+      this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
+        console.warn('[remotes] update failed', err);
+      });
+      this._renderPeers();
+      return;
+    }
   }
 
   _isSelf(pub) {
@@ -586,234 +822,17 @@ export class Mesh {
 
         // Also proactively probe book once
         this._probeBookIfNeeded();
+
+        this._flushPendingMessages();
       });
 
       this.client.onMessage(({ src, payload }) => {
-        // Learn id + mark lastMsg on the address we heard from
-        if (src) {
-          const m = /^([a-z0-9_-]+)\.([0-9a-f]{64})$/i.exec(src);
-          if (m) {
-            const id = m[1];
-            const pub = m[2].toLowerCase();
-            this._idSet(pub).add(id);
-            const info = this.addrPool.get(src) || {};
-            info.lastMsg = now();
-            this.addrPool.set(src, info);
-            this._saveBookSoon();
-          }
-        }
-
-        // Decode text payloads
         let text = payload;
-        if (payload instanceof Uint8Array) { try { text = new TextDecoder().decode(payload); } catch { } }
-        if (typeof text !== 'string' || !text.trim().startsWith('{')) return;
-        let msg = null; try { msg = JSON.parse(text); } catch { return; }
-        const t = now();
-
-        if (msg.type === 'hello' && msg.from) {
-          if (this._isSelf(msg.from)) return;              // <-- avoid self-remote
-          const pub = msg.from.toLowerCase();
-          this._touchPeer(pub, t);
-          const alias = this._sanitizeAlias(msg.alias || '');
-          this.app.remotes.ensure(pub, alias || this._aliasFor(pub));
-          this._applyAlias(pub, alias);
-          this._saveBookSoon();
-
-          // ★ Auto-snapshot back to greeter
-          this._sendPoseSnapshotTo(pub).catch(() => { });
-          this._announceJoin(pub);
-          return;
+        if (payload instanceof Uint8Array) {
+          try { text = new TextDecoder().decode(payload); } catch { return; }
         }
-
-        if (msg.type === 'hb') {
-          // Reply to any sender; store peer activity
-          this._sendRaw(src, JSON.stringify({ type: 'hb_ack', from: this.selfPub, t_client: msg.t_client }));
-          if (msg.from) this._touchPeer(msg.from.toLowerCase(), t);
-          return;
-        }
-
-        if (msg.type === 'hb_ack' && typeof msg.t_client === 'number') {
-          const rtt = Math.max(0, now() - msg.t_client);
-          const m = this.addrPool.get(src) || {};
-          m.lastAck = now(); m.rttMs = rtt;
-          this.addrPool.set(src, m);
-
-          // If the signaller, update UI
-          const sigAddr = isHex64(this.signallerHex) ? `signal.${this.signallerHex}` : '';
-          if (src === sigAddr) {
-            this._signallerLatencyMs = rtt;
-            this._updateDiscoveryUi();
-          }
-
-          this._saveBookSoon();
-          return;
-        }
-
-        if (msg.type === 'peers' && Array.isArray(msg.items)) {
-          for (const it of msg.items) {
-            const pub = (it.pub || '').toLowerCase(); if (!pub || pub === this.selfPub) continue;
-            this._touchPeer(pub, t);
-            const ids = Array.isArray(it.ids) ? it.ids : [];
-            ids.forEach(id => this._idSet(pub).add(id));
-            if (it.addr && isAddr(it.addr)) this.peers.get(pub).addr = it.addr;
-
-            const alias = this._sanitizeAlias(it.alias || '');
-            this._applyAlias(pub, alias);
-
-            // Ensure candidate addrs exist in pool
-            for (const id of this._idSet(pub)) {
-              const a = addrFrom(id, pub);
-              if (!this.addrPool.has(a)) this.addrPool.set(a, {});
-            }
-
-            this.app.remotes.ensure(pub, this._aliasFor(pub));
-
-            // ★ Auto-snapshot to each discovered peer
-            this._sendPoseSnapshotTo(pub).catch(() => { });
-          }
-          this._renderPeers();
-          this._saveBookSoon();
-          return;
-        }
-
-        if (msg.type === 'peers_req') {
-          // Send roster to requester
-          this._sendRoster(src);
-
-          // ★ If requester identity known, send snapshot back
-          if (msg.from && /^[0-9a-f]{64}$/i.test(msg.from)) {
-            const pub = msg.from.toLowerCase();
-            this._touchPeer(pub, t);
-            this._sendPoseSnapshotTo(pub).catch(() => { });
-          }
-          return;
-        }
-
-        if (msg.type === 'alias' && msg.from) {
-          if (this._isSelf(msg.from)) return;
-          const pub = msg.from.toLowerCase();
-          this._touchPeer(pub, t);
-          this._applyAlias(pub, msg.alias || '');
-          return;
-        }
-
-        if (msg.type === 'teleport_req' && msg.from) {
-          if (!this.selfPub) return;
-          const target = (msg.to || this.selfPub).toLowerCase();
-          if (target !== this.selfPub) return;
-          const from = msg.from.toLowerCase();
-          this._touchPeer(from, t);
-          const msgTs = Number(msg.ts);
-          const entry = this.teleportInbox.get(from) || {};
-          entry.ts = Number.isFinite(msgTs) ? msgTs : t;
-          entry.status = 'pending';
-          entry.respondedAt = undefined;
-          entry.reason = undefined;
-          this.teleportInbox.set(from, entry);
-          this._renderPeers();
-          return;
-        }
-
-        if (msg.type === 'teleport_rsp' && msg.from) {
-          if (!this.selfPub) return;
-          const target = (msg.to || this.selfPub).toLowerCase();
-          if (target !== this.selfPub) return;
-          const from = msg.from.toLowerCase();
-          this._touchPeer(from, t);
-          const msgTs = Number(msg.ts);
-          const entry = this.teleportOutbox.get(from) || { ts: Number.isFinite(msgTs) ? msgTs : t };
-          if (!Number.isFinite(entry.ts)) entry.ts = Number.isFinite(msgTs) ? msgTs : t;
-          entry.respondedAt = t;
-          entry.reason = msg.reason || null;
-
-          if (msg.accepted) {
-            if (msg.dest) {
-              entry.status = 'accepted';
-              entry.dest = msg.dest;
-              const applied = this.app.applyTeleportArrival?.(msg.dest, from);
-              if (applied === false) {
-                entry.status = 'error';
-                entry.reason = 'teleport failed';
-              }
-            } else {
-              entry.status = 'unavailable';
-              entry.reason = entry.reason || 'no destination provided';
-            }
-          } else {
-            entry.status = msg.reason === 'unavailable' ? 'unavailable' : 'rejected';
-          }
-
-          this.teleportOutbox.set(from, entry);
-          this._renderPeers();
-          return;
-        }
-
-        if (msg.type === 'pose' && msg.from && Array.isArray(msg.pose?.p) && Array.isArray(msg.pose?.q)) {
-          if (this._isSelf(msg.from)) return;
-          const pub = msg.from.toLowerCase();
-          this._touchPeer(pub, t);
-          const info = { rtt: this.addrPool.get(src)?.rttMs ?? null, age: fmtAgo(now() - msg.ts) };
-          const pose = msg.pose;
-
-          const poseOut = {
-            p: Array.isArray(pose.p) ? pose.p.map(v => Number(v)) : [0, 0, 0],
-            q: Array.isArray(pose.q) ? pose.q.map(v => Number(v)) : [0, 0, 0, 1],
-            j: pose.j ? 1 : 0,
-            c: pose.c ? 1 : 0
-          };
-
-          if (pose.xr && typeof pose.xr === 'object') {
-            const xrIn = pose.xr;
-            const xrOut = {
-              active: xrIn.active != null ? (Number(xrIn.active) ? 1 : 0) : 1
-            };
-            const yawVal = Number(xrIn.headYaw);
-            if (Number.isFinite(yawVal)) xrOut.headYaw = yawVal;
-            const pitchVal = Number(xrIn.headPitch);
-            if (Number.isFinite(pitchVal)) xrOut.headPitch = pitchVal;
-            const rollVal = Number(xrIn.headRoll);
-            if (Number.isFinite(rollVal)) xrOut.headRoll = rollVal;
-            const heightVal = Number(xrIn.headHeight);
-            if (Number.isFinite(heightVal)) xrOut.headHeight = heightVal;
-            poseOut.xr = xrOut;
-          }
-
-          let geoNorm = null;
-          if (msg.geo) {
-            const lat = Number(msg.geo.lat);
-            const lon = Number(msg.geo.lon);
-            if (Number.isFinite(lat) && Number.isFinite(lon)) {
-              geoNorm = { lat, lon };
-              const eyeVal = Number(msg.geo.eye);
-              if (Number.isFinite(eyeVal)) geoNorm.eye = eyeVal;
-              const groundVal = Number(msg.geo.ground);
-              if (Number.isFinite(groundVal)) geoNorm.ground = groundVal;
-            }
-          }
-
-          if (geoNorm) {
-            const w = this._geoToWorld(geoNorm.lat, geoNorm.lon);
-            if (w) {
-              poseOut.p[0] = +w.x.toFixed(3);
-              poseOut.p[2] = +w.z.toFixed(3);
-
-              const localGround = this._localGroundAt(w.x, w.z);
-              const eye = Number.isFinite(geoNorm.eye)
-                ? geoNorm.eye
-                : (Number.isFinite(geoNorm.ground) && Number.isFinite(poseOut.p[1]) ? (poseOut.p[1] - geoNorm.ground) : null);
-              if (Number.isFinite(localGround) && Number.isFinite(eye)) {
-                poseOut.p[1] = +(localGround + eye).toFixed(3);
-              }
-            }
-          }
-
-          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm, xr: poseOut.xr || null });
-          this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
-            console.warn('[remotes] update failed', err);
-          });
-          this._renderPeers();
-          return;
-        }
+        if (typeof text !== 'string') return;
+        this._handleIncomingMessage(src, text);
       });
 
       this.client.on('willreconnect', () => setNkn('NKN: reconnecting…', 'warn'));

@@ -3,6 +3,7 @@ const menuBtn = document.getElementById('menu');
 const menuPane = document.getElementById('menuPane');
 const backdrop = document.getElementById('backdrop');
 const closeButton = document.getElementById('closeButton');
+const controlTabsRoot = document.getElementById('controlTabs');
 
 const dotNkn = document.getElementById('dotNkn');
 const txtNkn = document.getElementById('txtNkn');
@@ -82,6 +83,51 @@ function closeMenu() {
   menuPane.style.display = 'none';
   document.body?.classList?.remove('modal-open');
   perfHud?.setAttribute('aria-expanded', 'false');
+}
+
+const CONTROL_TAB_STORAGE = 'xr.controlTab.v1';
+
+function activateControlTab(tabId, { persist = true, focus = true } = {}) {
+  if (!controlTabsRoot) return;
+  const buttons = controlTabsRoot.querySelectorAll('[data-tab]');
+  const panels = controlTabsRoot.querySelectorAll('[data-tab-panel]');
+  let targetId = tabId;
+  if (!targetId) {
+    const activeBtn = controlTabsRoot.querySelector('.control-tab.is-active');
+    targetId = activeBtn?.dataset?.tab || buttons[0]?.dataset?.tab;
+  }
+  if (!targetId) return;
+  buttons.forEach((btn) => {
+    const isActive = btn.dataset.tab === targetId;
+    btn.classList.toggle('is-active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    if (isActive && focus) btn.focus({ preventScroll: true });
+  });
+  panels.forEach((panel) => {
+    const match = panel.dataset.tabPanel === targetId;
+    panel.classList.toggle('is-active', match);
+    if (match) panel.removeAttribute('hidden');
+    else panel.setAttribute('hidden', '');
+  });
+  if (persist) {
+    try { localStorage.setItem(CONTROL_TAB_STORAGE, targetId); } catch {}
+  }
+}
+
+if (controlTabsRoot) {
+  const buttons = controlTabsRoot.querySelectorAll('[data-tab]');
+  buttons.forEach((btn) => {
+    btn.addEventListener('click', () => activateControlTab(btn.dataset.tab, { focus: true }));
+  });
+  let initialTab = null;
+  try {
+    initialTab = localStorage.getItem(CONTROL_TAB_STORAGE);
+  } catch {}
+  if (initialTab && controlTabsRoot.querySelector(`[data-tab="${initialTab}"]`)) {
+    activateControlTab(initialTab, { persist: false, focus: false });
+  } else if (buttons.length) {
+    activateControlTab(buttons[0].dataset.tab, { persist: false, focus: false });
+  }
 }
 
 menuBtn?.addEventListener('click', openMenu);
@@ -175,6 +221,7 @@ export const ui = {
   poseHzEl, poseSentEl, poseDropEl, poseRateEl,
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
+  controlTabsRoot,
   processLeaderboardSection, processLeaderboard, processCards, processGraph, processEmptyState, processReset,
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
@@ -187,5 +234,6 @@ export const ui = {
   terrainModeGeohash, terrainModeLatLng,
   displayNameInput, displayNameSave, toastHost,
   applyHudStatusDot,
-  openMenu, closeMenu
+  openMenu, closeMenu,
+  activateControlTab
 };

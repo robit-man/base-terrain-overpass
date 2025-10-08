@@ -110,6 +110,9 @@ export class SceneManager {
     uniforms['mieDirectionalG'].value = mieDirectionalG;
     uniforms['sunPosition'].value.copy(direction.clone().multiplyScalar(45000));
 
+    this.currentSunAltitude = altitude;
+    this.currentSunStrength = sunStrength;
+
     if (this._skyEnvTarget) this._skyEnvTarget.dispose();
     this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
     this.scene.environment = this._skyEnvTarget.texture;
