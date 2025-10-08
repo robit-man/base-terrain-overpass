@@ -163,8 +163,13 @@ class App {
     this.sceneMgr = new SceneManager();
 
     // === NEW: cap pixel ratio to avoid overdraw on HiDPI ===
+    this._pixelRatioBounds = {
+      min: 1,
+      max: Math.min(window.devicePixelRatio || 1, 1.5),
+    };
+    this._pixelRatioState = 'high';
     try {
-      const pr = Math.min(window.devicePixelRatio || 1, 1.5);
+      const pr = this._pixelRatioBounds.max;
       this.sceneMgr.renderer.setPixelRatio(pr);
     } catch {}
 
@@ -194,6 +199,9 @@ class App {
     // === NEW: throttling state (non-breaking) ===
     this._hoverNextAllowedMs = 0;
     this._pointerLastMoveMs = 0;
+    this._hoverDirty = true;
+    this._hoverLastRayCamPos = new THREE.Vector3(Infinity, Infinity, Infinity);
+    this._hoverCamPos = new THREE.Vector3();
     this._miniMapNextMs = 0;
     this._lastHexUpdatePos = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._nextHexUpdateMs = 0;
@@ -2566,6 +2574,7 @@ class App {
     this._pointerNdc.y = -(y * 2 - 1);
     this._pointerNdc.has = true;
     this._pointerLastMoveMs = (performance && performance.now) ? performance.now() : Date.now(); // NEW
+    this._hoverDirty = true;
   }
 
   // === NEW: throttled hover raycast ===

@@ -126,12 +126,12 @@ export class BuildingManager {
     color = 0x333333,
     roadWidth = 3,
     roadOffset = 0.05,
-    roadStep = 14,
+    roadStep = 18,
     roadAdaptive = false,
-    roadMinStep = 12,
-    roadMaxStep = 28,
+    roadMinStep = 14,
+    roadMaxStep = 32,
     roadAngleThresh = 0.35,
-    roadMaxSegments = 36,
+    roadMaxSegments = 28,
     roadLit = false,
     roadShadows = false,
     roadColor = 0x202020,
@@ -265,6 +265,7 @@ export class BuildingManager {
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
     this._pickMaterial.depthWrite = false;
     this._pickMaterial.depthTest = false;
+    this._pickMaterial.side = THREE.DoubleSide;
 
     this._trackingNode = null;
     if (camera?.parent?.isObject3D) {
@@ -289,6 +290,7 @@ export class BuildingManager {
     this._resnapIdleHandle = null;
     this._resnapPendingBudget = 0;
     this._qosTargetFps = TARGET_FPS;
+    this._maxFrameFeatures = 1;
 
     // Init CSS3D (non-invasive overlay)
     this._ensureCSS3DLayer();
@@ -355,6 +357,7 @@ export class BuildingManager {
     this._tileUpdateInterval = lerp(0.55, 0);
     this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
     if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
+    this._maxFrameFeatures = Math.max(1, Math.round(lerp(1, 3)));
 
     const desiredRadius = this._baseRadius;
     if (Math.abs(desiredRadius - this.radius) > 0.5) {
@@ -449,7 +452,7 @@ export class BuildingManager {
       }
     }
 
-    this._drainBuildQueue(this._frameBudgetMs);
+    this._drainBuildQueue(this._frameBudgetMs, null, this._maxFrameFeatures);
     this._processMergeQueue();
 
     this._resnapTimer += dt;
@@ -1186,7 +1189,7 @@ export class BuildingManager {
     }
   }
 
-  _drainBuildQueue(budgetMs, deadline) {
+  _drainBuildQueue(budgetMs, deadline, maxFeatures = Infinity) {
     if (!this._activeBuildJob && !this._buildQueue.length) return;
 
     const frameBudget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : this._frameBudgetMs;
@@ -1221,6 +1224,7 @@ export class BuildingManager {
       if (after > before) featuresProcessed += (after - before);
       iterations++;
       if (!progressed) break;
+      if (featuresProcessed >= maxFeatures) break;
 
       if (job.done || job.featureIndex >= job.features.length) {
         job.done = true;
@@ -1497,8 +1501,9 @@ export class BuildingManager {
     // Solid + picker: generated directly from same footprint
     const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
 
-    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
-    pickMesh.position.set(0, baseline, 0);
+    const pickGeo = this._makePickGeometry(rawFootprint);
+    const pickMesh = new THREE.Mesh(pickGeo, this._pickMaterial);
+    pickMesh.position.set(0, groundBase + extrusion * 0.5, 0);
 
     const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
     const fillMat = new THREE.MeshStandardMaterial({
@@ -1513,8 +1518,8 @@ export class BuildingManager {
     const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
-    solidMesh.castShadow = true;
-    solidMesh.receiveShadow = true;
+    solidMesh.castShadow = false;
+    solidMesh.receiveShadow = false;
 
     const centroid = averagePoint(rawFootprint);
     const address = formatAddress(tags);
@@ -1541,6 +1546,18 @@ export class BuildingManager {
     geo.computeBoundingSphere();
     geo.computeBoundingBox();
     return geo;
+  }
+
+  _makePickGeometry(footprint) {
+    if (!footprint?.length || footprint.length < 6) return new THREE.BufferGeometry();
+    const shape = new THREE.Shape();
+    for (let i = 0; i < footprint.length; i += 2) {
+      const x = footprint[i];
+      const z = footprint[i + 1];
+      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
+    }
+    shape.autoClose = true;
+    return new THREE.ShapeGeometry(shape, 1).rotateX(-Math.PI / 2);
   }
 
   /* ---------------- resnap & hover visuals ---------------- */
