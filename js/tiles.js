@@ -144,6 +144,11 @@ export class TileManager {
       () => this._backfillMissing({ onlyIfRelayReady: true }),
       this._backfillIntervalMs
     );
+
+    this._heightCache = new Map();
+    this._heightCacheTTL = 250;
+    this._heightCacheScale = 2;
+    this._heightMeshesFallback = [];
   }
 
   /* ---------------- small helpers ---------------- */
@@ -896,6 +901,7 @@ export class TileManager {
 
     this._initColorsNearBlack(tile);
     this._markRelaxListDirty();
+    this._invalidateHeightCache();
 
     if (!this._tryLoadTileFromCache(tile)) {
       if (this._tryLoadInteractiveSeed(tile)) {
@@ -1032,6 +1038,7 @@ export class TileManager {
     this.tiles.set(id, tile);
 
     this._initFarfieldColors(tile);
+    this._invalidateHeightCache();
 
     if (tile.grid?.points?.material) {
       const mat = tile.grid.points.material;
@@ -1120,6 +1127,7 @@ export class TileManager {
 
     // Swap into map, dispose low-res
     this.tiles.set(id, t);
+    this._invalidateHeightCache();
     this._markRelaxListDirty();
     try {
       this.scene.remove(v.grid.group);
@@ -2508,12 +2516,89 @@ export class TileManager {
 
   /* ---------------- Queries & controls ---------------- */
 
-  getHeightAt(x, z) {
-    const t0 = performance?.now ? performance.now() : Date.now();
-    const tmp = new THREE.Vector3(x, 10000, z);
+  _worldToAxialFloat(x, z) {
+    const a = this.tileRadius;
+    const q = (2 / 3) * (x / a);
+    const r = ((-1 / 3) * (x / a)) + ((Math.sqrt(3) / 3) * (z / a));
+    return { q, r };
+  }
+
+  _axialRound(q, r) {
+    let x = q;
+    let y = r;
+    let z = -x - y;
+    let rx = Math.round(x);
+    let ry = Math.round(y);
+    let rz = Math.round(z);
+
+    const xDiff = Math.abs(rx - x);
+    const yDiff = Math.abs(ry - y);
+    const zDiff = Math.abs(rz - z);
+
+    if (xDiff > yDiff && xDiff > zDiff) {
+      rx = -ry - rz;
+    } else if (yDiff > zDiff) {
+      ry = -rx - rz;
+    } else {
+      rz = -rx - ry;
+    }
+    return { q: rx, r: ry };
+  }
+
+  _axialNeighbors(q, r) {
+    return [
+      { q: q + 1, r },
+      { q: q + 1, r: r - 1 },
+      { q, r: r - 1 },
+      { q: q - 1, r },
+      { q: q - 1, r: r + 1 },
+      { q, r: r + 1 },
+    ];
+  }
+
+  _collectHeightMeshesNear(x, z) {
+    const centerFloat = this._worldToAxialFloat(x, z);
+    const center = this._axialRound(centerFloat.q, centerFloat.r);
+    const coords = [center, ...this._axialNeighbors(center.q, center.r)];
     const meshes = [];
-    for (const t of this.tiles.values()) if (t.type === 'interactive') meshes.push(t.grid.mesh);
-    if (meshes.length === 0) return this._lastHeight;
+    for (const { q, r } of coords) {
+      const tile = this.tiles.get(`${q},${r}`);
+      if (tile?.type === 'interactive' && tile.grid?.mesh) meshes.push(tile.grid.mesh);
+    }
+    if (meshes.length) return meshes;
+    if (!this._heightMeshesFallback.length) {
+      for (const t of this.tiles.values()) {
+        if (t.type === 'interactive' && t.grid?.mesh) this._heightMeshesFallback.push(t.grid.mesh);
+      }
+    }
+    return this._heightMeshesFallback;
+  }
+
+  _heightCacheKey(x, z) {
+    const scale = this._heightCacheScale;
+    const qx = Math.round(x * scale);
+    const qz = Math.round(z * scale);
+    return `${qx}:${qz}`;
+  }
+
+  _invalidateHeightCache() {
+    this._heightCache.clear();
+    this._heightMeshesFallback.length = 0;
+  }
+
+  getHeightAt(x, z) {
+    const perfNow = performance?.now ? performance.now.bind(performance) : null;
+    const start = perfNow ? perfNow() : Date.now();
+    const now = perfNow ? perfNow() : Date.now();
+    const key = this._heightCacheKey(x, z);
+    const cached = this._heightCache.get(key);
+    if (cached && (now - cached.t) < this._heightCacheTTL) {
+      return cached.h;
+    }
+
+    const tmp = new THREE.Vector3(x, 10000, z);
+    const meshes = this._collectHeightMeshesNear(x, z);
+    if (!meshes || meshes.length === 0) return this._lastHeight;
     this.ray.set(tmp, this.DOWN);
     const hit = this.ray.intersectObjects(meshes, true);
     let result = this._lastHeight;
@@ -2521,11 +2606,14 @@ export class TileManager {
       result = hit[0].point.y;
       this._lastHeight = result;
     }
-    const dt = (performance?.now ? performance.now() : Date.now()) - t0;
-    const now = performance?.now ? performance.now() : Date.now();
-    if ((!this._perfLogNext || now >= this._perfLogNext) && dt > 2) {
-      console.log(`[tiles.getHeightAt] meshes=${meshes.length} hit=${hit.length > 0} duration=${dt.toFixed(2)}ms`);
-      this._perfLogNext = now + 2000;
+    this._heightCache.set(key, { h: result, t: now });
+    if (this._heightCache.size > 4096) this._heightCache.clear();
+
+    const duration = (perfNow ? perfNow() : Date.now()) - start;
+    const logNow = perfNow ? perfNow() : Date.now();
+    if ((!this._perfLogNext || logNow >= this._perfLogNext) && duration > 2) {
+      console.log(`[tiles.getHeightAt] meshes=${meshes.length} hit=${hit.length > 0} duration=${duration.toFixed(2)}ms`);
+      this._perfLogNext = logNow + 2000;
     }
     return result;
   }
@@ -2555,6 +2643,7 @@ export class TileManager {
   }
 
   refreshTiles() {
+    this._invalidateHeightCache();
     for (const tile of this.tiles.values()) {
       tile.ready.fill(0);
       tile.fetched.clear();
@@ -2585,6 +2674,10 @@ export class TileManager {
     this._fetchPhase = 'interactive';
     this._markRelaxListDirty();
     this._scheduleBackfill(0);
+  }
+
+  invalidateHeightCache() {
+    this._invalidateHeightCache();
   }
 
   /* ---------------- Cleanup ---------------- */

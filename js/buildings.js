@@ -286,6 +286,8 @@ export class BuildingManager {
     this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
     this._tileUpdateTimer = 0;
     this._resnapTimer = 0;
+    this._resnapIdleHandle = null;
+    this._resnapPendingBudget = 0;
     this._qosTargetFps = TARGET_FPS;
 
     // Init CSS3D (non-invasive overlay)
@@ -1737,13 +1739,51 @@ export class BuildingManager {
       : this._resnapFrameBudgetMs;
     if (effectiveBudget <= 0) return;
 
-    const now = () => this._nowMs();
-    const start = now();
+    this._resnapPendingBudget = Math.max(this._resnapPendingBudget, effectiveBudget);
+    this._scheduleResnapWork();
+  }
+
+  _scheduleResnapWork() {
+    if (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length) return;
+    if (this._resnapIdleHandle != null) return;
+
+    const callback = (deadline) => {
+      this._resnapIdleHandle = null;
+      this._runResnapWork(deadline);
+    };
+
+    if (typeof requestIdleCallback === 'function') {
+      this._resnapIdleHandle = requestIdleCallback(callback);
+    } else {
+      this._resnapIdleHandle = setTimeout(() => callback({
+        timeRemaining: () => this._resnapPendingBudget || this._resnapFrameBudgetMs
+      }), 0);
+    }
+  }
+
+  _runResnapWork(deadline) {
+    const idleBudget = deadline && typeof deadline.timeRemaining === 'function'
+      ? deadline.timeRemaining()
+      : this._resnapFrameBudgetMs;
+    if (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length) return;
+    const budget = Math.max(0.25, Math.min(this._resnapPendingBudget || this._resnapFrameBudgetMs, idleBudget || this._resnapFrameBudgetMs));
+    this._resnapPendingBudget = 0;
+
+    this._processResnapSlice(budget);
+
+    if (this._resnapQueue && this._resnapIndex < this._resnapQueue.length) {
+      this._scheduleResnapWork();
+    }
+  }
+
+  _processResnapSlice(budgetMs) {
+    if (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length) return;
+    const start = this._nowMs();
     let processed = 0;
 
     while (this._resnapIndex < this._resnapQueue.length) {
-      const elapsed = now() - start;
-      if (elapsed > effectiveBudget) break;
+      const elapsed = this._nowMs() - start;
+      if (elapsed > budgetMs) break;
 
       const tileKey = this._resnapQueue[this._resnapIndex++];
       const state = this._tileStates.get(tileKey);
@@ -1758,9 +1798,9 @@ export class BuildingManager {
     }
 
     if (this._debugEnabled) {
-      const duration = now() - start;
-      const nowMs = now();
-      if (duration > effectiveBudget * 0.8 || nowMs >= this._nextResnapLogMs) {
+      const duration = this._nowMs() - start;
+      const nowMs = this._nowMs();
+      if (duration > budgetMs * 0.8 || nowMs >= this._nextResnapLogMs) {
         this._debugLog('resnap', {
           durationMs: duration,
           processed,
@@ -1783,6 +1823,9 @@ export class BuildingManager {
       if (type === 'road') this._resnapRoad(extra);
       else if (type === 'water') this._resnapWater(extra);
       else if (type === 'area') this._resnapArea(extra);
+    }
+    if ((dirty || (state.extras && state.extras.length)) && this.tileManager?.invalidateHeightCache) {
+      this.tileManager.invalidateHeightCache();
     }
   }
 
