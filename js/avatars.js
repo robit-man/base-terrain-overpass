@@ -107,8 +107,27 @@ export class Avatar {
     this.mixer = mixer;
     this.height = height;
 
+    this._neckBone = null;
+    this._headBone = null;
+    this._headLookTargetYaw = 0;
+    this._headLookTargetPitch = 0;
+    this._headLookTargetRoll = 0;
+    this._headLookCurYaw = 0;
+    this._headLookCurPitch = 0;
+    this._headLookCurRoll = 0;
+    this._headLookTargetActive = false;
+    this._headLookRate = 12;
+    this._headYawMax = THREE.MathUtils.degToRad(75);
+    this._headPitchUpMax = THREE.MathUtils.degToRad(55);
+    this._headPitchDownMax = THREE.MathUtils.degToRad(65);
+    this._headRollMax = THREE.MathUtils.degToRad(30);
+    this._tmpQuatNeck = new THREE.Quaternion();
+    this._tmpQuatHead = new THREE.Quaternion();
+
     // Align feet to y=0
     this.root.position.y -= footYOffset;
+
+    this._initHeadBones();
 
     // Material basics
     this.root.traverse(obj => {
@@ -217,6 +236,56 @@ export class Avatar {
     this._airborneManual = !!active;
   }
 
+  setHeadLook(state = {}) {
+    const hasAngles = Number.isFinite(state.yaw) || Number.isFinite(state.pitch) || Number.isFinite(state.roll);
+    const active = state.active != null ? !!state.active : hasAngles;
+    const yawRaw = Number.isFinite(state.yaw) ? state.yaw : 0;
+    const pitchRaw = Number.isFinite(state.pitch) ? state.pitch : 0;
+    const rollRaw = Number.isFinite(state.roll) ? state.roll : 0;
+    const yaw = THREE.MathUtils.clamp(yawRaw, -this._headYawMax, this._headYawMax);
+    const pitch = THREE.MathUtils.clamp(pitchRaw, -this._headPitchDownMax, this._headPitchUpMax);
+    const roll = THREE.MathUtils.clamp(rollRaw, -this._headRollMax, this._headRollMax);
+    this._headLookTargetActive = active;
+    this._headLookTargetYaw = active ? yaw : 0;
+    this._headLookTargetPitch = active ? pitch : 0;
+    this._headLookTargetRoll = active ? roll : 0;
+  }
+
+  _initHeadBones() {
+    const seen = new Set();
+    const considerBone = (bone) => {
+      if (!bone || seen.has(bone)) return;
+      seen.add(bone);
+      const name = String(bone.name || '').toLowerCase();
+      if (!this._neckBone && name.includes('neck')) {
+        this._neckBone = bone;
+        return;
+      }
+      if (!this._headBone && name.includes('head')) {
+        this._headBone = bone;
+      }
+    };
+
+    this.root.traverse(obj => {
+      if (this._neckBone && this._headBone) return;
+      if (!obj?.isSkinnedMesh || !obj.skeleton) return;
+      for (const bone of obj.skeleton.bones) {
+        considerBone(bone);
+        if (this._neckBone && this._headBone) return;
+      }
+    });
+
+    if (!this._headBone && this._neckBone) {
+      const directChild = this._neckBone.children?.find?.(child => child?.isBone && String(child.name || '').toLowerCase().includes('head'));
+      if (directChild) {
+        this._headBone = directChild;
+      } else if (this._neckBone.children && this._neckBone.children.length) {
+        const firstBoneChild = this._neckBone.children.find(child => child?.isBone);
+        if (firstBoneChild) this._headBone = firstBoneChild;
+      }
+    }
+  }
+
   _chooseAvailable(candidates = []) {
     for (const name of candidates) {
       const mapped = STATE_ALIASES[name] || name;
@@ -322,6 +391,32 @@ export class Avatar {
     this._airborneAuto = true;
   }
 
+  _applyHeadLook(dt) {
+    if (!this._neckBone && !this._headBone) return;
+    const alpha = smoothAlpha(this._headLookRate, dt);
+    this._headLookCurYaw += (this._headLookTargetYaw - this._headLookCurYaw) * alpha;
+    this._headLookCurPitch += (this._headLookTargetPitch - this._headLookCurPitch) * alpha;
+    this._headLookCurRoll += (this._headLookTargetRoll - this._headLookCurRoll) * alpha;
+
+    const yaw = this._headLookCurYaw;
+    const pitch = this._headLookCurPitch;
+    const roll = this._headLookCurRoll;
+    const magnitude = Math.abs(yaw) + Math.abs(pitch) + Math.abs(roll);
+    if (magnitude < 1e-4 && !this._headLookTargetActive) return;
+
+    if (this._neckBone) {
+      this._tmpQuatNeck.setFromEuler(new THREE.Euler(pitch * 0.5, yaw * 0.6, roll * 0.3, 'XYZ'));
+      this._neckBone.quaternion.multiply(this._tmpQuatNeck);
+      this._neckBone.updateMatrixWorld(true);
+    }
+
+    if (this._headBone) {
+      this._tmpQuatHead.setFromEuler(new THREE.Euler(pitch * 0.75, yaw * 0.4, roll * 0.7, 'XYZ'));
+      this._headBone.quaternion.multiply(this._tmpQuatHead);
+      this._headBone.updateMatrixWorld(true);
+    }
+  }
+
   update(dt) {
     // Smooth speed towards target (external hint)
     const a = smoothAlpha(this._vRate, dt);
@@ -395,6 +490,7 @@ export class Avatar {
     }
 
     if (this.mixer) this.mixer.update(dt);
+    this._applyHeadLook(dt);
   }
 }
 

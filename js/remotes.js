@@ -142,6 +142,18 @@ export class Remotes {
     const x = pose.p[0], y = pose.p[1], z = pose.p[2];
 
     ent.avatar.setCrouch(!!pose.c);
+    if (ent.avatar?.setHeadLook) {
+      if (pose.xr && typeof pose.xr === 'object') {
+        ent.avatar.setHeadLook({
+          active: (pose.xr.active ?? 1) !== 0,
+          yaw: Number.isFinite(pose.xr.headYaw) ? pose.xr.headYaw : null,
+          pitch: Number.isFinite(pose.xr.headPitch) ? pose.xr.headPitch : null,
+          roll: Number.isFinite(pose.xr.headRoll) ? pose.xr.headRoll : null
+        });
+      } else {
+        ent.avatar.setHeadLook({ active: false });
+      }
+    }
 
     const geoEye = Number.isFinite(geo?.eye) ? Number(geo.eye) : null;
     const groundYRaw = Number.isFinite(y)

@@ -32,6 +32,10 @@ class PerfLogger {
     this._records = [];
     this._frameStart = 0;
     this._maxByLabel = new Map();
+    this.historyLimit = 120;
+    this._historyByLabel = new Map();
+    this._statsByLabel = new Map();
+    this._frameCounter = 0;
   }
 
   frameStart() {
@@ -54,6 +58,23 @@ class PerfLogger {
     this._records.push([label, duration]);
     const prev = this._maxByLabel.get(label) || 0;
     if (duration > prev) this._maxByLabel.set(label, duration);
+    let stat = this._statsByLabel.get(label);
+    if (!stat) {
+      stat = { total: 0, count: 0, max: 0, min: Infinity, last: 0 };
+      this._statsByLabel.set(label, stat);
+    }
+    stat.total += duration;
+    stat.count += 1;
+    stat.last = duration;
+    if (duration > stat.max) stat.max = duration;
+    if (duration < stat.min) stat.min = duration;
+    let history = this._historyByLabel.get(label);
+    if (!history) {
+      history = [];
+      this._historyByLabel.set(label, history);
+    }
+    history.push(duration);
+    if (history.length > this.historyLimit) history.splice(0, history.length - this.historyLimit);
     return duration;
   }
 
@@ -89,7 +110,34 @@ class PerfLogger {
       console.log(`[perf] frame ${frameDuration.toFixed(2)}ms | top ${top}${peaks}`);
       this._nextReportAt = end + this.reportIntervalMs;
     }
+    this._frameCounter += 1;
     return frameDuration;
+  }
+
+  getProcessStats() {
+    const out = [];
+    for (const [label, stat] of this._statsByLabel.entries()) {
+      const history = this._historyByLabel.get(label) || [];
+      const avg = stat.count ? stat.total / stat.count : 0;
+      const min = stat.min === Infinity ? 0 : stat.min;
+      out.push({
+        label,
+        avg,
+        max: stat.max || 0,
+        min,
+        last: stat.last || 0,
+        samples: stat.count || 0,
+        history: history.slice(-this.historyLimit),
+      });
+    }
+    out.sort((a, b) => (b.avg || 0) - (a.avg || 0));
+    return out;
+  }
+
+  resetStats() {
+    this._historyByLabel.clear();
+    this._statsByLabel.clear();
+    this._maxByLabel.clear();
   }
 }
 
@@ -101,6 +149,7 @@ const GPS_LOCK_KEY = 'xr.gpsLockEnabled.v1';
 const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
 const PLAYER_POSE_KEY = 'xr.playerPose.v1';
 const DEBUG_STATE_KEY = 'xr.debugMode.v1';
+const PROCESS_METRICS_KEY = 'xr.processMetrics.v2';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
 
 class App {
@@ -134,6 +183,7 @@ class App {
     this.sensors = new Sensors();
     this.input = new Input(this.sceneMgr);
     this._physicsPrimed = false;
+    this._xrPoseActive = false;
 
     this._perf = new PerformanceTuner({ targetFps: 60, minQuality: 0.35, maxQuality: 1.05 });
     this._perfSnapshots = { tiles: null, buildings: null };
@@ -151,6 +201,13 @@ class App {
     this._hudGeoNextMs = 0;
     this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._perfLogger = new PerfLogger({ slowFrameMs: 33, reportIntervalMs: 2000, labelLimit: 6 });
+    this._processMetricsStore = this._loadProcessMetrics();
+    this._processUi = {
+      nextUpdate: 0,
+      nextPersist: 0,
+      redrawInterval: 750,
+      persistInterval: 4000,
+    };
     this._sunUpdateNextMs = 0;
     this._sunOrigin = null;
 
@@ -420,6 +477,7 @@ class App {
 
     this._syncDebugUI();
     this._applyDebugMode();
+    this._initProcessLeaderboard();
 
     const relayInput = ui.terrainRelayInput;
     const datasetInput = ui.terrainDatasetInput;
@@ -829,6 +887,285 @@ class App {
     document.body?.classList?.toggle('debug-mode', on);
     if (on) {
       console.info('[debug] Debug mode enabled');
+    }
+    this._updateProcessLeaderboardVisibility();
+  }
+
+  _initProcessLeaderboard() {
+    if (this._processLeaderboardInit) return;
+    this._processLeaderboardInit = true;
+    if (ui.processReset) {
+      ui.processReset.addEventListener('click', () => {
+        this._perfLogger?.resetStats?.();
+        this._processMetricsStore = { version: 2, updatedAt: Date.now(), items: {} };
+        this._storeProcessMetrics();
+        this._renderProcessLeaderboard([]);
+        this._drawProcessGraph([]);
+      });
+    }
+    this._updateProcessLeaderboardVisibility(true);
+  }
+
+  _updateProcessLeaderboardVisibility(force = false) {
+    const section = ui.processLeaderboardSection;
+    if (section) {
+      section.style.display = this._debugMode ? '' : 'none';
+    }
+    if (!this._debugMode && !force) {
+      const stats = this._perfLogger?.getProcessStats?.() || [];
+      if (stats.length) this._persistProcessMetrics(stats);
+    }
+    if (this._debugMode || force) {
+      this._processUi.nextUpdate = 0;
+      this._processUi.nextPersist = 0;
+      const stats = this._getProcessStatsForDisplay();
+      this._renderProcessLeaderboard(stats);
+      this._drawProcessGraph(stats);
+      if (force) this._persistProcessMetrics(stats);
+    }
+  }
+
+  _getProcessStatsForDisplay() {
+    const live = this._perfLogger?.getProcessStats?.() || [];
+    if (live.length) return live;
+    const store = this._processMetricsStore;
+    if (!store?.items) return [];
+    const items = [];
+    for (const [label, data] of Object.entries(store.items)) {
+      if (!data) continue;
+      const history = Array.isArray(data.history) ? data.history.slice() : [];
+      items.push({
+        label,
+        avg: Number.isFinite(data.avg) ? data.avg : 0,
+        max: Number.isFinite(data.max) ? data.max : 0,
+        min: Number.isFinite(data.min) ? data.min : 0,
+        last: Number.isFinite(data.last) ? data.last : (Number.isFinite(data.avg) ? data.avg : 0),
+        samples: Number.isFinite(data.samples) ? data.samples : history.length,
+        history: history.slice(-this._perfLogger?.historyLimit || 120),
+      });
+    }
+    items.sort((a, b) => (b.avg || 0) - (a.avg || 0));
+    return items;
+  }
+
+  _renderProcessLeaderboard(stats) {
+    const host = ui.processCards;
+    const empty = ui.processEmptyState;
+    if (!host) return;
+    if (!stats || !stats.length) {
+      host.innerHTML = '';
+      if (empty) empty.style.display = '';
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    const frameBudget = 1000 / (this._perf?.targetFps || 60);
+    const palette = ['#4caf50', '#ff9800', '#29b6f6', '#f06292', '#ba68c8', '#8bc34a', '#ffb74d'];
+
+    stats.slice(0, 8).forEach((stat, index) => {
+      const usage = Math.max(0, Math.min(999, (stat.avg / frameBudget) * 100));
+      const last = Number.isFinite(stat.last) ? stat.last : 0;
+      const max = Number.isFinite(stat.max) ? stat.max : 0;
+      const avg = Number.isFinite(stat.avg) ? stat.avg : 0;
+      const min = Number.isFinite(stat.min) ? stat.min : 0;
+      const history = Array.isArray(stat.history) ? stat.history : [];
+      const recentWindow = history.length >= 2 ? history.slice(-5) : history;
+      const recentAvg = recentWindow.length
+        ? recentWindow.reduce((acc, val) => acc + val, 0) / recentWindow.length
+        : avg;
+      const trend = last - recentAvg;
+      const usageText = `${usage.toFixed(1)}%`; // resource usage
+      const trendText = `${trend >= 0 ? '+' : ''}${trend.toFixed(2)} ms`;
+
+      const card = document.createElement('div');
+      card.className = 'process-card';
+      card.dataset.label = stat.label;
+
+      const header = document.createElement('div');
+      header.className = 'process-card__header';
+      const title = document.createElement('span');
+      title.className = 'process-card__title';
+      title.textContent = stat.label;
+      const usageEl = document.createElement('span');
+      usageEl.className = 'process-card__usage';
+      usageEl.textContent = `${usageText} • Δ ${trendText}`;
+      usageEl.style.color = palette[index % palette.length];
+      header.appendChild(title);
+      header.appendChild(usageEl);
+      card.appendChild(header);
+
+      const metricsWrap = document.createElement('div');
+      metricsWrap.className = 'process-card__metrics';
+      const metrics = [
+        { label: 'avg', value: `${avg.toFixed(2)} ms` },
+        { label: 'last', value: `${last.toFixed(2)} ms` },
+        { label: 'max', value: `${max.toFixed(2)} ms` },
+        { label: 'min', value: `${min.toFixed(2)} ms` },
+        { label: 'usage', value: usageText },
+        { label: 'samples', value: `${stat.samples ?? history.length}` },
+      ];
+
+      metrics.forEach((metric) => {
+        const metricEl = document.createElement('div');
+        metricEl.className = 'process-card__metric';
+        const labelEl = document.createElement('span');
+        labelEl.className = 'tiny';
+        labelEl.textContent = metric.label;
+        const valueEl = document.createElement('span');
+        valueEl.className = 'mono';
+        valueEl.textContent = metric.value;
+        metricEl.appendChild(labelEl);
+        metricEl.appendChild(valueEl);
+        metricsWrap.appendChild(metricEl);
+      });
+
+      card.appendChild(metricsWrap);
+      fragment.appendChild(card);
+    });
+
+    host.replaceChildren(fragment);
+    if (empty) empty.style.display = 'none';
+  }
+
+  _drawProcessGraph(stats) {
+    const canvas = ui.processGraph;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const styleWidth = canvas.clientWidth || canvas.width || 480;
+    const styleHeight = canvas.clientHeight || canvas.height || 240;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== styleWidth * dpr || canvas.height !== styleHeight * dpr) {
+      canvas.width = styleWidth * dpr;
+      canvas.height = styleHeight * dpr;
+    }
+    const drawWidth = canvas.width / dpr;
+    const drawHeight = canvas.height / dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, drawWidth, drawHeight);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    ctx.fillRect(0, 0, drawWidth, drawHeight);
+
+    const palette = ['#4caf50', '#ff9800', '#29b6f6', '#f06292', '#ba68c8', '#8bc34a', '#ffb74d'];
+    const padding = 24;
+    const frameBudget = 1000 / (this._perf?.targetFps || 60);
+
+    const hasData = stats.some((stat) => Array.isArray(stat.history) && stat.history.length);
+    if (!hasData) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+      ctx.font = '14px Rajdhani, sans-serif';
+      ctx.fillText('Metrics will populate as debug samples arrive.', padding, drawHeight / 2);
+      return;
+    }
+
+    let maxValue = frameBudget;
+    stats.forEach((stat) => {
+      if (!Array.isArray(stat.history)) return;
+      stat.history.forEach((value) => {
+        if (Number.isFinite(value) && value > maxValue) maxValue = value;
+      });
+    });
+    if (maxValue <= 0) maxValue = 10;
+
+    // Baseline (frame budget)
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    const baselineY = drawHeight - padding - (frameBudget / maxValue) * (drawHeight - padding * 2);
+    ctx.beginPath();
+    ctx.moveTo(padding, baselineY);
+    ctx.lineTo(drawWidth - padding, baselineY);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '12px Rajdhani, sans-serif';
+    ctx.fillText('Frame budget', padding + 6, Math.max(12, baselineY - 6));
+
+    stats.slice(0, 5).forEach((stat, index) => {
+      const history = Array.isArray(stat.history) ? stat.history : [];
+      if (!history.length) return;
+      const color = palette[index % palette.length];
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      const len = history.length;
+      history.forEach((value, i) => {
+        const normVal = Number.isFinite(value) ? value : 0;
+        const x = padding + (len > 1 ? (i / (len - 1)) * (drawWidth - padding * 2) : 0);
+        const y = drawHeight - padding - (normVal / maxValue) * (drawHeight - padding * 2);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    });
+
+    // Legend
+    let legendX = padding;
+    const legendY = padding - 8;
+    stats.slice(0, 5).forEach((stat, index) => {
+      const color = palette[index % palette.length];
+      ctx.fillStyle = color;
+      ctx.fillRect(legendX, legendY, 10, 10);
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillText(stat.label, legendX + 14, legendY + 9);
+      legendX += ctx.measureText(stat.label).width + 40;
+    });
+  }
+
+  _persistProcessMetrics(stats) {
+    if (!stats || !stats.length) return;
+    if (!this._processMetricsStore || this._processMetricsStore.version !== 2) {
+      this._processMetricsStore = { version: 2, updatedAt: Date.now(), items: {} };
+    }
+    const store = this._processMetricsStore;
+    store.items = store.items || {};
+    stats.forEach((stat) => {
+      store.items[stat.label] = {
+        avg: stat.avg ?? 0,
+        max: stat.max ?? 0,
+        min: stat.min ?? 0,
+        last: stat.last ?? 0,
+        samples: stat.samples ?? 0,
+        history: Array.isArray(stat.history) ? stat.history.slice(-this._perfLogger?.historyLimit || 120) : [],
+      };
+    });
+    store.updatedAt = Date.now();
+    this._storeProcessMetrics();
+  }
+
+  _loadProcessMetrics() {
+    try {
+      const raw = localStorage.getItem(PROCESS_METRICS_KEY);
+      if (!raw) return { version: 2, updatedAt: 0, items: {} };
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return { version: 2, updatedAt: 0, items: {} };
+      if (parsed.version !== 2) return { version: 2, updatedAt: 0, items: {} };
+      if (typeof parsed.items !== 'object' || parsed.items == null) parsed.items = {};
+      return parsed;
+    } catch {
+      return { version: 2, updatedAt: 0, items: {} };
+    }
+  }
+
+  _storeProcessMetrics() {
+    try {
+      if (!this._processMetricsStore) return;
+      localStorage.setItem(PROCESS_METRICS_KEY, JSON.stringify(this._processMetricsStore));
+    } catch {
+      // ignore quota errors
+    }
+  }
+
+  _updateProcessLeaderboard() {
+    if (!this._debugMode) return;
+    if (!ui.processCards) return;
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now < (this._processUi.nextUpdate || 0)) return;
+    this._processUi.nextUpdate = now + (this._processUi.redrawInterval || 750);
+    const stats = this._getProcessStatsForDisplay();
+    this._renderProcessLeaderboard(stats);
+    this._drawProcessGraph(stats);
+    if (now >= (this._processUi.nextPersist || 0)) {
+      this._persistProcessMetrics(stats);
+      this._processUi.nextPersist = now + (this._processUi.persistInterval || 4000);
     }
   }
 
@@ -1988,6 +2325,15 @@ class App {
     const locomotionHeadHeight = xrOn && typeof this.move?.getXRHeadHeight === 'function'
       ? this.move.getXRHeadHeight()
       : null;
+    const locomotionHeadYaw = xrOn && typeof this.move?.getXRRelativeHeadYaw === 'function'
+      ? this.move.getXRRelativeHeadYaw()
+      : null;
+    const locomotionHeadPitch = xrOn && typeof this.move?.getXRHeadPitch === 'function'
+      ? this.move.getXRHeadPitch()
+      : null;
+    const locomotionHeadRoll = xrOn && typeof this.move?.getXRHeadRoll === 'function'
+      ? this.move.getXRHeadRoll()
+      : null;
 
     if (this.localAvatar) {
       measure('avatar.local', () => {
@@ -2028,7 +2374,26 @@ class App {
       const crouchActive = this.move.isCrouching?.() ?? false;
       const effectiveEyeHeight = Number.isFinite(locomotionHeadHeight) ? locomotionHeadHeight : eyeHeight;
       const actualY = groundY + effectiveEyeHeight;
-      this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt, crouchActive);
+      let poseExtras = null;
+      const headYawValid = Number.isFinite(locomotionHeadYaw);
+      const headPitchValid = Number.isFinite(locomotionHeadPitch);
+      const xrHeadActive = xrOn && headYawValid && headPitchValid;
+      if (xrHeadActive || this._xrPoseActive) {
+        const xrPayload = { active: xrHeadActive ? 1 : 0 };
+        if (xrHeadActive) {
+          xrPayload.headYaw = locomotionHeadYaw;
+          xrPayload.headPitch = locomotionHeadPitch;
+          if (Number.isFinite(locomotionHeadRoll)) xrPayload.headRoll = locomotionHeadRoll;
+          if (Number.isFinite(locomotionHeadHeight)) xrPayload.headHeight = locomotionHeadHeight;
+        } else {
+          xrPayload.headYaw = 0;
+          xrPayload.headPitch = 0;
+          xrPayload.headRoll = 0;
+        }
+        poseExtras = { xr: xrPayload };
+      }
+      this._xrPoseActive = xrHeadActive;
+      this.mesh.sendPoseIfChanged(dolly.position, qSend, actualY, jumpEvt, crouchActive, poseExtras);
     });
 
     measure('physics.update', () => {
@@ -2071,6 +2436,7 @@ class App {
     });
 
     logger?.frameEnd?.();
+    this._updateProcessLeaderboard();
   }
 
   _maybeUpdateSun(origin) {

@@ -31,12 +31,21 @@ export class Locomotion {
     this._vrJumpRequested = false;
     this._vrCrouchActive = false;
     this._headHeight = this.baseEye;
+    this._headPitch = 0;
+    this._headRoll = 0;
+    this._xrHeadPoseReady = false;
+
+    this._tmpHeadQuat = new THREE.Quaternion();
+    this._tmpHeadEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
     this._onXRSessionStart = () => {
       this._lastHeadRelativeYaw = 0;
       this._bodyYaw = 0;
       this._worldYaw = 0;
       this._headHeight = this.baseEye;
+      this._headPitch = 0;
+      this._headRoll = 0;
+      this._xrHeadPoseReady = false;
       if (this.sceneMgr?.dolly) {
         this.sceneMgr.dolly.rotation.y = 0;
         this.sceneMgr.dolly.quaternion.setFromEuler(new THREE.Euler(0, 0, 0, 'YXZ'));
@@ -52,6 +61,9 @@ export class Locomotion {
       this._vrJumpRequested = false;
       this._vrCrouchActive = false;
       this._headHeight = this.baseEye;
+      this._headPitch = 0;
+      this._headRoll = 0;
+      this._xrHeadPoseReady = false;
     };
     const xr = this.sceneMgr.renderer?.xr;
     if (xr?.addEventListener) {
@@ -300,7 +312,13 @@ export class Locomotion {
     this._setupVRControllers();
     const renderer = this.sceneMgr.renderer;
     const session = renderer?.xr?.getSession?.();
-    if (!session) { this._spd = 0; return; }
+    if (!session) {
+      this._spd = 0;
+      this._xrHeadPoseReady = false;
+      this._headPitch = 0;
+      this._headRoll = 0;
+      return;
+    }
     const dtClamped = Math.min(dt, 0.1);
     const moveVec = this._vrMoveVec.set(0, 0, 0);
     let moved = false;
@@ -349,6 +367,28 @@ export class Locomotion {
 
     const xrCamera = renderer.xr.getCamera(this.sceneMgr.camera);
     const viewCam = xrCamera?.cameras?.[0] || xrCamera;
+    const headQuat = this._tmpHeadQuat;
+    const headEuler = this._tmpHeadEuler;
+    let headQuatValid = false;
+    if (viewCam?.getWorldQuaternion) {
+      viewCam.getWorldQuaternion(headQuat);
+      headQuatValid = true;
+    } else if (this.sceneMgr?.camera?.getWorldQuaternion) {
+      this.sceneMgr.camera.getWorldQuaternion(headQuat);
+      headQuatValid = true;
+    }
+
+    if (headQuatValid) {
+      headEuler.setFromQuaternion(headQuat, 'YXZ');
+      const pitchLimit = THREE.MathUtils.degToRad(80);
+      const rollLimit = THREE.MathUtils.degToRad(55);
+      this._headPitch = THREE.MathUtils.clamp(headEuler.x, -pitchLimit, pitchLimit);
+      this._headRoll = THREE.MathUtils.clamp(headEuler.z, -rollLimit, rollLimit);
+    } else {
+      this._headPitch = 0;
+      this._headRoll = 0;
+    }
+
     const headForward = this._tmpHeadFlat;
     const headForwardValid = this._extractFlatForward(viewCam, headForward) ||
       this._extractFlatForward(this.sceneMgr.camera, headForward);
@@ -370,6 +410,12 @@ export class Locomotion {
       this._lastHeadRelativeYaw = 0;
       this._vrForward.copy(bodyForward);
       this._headHeight = this.baseEye;
+    }
+
+    this._xrHeadPoseReady = headForwardValid && headQuatValid;
+    if (!this._xrHeadPoseReady) {
+      this._headPitch = 0;
+      this._headRoll = 0;
     }
 
     this._worldYaw = this._normalizeAngle(finalYaw);
@@ -446,11 +492,24 @@ export class Locomotion {
   }
 
   getXRRelativeHeadYaw() {
+    if (!this._xrHeadPoseReady) return null;
     return this._lastHeadRelativeYaw || 0;
   }
 
+  getXRHeadPitch() {
+    return this._xrHeadPoseReady ? this._headPitch : null;
+  }
+
+  getXRHeadRoll() {
+    return this._xrHeadPoseReady ? this._headRoll : null;
+  }
+
   getXRBodyYaw() {
-    return this._bodyYaw || 0;
+    return Number.isFinite(this._bodyYaw) ? this._normalizeAngle(this._bodyYaw) : null;
+  }
+
+  isXRHeadPoseReady() {
+    return !!this._xrHeadPoseReady;
   }
 
   speed() { return this._spd; }

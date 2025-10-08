@@ -23,6 +23,12 @@ const lpSpd = document.getElementById('lpSpd');
 
 const peerSummary = document.getElementById('peerSummary');
 const peerList = document.getElementById('peerList');
+const processLeaderboardSection = document.getElementById('processLeaderboardSection');
+const processLeaderboard = document.getElementById('processLeaderboard');
+const processCards = document.getElementById('processCards');
+const processGraph = document.getElementById('processGraph');
+const processEmptyState = document.getElementById('processEmptyState');
+const processReset = document.getElementById('processReset');
 
 const hexSig = document.getElementById('hexSig');
 const nukeBtn = document.getElementById('nuke');
@@ -169,6 +175,7 @@ export const ui = {
   poseHzEl, poseSentEl, poseDropEl, poseRateEl,
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
+  processLeaderboardSection, processLeaderboard, processCards, processGraph, processEmptyState, processReset,
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,

@@ -72,6 +72,8 @@ export class Mesh {
     // thresholds (tight)
     this.POS_EPS = 0.0015;    // ~1.5 mm
     this.ANG_EPS = rad(0.35); // ~0.35°
+    this.XR_HEAD_EPS = rad(0.8);
+    this.XR_HEIGHT_EPS = 0.025;
 
     // ----- Address book -----
     this.book = { v: BOOK_VER, updatedAt: new Date().toISOString(), peers: [] };
@@ -760,6 +762,22 @@ export class Mesh {
             c: pose.c ? 1 : 0
           };
 
+          if (pose.xr && typeof pose.xr === 'object') {
+            const xrIn = pose.xr;
+            const xrOut = {
+              active: xrIn.active != null ? (Number(xrIn.active) ? 1 : 0) : 1
+            };
+            const yawVal = Number(xrIn.headYaw);
+            if (Number.isFinite(yawVal)) xrOut.headYaw = yawVal;
+            const pitchVal = Number(xrIn.headPitch);
+            if (Number.isFinite(pitchVal)) xrOut.headPitch = pitchVal;
+            const rollVal = Number(xrIn.headRoll);
+            if (Number.isFinite(rollVal)) xrOut.headRoll = rollVal;
+            const heightVal = Number(xrIn.headHeight);
+            if (Number.isFinite(heightVal)) xrOut.headHeight = heightVal;
+            poseOut.xr = xrOut;
+          }
+
           let geoNorm = null;
           if (msg.geo) {
             const lat = Number(msg.geo.lat);
@@ -789,7 +807,7 @@ export class Mesh {
             }
           }
 
-          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm });
+          this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm, xr: poseOut.xr || null });
           this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
             console.warn('[remotes] update failed', err);
           });
@@ -1212,14 +1230,63 @@ export class Mesh {
    * Send pose at up to 60 fps. Tight thresholds; jumpEvent forces immediate send.
    * Expect q to be yaw-only (we keep bodies upright), as provided by app.js.
    */
-  async sendPoseIfChanged(p, q, yOverride, jumpEvent = false, crouchActive = false) {
+  async sendPoseIfChanged(p, q, yOverride, jumpEvent = false, crouchActive = false, extras = null) {
     const t = now();
+
+    const normalizeXr = (src) => {
+      if (!src || typeof src !== 'object') return null;
+      const out = {};
+      out.active = src.active != null ? (src.active ? 1 : 0) : 1;
+      if (Number.isFinite(src.headYaw)) out.headYaw = src.headYaw;
+      if (Number.isFinite(src.headPitch)) out.headPitch = src.headPitch;
+      if (Number.isFinite(src.headRoll)) out.headRoll = src.headRoll;
+      if (Number.isFinite(src.headHeight)) out.headHeight = src.headHeight;
+      return out;
+    };
+
+    const anglesDiffer = (a, b, eps) => {
+      const aFinite = Number.isFinite(a);
+      const bFinite = Number.isFinite(b);
+      if (!aFinite && !bFinite) return false;
+      if (!aFinite || !bFinite) return true;
+      const diff = Math.abs(THREE.MathUtils.euclideanModulo((a - b) + Math.PI, Math.PI * 2) - Math.PI);
+      return diff > eps;
+    };
+
+    const scalarsDiffer = (a, b, eps) => {
+      const aFinite = Number.isFinite(a);
+      const bFinite = Number.isFinite(b);
+      if (!aFinite && !bFinite) return false;
+      if (!aFinite || !bFinite) return true;
+      return Math.abs(a - b) > eps;
+    };
+
+    const xrStateChanged = (prevState, nextState) => {
+      if (!prevState && !nextState) return false;
+      if (!prevState || !nextState) return true;
+      if ((prevState.active ?? 1) !== (nextState.active ?? 1)) return true;
+      if (anglesDiffer(prevState.headYaw, nextState.headYaw, this.XR_HEAD_EPS)) return true;
+      if (anglesDiffer(prevState.headPitch, nextState.headPitch, this.XR_HEAD_EPS)) return true;
+      if (anglesDiffer(prevState.headRoll, nextState.headRoll, this.XR_HEAD_EPS)) return true;
+      if (scalarsDiffer(prevState.headHeight, nextState.headHeight, this.XR_HEIGHT_EPS)) return true;
+      return false;
+    };
+
+    const xrSnapshot = normalizeXr(extras?.xr);
 
     // 60 fps gate
     if (!jumpEvent && (t - (this._lastSendAt || 0)) < this.MIN_INTERVAL_MS) return;
 
     const crouchFlag = crouchActive ? 1 : 0;
-    if (!this._posePrev) this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], c: crouchFlag, t: 0 };
+    if (!this._posePrev) {
+      this._posePrev = {
+        p: [p.x, p.y, p.z],
+        q: [q.x, q.y, q.z, q.w],
+        c: crouchFlag,
+        t: 0,
+        xr: xrSnapshot ? { ...xrSnapshot } : null
+      };
+    }
     const prev = this._posePrev;
 
     const posDelta = Math.hypot(p.x - prev.p[0], p.y - prev.p[1], p.z - prev.p[2]);
@@ -1227,10 +1294,17 @@ export class Mesh {
     const ang = 2 * Math.acos(Math.min(1, Math.abs(dot)));
 
     const crouchChanged = (prev.c ?? 0) !== crouchFlag;
-    const changed = posDelta > this.POS_EPS || ang > this.ANG_EPS || jumpEvent || crouchChanged;
+    const xrChanged = xrStateChanged(prev.xr, xrSnapshot);
+    const changed = posDelta > this.POS_EPS || ang > this.ANG_EPS || jumpEvent || crouchChanged || xrChanged;
     if (!changed) return;
 
-    this._posePrev = { p: [p.x, p.y, p.z], q: [q.x, q.y, q.z, q.w], c: crouchFlag, t };
+    this._posePrev = {
+      p: [p.x, p.y, p.z],
+      q: [q.x, q.y, q.z, q.w],
+      c: crouchFlag,
+      t,
+      xr: xrSnapshot ? { ...xrSnapshot } : null
+    };
 
     const y = Number.isFinite(yOverride) ? yOverride : p.y;
     const payload = {
@@ -1244,6 +1318,15 @@ export class Mesh {
         c: crouchFlag
       }
     };
+
+    if (xrSnapshot) {
+      const xrPayload = { active: xrSnapshot.active ?? 1 };
+      if (Number.isFinite(xrSnapshot.headYaw)) xrPayload.headYaw = +xrSnapshot.headYaw.toFixed(4);
+      if (Number.isFinite(xrSnapshot.headPitch)) xrPayload.headPitch = +xrSnapshot.headPitch.toFixed(4);
+      if (Number.isFinite(xrSnapshot.headRoll)) xrPayload.headRoll = +xrSnapshot.headRoll.toFixed(4);
+      if (Number.isFinite(xrSnapshot.headHeight)) xrPayload.headHeight = +xrSnapshot.headHeight.toFixed(3);
+      payload.pose.xr = xrPayload;
+    }
 
     const geo = this._geoPayload(p.x, p.z, y);
     if (geo) payload.geo = geo;
@@ -1288,6 +1371,15 @@ export class Mesh {
         j: 0
       }
     };
+    const xrPrev = this._posePrev?.xr;
+    if (xrPrev) {
+      const xrPayload = { active: xrPrev.active ?? 1 };
+      if (Number.isFinite(xrPrev.headYaw)) xrPayload.headYaw = +xrPrev.headYaw.toFixed(4);
+      if (Number.isFinite(xrPrev.headPitch)) xrPayload.headPitch = +xrPrev.headPitch.toFixed(4);
+      if (Number.isFinite(xrPrev.headRoll)) xrPayload.headRoll = +xrPrev.headRoll.toFixed(4);
+      if (Number.isFinite(xrPrev.headHeight)) xrPayload.headHeight = +xrPrev.headHeight.toFixed(3);
+      payload.pose.xr = xrPayload;
+    }
     const geo = this._geoPayload(dol.position.x, dol.position.z, actualY);
     if (geo) payload.geo = geo;
 

@@ -261,6 +261,19 @@
       <div class="tiny" id="peerSummary">—</div>
       <div id="peerList" class="peer-list"></div>
     </section>
+
+    <section class="modal-section debug-only" id="processLeaderboardSection">
+      <h3 class="section-title">Process Leaderboard</h3>
+      <div id="processLeaderboard" class="process-leaderboard">
+        <div class="process-header">
+          <div class="tiny">Sorted by average latency</div>
+          <button id="processReset" type="button" class="process-reset" title="Clear collected metrics">Reset Metrics</button>
+        </div>
+        <div id="processCards" class="process-cards"></div>
+        <canvas id="processGraph" width="480" height="240" aria-label="Process metrics over time"></canvas>
+        <div id="processEmptyState" class="process-empty tiny">Metrics will appear after debug mode collects activity.</div>
+      </div>
+    </section>
     </div>
   </div>
 

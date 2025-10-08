@@ -14,6 +14,10 @@ body.modal-open {
     overflow: hidden;
 }
 
+body:not(.debug-mode) .debug-only {
+    display: none !important;
+}
+
 * {
     font-family: "Rajdhani", sans-serif !important;
     letter-spacing: 0.04em;
@@ -196,6 +200,107 @@ input[type=text] {
     flex-direction: column;
     gap: 6px;
     align-items: flex-end
+}
+
+.process-leaderboard {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    background: rgba(15, 18, 30, 0.6);
+    border: 1px solid #ffffff1a;
+    border-radius: 18px;
+    padding: 16px;
+}
+
+.process-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.process-reset {
+    border: 1px solid #ffffff2b;
+    background: rgba(255, 255, 255, 0.04);
+    color: #fff;
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: background 0.2s ease, border 0.2s ease;
+}
+
+.process-reset:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: #ffffff44;
+}
+
+.process-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px;
+}
+
+.process-card {
+    background: rgba(6, 8, 16, 0.75);
+    border: 1px solid #ffffff12;
+    border-radius: 14px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.process-card__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.process-card__title {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.process-card__usage {
+    font-size: 12px;
+    color: #9aa0a6;
+}
+
+.process-card__metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+}
+
+.process-card__metric {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    color: #9aa0a6;
+}
+
+.process-card__metric .mono {
+    font-size: 13px;
+    color: #fff;
+}
+
+#processGraph {
+    width: 100%;
+    height: 220px;
+    border-radius: 12px;
+    border: 1px solid #ffffff10;
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.process-empty {
+    text-align: center;
+    padding: 8px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.04);
 }
 
 .peer .actions button {
