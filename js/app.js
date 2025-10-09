@@ -195,6 +195,7 @@ class App {
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
     this._hudGeoCached = { lat: null, lon: null, hash: null };
+    this._selectedRegion = null;
 
     // === NEW: throttling state (non-breaking) ===
     this._hoverNextAllowedMs = 0;
@@ -219,6 +220,7 @@ class App {
     this._uiTheme = null;
     this._sunUpdateNextMs = 0;
     this._sunOrigin = null;
+    this._syncTerrainResolutionUi = null;
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -227,6 +229,15 @@ class App {
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
     });
+    this._terrainDefaults = {
+      min: this.hexGridMgr?.spacingMinMeters ?? 8,
+      max: this.hexGridMgr?.spacingMaxMeters ?? 220,
+      falloff: this.hexGridMgr?.spacingFalloff ?? 1.6,
+      radius: this.hexGridMgr?.radiusMeters ?? 420,
+      recenter: this.hexGridMgr?.recenterDistanceMeters ?? 20,
+      expandRatio: this.hexGridMgr?.expandRatio ?? 0.68,
+      growthFactor: this.hexGridMgr?.growthFactor ?? 1.45,
+    };
 
     this.buildings = new BuildingManager({
       radius: 3000,
@@ -450,6 +461,7 @@ class App {
       setBtn: document.getElementById('miniMapSet'),
       moveBtn: ui.miniMapMove,
       snapBtn: ui.miniMapSnap,
+      selectBtn: ui.miniMapSelect,
       tileManager: this.hexGridMgr,
       getWorldPosition: () => this.sceneMgr?.dolly?.position,
       getHeadingDeg: () => {
@@ -479,6 +491,7 @@ class App {
         this._handleMiniMapTeleport({ lat, lon });
       },
       onRequestSnap: ({ headingRad }) => this._snapToCompassHeading(headingRad),
+      onRegionSelected: ({ lat, lon, apothemM }) => this._handleRegionSelected({ lat, lon, apothemM }),
     });
 
     this._syncGpsLockUI();
@@ -491,6 +504,7 @@ class App {
     this._applyDebugMode();
     this._updateUiThemeBySun();
     this._initProcessLeaderboard();
+    this._bindTerrainResolutionUi();
 
     const relayInput = ui.terrainRelayInput;
     const datasetInput = ui.terrainDatasetInput;
@@ -682,6 +696,157 @@ class App {
       teleport: true,
       force: true,
     });
+  }
+
+  _handleRegionSelected({ lat, lon, apothemM } = {}) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    this._selectedRegion = {
+      lat,
+      lon,
+      apothemM: Number.isFinite(apothemM) ? apothemM : null,
+    };
+    if (Number.isFinite(apothemM) && this.hexGridMgr) {
+      const circumRadius = Math.max(60, Math.min(2200, (apothemM * 2) / Math.sqrt(3)));
+      this.hexGridMgr.setTerrainResolution({ radius: circumRadius, apothem: apothemM });
+      this._syncTerrainResolutionUi?.();
+    }
+    this._handleGpsUpdate({
+      lat,
+      lon,
+      source: 'manual',
+      manual: true,
+      force: true,
+      regionSelected: true,
+    });
+  }
+
+  _bindTerrainResolutionUi() {
+    const minInput = ui.terrainMinResolution;
+    const maxInput = ui.terrainMaxResolution;
+    const falloffInput = ui.terrainFalloff;
+    const radiusInput = ui.terrainRadius;
+    const recenterInput = ui.terrainRecenter;
+    const expandInput = ui.terrainExpandRatio;
+    const growthInput = ui.terrainGrowthFactor;
+    const minLabel = ui.terrainMinResolutionValue;
+    const maxLabel = ui.terrainMaxResolutionValue;
+    const falloffLabel = ui.terrainFalloffValue;
+    const radiusLabel = ui.terrainRadiusValue;
+    const recenterLabel = ui.terrainRecenterValue;
+    const expandLabel = ui.terrainExpandRatioValue;
+    const growthLabel = ui.terrainGrowthFactorValue;
+    const resetBtn = ui.terrainResolutionReset;
+
+    if (!minInput || !maxInput || !falloffInput || !radiusInput || !recenterInput || !expandInput || !growthInput) return;
+
+    const updateLabels = () => {
+      if (minLabel) minLabel.textContent = `${Math.round(Number(minInput.value))} m`;
+      if (maxLabel) maxLabel.textContent = `${Math.round(Number(maxInput.value))} m`;
+      if (falloffLabel) falloffLabel.textContent = `${Number(falloffInput.value).toFixed(1)}×`;
+      if (radiusLabel) radiusLabel.textContent = `${Math.round(Number(radiusInput.value))} m`;
+      if (recenterLabel) recenterLabel.textContent = `${Math.round(Number(recenterInput.value))} m`;
+      if (expandLabel) expandLabel.textContent = Number(expandInput.value).toFixed(2);
+      if (growthLabel) growthLabel.textContent = `${Number(growthInput.value).toFixed(2)}×`;
+    };
+
+    const syncInputs = () => {
+      if (!this.hexGridMgr) return;
+      minInput.value = `${Math.round(this.hexGridMgr.spacingMinMeters || 8)}`;
+      maxInput.value = `${Math.round(this.hexGridMgr.spacingMaxMeters || 220)}`;
+      falloffInput.value = `${Number(this.hexGridMgr.spacingFalloff || 1.6).toFixed(1)}`;
+      radiusInput.value = `${Math.round(this.hexGridMgr.radiusMeters || 420)}`;
+      recenterInput.value = `${Math.round(this.hexGridMgr.recenterDistanceMeters || 20)}`;
+      expandInput.value = `${Number(this.hexGridMgr.expandRatio ?? 0.68).toFixed(2)}`;
+      growthInput.value = `${Number(this.hexGridMgr.growthFactor ?? 1.45).toFixed(2)}`;
+      const radiusVal = Number(radiusInput.value) || 420;
+      recenterInput.max = `${Math.max(10, Math.round(radiusVal * 0.95))}`;
+      recenterInput.min = '2';
+      updateLabels();
+      const minFloor = Math.max(20, Math.ceil(Number(minInput.value) + 0.5));
+      maxInput.min = `${Math.min(minFloor, Number(maxInput.max) || 600)}`;
+    };
+
+    const apply = () => {
+      const minRaw = Number(minInput.value);
+      const maxRaw = Number(maxInput.value);
+      let falloffRaw = Number(falloffInput.value);
+      let radiusRaw = Number(radiusInput.value);
+      let recenterRaw = Number(recenterInput.value);
+      let expandRaw = Number(expandInput.value);
+      let growthRaw = Number(growthInput.value);
+
+      const minClamped = Math.max(0.5, minRaw || this.hexGridMgr?.spacingMinMeters || 8);
+      let maxClamped = Math.max(minClamped + 0.5, maxRaw || this.hexGridMgr?.spacingMaxMeters || 220);
+      falloffRaw = Math.min(5, Math.max(0.3, falloffRaw || this.hexGridMgr?.spacingFalloff || 1.6));
+      radiusRaw = Math.min(Math.max(radiusRaw || this.hexGridMgr?.radiusMeters || 420, 120), 2000);
+      const recenterMax = Math.max(10, Math.round(radiusRaw * 0.95));
+      recenterInput.max = `${recenterMax}`;
+      recenterRaw = Math.min(Math.max(recenterRaw || this.hexGridMgr?.recenterDistanceMeters || 20, 2), recenterMax);
+      expandRaw = Math.min(Math.max(expandRaw || this.hexGridMgr?.expandRatio || 0.68, 0.3), 0.9);
+      growthRaw = Math.min(Math.max(growthRaw || this.hexGridMgr?.growthFactor || 1.45, 1.05), 2.5);
+
+      const minFloor = Math.max(20, Math.ceil(minClamped + 0.5));
+      maxInput.min = `${Math.min(minFloor, Number(maxInput.max) || 600)}`;
+      if (Number(maxInput.value) !== maxClamped) maxInput.value = `${Math.round(maxClamped)}`;
+      if (Number(minInput.value) !== minClamped) minInput.value = `${Math.round(minClamped)}`;
+      falloffInput.value = `${falloffRaw.toFixed(1)}`;
+      radiusInput.value = `${Math.round(radiusRaw)}`;
+      recenterInput.value = `${Math.round(recenterRaw)}`;
+      expandInput.value = `${expandRaw.toFixed(2)}`;
+      growthInput.value = `${growthRaw.toFixed(2)}`;
+
+      this.hexGridMgr?.setTerrainResolution?.({
+        min: minClamped,
+        max: maxClamped,
+        falloff: falloffRaw,
+        radius: radiusRaw,
+        recenterDistance: recenterRaw,
+        expandRatio: expandRaw,
+        growthFactor: growthRaw,
+      });
+
+      updateLabels();
+    };
+
+    minInput.addEventListener('input', updateLabels);
+    maxInput.addEventListener('input', updateLabels);
+    falloffInput.addEventListener('input', updateLabels);
+    radiusInput.addEventListener('input', updateLabels);
+    recenterInput.addEventListener('input', updateLabels);
+    expandInput.addEventListener('input', updateLabels);
+    growthInput.addEventListener('input', updateLabels);
+
+    minInput.addEventListener('change', apply);
+    maxInput.addEventListener('change', apply);
+    falloffInput.addEventListener('change', apply);
+    radiusInput.addEventListener('change', apply);
+    recenterInput.addEventListener('change', apply);
+    expandInput.addEventListener('change', apply);
+    growthInput.addEventListener('change', apply);
+
+    resetBtn?.addEventListener('click', () => {
+      const defaults = this._terrainDefaults || {
+        min: 8,
+        max: 220,
+        falloff: 1.6,
+        radius: 420,
+        recenter: 20,
+        expandRatio: 0.68,
+        growthFactor: 1.45,
+      };
+      minInput.value = `${Math.round(defaults.min)}`;
+      maxInput.value = `${Math.round(defaults.max)}`;
+      falloffInput.value = `${Number(defaults.falloff).toFixed(1)}`;
+      radiusInput.value = `${Math.round(defaults.radius)}`;
+      recenterInput.value = `${Math.round(defaults.recenter)}`;
+      recenterInput.max = `${Math.max(10, Math.round(defaults.radius * 0.95))}`;
+      expandInput.value = `${Number(defaults.expandRatio).toFixed(2)}`;
+      growthInput.value = `${Number(defaults.growthFactor).toFixed(2)}`;
+      apply();
+    });
+
+    syncInputs();
+    this._syncTerrainResolutionUi = () => syncInputs();
   }
 
   _snapToCompassHeading(explicitHeadingRad = null) {
@@ -1898,7 +2063,7 @@ class App {
     let geohashValue = '--';
     if (latOk && lonOk) {
       try {
-        const spacing = this.hexGridMgr?.spacing ?? 10;
+        const spacing = this.hexGridMgr?.spacingMinMeters ?? 10;
         const precision = pickGeohashPrecision(spacing);
         geohashValue = geohashEncode(lat, lon, precision);
       } catch {

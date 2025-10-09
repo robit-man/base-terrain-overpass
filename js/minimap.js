@@ -1,4 +1,4 @@
-import { clampLat, worldToLatLon, wrapLon } from './geolocate.js';
+import { clampLat, worldToLatLon, wrapLon, metresPerDegree } from './geolocate.js';
 
 const DEFAULT_CENTER = { lat: 37.7749, lon: -122.4194, zoom: 13 };
 
@@ -20,6 +20,7 @@ export class MiniMap {
     setBtn,
     moveBtn,
     snapBtn,
+    selectBtn,
     tileManager,
     getWorldPosition,
     getHeadingDeg,
@@ -30,6 +31,7 @@ export class MiniMap {
     onRequestAuto,
     onRequestTeleport,
     onRequestSnap,
+    onRegionSelected,
   } = {}) {
     this.mapContainer = mapContainer || null;
     this.statusEl = statusEl || null;
@@ -37,6 +39,7 @@ export class MiniMap {
     this.setBtn = setBtn || null;
     this.moveBtn = moveBtn || null;
     this.snapBtn = snapBtn || null;
+    this.selectBtn = selectBtn || null;
     this.tileManager = tileManager || null;
     this.getWorldPosition = typeof getWorldPosition === 'function' ? getWorldPosition : null;
     this.getHeadingDeg = typeof getHeadingDeg === 'function' ? getHeadingDeg : () => 0;
@@ -47,6 +50,7 @@ export class MiniMap {
     this.onRequestAuto = typeof onRequestAuto === 'function' ? onRequestAuto : null;
     this.onRequestTeleport = typeof onRequestTeleport === 'function' ? onRequestTeleport : null;
     this.onRequestSnap = typeof onRequestSnap === 'function' ? onRequestSnap : null;
+    this.onRegionSelected = typeof onRegionSelected === 'function' ? onRegionSelected : null;
 
     this.followEnabled = true;
     this.userHasPanned = false;
@@ -71,6 +75,10 @@ export class MiniMap {
     this.map = null;
     this.playerMarker = null;
     this.peerLayer = null;
+    this._drawHex = null;
+    this._regionLayer = null;
+    this._selectedRegion = null;
+    this._drawToolsReady = false;
 
     this._initMap();
 
@@ -85,6 +93,7 @@ export class MiniMap {
 
     this.moveBtn?.addEventListener('click', () => this._handleMoveRequest());
     this.snapBtn?.addEventListener('click', () => this._handleSnapRequest());
+    this.selectBtn?.addEventListener('click', () => this._startHexDraw());
 
     this._updateFollowButton();
     this._updateMoveButton();
@@ -127,6 +136,8 @@ export class MiniMap {
         this._applyPlayerHeading(pending);
       }
     });
+
+    this._initDrawTools();
 
     const mouseToLatLng = (src) => {
       if (!src) return null;
@@ -243,6 +254,129 @@ export class MiniMap {
       armFromEvent(ev);
     });
   }
+
+  _initDrawTools() {
+    if (this._drawToolsReady) return;
+    if (!this.map || typeof window === 'undefined') return;
+    const L = window.L;
+    if (!L || !L.Draw) return;
+
+    if (!L.Draw.Hexagon) {
+      const SimpleShape = L.Draw.SimpleShape || L.Draw.Rectangle?.prototype;
+      L.Draw.Hexagon = SimpleShape.extend({
+        statics: { TYPE: 'hexagon' },
+        options: { shapeOptions: { color: '#6ee7ff', weight: 2, fillOpacity: 0.08, fillColor: '#6ee7ff' } },
+        initialize(map, options) {
+          this.type = L.Draw.Hexagon.TYPE;
+          L.Draw.SimpleShape.prototype.initialize.call(this, map, options);
+        },
+        _drawShape(latlng) {
+          const center = this._startLatLng;
+          if (!center || !latlng) return;
+          const { dLat, dLon } = metresPerDegree(center.lat);
+          const dx = (latlng.lng - center.lng) * dLon;
+          const dy = (latlng.lat - center.lat) * dLat;
+          const apothem = Math.max(5, Math.hypot(dx, dy));
+          this._lastApothemM = apothem;
+          const radius = (2 * apothem) / Math.sqrt(3);
+          const verts = [];
+          for (let k = 0; k < 6; k++) {
+            const theta = (Math.PI / 3) * k;
+            const vx = radius * Math.cos(theta);
+            const vy = radius * Math.sin(theta);
+            const lat = center.lat + vy / dLat;
+            const lon = center.lng + vx / dLon;
+            verts.push([lat, lon]);
+          }
+          if (!this._shape) {
+            this._shape = L.polygon(verts, this.options.shapeOptions);
+            this._map.addLayer(this._shape);
+          } else {
+            this._shape.setLatLngs(verts);
+          }
+        },
+        _fireCreatedEvent() {
+          if (!this._shape) return;
+          const layer = L.polygon(this._shape.getLatLngs(), this.options.shapeOptions);
+          layer._hexCenter = this._startLatLng;
+          layer._apothemM = this._lastApothemM || 0;
+          L.Draw.Feature.prototype._fireCreatedEvent.call(this, layer);
+        }
+      });
+    }
+
+    this.map.on(L.Draw.Event.CREATED, (e) => {
+      if (!e || !e.layer) return;
+      const layer = e.layer;
+      if (this._drawHex) {
+        try { this._drawHex.disable(); } catch {}
+      }
+      this._handleHexCreated(layer);
+    });
+
+    this._drawHex = new L.Draw.Hexagon(this.map, { shapeOptions: { color: '#6ee7ff', weight: 2, fillOpacity: 0.08 } });
+    this._drawToolsReady = true;
+  }
+
+  _startHexDraw() {
+    if (!this.map) return;
+    if (!this._drawToolsReady) this._initDrawTools();
+    if (!this._drawHex) return;
+    try {
+      this._drawHex.enable();
+      this.selectBtn?.classList?.add('is-active');
+      this._suspendAutoFollow(12000);
+    } catch {}
+  }
+
+  _handleHexCreated(layer) {
+    if (!layer || !this.map) return;
+    this.selectBtn?.classList?.remove('is-active');
+    if (this._regionLayer) {
+      try { this.map.removeLayer(this._regionLayer); } catch {}
+    }
+    this._regionLayer = layer.addTo(this.map);
+    if (typeof layer.setStyle === 'function') {
+      layer.setStyle({ color: '#6ee7ff', weight: 2, fillOpacity: 0.08, fillColor: '#6ee7ff' });
+    }
+    const center = layer._hexCenter || layer.getBounds()?.getCenter() || { lat: DEFAULT_CENTER.lat, lng: DEFAULT_CENTER.lon };
+    const apothemM = layer._apothemM || this._estimateApothem(layer);
+    this._selectedRegion = {
+      lat: clampLat(center.lat),
+      lon: clampLon(center.lng ?? center.lon),
+      apothemM: Number.isFinite(apothemM) ? apothemM : this.tileManager?.tileRadius || 0
+    };
+    const bounds = layer.getBounds?.();
+    if (bounds) {
+      try { this.map.fitBounds(bounds, { padding: [20, 20] }); } catch {}
+    }
+    this._setFollow(false);
+    this.viewCenter = { lat: this._selectedRegion.lat, lon: this._selectedRegion.lon };
+    this.userHasPanned = true;
+    this._updateMoveButton();
+    this._setStatus('manual', this._selectedRegion.lat, this._selectedRegion.lon);
+    if (typeof this.onRegionSelected === 'function') {
+      this.onRegionSelected({ lat: this._selectedRegion.lat, lon: this._selectedRegion.lon, apothemM: this._selectedRegion.apothemM });
+    }
+  }
+
+  _estimateApothem(layer) {
+    try {
+      const center = layer?._hexCenter || layer?.getBounds?.()?.getCenter?.();
+      const latlngs = layer?.getLatLngs?.();
+      const points = Array.isArray(latlngs) ? (Array.isArray(latlngs[0]) ? latlngs[0] : latlngs) : [];
+      if (!center || !points.length) return this.tileManager?.tileRadius || 0;
+      const vertex = points[0];
+      const meters = metresPerDegree(center.lat);
+      const dx = (vertex.lng - center.lng) * meters.dLon;
+      const dy = (vertex.lat - center.lat) * meters.dLat;
+      const radius = Math.hypot(dx, dy);
+      return Math.max(1, radius * Math.sqrt(3) / 2);
+    } catch {
+      return this.tileManager?.tileRadius || 0;
+    }
+  }
+
 
   update() {
     if (!this.tileManager?.origin) return;

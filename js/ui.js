@@ -62,11 +62,27 @@ const yawOffsetRange = document.getElementById('yawOffsetRange');
 const yawOffsetValue = document.getElementById('yawOffsetValue');
 const miniMapMove = document.getElementById('miniMapMove');
 const miniMapSnap = document.getElementById('miniMapSnap');
+const miniMapSelect = document.getElementById('miniMapSelect');
 const terrainRelayStatus = document.getElementById('terrainRelayStatus');
 const terrainRelayInput = document.getElementById('terrainRelayInput');
 const terrainDatasetInput = document.getElementById('terrainDatasetInput');
 const terrainModeGeohash = document.getElementById('terrainModeGeohash');
 const terrainModeLatLng = document.getElementById('terrainModeLatLng');
+const terrainMinResolution = document.getElementById('terrainMinResolution');
+const terrainMaxResolution = document.getElementById('terrainMaxResolution');
+const terrainFalloff = document.getElementById('terrainFalloff');
+const terrainMinResolutionValue = document.getElementById('terrainMinResolutionValue');
+const terrainMaxResolutionValue = document.getElementById('terrainMaxResolutionValue');
+const terrainFalloffValue = document.getElementById('terrainFalloffValue');
+const terrainRadius = document.getElementById('terrainRadius');
+const terrainRadiusValue = document.getElementById('terrainRadiusValue');
+const terrainRecenter = document.getElementById('terrainRecenter');
+const terrainRecenterValue = document.getElementById('terrainRecenterValue');
+const terrainExpandRatio = document.getElementById('terrainExpandRatio');
+const terrainExpandRatioValue = document.getElementById('terrainExpandRatioValue');
+const terrainGrowthFactor = document.getElementById('terrainGrowthFactor');
+const terrainGrowthFactorValue = document.getElementById('terrainGrowthFactorValue');
+const terrainResolutionReset = document.getElementById('terrainResolutionReset');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 const displayNameInput = document.getElementById('displayNameInput');
 const displayNameSave = document.getElementById('displayNameSave');
@@ -229,9 +245,14 @@ export const ui = {
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
-  miniMapMove, miniMapSnap,
+  miniMapMove, miniMapSnap, miniMapSelect,
   terrainRelayStatus, terrainRelayInput, terrainDatasetInput,
   terrainModeGeohash, terrainModeLatLng,
+  terrainMinResolution, terrainMaxResolution, terrainFalloff,
+  terrainMinResolutionValue, terrainMaxResolutionValue, terrainFalloffValue,
+  terrainRadius, terrainRadiusValue, terrainRecenter, terrainRecenterValue,
+  terrainExpandRatio, terrainExpandRatioValue, terrainGrowthFactor, terrainGrowthFactorValue,
+  terrainResolutionReset,
   displayNameInput, displayNameSave, toastHost,
   applyHudStatusDot,
   openMenu, closeMenu,

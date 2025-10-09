@@ -21,6 +21,8 @@
   <!-- Leaflet for minimap -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 
   <script>
     (function () {
@@ -156,6 +158,7 @@
           </div>
         </div>
         <div class="mini-map-actions" aria-label="Mini map actions">
+          <button id="miniMapSelect" type="button" class="mini-map-button" aria-label="Select terrain region">Select</button>
           <button id="miniMapMove" type="button" class="mini-map-button" aria-label="Teleport to selected mini map location">Move</button>
           <button id="miniMapSnap" type="button" class="mini-map-button" aria-label="Snap view to device compass heading">Snap</button>
         </div>
@@ -177,6 +180,7 @@
       <div class="control-tablist" role="tablist" aria-label="Control center sections">
         <button class="control-tab is-active" role="tab" aria-selected="true" aria-controls="tab-overview" data-tab="overview">Overview</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-navigation" data-tab="navigation">Navigation</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-environment" data-tab="environment">Environment</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-networking" data-tab="networking">Networking</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-diagnostics" data-tab="diagnostics">Diagnostics</button>
       </div>
@@ -254,6 +258,45 @@
               <button id="miniMapApply" type="button">Apply Manual</button>
             </div>
             <div id="miniMapStatus" class="tiny">Determining location…</div>
+          </section>
+        </div>
+
+        <div class="tab-panel" id="tab-environment" role="tabpanel" data-tab-panel="environment" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Terrain Resolution</h3>
+            <p class="modal-note">Tune the adaptive terrain mesh: adjust sampling density, falloff, surface radius, and when the mesh recenters under the player.</p>
+            <div class="slider-row">
+              <label for="terrainMinResolution">Center spacing <span id="terrainMinResolutionValue">8 m</span></label>
+              <input id="terrainMinResolution" type="range" min="1" max="60" value="8" step="1" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainMaxResolution">Edge spacing <span id="terrainMaxResolutionValue">220 m</span></label>
+              <input id="terrainMaxResolution" type="range" min="20" max="600" value="220" step="5" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainFalloff">Falloff exponent <span id="terrainFalloffValue">1.6×</span></label>
+              <input id="terrainFalloff" type="range" min="0.3" max="5" value="1.6" step="0.1" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainRadius">Surface radius <span id="terrainRadiusValue">420 m</span></label>
+              <input id="terrainRadius" type="range" min="120" max="2000" value="420" step="10" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainRecenter">Recentre distance <span id="terrainRecenterValue">20 m</span></label>
+              <input id="terrainRecenter" type="range" min="2" max="200" value="20" step="1" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainExpandRatio">Expansion ratio <span id="terrainExpandRatioValue">0.68</span></label>
+              <input id="terrainExpandRatio" type="range" min="0.3" max="0.9" value="0.68" step="0.01" />
+            </div>
+            <div class="slider-row">
+              <label for="terrainGrowthFactor">Expansion factor <span id="terrainGrowthFactorValue">1.45×</span></label>
+              <input id="terrainGrowthFactor" type="range" min="1.05" max="2.5" value="1.45" step="0.05" />
+            </div>
+            <div class="button-row">
+              <button id="terrainResolutionReset" type="button">Reset to defaults</button>
+            </div>
+            <p class="tiny">Center spacing controls detail beneath the player; edge spacing and falloff taper density toward the perimeter. The radius sets total coverage, while recenter distance and expansion ratios govern when the mesh shifts or grows.</p>
           </section>
         </div>
 

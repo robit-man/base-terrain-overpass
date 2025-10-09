@@ -1453,6 +1453,12 @@ canvas { touch-action: none; }
     transform: translateY(-1px);
 }
 
+#miniMapDock .mini-map-button.is-active {
+    background: var(--hud-button-border);
+    color: var(--hud-text-primary);
+    box-shadow: 0 6px 14px rgba(80, 140, 240, 0.25);
+}
+
 #miniMapDock .mini-map-button:focus-visible {
     outline: 2px solid var(--hud-button-border);
     outline-offset: 3px;
