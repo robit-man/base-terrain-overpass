@@ -25,8 +25,8 @@ export class SceneManager {
 
     this.pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(0x000000, 12000, 20000);
-    this.scene.background = new THREE.Color(0x20242c);
+    this.scene.fog = new THREE.Fog(0x1e212b, 1000, 10000);
+    this.scene.background = new THREE.Color(0x1e212b);
 
     // 🎯 Camera stays at (0,0,0) in dolly local space; dolly handles eye height
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);

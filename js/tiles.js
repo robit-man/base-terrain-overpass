@@ -9,7 +9,7 @@ import { TerrainRelay } from './terrainRelay.js';
 const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
 const DM_BUDGET_BYTES = 2800;
-const MAX_LOCATIONS_PER_BATCH = 800;
+const MAX_LOCATIONS_PER_BATCH = 1000;
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 
 // phased acquisition for interactive tiles
@@ -24,7 +24,7 @@ const HEX_DIRS = [
 ];
 
 export class TileManager {
-  constructor(scene, spacing = 10, tileRadius = 30, audio = null) {
+  constructor(scene, spacing = 20, tileRadius = 60, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.tiles = new Map(); this.origin = null;
@@ -36,8 +36,8 @@ export class TileManager {
 
     // ---- LOD configuration ----
     this.INTERACTIVE_RING = 2;
-    this.VISUAL_RING = 10;
-    this.FARFIELD_EXTRA = 10;
+    this.VISUAL_RING = 8;
+    this.FARFIELD_EXTRA = 4;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
     this.VISUAL_CREATE_BUDGET = 4;

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 export class UniformHexGrid {
-  constructor(spacing = 10, size = 100) {
+  constructor(spacing = 10, size = 200) {
     this.spacing = spacing;
     this.radius = size / 2;
     this._build();

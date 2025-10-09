@@ -229,6 +229,7 @@ class App {
     });
 
     this.buildings = new BuildingManager({
+      radius: 3000,
       scene: this.sceneMgr.scene,
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,
