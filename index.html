@@ -30,7 +30,7 @@
 
         var txt = (el.textContent || "").trim().toUpperCase();
         if (txt === "VR NOT AVAILABLE" || txt.includes("VR NOT AVAILABLE") || txt === "VR NOT SUPPORTED" || txt.includes("VR NOT SUPPORTED") || txt === "WEBXR NOT AVAILABLE" || txt.includes("WEBXR NOT AVAILABLE")) {
-          //el.remove();
+          el.remove();
           return true;
         }
         return false;

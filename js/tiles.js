@@ -1044,7 +1044,7 @@ export class TileManager {
       const mat = tile.grid.points.material;
       mat.transparent = false;
       mat.opacity = 1;
-      mat.sizeAttenuation = false;
+      mat.sizeAttenuation = true;
       mat.size = Math.max(0.5, this.tileRadius * 0.03);
       if (mat.color && typeof mat.color.setHex === 'function') mat.color.setHex(0x8aa0c0);
       mat.needsUpdate = true;
