@@ -1971,8 +1971,8 @@ canvas {
 }
 
 .hud-user {
-    background: rgba(22, 28, 40, 0.8);
     border-radius: 12px;
+    background:#ffffff33;
     border: 1px solid rgba(255, 255, 255, 0.08);
     padding: 0.55rem 0.75rem;
 }
@@ -1999,7 +1999,7 @@ canvas {
 .hud-user-top .hex {
     font-family: "Roboto Mono", "Fira Mono", monospace;
     font-size: 11px;
-    color: #9eb2ff;
+    color: #333333;
 }
 
 .hud-user-top .status {
@@ -2018,7 +2018,7 @@ canvas {
 
 .hud-user-info {
     font-size: 11px;
-    color: #c4cbe8;
+    color: #333333;
     letter-spacing: 0.02em;
     margin-bottom: 0.6rem;
 }

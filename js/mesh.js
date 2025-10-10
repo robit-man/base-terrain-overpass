@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { ui, setNkn, setSig, setSigMeta, pushToast } from './ui.js';
 import { createDiscovery } from './nats.js';
 import { latLonToWorld, worldToLatLon } from './geolocate.js';
+import { geohashEncode } from './geohash.js';
 import { now, fmtAgo, isHex64, shortHex, rad, deg } from './utils.js';
 
 /**
@@ -65,6 +66,14 @@ export class Mesh {
     this.byteWindow = [];
     this._pendingMessages = [];
     this._pendingMessagesLimit = 128;
+
+    this.geoShare = new Map(); // pub -> { matchPrec, sharePrec, remotePrec, remoteGh, remoteRadius, ... }
+    this.GEOHASH_MAX_PREC = 10;
+    this.GEOHASH_BASE_SHARE = 4;
+    this.GEOHASH_BLOCK_MS = 15_000;
+    this.GEOHASH_REQ_INTERVAL_MS = 2_000;
+    this.NEAR_DISTANCE_METERS = 100;
+    this._selfGeoCache = null;
 
     // 60 fps pose send target
     this.TARGET_HZ = 30;
@@ -313,20 +322,11 @@ export class Mesh {
         poseOut.xr = xrOut;
       }
 
-      let geoNorm = null;
-      if (msg.geo) {
-        const lat = Number(msg.geo.lat);
-        const lon = Number(msg.geo.lon);
-        if (Number.isFinite(lat) && Number.isFinite(lon)) {
-          geoNorm = { lat, lon };
-          const eyeVal = Number(msg.geo.eye);
-          if (Number.isFinite(eyeVal)) geoNorm.eye = eyeVal;
-          const groundVal = Number(msg.geo.ground);
-          if (Number.isFinite(groundVal)) geoNorm.ground = groundVal;
-        }
-      }
+      const geoResult = this._ingestPeerGeo(pub, msg.geo || null);
+      let geoNorm = geoResult?.geo || null;
+      let allowPlacement = geoResult?.allowPlacement ?? false;
 
-      if (geoNorm) {
+      if (allowPlacement && geoNorm && Number.isFinite(geoNorm.lat) && Number.isFinite(geoNorm.lon)) {
         const w = this._geoToWorld(geoNorm.lat, geoNorm.lon);
         if (w) {
           poseOut.p[0] = +w.x.toFixed(3);
@@ -339,13 +339,20 @@ export class Mesh {
           if (Number.isFinite(localGround) && Number.isFinite(eye)) {
             poseOut.p[1] = +(localGround + eye).toFixed(3);
           }
+        } else {
+          allowPlacement = false;
         }
       }
 
       this.latestPose.set(pub, { p: poseOut.p, q: poseOut.q, ts: msg.ts, j: poseOut.j, c: poseOut.c, geo: geoNorm, xr: poseOut.xr || null });
-      this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
-        console.warn('[remotes] update failed', err);
-      });
+      if (allowPlacement) {
+        this._setRemoteVisibility(pub, true);
+        this.app.remotes.update(pub, poseOut, info, geoNorm).catch(err => {
+          console.warn('[remotes] update failed', err);
+        });
+      } else {
+        this._setRemoteVisibility(pub, false);
+      }
       this._renderPeers();
       return;
     }
@@ -612,7 +619,370 @@ export class Mesh {
     };
     if (Number.isFinite(ground)) out.ground = +ground.toFixed(3);
     if (Number.isFinite(eye)) out.eye = +eye.toFixed(3);
+    try {
+      if (Number.isFinite(geo.lat) && Number.isFinite(geo.lon)) {
+        out.gh = geohashEncode(geo.lat, geo.lon, this.GEOHASH_MAX_PREC);
+        out.prec = this.GEOHASH_MAX_PREC;
+      }
+    } catch { /* ignore geohash failures */ }
+    out.ts = now();
     return out;
+  }
+
+  _geoShareState(pub) {
+    if (!pub) return null;
+    const key = pub.toLowerCase();
+    let state = this.geoShare.get(key);
+    if (!state) {
+      state = {
+        matchPrec: 0,
+        sharePrec: 0,
+        remotePrec: 0,
+        remoteGh: '',
+        remoteRadius: null,
+        remoteReq: 0,
+        lastSeen: 0,
+        blockedUntil: 0,
+        mismatchAt: null,
+        lastDistance: null,
+        lastSharedPrefix: '',
+        lastShareTs: 0,
+        weReqAt: 0,
+        weReqPrec: 0,
+        remoteHasActual: false
+      };
+      this.geoShare.set(key, state);
+    }
+    return state;
+  }
+
+  _selfEnvRadiusMeters() {
+    const mgr = this.app?.hexGridMgr;
+    const tileR = Number.isFinite(mgr?.tileRadius) ? Number(mgr.tileRadius) : null;
+    const fallback = 1000;
+    if (tileR && tileR > 0) return tileR;
+    const buildings = Number.isFinite(this.app?.buildings?.radius) ? Number(this.app.buildings.radius) : null;
+    if (buildings && buildings > 0) return buildings;
+    return fallback;
+  }
+
+  _geohashPrecisionToMeters(prec) {
+    const table = [
+      20000000, // 0 (no precision)
+      5000000,  // 1
+      1250000,  // 2
+      156000,   // 3
+      39000,    // 4
+      4900,     // 5
+      1200,     // 6
+      150,      // 7
+      19,       // 8
+      2.4,      // 9
+      0.6       // 10
+    ];
+    if (!Number.isFinite(prec) || prec <= 0) return table[0];
+    const idx = Math.min(table.length - 1, Math.max(1, Math.floor(prec)));
+    return table[idx];
+  }
+
+  _geohashPrefixMatch(a, b) {
+    if (!a || !b) return 0;
+    const len = Math.min(a.length, b.length, this.GEOHASH_MAX_PREC);
+    let i = 0;
+    while (i < len && a[i] === b[i]) i++;
+    return i;
+  }
+
+  _geohashDecode(hash) {
+    if (!hash || typeof hash !== 'string') return null;
+    const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+    let even = true;
+    let latMin = -90, latMax = 90;
+    let lonMin = -180, lonMax = 180;
+    const clean = hash.trim().toLowerCase();
+    for (let i = 0; i < clean.length; i++) {
+      const chr = clean[i];
+      const idx = GH32.indexOf(chr);
+      if (idx < 0) return null;
+      for (let bit = 4; bit >= 0; bit--) {
+        const mask = 1 << bit;
+        if (even) {
+          const mid = (lonMin + lonMax) / 2;
+          if (idx & mask) lonMin = mid;
+          else lonMax = mid;
+        } else {
+          const mid = (latMin + latMax) / 2;
+          if (idx & mask) latMin = mid;
+          else latMax = mid;
+        }
+        even = !even;
+      }
+    }
+    return { lat: { min: latMin, max: latMax }, lon: { min: lonMin, max: lonMax } };
+  }
+
+  _distanceMeters(lat1, lon1, lat2, lon2) {
+    if (![lat1, lon1, lat2, lon2].every(Number.isFinite)) return null;
+    const toRad = (degVal) => degVal * Math.PI / 180;
+    const R = 6371000;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  _currentSelfGeo(maxAgeMs = 1000) {
+    const cache = this._selfGeoCache;
+    const t = now();
+    if (cache && cache.ts && (t - cache.ts) <= maxAgeMs) return cache;
+    return this._updateSelfGeoCache();
+  }
+
+  _updateSelfGeoCache() {
+    try {
+      const dol = this.app?.sceneMgr?.dolly;
+      if (!dol) return null;
+      const groundY = this.app?.hexGridMgr?.getHeightAt?.(dol.position.x, dol.position.z);
+      const eyeHeight = this.app?.move?.eyeHeight?.() ?? 1.6;
+      const actualY = Number.isFinite(groundY) ? groundY + eyeHeight : dol.position.y;
+      const geo = this._geoPayload(dol.position.x, dol.position.z, actualY);
+      if (geo) {
+        geo.radius = this._selfEnvRadiusMeters();
+        this._selfGeoCache = geo;
+      }
+      return this._selfGeoCache;
+    } catch { return this._selfGeoCache || null; }
+  }
+
+  _composeGeoForPeer(pub, baseGeo, isFriend = false) {
+    if (!baseGeo || !baseGeo.gh || !pub) return null;
+    const state = this._geoShareState(pub);
+    if (!state) return null;
+    const nowTs = now();
+    state.lastSeen = nowTs;
+    state.selfGh = baseGeo.gh;
+
+    if (isFriend) {
+      state.sharePrec = this.GEOHASH_MAX_PREC;
+      state.matchPrec = this.GEOHASH_MAX_PREC;
+      state.blockedUntil = 0;
+      state.remoteReq = this.GEOHASH_MAX_PREC;
+      const friendGeo = {
+        mode: 'friend',
+        lat: baseGeo.lat,
+        lon: baseGeo.lon,
+        gh: baseGeo.gh,
+        prec: this.GEOHASH_MAX_PREC,
+        radius: this._selfEnvRadiusMeters(),
+        ts: nowTs
+      };
+      if (Number.isFinite(baseGeo.eye)) friendGeo.eye = baseGeo.eye;
+      if (Number.isFinite(baseGeo.ground)) friendGeo.ground = baseGeo.ground;
+      return friendGeo;
+    }
+
+    const maxPrec = this.GEOHASH_MAX_PREC;
+    const remotePrec = Math.max(0, Math.min(maxPrec, state.remotePrec || 0));
+    const matchPrec = Math.max(0, Math.min(maxPrec, state.matchPrec || 0));
+
+    if (state.blockedUntil && state.blockedUntil > nowTs) {
+      state.sharePrec = Math.min(state.sharePrec || 0, matchPrec, remotePrec);
+    }
+
+    let sharePrec = Math.min(matchPrec, remotePrec, maxPrec);
+    if (!Number.isFinite(sharePrec) || sharePrec < 0) sharePrec = 0;
+
+    const remoteRequested = Number.isFinite(state.remoteReq) && state.remoteReq > 0
+      ? Math.min(state.remoteReq, maxPrec)
+      : null;
+    if (remoteRequested != null) {
+      sharePrec = Math.min(sharePrec, remoteRequested);
+    }
+
+    const prevShare = Number.isFinite(state.sharePrec) ? Math.max(0, state.sharePrec) : 0;
+    if (sharePrec >= this.GEOHASH_BASE_SHARE && prevShare < this.GEOHASH_BASE_SHARE) {
+      sharePrec = Math.min(sharePrec, this.GEOHASH_BASE_SHARE);
+    } else if (sharePrec > prevShare + 1) {
+      sharePrec = prevShare + 1;
+    }
+
+    if (state.blockedUntil && state.blockedUntil > nowTs) {
+      sharePrec = Math.min(sharePrec, prevShare);
+    }
+
+    const prefix = baseGeo.gh.slice(0, Math.max(0, sharePrec));
+    const payload = {
+      mode: 'prefix',
+      gh: prefix,
+      prec: Math.max(0, sharePrec),
+      max: maxPrec,
+      radius: this._selfEnvRadiusMeters(),
+      ts: nowTs
+    };
+
+    const nextPrec = Math.min(maxPrec, Math.max(0, sharePrec + 1));
+    const allowReq = (nowTs - (state.weReqAt || 0)) >= this.GEOHASH_REQ_INTERVAL_MS;
+    if (allowReq && sharePrec < maxPrec) {
+      payload.req = nextPrec;
+      state.weReqAt = nowTs;
+      state.weReqPrec = nextPrec;
+    }
+
+    state.sharePrec = Math.max(0, sharePrec);
+    state.lastSharedPrefix = prefix;
+    state.lastShareTs = nowTs;
+
+    return payload;
+  }
+
+  _clonePoseEnvelope(basePayload) {
+    const clone = {
+      type: basePayload.type,
+      from: basePayload.from,
+      ts: basePayload.ts,
+      pose: {
+        p: basePayload.pose.p.slice(),
+        q: basePayload.pose.q.slice(),
+        j: basePayload.pose.j,
+        c: basePayload.pose.c
+      }
+    };
+    if (basePayload.pose.xr) {
+      clone.pose.xr = { ...basePayload.pose.xr };
+    }
+    return clone;
+  }
+
+  _payloadForPeer(basePayload, baseGeo, pub, isFriend = false) {
+    const payload = this._clonePoseEnvelope(basePayload);
+    const geo = this._composeGeoForPeer(pub, baseGeo, isFriend);
+    if (geo) payload.geo = geo;
+
+    const state = this.geoShare.get(pub.toLowerCase());
+    if (state && !isFriend) {
+      const sharePrec = Number.isFinite(state.sharePrec) ? state.sharePrec : 0;
+      const meterSnap = this._geohashPrecisionToMeters(Math.max(0, sharePrec));
+      if (meterSnap > 0) {
+        const snap = Math.max(0.5, Math.min(25, meterSnap / 20));
+        payload.pose.p = payload.pose.p.map((value, idx) => {
+          if (idx === 1) return +value.toFixed(3);
+          return Math.round(value / snap) * snap;
+        });
+      }
+    }
+
+    return payload;
+  }
+
+  _ingestPeerGeo(pub, geoMsg) {
+    if (!pub) return { geo: null, allowPlacement: false };
+    const state = this._geoShareState(pub);
+    const nowTs = now();
+    state.lastSeen = nowTs;
+
+    if (!geoMsg || typeof geoMsg !== 'object') {
+      const cached = state.lastGeoOut ? { ...state.lastGeoOut } : null;
+      return { geo: cached, allowPlacement: this._shouldInjectPeer(state) };
+    }
+
+    let geoOut = null;
+    let lat = Number.isFinite(geoMsg?.lat) ? Number(geoMsg.lat) : null;
+    let lon = Number.isFinite(geoMsg?.lon) ? Number(geoMsg.lon) : null;
+    if (Number.isFinite(geoMsg?.radius)) {
+      const radiusVal = Math.max(0, Number(geoMsg.radius));
+      state.remoteRadius = radiusVal;
+    }
+    if (Number.isFinite(geoMsg?.req)) {
+      const reqVal = Math.max(0, Math.min(this.GEOHASH_MAX_PREC, Math.floor(Number(geoMsg.req))));
+      state.remoteReq = reqVal;
+    }
+
+    let remoteGh = '';
+    let approxFromGh = false;
+    if (typeof geoMsg?.gh === 'string' && geoMsg.gh.length) {
+      remoteGh = geoMsg.gh.trim().toLowerCase().replace(/[^0-9a-z]/g, '');
+      const declaredPrec = Number.isFinite(geoMsg.prec) ? Math.floor(Number(geoMsg.prec)) : remoteGh.length;
+      const remotePrec = Math.min(this.GEOHASH_MAX_PREC, Math.max(0, Math.min(remoteGh.length, declaredPrec)));
+      state.remoteGh = remoteGh.slice(0, remotePrec);
+      state.remotePrec = remotePrec;
+
+      const selfGeo = this._currentSelfGeo() || null;
+      const selfGh = selfGeo?.gh || null;
+      const matchPrec = this._geohashPrefixMatch(selfGh, state.remoteGh);
+      state.matchPrec = matchPrec;
+
+      if (remotePrec > 0 && matchPrec < remotePrec) {
+        state.mismatchAt = Math.min(state.mismatchAt || Infinity, matchPrec + 1);
+        state.blockedUntil = nowTs + this.GEOHASH_BLOCK_MS;
+      } else if (remotePrec > 0) {
+        state.mismatchAt = null;
+      }
+
+      if ((!Number.isFinite(lat) || !Number.isFinite(lon)) && state.remoteGh) {
+        const decoded = this._geohashDecode(state.remoteGh);
+        if (decoded) {
+          lat = (decoded.lat.min + decoded.lat.max) / 2;
+          lon = (decoded.lon.min + decoded.lon.max) / 2;
+          approxFromGh = true;
+        }
+      }
+    } else {
+      state.remoteGh = '';
+      state.remotePrec = 0;
+    }
+
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      geoOut = { lat, lon };
+      const eyeVal = Number.isFinite(geoMsg?.eye) ? Number(geoMsg.eye) : null;
+      const groundVal = Number.isFinite(geoMsg?.ground) ? Number(geoMsg.ground) : null;
+      if (Number.isFinite(eyeVal)) geoOut.eye = eyeVal;
+      if (Number.isFinite(groundVal)) geoOut.ground = groundVal;
+      if (approxFromGh) geoOut.approx = true;
+    }
+
+    if (state.remoteGh) {
+      if (!geoOut) geoOut = {};
+      geoOut.gh = state.remoteGh;
+      geoOut.prec = state.remotePrec;
+    }
+
+    const selfGeo = this._currentSelfGeo();
+    if (geoOut && selfGeo && Number.isFinite(geoOut.lat) && Number.isFinite(geoOut.lon)) {
+      const dist = this._distanceMeters(selfGeo.lat, selfGeo.lon, geoOut.lat, geoOut.lon);
+      if (Number.isFinite(dist)) state.lastDistance = dist;
+    }
+
+    state.remoteHasActual = Number.isFinite(geoMsg?.lat) && Number.isFinite(geoMsg?.lon);
+    state.lastRemoteGeo = geoMsg || null;
+    state.lastRemoteGeoTs = nowTs;
+    state.lastGeoOut = geoOut ? { ...geoOut } : null;
+
+    const allowPlacement = this._shouldInjectPeer(state);
+    return { geo: geoOut, allowPlacement };
+  }
+
+  _shouldInjectPeer(state) {
+    if (!state) return false;
+    if (state.remoteHasActual) return true;
+    const matchPrec = Math.max(0, Math.min(state.matchPrec || 0, state.remotePrec || 0, this.GEOHASH_MAX_PREC));
+    if (!matchPrec) return false;
+    const cellMeters = this._geohashPrecisionToMeters(matchPrec);
+    const selfRadius = this._selfEnvRadiusMeters();
+    const remoteRadius = Number.isFinite(state.remoteRadius) && state.remoteRadius > 0
+      ? state.remoteRadius
+      : selfRadius;
+    if (Number.isFinite(state.lastDistance)) {
+      return state.lastDistance <= (selfRadius + remoteRadius);
+    }
+    return cellMeters <= (selfRadius + remoteRadius);
+  }
+
+  _setRemoteVisibility(pub, visible) {
+    if (!pub || !this.app?.remotes?.map) return;
+    const ent = this.app.remotes.map.get(pub);
+    if (ent?.group) ent.group.visible = !!visible;
   }
 
   _discoveryMeta() {
@@ -953,10 +1323,17 @@ export class Mesh {
       const lp = this.latestPose.get(pub);
       if (lp) {
         const eul = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(lp.q[0], lp.q[1], lp.q[2], lp.q[3]), 'YXZ');
-        const ll = lp.geo && Number.isFinite(lp.geo.lat) && Number.isFinite(lp.geo.lon)
-          ? ` | ll ${lp.geo.lat.toFixed(5)}, ${lp.geo.lon.toFixed(5)}`
-          : '';
-        poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: ${lp.p.map(v => v.toFixed(2)).join(', ')}${ll} | yaw ${deg(eul.y).toFixed(1)}°${lp.j ? ' • jumped' : ''}`;
+        let geoLabel = '';
+        if (lp.geo) {
+          if (Number.isFinite(lp.geo.lat) && Number.isFinite(lp.geo.lon)) {
+            const approxTag = lp.geo.approx ? ' (≈)' : '';
+            geoLabel = ` | ll ${lp.geo.lat.toFixed(5)}, ${lp.geo.lon.toFixed(5)}${approxTag}`;
+          } else if (lp.geo.gh) {
+            const precTag = lp.geo.prec ? `/${lp.geo.prec}` : '';
+            geoLabel = ` | gh ${lp.geo.gh}${precTag}`;
+          }
+        }
+        poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: ${lp.p.map(v => v.toFixed(2)).join(', ')}${geoLabel} | yaw ${deg(eul.y).toFixed(1)}°${lp.j ? ' • jumped' : ''}`;
       } else {
         poseDiv.textContent = `addr: ${ent.addr || '—'} | pose: —`;
       }
@@ -1381,16 +1758,26 @@ export class Mesh {
       payload.pose.xr = xrPayload;
     }
 
-    const geo = this._geoPayload(p.x, p.z, y);
-    if (geo) payload.geo = geo;
+    const baseGeo = this._geoPayload(p.x, p.z, y);
+    if (baseGeo) {
+      baseGeo.radius = this._selfEnvRadiusMeters();
+      this._selfGeoCache = baseGeo;
+    } else {
+      this._selfGeoCache = null;
+    }
 
-    const pkt = JSON.stringify(payload);
-    this._noteBytes(pkt);
+    const basePayload = payload;
     this.hzCount++;
 
     for (const [pub] of this.peers.entries()) {
       if (pub === this.selfPub) continue;
       if (!this._online(pub)) continue;
+      const isFriend = this.app?.isFriend?.(pub) ?? false;
+      const envelope = baseGeo
+        ? this._payloadForPeer(basePayload, baseGeo, pub, isFriend)
+        : this._clonePoseEnvelope(basePayload);
+      const pkt = JSON.stringify(envelope);
+      this._noteBytes(pkt);
       const addrs = this._bestAddrs(pub);
       let sent = false;
       for (const to of addrs) { try { await this._sendRaw(to, pkt); sent = true; break; } catch { } }
@@ -1433,10 +1820,20 @@ export class Mesh {
       if (Number.isFinite(xrPrev.headHeight)) xrPayload.headHeight = +xrPrev.headHeight.toFixed(3);
       payload.pose.xr = xrPayload;
     }
-    const geo = this._geoPayload(dol.position.x, dol.position.z, actualY);
-    if (geo) payload.geo = geo;
+    const baseGeo = this._geoPayload(dol.position.x, dol.position.z, actualY);
+    if (baseGeo) {
+      baseGeo.radius = this._selfEnvRadiusMeters();
+      this._selfGeoCache = baseGeo;
+    } else {
+      this._selfGeoCache = null;
+    }
 
-    const pkt = JSON.stringify(payload);
+    const isFriend = this.app?.isFriend?.(pub) ?? false;
+    const envelope = baseGeo
+      ? this._payloadForPeer(payload, baseGeo, pub, isFriend)
+      : this._clonePoseEnvelope(payload);
+    const pkt = JSON.stringify(envelope);
+    this._noteBytes(pkt);
 
     const addrs = this._bestAddrs(pub);
     let sent = false;
