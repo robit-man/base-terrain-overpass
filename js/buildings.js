@@ -366,8 +366,8 @@ export class BuildingManager {
 
   applyPerfProfile(profile = {}) {
     const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._currentPerfQuality;
-    const quality = THREE.MathUtils.clamp(qualityRaw ?? 1, 0.3, 1.1);
-    this._currentPerfQuality = quality;
+    const qualityClamp = THREE.MathUtils.clamp(qualityRaw ?? 1, 0.3, 1.1);
+    this._currentPerfQuality = qualityClamp;
 
     const fps = Number.isFinite(profile?.smoothedFps) ? profile.smoothedFps : this._smoothedFps;
     if (Number.isFinite(fps)) this._smoothedFps = fps;
@@ -377,22 +377,29 @@ export class BuildingManager {
       : (this._qosTargetFps || TARGET_FPS);
     this._qosTargetFps = target;
 
-    const lerp = (lo, hi) => lo + (hi - lo) * quality;
-    this._frameBudgetMs = lerp(0.45, BUILD_FRAME_BUDGET_MS);
-    this._idleBudgetMs = lerp(2.4, BUILD_IDLE_BUDGET_MS);
-    this._mergeBudgetMs = lerp(1.6, MERGE_BUDGET_MS);
-    this._resnapFrameBudgetMs = lerp(0.35, RESNAP_FRAME_BUDGET_MS);
-    this._resnapInterval = lerp(RESNAP_INTERVAL * 3.6, RESNAP_INTERVAL);
-    this._resnapHotBudgetMs = lerp(0.25, 0.8);
-    this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(lerp(1, 4)));
-    this._tileUpdateInterval = lerp(0.55, 0);
+    const qMin = 0.3;
+    const qMax = 1.05;
+    const norm = THREE.MathUtils.clamp((qualityClamp - qMin) / (qMax - qMin), 0, 1);
+
+    this._frameBudgetMs = THREE.MathUtils.lerp(0.35, BUILD_FRAME_BUDGET_MS, norm);
+    this._idleBudgetMs = THREE.MathUtils.lerp(1.8, BUILD_IDLE_BUDGET_MS, norm);
+    this._mergeBudgetMs = THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, norm);
+    this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, norm);
+    this._resnapInterval = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, norm);
+    this._resnapHotBudgetMs = THREE.MathUtils.lerp(0.18, 0.8, norm);
+    this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, norm)));
+    this._tileUpdateInterval = THREE.MathUtils.lerp(0.65, 0.08, norm);
     this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
     if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
 
     if (this._radiusOverride == null) {
-      const autoRadius = this._computeVisualRingRadius();
-      if (Number.isFinite(autoRadius) && autoRadius > 0) {
-        this._baseRadius = autoRadius;
+      const baseline = this._computeVisualRingRadius();
+      const baseRadius = Number.isFinite(baseline) && baseline > 0 ? baseline : this._defaultRadius;
+      const scaledRadius = Math.max(200,
+        Math.round(THREE.MathUtils.lerp(baseRadius * 0.45, baseRadius * 1.2, norm))
+      );
+      if (Number.isFinite(scaledRadius) && scaledRadius > 0) {
+        this._baseRadius = scaledRadius;
       }
     }
 
@@ -404,11 +411,11 @@ export class BuildingManager {
       this._refreshRadiusVisibility();
     }
 
-    const level = quality >= 0.82 ? 'high' : (quality >= 0.6 ? 'medium' : 'low');
+    const level = qualityClamp >= 0.82 ? 'high' : (qualityClamp >= 0.6 ? 'medium' : 'low');
     this._qosLevel = level;
 
     return {
-      quality,
+      quality: qualityClamp,
       level,
       frameBudget: this._frameBudgetMs,
       idleBudget: this._idleBudgetMs,
@@ -416,6 +423,7 @@ export class BuildingManager {
       resnapBudget: this._resnapFrameBudgetMs,
       resnapInterval: this._resnapInterval,
       radius: this.radius,
+      tileUpdateInterval: this._tileUpdateInterval,
     };
   }
 

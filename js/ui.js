@@ -30,6 +30,20 @@ const processCards = document.getElementById('processCards');
 const processGraph = document.getElementById('processGraph');
 const processEmptyState = document.getElementById('processEmptyState');
 const processReset = document.getElementById('processReset');
+const diagPidTargetFps = document.getElementById('diagPidTargetFps');
+const diagPidSmoothedFps = document.getElementById('diagPidSmoothedFps');
+const diagPidError = document.getElementById('diagPidError');
+const diagPidIntegral = document.getElementById('diagPidIntegral');
+const diagPidDerivative = document.getElementById('diagPidDerivative');
+const diagPidQuality = document.getElementById('diagPidQuality');
+const diagPidKp = document.getElementById('diagPidKp');
+const diagPidKi = document.getElementById('diagPidKi');
+const diagPidKd = document.getElementById('diagPidKd');
+const diagPidGain = document.getElementById('diagPidGain');
+const diagPidDeadband = document.getElementById('diagPidDeadband');
+const diagPidSmoothing = document.getElementById('diagPidSmoothing');
+const diagPidApply = document.getElementById('diagPidApply');
+const diagPidReset = document.getElementById('diagPidReset');
 
 const hexSig = document.getElementById('hexSig');
 const nukeBtn = document.getElementById('nuke');
@@ -271,6 +285,8 @@ export const ui = {
   peerSummary, peerList,
   controlTabsRoot,
   processLeaderboardSection, processLeaderboard, processCards, processGraph, processEmptyState, processReset,
+  diagPidTargetFps, diagPidSmoothedFps, diagPidError, diagPidIntegral, diagPidDerivative, diagPidQuality,
+  diagPidKp, diagPidKi, diagPidKd, diagPidGain, diagPidDeadband, diagPidSmoothing, diagPidApply, diagPidReset,
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,

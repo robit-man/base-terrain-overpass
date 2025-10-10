@@ -27,6 +27,8 @@ export class ChaseCam {
     this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
     this.smooth = 24.0;
+    this.defaultMinBoom = this.minBoom;
+    this.defaultMaxBoom = this.maxBoom;
 
     // Mobile-device pitch handling
     this.isMobile = /Mobi|Android/i.test(navigator.userAgent);
@@ -41,6 +43,15 @@ export class ChaseCam {
     this._orbitTarget = new THREE.Vector3();
     this._worldTarget = new THREE.Vector3();
     this._clampedLocal = new THREE.Vector3();
+
+    this._pinch = {
+      active: false,
+      startDist: 0,
+      startBoom: this.targetBoom,
+      scale: 0.02
+    };
+    this._pinchTouches = new Map();
+    this._setupPinchGestures();
 
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
@@ -59,6 +70,78 @@ export class ChaseCam {
       dolly.add(camera);
     }
     camera.position.set(0, 0, 0);
+  }
+
+  _setupPinchGestures() {
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (!canvas || typeof canvas.addEventListener !== 'function') return;
+
+    const updatePinch = () => {
+      if (!this._pinch.active) return;
+      if (this._pinchTouches.size < 2) return;
+      const touches = [...this._pinchTouches.values()];
+      const dx = touches[0].x - touches[1].x;
+      const dy = touches[0].y - touches[1].y;
+      const dist = Math.hypot(dx, dy);
+      if (!isFinite(dist) || dist <= 0) return;
+      const delta = dist - this._pinch.startDist;
+      const target = this._pinch.startBoom + delta * this._pinch.scale;
+      this.targetBoom = THREE.MathUtils.clamp(target, this.minBoom, this.maxBoom);
+    };
+
+    const endPinch = () => {
+      if (!this._pinch.active) return;
+      this._pinch.active = false;
+      this._pinch.startDist = 0;
+      this._pinch.startBoom = this.targetBoom;
+    };
+
+    const pointerDown = (e) => {
+      if (e.pointerType !== 'touch') return;
+      this._pinchTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this._pinchTouches.size === 2) {
+        const touches = [...this._pinchTouches.values()];
+        const dx = touches[0].x - touches[1].x;
+        const dy = touches[0].y - touches[1].y;
+        this._pinch.startDist = Math.max(1, Math.hypot(dx, dy));
+        this._pinch.startBoom = this.targetBoom;
+        this._pinch.active = true;
+      }
+    };
+
+    const pointerMove = (e) => {
+      if (e.pointerType !== 'touch') return;
+      const touch = this._pinchTouches.get(e.pointerId);
+      if (!touch) return;
+      touch.x = e.clientX;
+      touch.y = e.clientY;
+      if (this._pinch.active) {
+        e.preventDefault();
+        updatePinch();
+      }
+    };
+
+    const pointerUp = (e) => {
+      if (e.pointerType !== 'touch') return;
+      this._pinchTouches.delete(e.pointerId);
+      if (this._pinch.active && this._pinchTouches.size < 2) {
+        endPinch();
+      }
+    };
+
+    const pointerCancel = (e) => {
+      if (e.pointerType !== 'touch') return;
+      this._pinchTouches.delete(e.pointerId);
+      if (this._pinch.active && this._pinchTouches.size < 2) {
+        endPinch();
+      }
+    };
+
+    canvas.addEventListener('pointerdown', pointerDown, { passive: true });
+    canvas.addEventListener('pointermove', pointerMove, { passive: false });
+    canvas.addEventListener('pointerup', pointerUp, { passive: true });
+    canvas.addEventListener('pointercancel', pointerCancel, { passive: true });
+    canvas.addEventListener('pointerout', pointerCancel, { passive: true });
   }
 
   isFirstPerson() { return this.targetBoom <= this.FIRST_THRESHOLD; }

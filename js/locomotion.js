@@ -88,12 +88,14 @@ export class Locomotion {
     this._touchYawOffset = 0;
     this._lastAppliedTouchYaw = 0;
     this._touchYawRate = THREE.MathUtils.degToRad(180); // rad/s when swipe fully deflected
+    this._touchYawFiltered = 0;
+    this._touchYawSmoothHz = 1.2; // molasses drag for swipe yaw
     this._snapYawTarget = null;
     this._snapYawActive = false;
     this._snapYawEpsilon = THREE.MathUtils.degToRad(1.5);
     this._tmpForward = new THREE.Vector3();
 
-    this._sign = { forward: 1, strafe: 1, yaw: 1 };
+    this._sign = { forward: 1, strafe: 1, yaw: -1 };
   }
 
   update(dt, groundY, xrPresenting) {
@@ -108,7 +110,14 @@ export class Locomotion {
     let mobileDy = 0;
     let baseYaw = this._currentYaw();
     if (isMobileDevice) {
-      mobileDx = signYaw * THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
+      const rawDx = THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
+      const smoothAlpha = 1 - Math.exp(-this._touchYawSmoothHz * Math.max(0, dt));
+      this._touchYawFiltered += (rawDx - this._touchYawFiltered) * smoothAlpha;
+      if (!this.input.touch.active) {
+        this._touchYawFiltered += (0 - this._touchYawFiltered) * smoothAlpha;
+      }
+      this._touchYawFiltered = THREE.MathUtils.clamp(this._touchYawFiltered, -1, 1);
+      mobileDx = signYaw * this._touchYawFiltered;
       mobileDy = signForward * THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
       const yawDelta = mobileDx * this._touchYawRate * dt;
       if (Math.abs(yawDelta) > 1e-5) {
@@ -149,6 +158,7 @@ export class Locomotion {
         .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
       dol.quaternion.copy(q);
       this._lastAppliedTouchYaw = 0;
+      this._touchYawFiltered = 0;
       baseYaw = this._currentYaw();
     }
 

@@ -17,7 +17,7 @@ import { ChaseCam } from './chasecam.js';
 import { BuildingManager } from './buildings.js';
 import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
-import { PerformanceTuner } from './performance.js';
+import { AdaptiveQualityManager } from './adaptiveQuality.js';
 
 class PerfLogger {
   constructor({ slowFrameMs = 33, reportIntervalMs = 2000, labelLimit = 6 } = {}) {
@@ -190,7 +190,6 @@ class App {
     this._physicsPrimed = false;
     this._xrPoseActive = false;
 
-    this._perf = new PerformanceTuner({ targetFps: 60, minQuality: 0.35, maxQuality: 1.05 });
     this._perfSnapshots = { tiles: null, buildings: null };
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
@@ -254,12 +253,25 @@ class App {
     this._terrainUpdateTimer = null;
     this._buildingUpdateTimer = null;
 
-    const initialProfile = this._perf.profile();
-    const initialTiles = this.hexGridMgr.applyPerfProfile?.(initialProfile) || null;
-    const initialBuildings = this.buildings.applyPerfProfile?.(initialProfile) || null;
-    if (initialTiles) this._perfSnapshots.tiles = initialTiles;
+    this._perf = new AdaptiveQualityManager({ targetFps: 60, minQuality: 0.35, maxQuality: 1.05 });
+    const measuredApply = (label, fn) => (profile) => {
+      if (!this._perfLogger) return fn(profile);
+      return this._perfLogger.measure(label, () => fn(profile));
+    };
+    this._perf.registerSubsystem('terrain', {
+      apply: measuredApply('tiles.applyProfile', (profile) => this.hexGridMgr?.applyPerfProfile?.(profile) || null),
+    });
+    this._perf.registerSubsystem('buildings', {
+      apply: measuredApply('buildings.applyProfile', (profile) => this.buildings?.applyPerfProfile?.(profile) || null),
+    });
+
+    const initialState = this._perf.applyAll({ force: true });
+    const initialTerrain = initialState.subsystems?.terrain || null;
+    const initialBuildings = initialState.subsystems?.buildings || null;
+    if (initialTerrain) this._perfSnapshots.tiles = initialTerrain;
     if (initialBuildings) this._perfSnapshots.buildings = initialBuildings;
-    this._updateHudMeta(initialProfile);
+    this._updateHudMeta(initialState);
+    this._updatePidDiagnostics(initialState, { forceInputs: true });
     this._updateHudCompass();
 
     this._setupPhysics();
@@ -538,6 +550,7 @@ class App {
     });
 
     this._setupEnvironmentControls();
+    this._setupDiagnosticsControls();
     this._setupCharacterControls();
     this._populateDeviceInfo();
     this._syncEnvironmentAutoButtons();
@@ -1118,6 +1131,98 @@ class App {
     this._syncEnvironmentAutoButtons();
   }
 
+  _setupDiagnosticsControls() {
+    if (!ui.diagPidApply) return;
+    const current = this._perf?.profile?.();
+    this._syncPidInputs(current, { force: true });
+    ui.diagPidApply.addEventListener('click', () => {
+      const snapshot = this._perf?.profile?.();
+      const pid = snapshot?.pid || {};
+      const read = (input, fallback) => {
+        if (!input) return fallback;
+        const raw = Number.parseFloat(input.value);
+        return Number.isFinite(raw) ? raw : fallback;
+      };
+      this._perf?.setPidTuning?.({
+        kp: read(ui.diagPidKp, pid.kp),
+        ki: read(ui.diagPidKi, pid.ki),
+        kd: read(ui.diagPidKd, pid.kd),
+        gain: read(ui.diagPidGain, pid.gain),
+        deadband: read(ui.diagPidDeadband, pid.deadband),
+        smoothing: read(ui.diagPidSmoothing, pid.smoothing),
+      });
+      const updated = this._perf?.profile?.();
+      this._updatePidDiagnostics(updated, { forceInputs: true });
+    });
+    ui.diagPidReset?.addEventListener('click', () => {
+      this._perf?.resetPidState?.();
+      const updated = this._perf?.profile?.();
+      this._updatePidDiagnostics(updated, { forceInputs: true });
+    });
+  }
+
+  _syncPidInputs(profile, { force = false } = {}) {
+    if (!ui.diagPidKp) return;
+    const pid = profile?.pid || {};
+    const assign = (input, value) => {
+      if (!input) return;
+      if (!force && document.activeElement === input) return;
+      if (Number.isFinite(value)) input.value = String(value);
+    };
+    assign(ui.diagPidKp, pid.kp);
+    assign(ui.diagPidKi, pid.ki);
+    assign(ui.diagPidKd, pid.kd);
+    assign(ui.diagPidGain, pid.gain);
+    assign(ui.diagPidDeadband, pid.deadband);
+    assign(ui.diagPidSmoothing, pid.smoothing);
+  }
+
+  _updatePidDiagnostics(perfState, { forceInputs = false } = {}) {
+    if (!ui.diagPidTargetFps) return;
+    const pid = perfState?.pid || {};
+    const format = (value, digits = 2) => (Number.isFinite(value) ? value.toFixed(digits) : '--');
+    const setText = (el, value) => { if (el) el.textContent = value; };
+    const target = perfState?.targetFps;
+    setText(ui.diagPidTargetFps, Number.isFinite(target) ? `${Math.round(target)}` : '--');
+    setText(ui.diagPidSmoothedFps, format(perfState?.smoothedFps, 2));
+    setText(ui.diagPidError, format(pid.error, 2));
+    setText(ui.diagPidIntegral, format(pid.integral, 2));
+    setText(ui.diagPidDerivative, format(pid.derivative, 2));
+    setText(ui.diagPidQuality, format(perfState?.quality, 3));
+    this._syncPidInputs(perfState, { force: forceInputs });
+  }
+
+  _summarizeTerrain() {
+    const tm = this.hexGridMgr;
+    if (!tm) return null;
+    return {
+      interactiveRing: tm.INTERACTIVE_RING,
+      visualRing: tm.VISUAL_RING,
+      farfieldRing: tm.FARFIELD_RING,
+      farfieldCreateBudget: tm.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: tm.FARFIELD_BATCH_SIZE,
+      relaxIters: tm.RELAX_ITERS_PER_FRAME,
+      relaxBudget: Number.isFinite(tm.RELAX_FRAME_BUDGET_MS)
+        ? Number(tm.RELAX_FRAME_BUDGET_MS.toFixed?.(2) ?? tm.RELAX_FRAME_BUDGET_MS)
+        : null,
+      visualCreateBudget: tm.VISUAL_CREATE_BUDGET,
+    };
+  }
+
+  _summarizeBuildings() {
+    const build = this.buildings;
+    if (!build) return null;
+    return {
+      frameBudget: build._frameBudgetMs,
+      idleBudget: build._idleBudgetMs,
+      mergeBudget: build._mergeBudgetMs,
+      resnapBudget: build._resnapFrameBudgetMs,
+      resnapInterval: build._resnapInterval,
+      radius: build.radius,
+      quality: build._currentPerfQuality,
+    };
+  }
+
   _setupCharacterControls() {
     if (!ui.charFlipForward || !ui.charFlipStrafe || !ui.charFlipYaw) return;
     const bind = (el, axis) => {
@@ -1237,13 +1342,26 @@ class App {
     if (settings) this._updateTerrainCurrentDisplay?.(settings);
     this._syncTerrainControls?.();
     this._syncBuildingControls?.();
+    const profile = this._perf?.profile?.();
+    const summary = this._summarizeTerrain();
+    if (summary) this._perfSnapshots.tiles = summary;
+    if (profile) {
+      this._updateHudMeta(profile);
+      this._updatePidDiagnostics(profile);
+    }
   }
 
   _enableTerrainAuto(targetFps) {
     if (!this.hexGridMgr?.resetTerrainSettings) return;
     this.hexGridMgr.resetTerrainSettings();
+    this._perf?.setSubsystemAuto?.('terrain', true);
     const profile = this._perf?.profile?.();
-    if (profile) this.hexGridMgr.applyPerfProfile(profile);
+    if (profile) {
+      const summary = this._perf?.applySubsystem?.('terrain', { force: true, profile });
+      if (summary) this._perfSnapshots.tiles = summary;
+      this._updateHudMeta(profile);
+      this._updatePidDiagnostics(profile);
+    }
     this._terrainAuto = true;
     this._syncTerrainControls?.();
     this._updateTerrainCurrentDisplay?.(this.hexGridMgr?.getTerrainSettings?.());
@@ -1269,13 +1387,26 @@ class App {
     this._syncEnvironmentAutoButtons();
     this._updateBuildingCurrentDisplay?.(this.buildings?.getBuildingSettings?.());
     this._syncBuildingControls?.();
+    const profile = this._perf?.profile?.();
+    const summary = this._summarizeBuildings();
+    if (summary) this._perfSnapshots.buildings = summary;
+    if (profile) {
+      this._updateHudMeta(profile);
+      this._updatePidDiagnostics(profile);
+    }
   }
 
   _enableBuildingAuto(targetFps) {
     if (!this.buildings?.resetBuildingSettings) return;
     this.buildings.resetBuildingSettings();
+    this._perf?.setSubsystemAuto?.('buildings', true);
     const profile = this._perf?.profile?.();
-    if (profile) this.buildings.applyPerfProfile(profile);
+    if (profile) {
+      const summary = this._perf?.applySubsystem?.('buildings', { force: true, profile });
+      if (summary) this._perfSnapshots.buildings = summary;
+      this._updateHudMeta(profile);
+      this._updatePidDiagnostics(profile);
+    }
     this._buildingAuto = true;
     this._syncBuildingControls?.();
     this._updateBuildingCurrentDisplay?.(this.buildings?.getBuildingSettings?.());
@@ -1287,12 +1418,14 @@ class App {
   _disableTerrainAuto() {
     if (!this._terrainAuto) return;
     this._terrainAuto = false;
+    this._perf?.setSubsystemAuto?.('terrain', false);
     this._syncEnvironmentAutoButtons();
   }
 
   _disableBuildingAuto() {
     if (!this._buildingAuto) return;
     this._buildingAuto = false;
+    this._perf?.setSubsystemAuto?.('buildings', false);
     this._syncEnvironmentAutoButtons();
   }
 
@@ -1319,6 +1452,8 @@ class App {
     if (ui.envTerrainTargetFpsValue) ui.envTerrainTargetFpsValue.textContent = `${fps} fps`;
     if (ui.envBuildingTargetFps) ui.envBuildingTargetFps.value = fps;
     if (ui.envBuildingTargetFpsValue) ui.envBuildingTargetFpsValue.textContent = `${fps} fps`;
+    const profile = this._perf?.profile?.();
+    if (profile) this._updatePidDiagnostics(profile);
   }
 
   _refreshEnvironmentTerrainSummary() {
@@ -2406,8 +2541,12 @@ class App {
 
     this.chase.targetBoom = 0.0;
     this.chase.boom = 0.0;
-    this.chase.minBoom = 0.0;
-    this.chase.maxBoom = 0.0;
+    if (Number.isFinite(this.chase.defaultMinBoom)) {
+      this.chase.minBoom = this.chase.defaultMinBoom;
+    }
+    if (Number.isFinite(this.chase.defaultMaxBoom)) {
+      this.chase.maxBoom = this.chase.defaultMaxBoom;
+    }
 
     this._mobileFPVOn = true;
   }
@@ -2823,12 +2962,13 @@ class App {
     const perfState = measure('perf.sample', () => this._perf.sample({ dt, fps: fpsSample }));
 
     if (perfState.qualityChanged || perfState.hudReady) {
-      const tileSummary = measure('tiles.applyProfile', () => this.hexGridMgr?.applyPerfProfile?.(perfState) || null);
-      const buildingSummary = measure('buildings.applyProfile', () => this.buildings?.applyPerfProfile?.(perfState) || null);
-      if (tileSummary) this._perfSnapshots.tiles = tileSummary;
+      const tileSummary = perfState.subsystems?.terrain ?? null;
+      const buildingSummary = perfState.subsystems?.buildings ?? null;
+      if (tileSummary && this._terrainAuto) this._perfSnapshots.tiles = tileSummary;
+      if (buildingSummary && this._buildingAuto) this._perfSnapshots.buildings = buildingSummary;
       if (tileSummary) this._refreshEnvironmentTerrainSummary(tileSummary);
-      if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
       if (buildingSummary) this._refreshEnvironmentBuildingSummary(buildingSummary);
+      this._updatePidDiagnostics(perfState);
     }
 
     const originForSun = this.hexGridMgr?.origin;

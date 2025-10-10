@@ -30,6 +30,8 @@ export class PerformanceTuner {
     this._lastError = 0;
     this._integralLimit = 240; // prevents wind-up under steady low FPS
     this._hudTimer = 0;
+    this._lastDerivative = 0;
+    this._lastDelta = 0;
     this._qualityNotify = this._quality;
     this._qualityEpsilon = 0.015;
     this._profile = {
@@ -37,6 +39,18 @@ export class PerformanceTuner {
       smoothedFps: this._smoothedFps,
       quality: this._quality,
       level: 'high',
+      pid: {
+        error: 0,
+        integral: 0,
+        derivative: 0,
+        delta: 0,
+        kp: this.kp,
+        ki: this.ki,
+        kd: this.kd,
+        gain: this.gain,
+        deadband: this.deadband,
+        smoothing: this.smoothing,
+      },
     };
   }
 
@@ -51,10 +65,12 @@ export class PerformanceTuner {
 
     this._integral = clamp(this._integral + error * safeDt, -this._integralLimit, this._integralLimit);
     const derivative = (error - this._lastError) / safeDt;
+    this._lastDerivative = derivative;
     const control = this.kp * error + this.ki * this._integral + this.kd * derivative;
     this._lastError = error;
 
     const delta = control * this.gain * safeDt;
+    this._lastDelta = delta;
     if (Math.abs(delta) > 1e-6) {
       this._quality = clamp(this._quality - delta, this.minQuality, this.maxQuality);
     }
@@ -74,6 +90,18 @@ export class PerformanceTuner {
       level,
       hudReady,
       qualityChanged,
+      pid: {
+        error,
+        integral: this._integral,
+        derivative: this._lastDerivative,
+        delta: this._lastDelta,
+        kp: this.kp,
+        ki: this.ki,
+        kd: this.kd,
+        gain: this.gain,
+        deadband: this.deadband,
+        smoothing: this.smoothing,
+      },
     };
 
     return this._profile;
@@ -87,6 +115,49 @@ export class PerformanceTuner {
     if (!Number.isFinite(fps) || fps <= 0) return;
     this.targetFps = fps;
     this._profile.targetFps = fps;
+  }
+
+  setPidTuning({
+    kp,
+    ki,
+    kd,
+    gain,
+    deadband,
+    smoothing,
+  } = {}) {
+    if (Number.isFinite(kp)) this.kp = kp;
+    if (Number.isFinite(ki)) this.ki = ki;
+    if (Number.isFinite(kd)) this.kd = kd;
+    if (Number.isFinite(gain)) this.gain = gain;
+    if (Number.isFinite(deadband) && deadband >= 0) this.deadband = deadband;
+    if (Number.isFinite(smoothing) && smoothing > 0) this.smoothing = smoothing;
+    if (this._profile?.pid) {
+      this._profile.pid = {
+        ...this._profile.pid,
+        kp: this.kp,
+        ki: this.ki,
+        kd: this.kd,
+        gain: this.gain,
+        deadband: this.deadband,
+        smoothing: this.smoothing,
+      };
+    }
+  }
+
+  resetPidState() {
+    this._integral = 0;
+    this._lastError = 0;
+    this._lastDerivative = 0;
+    this._lastDelta = 0;
+    if (this._profile?.pid) {
+      this._profile.pid = {
+        ...this._profile.pid,
+        error: 0,
+        integral: 0,
+        derivative: 0,
+        delta: 0,
+      };
+    }
   }
 
   _levelForQuality(q) {

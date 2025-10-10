@@ -3002,20 +3002,39 @@ _stitchInteractiveToVisualEdges(tile, {
 
   applyPerfProfile(profile = {}) {
     const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._lodQuality;
-    const quality = THREE.MathUtils.clamp(qualityRaw, 0.3, 1.2);
-    this._lodQuality = quality;
+    const qualityClamp = THREE.MathUtils.clamp(qualityRaw, 0.3, 1.2);
+    this._lodQuality = qualityClamp;
+
+    const qMin = 0.3;
+    const qMax = 1.05;
+    const norm = THREE.MathUtils.clamp((qualityClamp - qMin) / (qMax - qMin), 0, 1);
 
     const baseInteractive = this._baseLod.interactiveRing;
     const baseVisual = this._baseLod.visualRing;
-    const baseFarfield = this._baseLod.farfieldRing;
-    const baseFarfieldBatch = this._baseLod.farfieldBatchSize || this.FARFIELD_BATCH_SIZE;
-    const farfieldExtra = Number.isFinite(this._baseLod.farfieldExtra)
+    const baseFarfieldExtra = Number.isFinite(this._baseLod.farfieldExtra)
       ? this._baseLod.farfieldExtra
-      : Math.max(1, baseFarfield - baseVisual);
+      : Math.max(1, this._baseLod.farfieldRing - this._baseLod.visualRing);
+    const baseVisualBudget = this._baseLod.visualCreateBudget || 4;
+    const baseFarfieldBudget = this._baseLod.farfieldCreateBudget || 60;
+    const baseFarfieldBatch = this._baseLod.farfieldBatchSize || this.FARFIELD_BATCH_SIZE;
+    const baseRelaxIters = this._baseLod.relaxIters || this.RELAX_ITERS_PER_FRAME;
+    const baseRelaxBudget = this._baseLod.relaxBudget || this.RELAX_FRAME_BUDGET_MS;
+
+    const interactiveMin = Math.max(1, Math.round(baseInteractive * 0.5));
+    const interactiveMax = Math.max(interactiveMin + 1, Math.round(baseInteractive * 1.35));
+    const interactiveRing = Math.max(1, Math.round(THREE.MathUtils.lerp(interactiveMin, interactiveMax, norm)));
+
+    const visualMin = Math.max(interactiveRing + 1, Math.round(baseVisual * 0.55));
+    const visualMax = Math.max(visualMin + 1, Math.round(baseVisual * 1.25));
+    const visualRing = Math.max(interactiveRing + 1, Math.round(THREE.MathUtils.lerp(visualMin, visualMax, norm)));
+
+    const farfieldExtraMin = Math.max(4, Math.round(baseFarfieldExtra * 0.4));
+    const farfieldExtraMax = Math.max(farfieldExtraMin, Math.round(baseFarfieldExtra * 1.3));
+    const farfieldExtra = Math.max(1, Math.round(THREE.MathUtils.lerp(farfieldExtraMin, farfieldExtraMax, norm)));
 
     let ringChanged = false;
-    if (this.INTERACTIVE_RING !== baseInteractive) { this.INTERACTIVE_RING = baseInteractive; ringChanged = true; }
-    if (this.VISUAL_RING !== baseVisual) { this.VISUAL_RING = baseVisual; ringChanged = true; }
+    if (this.INTERACTIVE_RING !== interactiveRing) { this.INTERACTIVE_RING = interactiveRing; ringChanged = true; }
+    if (this.VISUAL_RING !== visualRing) { this.VISUAL_RING = visualRing; ringChanged = true; }
     const targetFarfieldRing = this.VISUAL_RING + farfieldExtra;
     if (this.FARFIELD_RING !== targetFarfieldRing) {
       this.FARFIELD_RING = targetFarfieldRing;
@@ -3029,12 +3048,13 @@ _stitchInteractiveToVisualEdges(tile, {
       this._scheduleBackfill(0);
     }
 
-    this.VISUAL_CREATE_BUDGET = Number.MAX_SAFE_INTEGER;
-    this.FARFIELD_CREATE_BUDGET = this._baseLod.farfieldCreateBudget;
-    this.FARFIELD_BATCH_SIZE = Math.max(1, Math.round(baseFarfieldBatch));
+    const visualBudget = Math.max(1, Math.round(THREE.MathUtils.lerp(baseVisualBudget * 0.25, baseVisualBudget, norm)));
+    this.VISUAL_CREATE_BUDGET = visualBudget;
+    this.FARFIELD_CREATE_BUDGET = Math.max(4, Math.round(THREE.MathUtils.lerp(baseFarfieldBudget * 0.35, baseFarfieldBudget * 1.15, norm)));
+    this.FARFIELD_BATCH_SIZE = Math.max(4, Math.round(THREE.MathUtils.lerp(Math.max(8, baseFarfieldBatch * 0.5), baseFarfieldBatch * 1.1, norm)));
 
-    this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(quality * this._baseLod.relaxIters));
-    this.RELAX_FRAME_BUDGET_MS = 1.5 + quality * 1.5;
+    this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(THREE.MathUtils.lerp(Math.max(4, baseRelaxIters * 0.45), baseRelaxIters * 1.25, norm)));
+    this.RELAX_FRAME_BUDGET_MS = +(THREE.MathUtils.lerp(Math.max(0.6, baseRelaxBudget * 0.6), baseRelaxBudget * 1.45, norm).toFixed(2));
 
     for (const tile of this.tiles.values()) {
       if (!tile?.wire?.material?.userData) continue;
@@ -3046,10 +3066,12 @@ _stitchInteractiveToVisualEdges(tile, {
     }
 
     return {
+      quality: this._lodQuality,
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
-      visualCreateBudget: this.VISUAL_CREATE_BUDGET,
       farfieldRing: this.FARFIELD_RING,
+      farfieldExtra: this.FARFIELD_EXTRA,
+      visualCreateBudget: this.VISUAL_CREATE_BUDGET,
       farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
       farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       relaxIters: this.RELAX_ITERS_PER_FRAME,

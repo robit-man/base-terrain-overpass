@@ -403,6 +403,32 @@
             <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>
           </section>
 
+          <section class="modal-section">
+            <h3 class="section-title">Adaptive Quality</h3>
+            <div class="kv"><span class="tiny">Target FPS</span>&nbsp;<span id="diagPidTargetFps" class="mono">60</span></div>
+            <div class="kv"><span class="tiny">Smoothed FPS</span>&nbsp;<span id="diagPidSmoothedFps" class="mono">60.0</span></div>
+            <div class="kv"><span class="tiny">Error</span>&nbsp;<span id="diagPidError" class="mono">0.00</span></div>
+            <div class="kv"><span class="tiny">Integral</span>&nbsp;<span id="diagPidIntegral" class="mono">0.00</span></div>
+            <div class="kv"><span class="tiny">Derivative</span>&nbsp;<span id="diagPidDerivative" class="mono">0.00</span></div>
+            <div class="kv"><span class="tiny">Quality</span>&nbsp;<span id="diagPidQuality" class="mono">1.00</span></div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">PID Tuning</h3>
+            <div class="pid-grid">
+              <label class="pid-cell">k_p<input id="diagPidKp" type="number" step="0.001" min="0" /></label>
+              <label class="pid-cell">k_i<input id="diagPidKi" type="number" step="0.001" min="0" /></label>
+              <label class="pid-cell">k_d<input id="diagPidKd" type="number" step="0.001" min="0" /></label>
+              <label class="pid-cell">Gain<input id="diagPidGain" type="number" step="0.01" min="0" /></label>
+              <label class="pid-cell">Deadband<input id="diagPidDeadband" type="number" step="0.1" min="0" /></label>
+              <label class="pid-cell">Smoothing<input id="diagPidSmoothing" type="number" step="0.01" min="0.01" /></label>
+            </div>
+            <div class="button-row">
+              <button id="diagPidApply" type="button">Apply Gains</button>
+              <button id="diagPidReset" type="button">Reset Integrator</button>
+            </div>
+          </section>
+
           <section class="modal-section debug-only" id="processLeaderboardSection">
             <h3 class="section-title">Process Leaderboard</h3>
             <div id="processLeaderboard" class="process-leaderboard">
