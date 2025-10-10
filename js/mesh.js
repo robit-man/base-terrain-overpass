@@ -244,6 +244,7 @@ export class Mesh {
       entry.respondedAt = undefined;
       entry.reason = undefined;
       this.teleportInbox.set(from, entry);
+      this._emitTeleportStatus(from, entry);
       this._renderPeers();
       return;
     }
@@ -520,6 +521,11 @@ export class Mesh {
     if (prev === (norm || '')) return;
     this.app?.remotes?.setAlias(key, norm);
     this._renderPeers();
+  }
+
+  _emitTeleportStatus(pub, entry) {
+    if (!pub) return;
+    this.app?.notifyTeleportToast?.(pub, entry || null);
   }
 
   _broadcastAlias() {
@@ -931,6 +937,7 @@ export class Mesh {
     const t = now();
     this._pruneTeleportState(t);
     const rows = [...this.peers.entries()].sort((a, b) => (b[1].lastTs || 0) - (a[1].lastTs || 0));
+    const hudUsers = [];
     if (ui.peerList) ui.peerList.innerHTML = '';
     let pendingIncoming = 0;
     for (const [pub, ent] of rows) {
@@ -963,6 +970,17 @@ export class Mesh {
       if (actionsNode) row.appendChild(actionsNode);
 
       if (ui.peerList) ui.peerList.appendChild(row);
+
+      hudUsers.push({
+        pub,
+        alias: this._aliasFor(pub),
+        short: shortHex(pub, 6, 4),
+        online,
+        lastTs: ent.lastTs || 0,
+        geo: lp?.geo || null,
+        incomingStatus: incoming?.status || null,
+        outgoingStatus: outgoing?.status || null,
+      });
     }
     let online = 0; for (const pub of this.peers.keys()) if (this._online(pub)) online++;
     if (ui.hudPeerCount) ui.hudPeerCount.textContent = String(online);
@@ -971,6 +989,8 @@ export class Mesh {
       if (pendingIncoming > 0) parts.push(`${pendingIncoming} teleport request${pendingIncoming > 1 ? 's' : ''}`);
       ui.peerSummary.textContent = parts.join(' • ');
     }
+
+    this.app?.updateHudUserList?.(hudUsers);
   }
 
   _pruneTeleportState(nowTs = now()) {
@@ -990,7 +1010,10 @@ export class Mesh {
       const ref = Number.isFinite(info.respondedAt) ? info.respondedAt : (Number.isFinite(info.ts) ? info.ts : nowTs);
       if (nowTs - ref > TELEPORT_STALE_MS) removeIn.push(pub);
     }
-    removeIn.forEach((pub) => this.teleportInbox.delete(pub));
+    removeIn.forEach((pub) => {
+      this.teleportInbox.delete(pub);
+      this._emitTeleportStatus(pub, null);
+    });
 
     const removeOut = [];
     for (const [pub, info] of this.teleportOutbox.entries()) {
@@ -1158,6 +1181,7 @@ export class Mesh {
     if (!accepted && payload.reason) entry.reason = payload.reason;
     entry.respondedAt = nowTs;
     this.teleportInbox.set(key, entry);
+    this._emitTeleportStatus(key, entry);
     this._touchPeer(key, nowTs);
     this._renderPeers();
 
@@ -1169,6 +1193,7 @@ export class Mesh {
       info.respondedAt = now();
       info.reason = 'send failed';
       this.teleportInbox.set(key, info);
+      this._emitTeleportStatus(key, info);
       this._renderPeers();
     });
   }
@@ -1194,6 +1219,14 @@ export class Mesh {
     entry.respondedAt = now();
     this.teleportOutbox.set(key, entry);
     this._renderPeers();
+  }
+
+  requestTeleport(pub) {
+    this._sendTeleportRequest(pub);
+  }
+
+  respondTeleport(pub, accept) {
+    this._respondTeleport(pub, accept);
   }
 
   async _sendToPub(pub, payload, { fallback = true } = {}) {

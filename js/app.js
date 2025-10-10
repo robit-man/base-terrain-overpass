@@ -11,7 +11,7 @@ import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
 import { ui, applyHudStatusDot } from './ui.js';
-import { deg } from './utils.js';
+import { deg, fmtAgo, shortHex } from './utils.js';
 import { AvatarFactory } from './avatars.js';
 import { ChaseCam } from './chasecam.js';
 import { BuildingManager } from './buildings.js';
@@ -239,6 +239,10 @@ class App {
       tileManager: this.hexGridMgr,
     });
 
+    this._friends = new Set(this._loadFriendList());
+    this._teleportToasts = new Map();
+    this._hudUserListVisible = false;
+    this._lastHudUsers = [];
     this._terrainAuto = true;
     this._buildingAuto = true;
     this._terrainUpdateTimer = null;
@@ -526,6 +530,12 @@ class App {
     });
 
     this._setupEnvironmentControls();
+    this._syncEnvironmentAutoButtons();
+
+    if (ui.hudUsersToggle) {
+      ui.hudUsersToggle.addEventListener('click', () => this._toggleHudUserList());
+    }
+    this._syncHudUserListVisibility();
 
     modeGeohash?.addEventListener('change', () => {
       if (!modeGeohash.checked) return;
@@ -1241,6 +1251,181 @@ class App {
     const settings = this.buildings?.getBuildingSettings?.();
     if (settings) this._updateBuildingCurrentDisplay?.(settings);
     if (this._buildingAuto) this._syncBuildingControls?.();
+  }
+
+  _toggleHudUserList() {
+    this._hudUserListVisible = !this._hudUserListVisible;
+    this._syncHudUserListVisibility();
+  }
+
+  _syncHudUserListVisibility() {
+    if (!ui.hudUserPanel || !ui.hudUsersToggle) return;
+    const visible = !!this._hudUserListVisible;
+    ui.hudUserPanel.hidden = !visible;
+    ui.hudUsersToggle.setAttribute('aria-expanded', visible ? 'true' : 'false');
+    ui.hudUsersToggle.textContent = visible ? 'Users ▾' : 'Users ▸';
+  }
+
+  _loadFriendList() {
+    try {
+      const raw = localStorage.getItem('NKN_FRIENDS_V1');
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.filter((p) => typeof p === 'string');
+    } catch { /* ignore */ }
+    return [];
+  }
+
+  _storeFriendList() {
+    try {
+      localStorage.setItem('NKN_FRIENDS_V1', JSON.stringify(Array.from(this._friends)));
+    } catch { /* noop */ }
+  }
+
+  isFriend(pub) {
+    if (!pub) return false;
+    return this._friends.has(pub.toLowerCase());
+  }
+
+  _toggleFriend(pub) {
+    if (!pub) return;
+    const key = pub.toLowerCase();
+    if (this._friends.has(key)) this._friends.delete(key);
+    else this._friends.add(key);
+    this._storeFriendList();
+    if (this._lastHudUsers) this.updateHudUserList(this._lastHudUsers);
+  }
+
+  updateHudUserList(users = []) {
+    this._lastHudUsers = Array.isArray(users) ? users.slice() : [];
+    if (!ui.hudUserList) return;
+    ui.hudUserList.innerHTML = '';
+    const nowMs = Date.now();
+    const sorted = [...this._lastHudUsers].sort((a, b) => {
+      const aOnline = a.online ? 1 : 0;
+      const bOnline = b.online ? 1 : 0;
+      if (aOnline !== bOnline) return bOnline - aOnline;
+      return (b.lastTs || 0) - (a.lastTs || 0);
+    });
+    for (const user of sorted) {
+      const row = document.createElement('div');
+      row.className = 'hud-user';
+      const top = document.createElement('div');
+      top.className = 'hud-user-top';
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'name';
+      nameSpan.textContent = user.alias || shortHex(user.pub || '', 6, 4);
+      const statusSpan = document.createElement('span');
+      statusSpan.className = 'status ' + (user.online ? 'online' : 'offline');
+      statusSpan.textContent = user.online ? 'ONLINE' : 'OFFLINE';
+      const hexSpan = document.createElement('span');
+      hexSpan.className = 'hex';
+      hexSpan.textContent = shortHex(user.pub || '', 6, 4);
+      top.appendChild(nameSpan);
+      top.appendChild(statusSpan);
+      top.appendChild(hexSpan);
+      row.appendChild(top);
+
+      const info = document.createElement('div');
+      info.className = 'hud-user-info';
+      const parts = [];
+      const agoMs = user.lastTs ? nowMs - user.lastTs : null;
+      if (user.online) parts.push('live');
+      if (agoMs != null) parts.push(user.online ? `seen ${fmtAgo(agoMs)} ago` : `last ${fmtAgo(agoMs)} ago`);
+      const geo = user.geo;
+      if (geo && geo.gh) parts.push(`gh ${geo.gh}`);
+      else if (geo && Number.isFinite(geo.lat) && Number.isFinite(geo.lon)) {
+        parts.push(`${geo.lat.toFixed(5)}, ${geo.lon.toFixed(5)}`);
+      }
+      if (user.incomingStatus === 'pending') parts.push('teleport request awaiting response');
+      info.textContent = parts.join(' • ');
+      row.appendChild(info);
+
+      const actions = document.createElement('div');
+      actions.className = 'hud-user-actions';
+      const friendBtn = document.createElement('button');
+      const isFriend = this.isFriend(user.pub);
+      friendBtn.className = 'friend' + (isFriend ? ' active' : '');
+      friendBtn.textContent = isFriend ? 'Remove Friend' : 'Add Friend';
+      friendBtn.addEventListener('click', () => this._toggleFriend(user.pub));
+      actions.appendChild(friendBtn);
+
+      const teleBtn = document.createElement('button');
+      teleBtn.className = 'teleport';
+      const pendingOut = user.outgoingStatus === 'pending';
+      teleBtn.textContent = pendingOut ? 'Requested…' : 'Teleport';
+      teleBtn.disabled = pendingOut || !user.online;
+      teleBtn.addEventListener('click', () => this.mesh?.requestTeleport?.(user.pub));
+      actions.appendChild(teleBtn);
+
+      row.appendChild(actions);
+      ui.hudUserList.appendChild(row);
+    }
+    this._syncHudUserListVisibility();
+  }
+
+  notifyTeleportToast(pub, entry) {
+    if (!ui.teleportToastHost) return;
+    const key = (pub || '').toLowerCase();
+    if (!key) return;
+    const status = entry?.status || null;
+    if (status !== 'pending') {
+      this._removeTeleportToast(key);
+      return;
+    }
+
+    let toast = this._teleportToasts.get(key);
+    const alias = this.mesh?._aliasFor?.(key) || shortHex(key, 6, 4);
+    const bodyText = `Incoming teleport request from ${alias}`;
+
+    if (!toast) {
+      const node = document.createElement('div');
+      node.className = 'teleport-toast';
+      const header = document.createElement('div');
+      header.className = 'teleport-header';
+      header.textContent = 'Teleport Request';
+      const body = document.createElement('div');
+      body.className = 'teleport-body';
+      const actions = document.createElement('div');
+      actions.className = 'teleport-actions';
+      const acceptBtn = document.createElement('button');
+      acceptBtn.className = 'accept';
+      acceptBtn.textContent = 'Accept';
+      acceptBtn.addEventListener('click', () => {
+        this.mesh?.respondTeleport?.(key, true);
+        this._removeTeleportToast(key);
+      });
+      const declineBtn = document.createElement('button');
+      declineBtn.className = 'decline';
+      declineBtn.textContent = 'Decline';
+      declineBtn.addEventListener('click', () => {
+        this.mesh?.respondTeleport?.(key, false);
+        this._removeTeleportToast(key);
+      });
+      actions.appendChild(acceptBtn);
+      actions.appendChild(declineBtn);
+      node.appendChild(header);
+      node.appendChild(body);
+      node.appendChild(actions);
+      ui.teleportToastHost.appendChild(node);
+      requestAnimationFrame(() => node.classList.add('show'));
+      toast = { node, body };
+      this._teleportToasts.set(key, toast);
+    }
+
+    if (toast.body) toast.body.textContent = bodyText;
+  }
+
+  _removeTeleportToast(key) {
+    const toast = this._teleportToasts.get(key);
+    if (!toast) return;
+    const { node } = toast;
+    const cleanup = () => {
+      if (node.parentElement) node.parentElement.removeChild(node);
+    };
+    node.classList.remove('show');
+    node.addEventListener('transitionend', cleanup, { once: true });
+    this._teleportToasts.delete(key);
   }
 
   _applyDebugMode() {

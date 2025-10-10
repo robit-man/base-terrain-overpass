@@ -68,6 +68,7 @@
 
 <body>
   <div id="toastHost" aria-live="polite" aria-atomic="false"></div>
+  <div id="teleportToastHost" aria-live="polite" aria-atomic="true"></div>
   <div id="buildingHoverToast" class="building-toast" aria-live="polite" aria-atomic="true" role="status" hidden>
     <div class="building-toast-name" data-role="toast-name"></div>
     <div class="building-toast-address" data-role="toast-address">—</div>
@@ -134,6 +135,13 @@
         <button id="hudDebugToggle" type="button" class="hud-button" aria-pressed="false" title="Toggle debug overlay">Debug</button>
         <button id="hudReset" type="button" class="hud-button" title="Clear caches and reload">Reset</button>
         <button id="menuBtn" type="button" class="hud-button" title="Opens control panel">Controls</button>
+      </div>
+
+      <div class="hud-userlist-footer">
+        <button id="hudUsersToggle" type="button" aria-expanded="false">Users ▸</button>
+        <div id="hudUserPanel" class="hud-user-panel" hidden>
+          <div id="hudUserList" class="hud-user-list"></div>
+        </div>
       </div>
     </div>
   </div>
