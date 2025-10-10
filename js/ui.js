@@ -1,5 +1,5 @@
 // UI references and helpers (menu, dots, labels)
-const menuBtn = document.getElementById('menu');
+const menuBtn = document.getElementById('menuBtn');
 const menuPane = document.getElementById('menuPane');
 const backdrop = document.getElementById('backdrop');
 const closeButton = document.getElementById('closeButton');
@@ -67,6 +67,38 @@ const terrainRelayInput = document.getElementById('terrainRelayInput');
 const terrainDatasetInput = document.getElementById('terrainDatasetInput');
 const terrainModeGeohash = document.getElementById('terrainModeGeohash');
 const terrainModeLatLng = document.getElementById('terrainModeLatLng');
+const envInteractiveRing = document.getElementById('envInteractiveRing');
+const envInteractiveRingValue = document.getElementById('envInteractiveRingValue');
+const envInteractiveRingCurrent = document.getElementById('envInteractiveRingCurrent');
+const envVisualRing = document.getElementById('envVisualRing');
+const envVisualRingValue = document.getElementById('envVisualRingValue');
+const envVisualRingCurrent = document.getElementById('envVisualRingCurrent');
+const envFarfieldExtra = document.getElementById('envFarfieldExtra');
+const envFarfieldExtraValue = document.getElementById('envFarfieldExtraValue');
+const envFarfieldExtraCurrent = document.getElementById('envFarfieldExtraCurrent');
+const envFarfieldNearPad = document.getElementById('envFarfieldNearPad');
+const envFarfieldNearPadValue = document.getElementById('envFarfieldNearPadValue');
+const envFarfieldNearPadCurrent = document.getElementById('envFarfieldNearPadCurrent');
+const envFarfieldBudget = document.getElementById('envFarfieldBudget');
+const envFarfieldBudgetValue = document.getElementById('envFarfieldBudgetValue');
+const envFarfieldBudgetCurrent = document.getElementById('envFarfieldBudgetCurrent');
+const envFarfieldBatch = document.getElementById('envFarfieldBatch');
+const envFarfieldBatchValue = document.getElementById('envFarfieldBatchValue');
+const envFarfieldBatchCurrent = document.getElementById('envFarfieldBatchCurrent');
+const envTileRadius = document.getElementById('envTileRadius');
+const envTileRadiusValue = document.getElementById('envTileRadiusValue');
+const envTileRadiusCurrent = document.getElementById('envTileRadiusCurrent');
+const envTerrainApply = document.getElementById('envTerrainApply');
+const envTerrainAuto = document.getElementById('envTerrainAuto');
+const envTerrainTargetFps = document.getElementById('envTerrainTargetFps');
+const envTerrainTargetFpsValue = document.getElementById('envTerrainTargetFpsValue');
+const envBuildingRadius = document.getElementById('envBuildingRadius');
+const envBuildingRadiusValue = document.getElementById('envBuildingRadiusValue');
+const envBuildingRadiusCurrent = document.getElementById('envBuildingRadiusCurrent');
+const envBuildingApply = document.getElementById('envBuildingApply');
+const envBuildingAuto = document.getElementById('envBuildingAuto');
+const envBuildingTargetFps = document.getElementById('envBuildingTargetFps');
+const envBuildingTargetFpsValue = document.getElementById('envBuildingTargetFpsValue');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 const displayNameInput = document.getElementById('displayNameInput');
 const displayNameSave = document.getElementById('displayNameSave');
@@ -131,8 +163,7 @@ if (controlTabsRoot) {
 }
 
 menuBtn?.addEventListener('click', openMenu);
-perfHud?.addEventListener('click', openMenu);
-perfHud?.addEventListener('keydown', (e) => {
+menuBtn?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault();
     openMenu();
@@ -232,6 +263,18 @@ export const ui = {
   miniMapMove, miniMapSnap,
   terrainRelayStatus, terrainRelayInput, terrainDatasetInput,
   terrainModeGeohash, terrainModeLatLng,
+  envInteractiveRing, envInteractiveRingValue, envInteractiveRingCurrent,
+  envVisualRing, envVisualRingValue, envVisualRingCurrent,
+  envFarfieldExtra, envFarfieldExtraValue, envFarfieldExtraCurrent,
+  envFarfieldNearPad, envFarfieldNearPadValue, envFarfieldNearPadCurrent,
+  envFarfieldBudget, envFarfieldBudgetValue, envFarfieldBudgetCurrent,
+  envFarfieldBatch, envFarfieldBatchValue, envFarfieldBatchCurrent,
+  envTileRadius, envTileRadiusValue, envTileRadiusCurrent,
+  envTerrainApply, envTerrainAuto,
+  envTerrainTargetFps, envTerrainTargetFpsValue,
+  envBuildingRadius, envBuildingRadiusValue, envBuildingRadiusCurrent,
+  envBuildingApply, envBuildingAuto,
+  envBuildingTargetFps, envBuildingTargetFpsValue,
   displayNameInput, displayNameSave, toastHost,
   applyHudStatusDot,
   openMenu, closeMenu,

@@ -133,6 +133,7 @@
         <button id="hudGpsReckon" type="button" class="hud-button" aria-pressed="false" title="Toggle GPS lock">GPS</button>
         <button id="hudDebugToggle" type="button" class="hud-button" aria-pressed="false" title="Toggle debug overlay">Debug</button>
         <button id="hudReset" type="button" class="hud-button" title="Clear caches and reload">Reset</button>
+        <button id="menuBtn" type="button" class="hud-button" title="Opens control panel">Controls</button>
       </div>
     </div>
   </div>
@@ -182,6 +183,7 @@
         <button class="control-tab is-active" role="tab" aria-selected="true" aria-controls="tab-overview" data-tab="overview">Overview</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-navigation" data-tab="navigation">Navigation</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-networking" data-tab="networking">Networking</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-environment" data-tab="environment">Environment</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-diagnostics" data-tab="diagnostics">Diagnostics</button>
       </div>
       <div class="control-tabpanels">
@@ -276,6 +278,64 @@
             <h3 class="section-title">Peers</h3>
             <div class="tiny" id="peerSummary">—</div>
             <div id="peerList" class="peer-list"></div>
+          </section>
+        </div>
+
+        <div class="tab-panel" id="tab-environment" role="tabpanel" data-tab-panel="environment" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Terrain LOD</h3>
+            <div class="slider-row">
+              <label for="envInteractiveRing">Interactive Ring <span class="mono" id="envInteractiveRingValue">4</span> <span class="tiny env-current" id="envInteractiveRingCurrent">(engine: 4)</span></label>
+              <input id="envInteractiveRing" type="range" min="1" max="10" step="1" value="4" />
+            </div>
+            <div class="slider-row">
+              <label for="envVisualRing">Visual Ring <span class="mono" id="envVisualRingValue">8</span> <span class="tiny env-current" id="envVisualRingCurrent">(engine: 8)</span></label>
+              <input id="envVisualRing" type="range" min="2" max="18" step="1" value="8" />
+            </div>
+            <div class="slider-row">
+              <label for="envFarfieldExtra">Farfield Extension <span class="mono" id="envFarfieldExtraValue">60</span> <span class="tiny env-current" id="envFarfieldExtraCurrent">(engine: 60)</span></label>
+              <input id="envFarfieldExtra" type="range" min="1" max="120" step="1" value="60" />
+            </div>
+            <div class="slider-row">
+              <label for="envFarfieldNearPad">Near Seam Padding <span class="mono" id="envFarfieldNearPadValue">6</span> <span class="tiny env-current" id="envFarfieldNearPadCurrent">(engine: 6)</span></label>
+              <input id="envFarfieldNearPad" type="range" min="0" max="24" step="1" value="6" />
+            </div>
+            <div class="slider-row">
+              <label for="envFarfieldBudget">Farfield Create Budget <span class="mono" id="envFarfieldBudgetValue">60</span> <span class="tiny env-current" id="envFarfieldBudgetCurrent">(engine: 60)</span></label>
+              <input id="envFarfieldBudget" type="range" min="5" max="160" step="5" value="60" />
+            </div>
+            <div class="slider-row">
+              <label for="envFarfieldBatch">Farfield Batch Size <span class="mono" id="envFarfieldBatchValue">48</span> <span class="tiny env-current" id="envFarfieldBatchCurrent">(engine: 48)</span></label>
+              <input id="envFarfieldBatch" type="range" min="8" max="128" step="4" value="48" />
+            </div>
+            <div class="slider-row">
+              <label for="envTileRadius">Tile Radius <span class="mono" id="envTileRadiusValue">100 m</span> <span class="tiny env-current" id="envTileRadiusCurrent">(engine: 100 m)</span></label>
+              <input id="envTileRadius" type="range" min="60" max="180" step="5" value="100" />
+            </div>
+            <div class="button-row">
+              <button id="envTerrainApply" type="button">Update Terrain</button>
+              <button id="envTerrainAuto" type="button" data-state="on">Auto (On)</button>
+            </div>
+            <div class="slider-row">
+              <label for="envTerrainTargetFps">Target FPS <span class="mono" id="envTerrainTargetFpsValue">60 fps</span></label>
+              <input id="envTerrainTargetFps" type="range" min="0" max="60" step="1" value="60" />
+            </div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Buildings</h3>
+            <div class="slider-row">
+              <label for="envBuildingRadius">Building Radius <span class="mono" id="envBuildingRadiusValue">3000 m</span> <span class="tiny env-current" id="envBuildingRadiusCurrent">(engine: 3000 m)</span></label>
+              <input id="envBuildingRadius" type="range" min="400" max="8000" step="100" value="3000" />
+            </div>
+            <div class="button-row">
+              <button id="envBuildingApply" type="button">Update Buildings</button>
+              <button id="envBuildingAuto" type="button" data-state="on">Auto (On)</button>
+            </div>
+            <div class="slider-row">
+              <label for="envBuildingTargetFps">Target FPS <span class="mono" id="envBuildingTargetFpsValue">60 fps</span></label>
+              <input id="envBuildingTargetFps" type="range" min="0" max="60" step="1" value="60" />
+            </div>
           </section>
         </div>
 

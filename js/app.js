@@ -239,6 +239,11 @@ class App {
       tileManager: this.hexGridMgr,
     });
 
+    this._terrainAuto = true;
+    this._buildingAuto = true;
+    this._terrainUpdateTimer = null;
+    this._buildingUpdateTimer = null;
+
     const initialProfile = this._perf.profile();
     const initialTiles = this.hexGridMgr.applyPerfProfile?.(initialProfile) || null;
     const initialBuildings = this.buildings.applyPerfProfile?.(initialProfile) || null;
@@ -519,6 +524,8 @@ class App {
       this.hexGridMgr.setRelayDataset(dataset);
       this.hexGridMgr.refreshTiles();
     });
+
+    this._setupEnvironmentControls();
 
     modeGeohash?.addEventListener('change', () => {
       if (!modeGeohash.checked) return;
@@ -898,6 +905,342 @@ class App {
     ui.hudDebugToggle.dataset.state = on ? 'on' : 'off';
     ui.hudDebugToggle.textContent = 'Debug';
     ui.hudDebugToggle.title = on ? 'Debug visuals enabled' : 'Show debug visuals';
+  }
+
+  _setupEnvironmentControls() {
+    const {
+      envInteractiveRing,
+      envInteractiveRingValue,
+      envVisualRing,
+      envVisualRingValue,
+      envFarfieldExtra,
+      envFarfieldExtraValue,
+      envFarfieldNearPad,
+      envFarfieldNearPadValue,
+      envFarfieldBudget,
+      envFarfieldBudgetValue,
+      envFarfieldBatch,
+      envFarfieldBatchValue,
+      envTileRadius,
+      envTileRadiusValue,
+      envTerrainApply,
+      envTerrainAuto,
+      envTerrainTargetFps,
+      envTerrainTargetFpsValue,
+      envBuildingRadius,
+      envBuildingRadiusValue,
+      envBuildingApply,
+      envBuildingAuto,
+      envBuildingTargetFps,
+      envBuildingTargetFpsValue,
+    } = ui;
+
+    if (!envInteractiveRing || !envVisualRing) {
+      this._syncTerrainControls = null;
+      this._syncBuildingControls = null;
+      this._syncEnvironmentTargets = null;
+      return;
+    }
+
+    const setText = (el, text) => { if (el) el.textContent = text; };
+    const setCurrent = (el, text, suffix = '') => {
+      if (!el) return;
+      const value = text != null ? text : '—';
+      el.textContent = `(engine: ${value}${suffix})`;
+    };
+
+    const updateTerrainCurrent = (settings) => {
+      if (!settings) return;
+      setCurrent(envInteractiveRingCurrent, settings.interactiveRing);
+      setCurrent(envVisualRingCurrent, settings.visualRing);
+      setCurrent(envFarfieldExtraCurrent, settings.farfieldExtra);
+      setCurrent(envFarfieldNearPadCurrent, settings.farfieldNearPad);
+      setCurrent(envFarfieldBudgetCurrent, settings.farfieldCreateBudget);
+      setCurrent(envFarfieldBatchCurrent, settings.farfieldBatchSize);
+      setCurrent(envTileRadiusCurrent, settings.tileRadius, ' m');
+    };
+    this._updateTerrainCurrentDisplay = updateTerrainCurrent;
+
+    const syncTerrainControls = () => {
+      const settings = this.hexGridMgr?.getTerrainSettings?.();
+      if (!settings) return;
+      const interactive = Math.round(settings.interactiveRing ?? this.hexGridMgr?.INTERACTIVE_RING ?? 4);
+      envInteractiveRing.value = interactive;
+      setText(envInteractiveRingValue, interactive);
+      envVisualRing.min = String(interactive + 1);
+      const visual = Math.max(interactive + 1, Math.round(settings.visualRing ?? interactive + 2));
+      envVisualRing.value = visual;
+      setText(envVisualRingValue, visual);
+      const farExtra = Math.max(1, Math.round(settings.farfieldExtra ?? this.hexGridMgr?.FARFIELD_EXTRA ?? 60));
+      envFarfieldExtra.value = farExtra;
+      setText(envFarfieldExtraValue, farExtra);
+      const nearPad = Math.max(0, Math.round(settings.farfieldNearPad ?? this.hexGridMgr?.FARFIELD_NEAR_PAD ?? 6));
+      envFarfieldNearPad.value = nearPad;
+      setText(envFarfieldNearPadValue, nearPad);
+      const budget = Math.max(1, Math.round(settings.farfieldCreateBudget ?? this.hexGridMgr?.FARFIELD_CREATE_BUDGET ?? 60));
+      envFarfieldBudget.value = budget;
+      setText(envFarfieldBudgetValue, budget);
+      const batch = Math.max(1, Math.round(settings.farfieldBatchSize ?? this.hexGridMgr?.FARFIELD_BATCH_SIZE ?? 48));
+      envFarfieldBatch.value = batch;
+      setText(envFarfieldBatchValue, batch);
+      if (envTileRadius) {
+        const radius = Math.round(settings.tileRadius ?? this.hexGridMgr?.tileRadius ?? 100);
+        envTileRadius.value = radius;
+        setText(envTileRadiusValue, `${radius} m`);
+      }
+      updateTerrainCurrent(settings);
+    };
+    this._syncTerrainControls = syncTerrainControls;
+
+    const updateBuildingCurrent = (settings) => {
+      if (!settings) return;
+      setCurrent(envBuildingRadiusCurrent, settings.radius, ' m');
+    };
+    this._updateBuildingCurrentDisplay = updateBuildingCurrent;
+
+    const syncBuildingControls = () => {
+      const settings = this.buildings?.getBuildingSettings?.();
+      if (!settings) return;
+      const radius = Math.round(settings.radius ?? this.buildings?.radius ?? 3000);
+      envBuildingRadius.value = radius;
+      setText(envBuildingRadiusValue, `${radius} m`);
+      updateBuildingCurrent(settings);
+    };
+    this._syncBuildingControls = syncBuildingControls;
+
+    const syncTargets = () => {
+      const fps = Math.round(this._perf?.profile?.().targetFps ?? 60);
+      if (envTerrainTargetFps) envTerrainTargetFps.value = fps;
+      setText(envTerrainTargetFpsValue, `${fps} fps`);
+      if (envBuildingTargetFps) envBuildingTargetFps.value = fps;
+      setText(envBuildingTargetFpsValue, `${fps} fps`);
+    };
+    this._syncEnvironmentTargets = syncTargets;
+
+    const handleInteractiveInput = () => {
+      const val = Number(envInteractiveRing.value);
+      setText(envInteractiveRingValue, val);
+      envVisualRing.min = String(val + 1);
+      if (Number(envVisualRing.value) < val + 1) {
+        envVisualRing.value = val + 1;
+      }
+      setText(envVisualRingValue, envVisualRing.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    };
+
+    envInteractiveRing.addEventListener('input', handleInteractiveInput);
+    envVisualRing.addEventListener('input', () => {
+      setText(envVisualRingValue, envVisualRing.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFarfieldExtra?.addEventListener('input', () => {
+      setText(envFarfieldExtraValue, envFarfieldExtra.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFarfieldNearPad?.addEventListener('input', () => {
+      setText(envFarfieldNearPadValue, envFarfieldNearPad.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFarfieldBudget?.addEventListener('input', () => {
+      setText(envFarfieldBudgetValue, envFarfieldBudget.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFarfieldBatch?.addEventListener('input', () => {
+      setText(envFarfieldBatchValue, envFarfieldBatch.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envTileRadius?.addEventListener('input', () => {
+      setText(envTileRadiusValue, `${envTileRadius.value} m`);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envBuildingRadius?.addEventListener('input', () => {
+      setText(envBuildingRadiusValue, `${envBuildingRadius.value} m`);
+      this._disableBuildingAuto();
+      this._scheduleBuildingUpdate();
+    });
+
+    envTerrainApply?.addEventListener('click', () => {
+      this._disableTerrainAuto();
+      this._applyTerrainSettingsFromUi();
+    });
+    envTerrainAuto?.addEventListener('click', () => {
+      const target = Number(envTerrainTargetFps?.value ?? this._perf?.profile?.().targetFps ?? 60);
+      this._enableTerrainAuto(target);
+    });
+    envTerrainTargetFps?.addEventListener('input', (e) => {
+      const val = Number(e.target.value);
+      this._handleTargetFpsChange(val);
+    });
+
+    envBuildingApply?.addEventListener('click', () => {
+      this._disableBuildingAuto();
+      this._applyBuildingSettingsFromUi();
+    });
+    envBuildingAuto?.addEventListener('click', () => {
+      const target = Number(envBuildingTargetFps?.value ?? this._perf?.profile?.().targetFps ?? 60);
+      this._enableBuildingAuto(target);
+    });
+    envBuildingTargetFps?.addEventListener('input', (e) => {
+      const val = Number(e.target.value);
+      this._handleTargetFpsChange(val);
+    });
+
+    syncTerrainControls();
+    syncBuildingControls();
+    syncTargets();
+    this._syncEnvironmentAutoButtons();
+  }
+
+  _syncEnvironmentAutoButtons() {
+    if (ui.envTerrainAuto) {
+      ui.envTerrainAuto.classList.toggle('on', !!this._terrainAuto);
+      ui.envTerrainAuto.setAttribute('aria-pressed', this._terrainAuto ? 'true' : 'false');
+      ui.envTerrainAuto.dataset.state = this._terrainAuto ? 'on' : 'off';
+      ui.envTerrainAuto.textContent = this._terrainAuto ? 'Auto (On)' : 'Auto (Off)';
+    }
+    if (ui.envBuildingAuto) {
+      ui.envBuildingAuto.classList.toggle('on', !!this._buildingAuto);
+      ui.envBuildingAuto.setAttribute('aria-pressed', this._buildingAuto ? 'true' : 'false');
+      ui.envBuildingAuto.dataset.state = this._buildingAuto ? 'on' : 'off';
+      ui.envBuildingAuto.textContent = this._buildingAuto ? 'Auto (On)' : 'Auto (Off)';
+    }
+  }
+
+  _collectTerrainSettingsFromUi() {
+    const interactive = Number(ui.envInteractiveRing?.value ?? this.hexGridMgr?.INTERACTIVE_RING ?? 4);
+    const visualRaw = Number(ui.envVisualRing?.value ?? this.hexGridMgr?.VISUAL_RING ?? interactive + 2);
+    const visual = Math.max(interactive + 1, visualRaw);
+    const farExtra = Math.max(1, Number(ui.envFarfieldExtra?.value ?? this.hexGridMgr?.FARFIELD_EXTRA ?? 60));
+    const nearPad = Math.max(0, Number(ui.envFarfieldNearPad?.value ?? this.hexGridMgr?.FARFIELD_NEAR_PAD ?? 6));
+    const budget = Math.max(1, Number(ui.envFarfieldBudget?.value ?? this.hexGridMgr?.FARFIELD_CREATE_BUDGET ?? 60));
+    const batch = Math.max(1, Number(ui.envFarfieldBatch?.value ?? this.hexGridMgr?.FARFIELD_BATCH_SIZE ?? 48));
+    const tileRadius = Math.max(10, Number(ui.envTileRadius?.value ?? this.hexGridMgr?.tileRadius ?? 100));
+    return {
+      interactiveRing: interactive,
+      visualRing: visual,
+      farfieldExtra: farExtra,
+      farfieldNearPad: nearPad,
+      farfieldCreateBudget: budget,
+      farfieldBatchSize: batch,
+      tileRadius,
+    };
+  }
+
+  _applyTerrainSettingsFromUi({ auto = false } = {}) {
+    if (!this.hexGridMgr?.updateTerrainSettings) return;
+    if (this._terrainUpdateTimer) {
+      clearTimeout(this._terrainUpdateTimer);
+      this._terrainUpdateTimer = null;
+    }
+    const config = this._collectTerrainSettingsFromUi();
+    this.hexGridMgr.updateTerrainSettings(config);
+    if (!auto) this._terrainAuto = false;
+    this._syncEnvironmentAutoButtons();
+    const settings = this.hexGridMgr.getTerrainSettings?.();
+    if (settings) this._updateTerrainCurrentDisplay?.(settings);
+    this._syncTerrainControls?.();
+    this._syncBuildingControls?.();
+  }
+
+  _enableTerrainAuto(targetFps) {
+    if (!this.hexGridMgr?.resetTerrainSettings) return;
+    this.hexGridMgr.resetTerrainSettings();
+    const profile = this._perf?.profile?.();
+    if (profile) this.hexGridMgr.applyPerfProfile(profile);
+    this._terrainAuto = true;
+    this._syncTerrainControls?.();
+    this._updateTerrainCurrentDisplay?.(this.hexGridMgr?.getTerrainSettings?.());
+    this._syncEnvironmentAutoButtons();
+    this._syncEnvironmentTargets?.();
+    this._handleTargetFpsChange(targetFps);
+  }
+
+  _collectBuildingSettingsFromUi() {
+    const radius = Math.max(200, Number(ui.envBuildingRadius?.value ?? this.buildings?.radius ?? 3000));
+    return { radius };
+  }
+
+  _applyBuildingSettingsFromUi({ auto = false } = {}) {
+    if (!this.buildings?.updateBuildingSettings) return;
+    if (this._buildingUpdateTimer) {
+      clearTimeout(this._buildingUpdateTimer);
+      this._buildingUpdateTimer = null;
+    }
+    const settings = this._collectBuildingSettingsFromUi();
+    this.buildings.updateBuildingSettings(settings);
+    if (!auto) this._buildingAuto = false;
+    this._syncEnvironmentAutoButtons();
+    this._updateBuildingCurrentDisplay?.(this.buildings?.getBuildingSettings?.());
+    this._syncBuildingControls?.();
+  }
+
+  _enableBuildingAuto(targetFps) {
+    if (!this.buildings?.resetBuildingSettings) return;
+    this.buildings.resetBuildingSettings();
+    const profile = this._perf?.profile?.();
+    if (profile) this.buildings.applyPerfProfile(profile);
+    this._buildingAuto = true;
+    this._syncBuildingControls?.();
+    this._updateBuildingCurrentDisplay?.(this.buildings?.getBuildingSettings?.());
+    this._syncEnvironmentAutoButtons();
+    this._syncEnvironmentTargets?.();
+    this._handleTargetFpsChange(targetFps);
+  }
+
+  _disableTerrainAuto() {
+    if (!this._terrainAuto) return;
+    this._terrainAuto = false;
+    this._syncEnvironmentAutoButtons();
+  }
+
+  _disableBuildingAuto() {
+    if (!this._buildingAuto) return;
+    this._buildingAuto = false;
+    this._syncEnvironmentAutoButtons();
+  }
+
+  _scheduleTerrainUpdate() {
+    if (this._terrainUpdateTimer) clearTimeout(this._terrainUpdateTimer);
+    this._terrainUpdateTimer = setTimeout(() => {
+      this._terrainUpdateTimer = null;
+      this._applyTerrainSettingsFromUi();
+    }, 150);
+  }
+
+  _scheduleBuildingUpdate() {
+    if (this._buildingUpdateTimer) clearTimeout(this._buildingUpdateTimer);
+    this._buildingUpdateTimer = setTimeout(() => {
+      this._buildingUpdateTimer = null;
+      this._applyBuildingSettingsFromUi();
+    }, 150);
+  }
+
+  _handleTargetFpsChange(value) {
+    const fps = Number.isFinite(value) ? Math.max(1, Math.round(value)) : 60;
+    this._perf?.setTargetFps?.(fps);
+    if (ui.envTerrainTargetFps) ui.envTerrainTargetFps.value = fps;
+    if (ui.envTerrainTargetFpsValue) ui.envTerrainTargetFpsValue.textContent = `${fps} fps`;
+    if (ui.envBuildingTargetFps) ui.envBuildingTargetFps.value = fps;
+    if (ui.envBuildingTargetFpsValue) ui.envBuildingTargetFpsValue.textContent = `${fps} fps`;
+  }
+
+  _refreshEnvironmentTerrainSummary() {
+    const settings = this.hexGridMgr?.getTerrainSettings?.();
+    if (settings) this._updateTerrainCurrentDisplay?.(settings);
+    if (this._terrainAuto) this._syncTerrainControls?.();
+  }
+
+  _refreshEnvironmentBuildingSummary() {
+    const settings = this.buildings?.getBuildingSettings?.();
+    if (settings) this._updateBuildingCurrentDisplay?.(settings);
+    if (this._buildingAuto) this._syncBuildingControls?.();
   }
 
   _applyDebugMode() {
@@ -2191,7 +2534,9 @@ class App {
       const tileSummary = measure('tiles.applyProfile', () => this.hexGridMgr?.applyPerfProfile?.(perfState) || null);
       const buildingSummary = measure('buildings.applyProfile', () => this.buildings?.applyPerfProfile?.(perfState) || null);
       if (tileSummary) this._perfSnapshots.tiles = tileSummary;
+      if (tileSummary) this._refreshEnvironmentTerrainSummary(tileSummary);
       if (buildingSummary) this._perfSnapshots.buildings = buildingSummary;
+      if (buildingSummary) this._refreshEnvironmentBuildingSummary(buildingSummary);
     }
 
     const originForSun = this.hexGridMgr?.origin;

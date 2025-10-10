@@ -44,6 +44,7 @@ export class TileManager {
     this.VISUAL_CREATE_BUDGET = 4;
     this.FARFIELD_CREATE_BUDGET = 60;
     this.FARFIELD_BATCH_SIZE = 48;
+    this.FARFIELD_NEAR_PAD = 6;
 
     // ---- interactive (high-res) relaxation ----
     this.RELAX_ITERS_PER_FRAME = 20;
@@ -94,6 +95,17 @@ export class TileManager {
       farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
+    };
+    this._defaultTerrainSettings = {
+      interactiveRing: this.INTERACTIVE_RING,
+      visualRing: this.VISUAL_RING,
+      farfieldExtra: this.FARFIELD_EXTRA,
+      farfieldRing: this.FARFIELD_RING,
+      farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
+      farfieldNearPad: this.FARFIELD_NEAR_PAD,
+      tileRadius: this.tileRadius,
+      spacing: this.spacing,
     };
     this._lodQuality = 1;
 
@@ -587,12 +599,13 @@ _stitchInteractiveToVisualEdges(tile, {
     }
   }
 
-
   _farfieldTierForDist(dist) {
-    if (dist <= this.VISUAL_RING + 24) return { stride: 3, scale: 3, samples: 'all', minPrec: 5 };
-    if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 6, samples: 'tips', minPrec: 4 };
-    if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 12, samples: 'tips', minPrec: 3 };
-    return { stride: 24, scale: 24, samples: 'tips', minPrec: 3 }; // keep corners so seams match
+    const nearPad = Math.max(2, Number.isFinite(this.FARFIELD_NEAR_PAD) ? this.FARFIELD_NEAR_PAD : 6);
+    if (dist <= this.VISUAL_RING + nearPad) return { stride: 1, scale: 1, samples: 'all', minPrec: 6 };
+    if (dist <= this.VISUAL_RING + 24) return { stride: 2, scale: 2, samples: 'tips', minPrec: 5 };
+    if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 4, samples: 'tips', minPrec: 4 };
+    if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 8, samples: 'tips', minPrec: 3 };
+    return { stride: 24, scale: 12, samples: 'center', minPrec: 3 }; // keep corners so seams match
   }
   _sealFarfieldCornersAgainstNeighbors(tile) {
     if (!tile || tile.type !== 'farfield') return;
@@ -664,6 +677,34 @@ _stitchInteractiveToVisualEdges(tile, {
     tile._adapterDirty = true;
     const key = this._farfieldAdapterKey(tile);
     if (key) this._farfieldAdapterDirty.add(key);
+  }
+  _resetFarfieldTileState(tile) {
+    if (!tile || tile.type !== 'farfield') return;
+    if (tile.ready) tile.ready.fill(0);
+    tile.unreadyCount = tile.pos?.count ?? 0;
+    if (tile.fetched) tile.fetched.clear();
+    tile.populating = false;
+  }
+  _fallbackFarfieldTile(tile) {
+    if (!tile || tile.type !== 'farfield') return false;
+    const currentMode = tile._farSampleMode || 'all';
+    if (currentMode !== 'all') {
+      tile._farSampleMode = 'all';
+      this._resetFarfieldTileState(tile);
+      this._queuePopulatePhase(tile, PHASE_FULL, true);
+      return true;
+    }
+    const scale = Math.max(1, Math.round(tile.scale || 1));
+    if (scale > 1) {
+      const id = `${tile.q},${tile.r}`;
+      const minPrec = Math.max(5, tile._farMinPrec || 5);
+      this._discardTile(id);
+      const t = this._addFarfieldTile(tile.q, tile.r, 1, 'all');
+      t._farMinPrec = minPrec;
+      this._queuePopulateIfNeeded(t, true);
+      return true;
+    }
+    return false;
   }
   _ensureFarfieldAdapter(tile) {
     if (!tile || tile.type !== 'farfield') return;
@@ -1505,6 +1546,10 @@ _stitchInteractiveToVisualEdges(tile, {
     this._initColorsNearBlack(tile);
     this._invalidateHeightCache();
     this._ensureFarfieldAdapter(tile);
+    for (const [dq, dr] of HEX_DIRS) {
+      const neighbor = this._getTile(q + dq, r + dr);
+      if (neighbor && neighbor.type === 'farfield') this._markFarfieldAdapterDirty(neighbor);
+    }
 
     if (!this._nextFarfieldLog || this._nowMs() >= this._nextFarfieldLog) {
       console.log('[tiles.farfield] add', { id, verts: tile.pos.count, scale, sampleMode });
@@ -2342,6 +2387,10 @@ _stitchInteractiveToVisualEdges(tile, {
       ? indices.filter((idx) => tile.ready[idx] !== 1)
       : [];
     if (missing.length) {
+      if (tile.type === 'farfield' && this._fallbackFarfieldTile(tile)) {
+        if (tile && typeof tile === 'object') tile.populating = false;
+        return;
+      }
       const allowRetry = this._registerPhaseRetry(tile, phase);
       if (allowRetry) {
         const key = this._phaseKey(phase);
@@ -3006,6 +3055,96 @@ _stitchInteractiveToVisualEdges(tile, {
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: Number(this.RELAX_FRAME_BUDGET_MS.toFixed(2)),
     };
+  }
+
+  getTerrainSettings() {
+    return {
+      interactiveRing: this.INTERACTIVE_RING,
+      visualRing: this.VISUAL_RING,
+      farfieldExtra: this.FARFIELD_EXTRA,
+      farfieldRing: this.FARFIELD_RING,
+      farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
+      farfieldNearPad: this.FARFIELD_NEAR_PAD,
+      tileRadius: this.tileRadius,
+      spacing: this.spacing,
+    };
+  }
+
+  getDefaultTerrainSettings() {
+    return { ...this._defaultTerrainSettings };
+  }
+
+  updateTerrainSettings({
+    interactiveRing,
+    visualRing,
+    farfieldExtra,
+    farfieldCreateBudget,
+    farfieldBatchSize,
+    farfieldNearPad,
+    tileRadius,
+    spacing,
+  } = {}) {
+    let needReset = false;
+    if (Number.isFinite(tileRadius) && tileRadius > 10 && tileRadius !== this.tileRadius) {
+      this.tileRadius = tileRadius;
+      needReset = true;
+    }
+    if (Number.isFinite(spacing) && spacing > 0 && spacing !== this.spacing) {
+      this.spacing = spacing;
+      needReset = true;
+    }
+
+    if (Number.isFinite(interactiveRing)) {
+      this.INTERACTIVE_RING = Math.max(1, Math.round(interactiveRing));
+    }
+    if (Number.isFinite(visualRing)) {
+      this.VISUAL_RING = Math.max(this.INTERACTIVE_RING + 1, Math.round(visualRing));
+    }
+    if (Number.isFinite(farfieldExtra)) {
+      this.FARFIELD_EXTRA = Math.max(1, Math.round(farfieldExtra));
+    }
+    this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
+
+    if (Number.isFinite(farfieldCreateBudget)) {
+      this.FARFIELD_CREATE_BUDGET = Math.max(1, Math.round(farfieldCreateBudget));
+    }
+    if (Number.isFinite(farfieldBatchSize)) {
+      this.FARFIELD_BATCH_SIZE = Math.max(1, Math.round(farfieldBatchSize));
+    }
+    if (Number.isFinite(farfieldNearPad)) {
+      this.FARFIELD_NEAR_PAD = Math.max(0, Math.round(farfieldNearPad));
+    }
+
+    this._baseLod = {
+      ...this._baseLod,
+      interactiveRing: this.INTERACTIVE_RING,
+      visualRing: this.VISUAL_RING,
+      farfieldExtra: this.FARFIELD_EXTRA,
+      farfieldRing: this.FARFIELD_RING,
+      farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
+      farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
+    };
+
+    if (needReset) {
+      this._resetAllTiles();
+      if (this.origin) {
+        this._ensureType(0, 0, 'interactive');
+        this._prewarmVisualRing(0, 0);
+        this._prewarmFarfieldRing(0, 0);
+      }
+    } else {
+      this._markRelaxListDirty();
+      if (this.origin) {
+        this._prewarmVisualRing(0, 0);
+        this._prewarmFarfieldRing(0, 0);
+      }
+    }
+    this._scheduleBackfill(0);
+  }
+
+  resetTerrainSettings() {
+    this.updateTerrainSettings(this.getDefaultTerrainSettings());
   }
 
   _nowMs() {

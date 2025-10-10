@@ -155,6 +155,7 @@ export class BuildingManager {
       : (Number.isFinite(visualRadius) ? visualRadius : 1000);
     this.radius = initialRadius;
     this._baseRadius = initialRadius;
+    this._defaultRadius = initialRadius;
     this._currentPerfQuality = 1;
     this.tileSize = tileSize || (tileManager?.tileRadius ? tileManager.tileRadius * 1.75 : 160);
     this._tileDiagHalf = this.tileSize * Math.SQRT2 * 0.5;
@@ -416,6 +417,33 @@ export class BuildingManager {
       resnapInterval: this._resnapInterval,
       radius: this.radius,
     };
+  }
+
+  getBuildingSettings() {
+    return {
+      radius: this.radius,
+      baseRadius: this._baseRadius,
+      override: this._radiusOverride,
+    };
+  }
+
+  updateBuildingSettings({ radius } = {}) {
+    if (Number.isFinite(radius) && radius > 0) {
+      const r = Math.max(200, Number(radius));
+      this._radiusOverride = r;
+      this._baseRadius = r;
+      this.radius = r;
+      this._refreshRadiusVisibility();
+      this._updateTiles(true);
+    }
+  }
+
+  resetBuildingSettings() {
+    this._radiusOverride = null;
+    this._baseRadius = this._defaultRadius;
+    this.radius = this._defaultRadius;
+    this._refreshRadiusVisibility();
+    this._updateTiles(true);
   }
 
   updateQoS({ fps, target = TARGET_FPS, quality } = {}) {
