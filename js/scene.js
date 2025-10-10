@@ -25,8 +25,6 @@ export class SceneManager {
 
     this.pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(0x1e212b, 1000, 10000);
-    this.scene.background = new THREE.Color(0x1e212b);
 
     // 🎯 Camera stays at (0,0,0) in dolly local space; dolly handles eye height
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
@@ -73,6 +71,13 @@ export class SceneManager {
 
     this._skyEnvTarget = null;
 
+    // ---- Tile radius sampling (used for fog near/far) ----
+    // You can override with setTileRadiusSource(number | () => number)
+    this._tileRadiusSource = 4000; // fallback
+
+    // ---- Sky probe (offscreen) to sample horizon color ----
+    this._initSkyProbe();
+
     addEventListener('resize', () => {
       this.camera.aspect = innerWidth / innerHeight;
       this.camera.updateProjectionMatrix();
@@ -80,6 +85,159 @@ export class SceneManager {
     });
 
     this.updateSun({ lat: 0, lon: 0, date: new Date() });
+  }
+
+  // Public API to supply tile radius (number) or a function that returns a number each call.
+  setTileRadiusSource(src) {
+    this._tileRadiusSource = src;
+    if (this.currentSunAltitude !== undefined) this._syncFogToSky();
+  }
+
+  // ---------- SKY PROBE: offscreen sampling ----------
+  _initSkyProbe() {
+    // Small target; linear color (default), no depth/stencil needed
+    const S = 64;
+    this._probeSize = S;
+    this._probeRT = new THREE.WebGLRenderTarget(S, S, {
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+      type: THREE.UnsignedByteType
+    });
+
+    // Separate scene with a Sky sharing the SAME material (so uniforms track)
+    this._probeScene = new THREE.Scene();
+    this._probeSky = new Sky();
+    this._probeSky.scale.setScalar(60000);
+    this._probeSky.material = this.sky.material; // share the material/uniforms
+    this._probeScene.add(this._probeSky);
+
+    // Level camera; horizon sits at vertical center when level
+    this._probeCamera = new THREE.PerspectiveCamera(75, 1, 1, 100000);
+    this._probeCamera.position.set(0, 0, 0);
+    this._probeCamera.up.set(0, 1, 0);
+    this._probeCamera.lookAt(new THREE.Vector3(0, 0, -1));
+
+    // Buffer reused for reads
+    this._probePixels = new Uint8Array(S * S * 4);
+
+    // Last good color fallback
+    this._lastFogColor = new THREE.Color(0x223344);
+  }
+
+  _sampleSkyHorizonColor() {
+    const rt = this._probeRT;
+    const S = this._probeSize;
+
+    // Save renderer state
+    const prevRT = this.renderer.getRenderTarget();
+    const prevAutoClear = this.renderer.autoClear;
+    const prevClearColor = new THREE.Color();
+    const prevClearAlpha = this.renderer.getClearAlpha();
+    this.renderer.getClearColor(prevClearColor);
+
+    // Render sky-only to offscreen
+    this.renderer.setRenderTarget(rt);
+    this.renderer.autoClear = true;
+    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.clear();
+    this.renderer.render(this._probeScene, this._probeCamera);
+
+    // Read pixels
+    this.renderer.readRenderTargetPixels(rt, 0, 0, S, S, this._probePixels);
+
+    // Restore renderer state
+    this.renderer.setRenderTarget(prevRT);
+    this.renderer.setClearColor(prevClearColor, prevClearAlpha);
+    this.renderer.autoClear = prevAutoClear;
+
+    // Sample a thin band just BELOW the horizon (center - small offset)
+    const offset = Math.max(1, Math.floor(S * 0.02)); // ~2% of height
+    const horizonRow = Math.max(0, Math.min(S - 1, Math.floor(S * 0.5) - offset));
+
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
+
+    // Average across 3 rows to smooth, skip edges
+    for (let dy = 0; dy < 3; dy++) {
+      const y = Math.max(0, Math.min(S - 1, horizonRow - dy));
+      for (let x = 2; x < S - 2; x++) {
+        const idx = (y * S + x) * 4;
+        rSum += this._probePixels[idx + 0];
+        gSum += this._probePixels[idx + 1];
+        bSum += this._probePixels[idx + 2];
+        count++;
+      }
+    }
+
+    if (count === 0) return this._lastFogColor.clone();
+
+    // Pixels are in linear space (target encoding is LinearEncoding)
+    const r = (rSum / count) / 255;
+    const g = (gSum / count) / 255;
+    const b = (bSum / count) / 255;
+
+    // Guard against fully transparent/black clears (shouldn't happen since Sky fills)
+    const c = (r + g + b) > 0.0001 ? new THREE.Color(r, g, b) : this._lastFogColor.clone();
+    this._lastFogColor.copy(c);
+    return c;
+  }
+
+  // ---------- Tile radius helpers & fog distances ----------
+  _sampleTileRadius() {
+    const src = this._tileRadiusSource;
+    let r = (typeof src === 'function') ? src() : src;
+    if (!isFinite(r) || r <= 0) r = 4000;
+    return r;
+  }
+
+  // Start close for atmospheric perspective; scale far with tile radius; tighten at night/haze
+  _computeFogDistances(tileRadius, altitude, turbidity) {
+    const R = tileRadius;
+
+    const altDeg = THREE.MathUtils.radToDeg(altitude ?? 0);
+    const night = 1 - THREE.MathUtils.smoothstep(altDeg, -12, 10); // 0 day -> 1 night
+    const haze  = THREE.MathUtils.clamp((turbidity - 2) / 8, 0, 1);
+
+    const nearBase = THREE.MathUtils.clamp(R * 0.012, 10, 40);      // ~10–40m typical
+    let near = nearBase * (1 - 0.35 * haze) * (1 - 0.25 * night);
+
+    const farBase = R * 1.45;
+    let far = farBase * (1 - 0.18 * haze - 0.28 * night);
+
+    // Clamp and keep healthy separation
+    const EPS = 5;
+    near = THREE.MathUtils.clamp(near, this.camera.near + EPS, this.camera.far - EPS);
+    far  = THREE.MathUtils.clamp(far,  near + 150,          this.camera.far - EPS);
+
+    return { near, far };
+  }
+
+  _syncFogToSky() {
+    const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
+
+    // 🔍 Sample the true horizon color from the Sky shader
+    const fogColor = this._sampleSkyHorizonColor();
+
+    // Distances based on tile radius + atmosphere
+    const tileRadius = this._sampleTileRadius();
+    const { near, far } = this._computeFogDistances(tileRadius, this.currentSunAltitude ?? 0, turbidity);
+
+    if (!this.scene.fog) {
+      this.scene.fog = new THREE.Fog(fogColor.clone(), near, far);
+    } else {
+      this.scene.fog.color.copy(fogColor);
+      this.scene.fog.near = near;
+      this.scene.fog.far  = far;
+    }
+
+    // Match clear color so sky/fog blend seamlessly at edges
+    this.renderer.setClearColor(fogColor, 1);
+
+    // Ensure Sky is visible (not a solid color background)
+    if (this.scene.background && this.scene.background.isColor) {
+      this.scene.background = null;
+    }
   }
 
   updateSun({
@@ -116,6 +274,9 @@ export class SceneManager {
     if (this._skyEnvTarget) this._skyEnvTarget.dispose();
     this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
     this.scene.environment = this._skyEnvTarget.texture;
+
+    // ⬇️ keep fog in lockstep with sky & tile radius
+    this._syncFogToSky();
   }
 
   _computeSunDirection(lat, lon, date) {

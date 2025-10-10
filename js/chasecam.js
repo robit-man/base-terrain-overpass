@@ -45,7 +45,7 @@ export class ChaseCam {
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
       this.targetBoom = THREE.MathUtils.clamp(
-        this.targetBoom + e.deltaY * 0.01,
+        this.targetBoom + e.deltaY * 0.1,
         this.minBoom,
         this.maxBoom
       );

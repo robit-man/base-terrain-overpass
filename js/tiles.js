@@ -24,7 +24,7 @@ const HEX_DIRS = [
 ];
 
 export class TileManager {
-  constructor(scene, spacing = 20, tileRadius = 60, audio = null) {
+  constructor(scene, spacing = 20, tileRadius = 100, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.tiles = new Map(); this.origin = null;
@@ -35,9 +35,9 @@ export class TileManager {
     this._interactiveSecondPass = false;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 2;
+    this.INTERACTIVE_RING = 1;
     this.VISUAL_RING = 8;
-    this.FARFIELD_EXTRA = 4;
+    this.FARFIELD_EXTRA = 50;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
     this.VISUAL_CREATE_BUDGET = 4;
@@ -230,6 +230,117 @@ export class TileManager {
     }
     return out;
   }
+// Smoothly force interactive edges to match straight visual edges,
+// with a short radial blend band so there are no gaps or hard kinks.
+_stitchInteractiveToVisualEdges(tile, {
+  bandRatio = 0.07,              // ~7% of radius inward is blended
+  sideArc   = Math.PI / 10       // angular width considered "this side"
+} = {}) {
+  if (!tile || tile.type !== 'interactive') return;
+
+  const pos   = tile.pos;
+  const aR    = this.tileRadius;
+  const base  = tile.grid.group.position;
+  const tips  = this._selectCornerTipIndices(tile);
+  if (!tips || tips.length < 6) return;
+
+  // angular centers for the 6 sides (halfway between corners)
+  const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+  const RIM_STRICT   = aR * 0.985;                // true outer rim, matches _isRimVertex/_pinEdgesFromCorners
+  const BAND_INNER   = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio))); // inner edge of blend band
+
+  // utility
+  const rayToMesh = (mesh, x, z) => {
+    if (!mesh) return null;
+    this.ray.set(new THREE.Vector3(x, 1e6, z), this.DOWN);
+    const hit = this.ray.intersectObject(mesh, true);
+    return (hit && hit.length) ? hit[0].point.y : null;
+  };
+
+  // For each of the 6 sides, if neighbor is visual/farfield, collate a side band and blend to a straight line.
+  for (let s = 0; s < 6; s++) {
+    // neighbor across side s
+    const nq = tile.q + HEX_DIRS[s][0];
+    const nr = tile.r + HEX_DIRS[s][1];
+    const nTile = this._getTile(nq, nr);
+    if (!nTile || (nTile.type === 'interactive')) continue; // only stitch to visual/farfield
+
+    const nMesh = this._getMeshForTile(nTile);
+
+    // the two corner tips that bound side s
+    const iA = tips[s];
+    const iB = tips[(s + 1) % 6];
+    if (iA == null || iB == null) continue;
+
+    // world positions of those corner tips
+    const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA);
+    const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB);
+
+    // heights from the neighbor *visual* (authoritative for the shared edge).
+    // fallback to our own if sampling fails
+    let Ay = rayToMesh(nMesh, Ax, Az);
+    let By = rayToMesh(nMesh, Bx, Bz);
+    if (!Number.isFinite(Ay)) Ay = pos.getY(iA);
+    if (!Number.isFinite(By)) By = pos.getY(iB);
+
+    // AB for projecting t along the edge segment
+    const ABx = (Bx - Ax), ABz = (Bz - Az);
+    const denom = ABx * ABx + ABz * ABz;
+    if (denom < 1e-8) continue;
+
+    // pass 1: compute and apply to the *rim* (exact line), and collect band vertices to feather
+    const bandIdx = [];
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+      if (r < BAND_INNER) continue; // only edge band
+      // Is this vertex aligned with side s by angle?
+      const a = this._angleOf(x, z);
+      const d = this._angDiff(a, sideAng[s]);
+      if (d > sideArc) continue;
+
+      const wx = base.x + x, wz = base.z + z;
+      // param t along AB (0 at A, 1 at B)
+      let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
+      if (!Number.isFinite(t)) t = 0;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+
+      // straight-line height at this edge point
+      const yLine = Ay + t * (By - Ay);
+
+      if (r >= RIM_STRICT) {
+        // true rim: snap exactly to straight line and keep it pinned
+        pos.setY(i, yLine);
+        if (tile.locked) tile.locked[i] = 1; // prevent relax from curving it later
+      } else {
+        // inside the rim: we'll feather in pass 2
+        bandIdx.push({ i, r, yLine });
+      }
+    }
+
+    // pass 2: feather the inner band (smoothly blend original -> line as we approach the rim)
+    if (bandIdx.length) {
+      const span = Math.max(1e-4, aR - BAND_INNER);
+      for (const { i, r, yLine } of bandIdx) {
+        const y0 = pos.getY(i);
+        // radial weight: 0 at BAND_INNER, 1 at rim; smoothstep to avoid flat spots
+        let w = (r - BAND_INNER) / span;
+        if (w < 0) w = 0; else if (w > 1) w = 1;
+        w = w * w * (3 - 2 * w); // smoothstep
+        const y = y0 + (yLine - y0) * w;
+        pos.setY(i, y);
+      }
+    }
+  }
+
+  pos.needsUpdate = true;
+  try {
+    tile.grid.geometry.computeVertexNormals();
+  } catch {}
+  // keep CPU buffers in sync for relax/coloring:
+  this._pullGeometryToBuffers(tile);
+  this._applyAllColorsGlobal(tile);
+}
 
   _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
     this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
@@ -276,7 +387,25 @@ export class TileManager {
     if (d > Math.PI) d = 2 * Math.PI - d;
     return d;
   }
-
+  _getTerrainMaterial() {
+    if (!this._terrainMat) {
+      this._terrainMat = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        side: THREE.BackSide,
+        metalness: 0.05,
+        roughness: 0.75,
+      });
+    }
+    return this._terrainMat;
+  }
+  _applyTerrainMaterial(mesh) {
+    if (!mesh) return;
+    const mat = this._getTerrainMaterial();
+    try { mesh.material?.dispose?.(); } catch { }
+    mesh.material = mat;
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
+  }
   // classify outer ring into 6 sides and 6 corners (by angle & radius)
   _classifyRimAndCorners(tile) {
     const pos = tile.pos;
@@ -420,6 +549,58 @@ export class TileManager {
     } else {
       for (let i = 0; i < tile.pos.count; i++) {
         const y = tile.pos.getY(i); tgt[i] = y; alt[i] = y;
+      }
+    }
+  }
+
+
+  _farfieldTierForDist(dist) {
+    if (dist <= this.VISUAL_RING + 24) return { stride: 3, scale: 3, samples: 'all', minPrec: 5 };
+    if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 6, samples: 'tips', minPrec: 4 };
+    if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 12, samples: 'tips', minPrec: 3 };
+    return { stride: 24, scale: 24, samples: 'tips', minPrec: 3 }; // keep corners so seams match
+  }
+  _sealFarfieldCornersAgainstNeighbors(tile) {
+    if (!tile || tile.type !== 'farfield') return;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const neighborMeshes = this._gatherNeighborMeshes(tile.q, tile.r); // includes visual/interactive nearby
+
+    if (!neighborMeshes.length) return;
+
+    // corners are indices 1..6
+    for (let i = 1; i <= 6; i++) {
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+      this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+      const hits = this.ray.intersectObjects(neighborMeshes, true);
+      if (hits && hits.length) {
+        // take the first (nearest) for determinism
+        const y = hits[0].point.y;
+        if (Number.isFinite(y)) pos.setY(i, y);
+      }
+    }
+
+    pos.needsUpdate = true;
+    try { tile.grid.geometry.computeVertexNormals(); } catch { }
+  }
+
+  // JS % is weird for negatives; normalize
+  _divisible(n, k) { n = Math.round(n); k = Math.max(1, Math.round(k)); return ((n % k) + k) % k === 0; }
+  _forEachAxialRing(q0, r0, radius, step, cb) {
+    step = Math.max(1, Math.floor(step));
+    if (radius <= 0) { cb(q0, r0); return; }
+    let q = q0 + HEX_DIRS[4][0] * radius;
+    let r = r0 + HEX_DIRS[4][1] * radius;
+    for (let side = 0; side < 6; side++) {
+      const dir = HEX_DIRS[side];
+      let remaining = radius;
+      while (remaining > 0) {
+        cb(q, r);
+        const hop = Math.min(step, remaining);
+        q += dir[0] * hop;
+        r += dir[1] * hop;
+        remaining -= hop;
       }
     }
   }
@@ -691,8 +872,12 @@ export class TileManager {
   _cacheKey(tile) {
     const originKey = this._originCacheKey || 'na';
     const datasetKey = (this.relayDataset || '').replace(/[^a-z0-9._-]/gi, '').slice(0, 40);
-    return `tile:${this.CACHE_VER}:${originKey}:${tile.type}:${this.spacing}:${this.tileRadius}:${datasetKey}:${this.relayMode}:${tile.q},${tile.r}`;
+    const effRadius = (tile && tile._radiusOverride) ? tile._radiusOverride : this.tileRadius;
+    const sampleMode = (tile && tile._farSampleMode) ? tile._farSampleMode : 'all';
+    return `tile:${this.CACHE_VER}:${originKey}:${tile.type}:${this.spacing}:${effRadius}:${datasetKey}:${this.relayMode}:${sampleMode}:${tile.q},${tile.r}`;
   }
+
+
   _tryLoadTileFromCache(tile) {
     try {
       const key = this._cacheKey(tile);
@@ -917,6 +1102,83 @@ export class TileManager {
   }
 
   /* ---------------- creation: visual tile (7 verts) ---------------- */
+  _makeLowResHexMeshForRadius(a) {
+    const center = { x: 0, z: 0 };
+    const corners = this._hexCorners(a);
+    const verts = [center, ...corners];
+
+    const pos = new Float32Array(verts.length * 3);
+    for (let i = 0; i < verts.length; i++) {
+      pos[3 * i + 0] = verts[i].x;
+      pos[3 * i + 1] = 0;
+      pos[3 * i + 2] = verts[i].z;
+    }
+    const idx = [];
+    for (let i = 1; i <= 6; i++) { const j = i === 6 ? 1 : i + 1; idx.push(0, i, j); }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+    geom.setIndex(idx);
+
+    const cols = new Float32Array(verts.length * 3);
+    for (let i = 0; i < verts.length; i++) { const o = 3 * i; cols[o] = cols[o + 1] = cols[o + 2] = this.LUM_MIN; }
+    geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
+    geom.computeVertexNormals();
+
+    const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide });
+    const mesh = new THREE.Mesh(geom, this._getTerrainMaterial());
+    mesh.frustumCulled = false; mesh.receiveShadow = false; mesh.castShadow = false;
+
+    const group = new THREE.Group(); group.add(mesh);
+    return { group, mesh, geometry: geom, mat };
+  }
+
+  // pick stride/scale/sample strategy by distance
+  _farfieldTierForDist(dist) {
+    // tune these bands freely; goal is to cap #tiles & #queries
+    if (dist <= this.VISUAL_RING + 24) return { stride: 3, scale: 3, samples: 'all', minPrec: 5 };
+    if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 6, samples: 'tips', minPrec: 4 };
+    if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 12, samples: 'tips', minPrec: 3 };
+    return { stride: 24, scale: 24, samples: 'center', minPrec: 3 }; // absurd horizon: 1 sample/tile
+  }
+
+  // normalize modulo for negatives
+  _divisible(n, k) { n = Math.round(n); k = Math.max(1, Math.round(k)); return ((n % k) + k) % k === 0; }
+
+  // which indices to fetch for a farfield tile (geometry is [center, corner1..6])
+  _farfieldSampleIndices(tile) {
+    const mode = tile._farSampleMode || 'all';
+    if (mode === 'tips') return [1, 2, 3, 4, 5, 6];
+    // default: fetch everything (center + tips)
+    return [0, 1, 2, 3, 4, 5, 6];
+  }
+
+  // after sparse fetch, fill the rest locally to avoid extra network
+  _completeFarfieldFromSparse(tile) {
+    const pos = tile.pos;
+    const ready = tile.ready;
+    const mode = tile._farSampleMode || 'all';
+
+    if (mode === 'tips') {
+      // set center to average of tips (gives large-scale slope continuity)
+      let sum = 0, cnt = 0;
+      for (let i = 1; i <= 6; i++) { const y = pos.getY(i); if (Number.isFinite(y)) { sum += y; cnt++; } }
+      const cy = cnt ? (sum / cnt) : 0;
+      pos.setY(0, cy);
+    }
+    for (let i = 0; i < pos.count; i++) ready[i] = 1;
+    tile.unreadyCount = 0;
+    pos.needsUpdate = true;
+    try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    this._applyAllColorsGlobal(tile);
+  }
+
+  // effective spacing for a tile (used to choose coarse geohash precision)
+  _effectiveSpacingForTile(tile) {
+    const s = this.spacing;
+    const sc = Number.isFinite(tile?.scale) ? tile.scale : 1;
+    return s * Math.max(1, sc);
+  }
 
   _makeLowResHexMesh() {
     const a = this.tileRadius;
@@ -948,7 +1210,8 @@ export class TileManager {
       metalness: 0.05,
       roughness: 0.75,
     });
-    const mesh = new THREE.Mesh(geom, mat); mesh.frustumCulled = false;
+    const mesh = new THREE.Mesh(geom, this._getTerrainMaterial());
+    mesh.frustumCulled = false;
     mesh.receiveShadow = true;
     mesh.castShadow = false;
 
@@ -1001,28 +1264,36 @@ export class TileManager {
     }
     return tile;
   }
-
-  /* ---------------- creation: farfield tile (center point) ---------------- */
-
-  _addFarfieldTile(q, r) {
+  _addFarfieldTile(q, r, scale = 1, sampleMode = 'all') {
     const id = `${q},${r}`;
-    if (this.tiles.has(id)) return this.tiles.get(id);
+    const existing = this.tiles.get(id);
+    if (existing) {
+      if (existing.type === 'farfield' && ((existing.scale || 1) !== scale || (existing._farSampleMode || 'all') !== sampleMode)) {
+        this._discardTile(id);
+      } else {
+        return existing;
+      }
+    }
 
-    const far = new HexCenterPoint(this.tileRadius * 2);
-    far.group.name = `tile-far-${id}`;
+    const radius = this.tileRadius * Math.max(1, Math.round(scale));
+    const low = this._makeLowResHexMeshForRadius(radius);
+    low.group.name = `tile-far-${id}`;
     const wp = this._axialWorld(q, r);
-    far.group.position.set(wp.x, 0, wp.z);
-    this.scene.add(far.group);
+    low.group.position.set(wp.x, 0, wp.z);
+    this.scene.add(low.group);
 
-    const pos = far.geometry.attributes.position;
+    // keep farfield out of height raycasts so near queries stay fast
+    if (low.mesh) low.mesh.raycast = function () { };
+
+    const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
-    const neighbors = Array.from({ length: pos.count }, () => []);
-    const colAttr = far.geometry.attributes.color;
+    const neighbors = this._buildAdjacency(low.geometry.getIndex(), pos.count);
+    const colAttr = low.geometry.attributes.color;
     if (colAttr) colAttr.setUsage(THREE.DynamicDrawUsage);
 
     const tile = {
       type: 'farfield',
-      grid: { group: far.group, points: far.points, geometry: far.geometry, mat: far.mat },
+      grid: { group: low.group, mesh: low.mesh, geometry: low.geometry, mat: low.mat },
       q, r,
       pos,
       neighbors,
@@ -1030,28 +1301,21 @@ export class TileManager {
       fetched: new Set(),
       populating: false,
       unreadyCount: pos.count,
-      col: far.geometry.attributes.color,
+      col: low.geometry.attributes.color,
       _phase: { fullDone: false },
       _queuedPhases: new Set(),
-      _retryCounts: { full: 0 }
+      _retryCounts: { full: 0 },
+      scale,
+      _radiusOverride: radius,
+      _farSampleMode: sampleMode
     };
     this.tiles.set(id, tile);
 
-    this._initFarfieldColors(tile);
+    this._initColorsNearBlack(tile);
     this._invalidateHeightCache();
 
-    if (tile.grid?.points?.material) {
-      const mat = tile.grid.points.material;
-      mat.transparent = false;
-      mat.opacity = 1;
-      mat.sizeAttenuation = true;
-      mat.size = Math.max(0.5, this.tileRadius * 0.03);
-      if (mat.color && typeof mat.color.setHex === 'function') mat.color.setHex(0x8aa0c0);
-      mat.needsUpdate = true;
-    }
-
     if (!this._nextFarfieldLog || this._nowMs() >= this._nextFarfieldLog) {
-      console.log('[tiles.farfield] add', { id, points: tile.pos.count });
+      console.log('[tiles.farfield] add', { id, verts: tile.pos.count, scale, sampleMode });
       this._nextFarfieldLog = this._nowMs() + 2000;
     }
 
@@ -1138,6 +1402,7 @@ export class TileManager {
 
     // Seal edges with corner-safe snapping and relax inner corner band
     this._sealEdgesCornerSafe(t);
+    this._stitchInteractiveToVisualEdges(t);
     this._fixStuckZeros(t, /*rimOnly=*/true);
 
     // Fetch phased full-res now
@@ -1924,6 +2189,13 @@ export class TileManager {
       this._applyAllColorsGlobal(tile);
     }
 
+
+   // Finally, if any side borders a visual/farfield tile, feather to a straight edge line
+   // derived from the neighbor’s tip heights. This guarantees no cracks at the LOD boundary.
+   if (tile.type === 'interactive') {
+     this._stitchInteractiveToVisualEdges(tile, { bandRatio: 0.07, sideArc: Math.PI / 10 });
+   }
+
     // ---- mark phase complete & chain next ----
     if (tile.type === 'interactive') {
       this._handleInteractivePhaseCompletion(tile, phase);
@@ -1980,12 +2252,26 @@ export class TileManager {
     const tiles = this._gatherFarfieldBatch(primary);
     if (!tiles.length) { if (primary) primary.populating = false; return; }
 
+    // Build a single, coarse precision for the whole batch based on the "worst" (biggest) tiles.
+    const effSpacings = tiles.map(t => this._effectiveSpacingForTile(t));
+    const maxEffSpacing = effSpacings.length ? Math.max(...effSpacings) : this.spacing;
+    let precision = pickGeohashPrecision(maxEffSpacing);
+    // obey per-tile minimum precision hints (coarser == smaller number of chars)
+    let forcedMin = 99;
+    for (const t of tiles) if (Number.isFinite(t._farMinPrec)) forcedMin = Math.min(forcedMin, t._farMinPrec);
+    if (Number.isFinite(forcedMin)) precision = Math.max(forcedMin, precision);
+
+    const mode = this.relayMode;
+
+    // Gather only the indices we truly want for each far tile (center / tips / all).
     const latLonAll = [];
     const refs = [];
     for (const tile of tiles) {
-      const latLon = this._collectTileLatLon(tile);
+      const pos = tile.pos;
       const ready = tile.ready;
-      for (let i = 0; i < latLon.length; i++) {
+      const idxs = this._farfieldSampleIndices(tile);
+      const latLon = this._collectTileLatLon(tile);
+      for (const i of idxs) {
         if (ready && ready[i]) continue;
         latLonAll.push(latLon[i]);
         refs.push({ tile, index: i });
@@ -1995,6 +2281,8 @@ export class TileManager {
     if (!latLonAll.length) {
       for (const tile of tiles) {
         tile.populating = false;
+        // derive missing verts locally (e.g., set corners from center)
+        this._completeFarfieldFromSparse(tile);
         tile._phase.fullDone = true;
         this._saveTileToCache(tile);
         this._tryAdvanceFetchPhase(tile);
@@ -2002,8 +2290,6 @@ export class TileManager {
       return;
     }
 
-    const mode = this.relayMode;
-    const precision = pickGeohashPrecision(this.spacing);
     const indices = latLonAll.map((_, i) => i);
     const geohashes = mode === 'geohash'
       ? latLonAll.map(({ lat, lng }) => geohashEncode(lat, lng, precision))
@@ -2013,6 +2299,7 @@ export class TileManager {
       ? this._indicesToBatchesGeohash(indices, geohashes, precision)
       : this._indicesToBatchesLatLng(indices, latLonAll);
 
+    // Dedup maps so multiple refs share the same response (huge savings with coarse precision).
     const geohashMap = geohashes ? new Map() : null;
     if (geohashMap) {
       geohashes.forEach((gh, i) => {
@@ -2069,14 +2356,25 @@ export class TileManager {
               applyIdx(idx, height);
             }
           })
-          .catch(() => { /* ignore errors; will retry via backfill */ })
+          .catch(() => { /* ignore; backfill will retry */ })
       );
     });
 
     await Promise.allSettled(requests);
 
+    // finalize tiles (derive missing verts if we used sparse sampling)
     for (const tile of tiles) {
       tile.populating = false;
+
+      // If we fetched sparse samples, complete locally now.
+      if ((tile._farSampleMode === 'center' || tile._farSampleMode === 'tips') && tile.unreadyCount > 0) {
+        // Only complete if at least one sample landed; otherwise let retry logic handle.
+        if (tile.fetched && tile.fetched.size > 0) {
+          this._completeFarfieldFromSparse(tile);
+        }
+      }
+      this._sealFarfieldCornersAgainstNeighbors(tile);
+
       if (tile.unreadyCount > 0) {
         const allowRetry = this._registerPhaseRetry(tile, PHASE_FULL);
         if (allowRetry) {
@@ -2092,14 +2390,13 @@ export class TileManager {
 
       const done = tile.unreadyCount === 0;
       tile._phase.fullDone = done;
-      if (done) {
-        this._saveTileToCache(tile);
-      } else {
-        this._queuePopulate(tile, false);
-      }
+      if (done) this._saveTileToCache(tile);
+      else this._queuePopulate(tile, false);
+
       this._tryAdvanceFetchPhase(tile);
     }
   }
+
 
 
   /* ---------------- backfill orchestration ---------------- */
@@ -2164,24 +2461,20 @@ export class TileManager {
   }
 
   _prewarmFarfieldRing(q0 = 0, r0 = 0) {
-    for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
-      const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
-      const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
-      for (let dr = rMin; dr <= rMax; dr++) {
-        const q = q0 + dq, r = r0 + dr;
-        const dist = this._hexDist(q, r, q0, r0);
-        if (dist <= this.VISUAL_RING) continue;
+    for (let d = this.VISUAL_RING + 1; d <= this.FARFIELD_RING; d++) {
+      const tier = this._farfieldTierForDist(d);
+      const { stride, scale, samples, minPrec } = tier;
+      this._forEachAxialRing(q0, r0, d, stride, (q, r) => {
         const id = `${q},${r}`;
         if (!this.tiles.has(id)) {
-          this._addFarfieldTile(q, r);
-        } else {
-          const t = this.tiles.get(id);
-          this._queuePopulateIfNeeded(t, false);
+          const t = this._addFarfieldTile(q, r, scale, samples);
+          t._farMinPrec = minPrec;
         }
-      }
+      });
     }
     this._scheduleBackfill(0);
   }
+
 
   /* ---------------- per-frame: ensure LOD, relax, prune ---------------- */
 
@@ -2240,8 +2533,7 @@ export class TileManager {
         }
       }
     }
-
-    // 3) farfield outward with budget
+    // 3) farfield outward with budget (strided + scaled + sparse sampling)
     let farCreated = 0;
     farOuter:
     for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
@@ -2251,19 +2543,33 @@ export class TileManager {
         const q = q0 + dq, r = r0 + dr;
         const dist = this._hexDist(q, r, q0, r0);
         if (dist <= this.VISUAL_RING) continue;
+
+        const { stride, scale, samples, minPrec } = this._farfieldTierForDist(dist);
+
+        // only every Nth axial coordinate at this ring -> massive tile count drop
+        if (!this._divisible(q - q0, stride) || !this._divisible(r - r0, stride)) continue;
+
         const id = `${q},${r}`;
         const existing = this.tiles.get(id);
+
         if (!existing) {
-          this._addFarfieldTile(q, r);
+          const t = this._addFarfieldTile(q, r, scale, samples);
+          t._farMinPrec = minPrec; // hint for batch precision
           if (++farCreated >= this.FARFIELD_CREATE_BUDGET) break farOuter;
-        } else if (existing.type !== 'farfield') {
+        } else if (existing.type !== 'farfield' ||
+          (existing.scale || 1) !== scale ||
+          (existing._farSampleMode || 'all') !== samples) {
           this._discardTile(id);
-          this._addFarfieldTile(q, r);
+          const t = this._addFarfieldTile(q, r, scale, samples);
+          t._farMinPrec = minPrec;
+          if (++farCreated >= this.FARFIELD_CREATE_BUDGET) break farOuter;
         } else {
+          existing._farMinPrec = minPrec;
           this._queuePopulateIfNeeded(existing, false);
         }
       }
     }
+
 
     // 4) prune/downgrade rings
     const toRemove = [];
@@ -2648,8 +2954,7 @@ export class TileManager {
       tile.ready.fill(0);
       tile.fetched.clear();
       tile.unreadyCount = tile.pos.count;
-      if (tile.type === 'farfield') this._initFarfieldColors(tile);
-      else this._initColorsNearBlack(tile);
+      this._initColorsNearBlack(tile);
       tile.populating = false;
       tile._queuedPhases?.clear?.();
 
