@@ -262,6 +262,11 @@ export class BuildingManager {
 
     this._resnapQueue = [];
     this._resnapIndex = 0;
+    this._resnapDirtyQueue = [];
+    this._resnapDirtyIndex = 0;
+    this._resnapDirtyTiles = new Set();
+    this._resnapDirtyMaxPerFrame = 2;
+    this._resnapHotBudgetMs = 0.6;
 
     this._waterMaterials = new Set();
 
@@ -286,6 +291,21 @@ export class BuildingManager {
     }
 
     this._cachePrefix = `${CACHE_PREFIX}:${this.tileSize}:`;
+    const offsetBase = Math.max(4, this.tileSize * 0.6);
+    this._resnapOffsets = [
+      [0, 0],
+      [offsetBase, 0],
+      [-offsetBase, 0],
+      [0, offsetBase],
+      [0, -offsetBase],
+      [offsetBase, offsetBase],
+      [offsetBase, -offsetBase],
+      [-offsetBase, offsetBase],
+      [-offsetBase, -offsetBase],
+    ];
+    if (this.tileManager?.addHeightListener) {
+      this._heightListenerDispose = this.tileManager.addHeightListener((evt) => this._handleTerrainHeightChange(evt));
+    }
 
     // QoS / performance state (auto-tuned via updateQoS)
     this._qosLevel = 'high';
@@ -362,6 +382,8 @@ export class BuildingManager {
     this._mergeBudgetMs = lerp(1.6, MERGE_BUDGET_MS);
     this._resnapFrameBudgetMs = lerp(0.35, RESNAP_FRAME_BUDGET_MS);
     this._resnapInterval = lerp(RESNAP_INTERVAL * 3.6, RESNAP_INTERVAL);
+    this._resnapHotBudgetMs = lerp(0.25, 0.8);
+    this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(lerp(1, 4)));
     this._tileUpdateInterval = lerp(0.55, 0);
     this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
     if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
@@ -470,6 +492,9 @@ export class BuildingManager {
 
     this._drainBuildQueue(this._frameBudgetMs);
     this._processMergeQueue();
+    const dirtyBefore = this._resnapDirtyQueue.length;
+    this._drainDirtyResnapQueue(this._resnapHotBudgetMs);
+    if (dirtyBefore) this._resnapTimer = 0;
 
     this._resnapTimer += dt;
     if (this._resnapTimer > this._resnapInterval) {
@@ -495,6 +520,10 @@ export class BuildingManager {
     this.scene?.remove(this.group);
     this.clearHover();
     this._hideAddressToast(true);
+    if (this._heightListenerDispose) {
+      try { this._heightListenerDispose(); } catch { }
+      this._heightListenerDispose = null;
+    }
     this._clearAllTiles();
     this._edgeMaterial.dispose();
     this._highlightEdgeMaterial.dispose();
@@ -1831,6 +1860,51 @@ export class BuildingManager {
     this._hoverLabel.lookAt(camera.getWorldPosition(this._tmpVec3));
   }
 
+  _handleTerrainHeightChange(evt) {
+    if (!evt || !this._hasOrigin) return;
+    const world = evt.world;
+    if (!world) return;
+    const enqueue = (x, z) => {
+      const key = this._tileKeyForWorld(x, z);
+      this._enqueueDirtyResnap(key);
+    };
+    enqueue(world.x, world.z);
+    if (Array.isArray(this._resnapOffsets)) {
+      for (let i = 1; i < this._resnapOffsets.length; i++) {
+        const [dx, dz] = this._resnapOffsets[i];
+        enqueue(world.x + dx, world.z + dz);
+      }
+    }
+  }
+
+  _enqueueDirtyResnap(tileKey) {
+    if (!tileKey) return;
+    if (this._resnapDirtyTiles.has(tileKey)) return;
+    this._resnapDirtyTiles.add(tileKey);
+    this._resnapDirtyQueue.push(tileKey);
+  }
+
+  _drainDirtyResnapQueue(budgetMs = this._resnapHotBudgetMs) {
+    if (!this._resnapDirtyQueue.length) return;
+    const budget = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 0;
+    const start = this._nowMs();
+    let processed = 0;
+    while (this._resnapDirtyIndex < this._resnapDirtyQueue.length) {
+      if (this._resnapDirtyMaxPerFrame > 0 && processed >= this._resnapDirtyMaxPerFrame) break;
+      if (budget > 0 && (this._nowMs() - start) > budget) break;
+      const tileKey = this._resnapDirtyQueue[this._resnapDirtyIndex++];
+      this._resnapDirtyTiles.delete(tileKey);
+      const state = this._tileStates.get(tileKey);
+      if (!state) continue;
+      this._resnapTile(tileKey, state);
+      processed++;
+    }
+    if (this._resnapDirtyIndex >= this._resnapDirtyQueue.length) {
+      this._resnapDirtyQueue.length = 0;
+      this._resnapDirtyIndex = 0;
+    }
+  }
+
   /* ---------------- resnap sweep ---------------- */
 
   _queueResnapSweep() {
@@ -2495,6 +2569,12 @@ export class BuildingManager {
     const state = this._tileStates.get(tileKey);
     if (!state) return;
 
+    if (this._resnapDirtyTiles.has(tileKey)) this._resnapDirtyTiles.delete(tileKey);
+    if (this._resnapDirtyQueue.length) {
+      this._resnapDirtyQueue = this._resnapDirtyQueue.filter((key) => key !== tileKey);
+      this._resnapDirtyIndex = Math.min(this._resnapDirtyIndex, this._resnapDirtyQueue.length);
+    }
+
     for (const building of state.buildings) {
       if (building.render) {
         this.group.remove(building.render);
@@ -2549,6 +2629,9 @@ export class BuildingManager {
     this._buildTickScheduled = false;
     this._resnapQueue = [];
     this._resnapIndex = 0;
+    this._resnapDirtyQueue.length = 0;
+    this._resnapDirtyIndex = 0;
+    this._resnapDirtyTiles.clear();
     for (const tileKey of Array.from(this._tileStates.keys())) this._removeTileObjects(tileKey);
     this._tileStates.clear();
   }

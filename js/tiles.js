@@ -150,6 +150,8 @@ export class TileManager {
     this._heightCacheTTL = 250;
     this._heightCacheScale = 2;
     this._heightMeshesFallback = [];
+    this._heightListeners = new Set();
+    this._farfieldAdapterDirty = new Set();
   }
 
   /* ---------------- small helpers ---------------- */
@@ -399,6 +401,27 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     return this._terrainMat;
   }
+  addHeightListener(fn) {
+    if (typeof fn !== 'function') return () => {};
+    this._heightListeners.add(fn);
+    return () => this._heightListeners.delete(fn);
+  }
+  removeHeightListener(fn) {
+    if (!fn) return;
+    this._heightListeners.delete(fn);
+  }
+  _notifyHeightListeners(tile, idx, wx, wy, wz) {
+    if (!this._heightListeners || !this._heightListeners.size) return;
+    const payload = {
+      tile,
+      index: idx,
+      world: { x: wx, y: wy, z: wz },
+      type: tile?.type || null,
+    };
+    for (const listener of this._heightListeners) {
+      try { listener(payload); } catch { /* ignore listener error */ }
+    }
+  }
   _getFarfieldMaterial() {
     if (!this._farfieldMat) {
       this._farfieldMat = this._getTerrainMaterial().clone();
@@ -593,7 +616,7 @@ _stitchInteractiveToVisualEdges(tile, {
     }
 
     pos.needsUpdate = true;
-    tile._adapterDirty = true;
+    this._markFarfieldAdapterDirty(tile);
     try { tile.grid.geometry.computeVertexNormals(); } catch { }
   }
 
@@ -632,6 +655,16 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     return Number.isFinite(center.y) ? center.y : 0;
   }
+  _farfieldAdapterKey(tile) {
+    if (!tile) return null;
+    return `${tile.q},${tile.r}`;
+  }
+  _markFarfieldAdapterDirty(tile) {
+    if (!tile || tile.type !== 'farfield') return;
+    tile._adapterDirty = true;
+    const key = this._farfieldAdapterKey(tile);
+    if (key) this._farfieldAdapterDirty.add(key);
+  }
   _ensureFarfieldAdapter(tile) {
     if (!tile || tile.type !== 'farfield') return;
     if (!tile._adapter) {
@@ -659,9 +692,13 @@ _stitchInteractiveToVisualEdges(tile, {
       }
       colAttr.needsUpdate = true;
       tile._adapter = { mesh, geometry: geom, posAttr, colAttr };
+      this._markFarfieldAdapterDirty(tile);
     }
+    if (!tile._adapterDirty) return;
     this._updateFarfieldAdapter(tile);
     tile._adapterDirty = false;
+    const key = this._farfieldAdapterKey(tile);
+    if (key) this._farfieldAdapterDirty.delete(key);
   }
   _updateFarfieldAdapter(tile) {
     const adapter = tile?._adapter;
@@ -700,13 +737,30 @@ _stitchInteractiveToVisualEdges(tile, {
     try { adapter.geometry.computeVertexNormals(); } catch { }
   }
   _refreshFarfieldAdapters(q0, r0) {
+    if (!this._farfieldAdapterDirty.size) return;
     const seamMax = this.VISUAL_RING + 4;
-    for (const tile of this.tiles.values()) {
-      if (tile.type !== 'farfield') continue;
+    const budget = Math.max(1, Math.floor(this.FARFIELD_CREATE_BUDGET * 0.1) || 3);
+    let processed = 0;
+    for (const key of Array.from(this._farfieldAdapterDirty)) {
+      if (processed >= budget) break;
+      const tile = this.tiles.get(key);
+      if (!tile || tile.type !== 'farfield') {
+        this._farfieldAdapterDirty.delete(key);
+        continue;
+      }
       const dist = this._hexDist(tile.q, tile.r, q0, r0);
-      if (dist < this.VISUAL_RING) continue;
-      if (dist > seamMax) continue;
-      this._ensureFarfieldAdapter(tile);
+      if (dist < this.VISUAL_RING || dist > seamMax) {
+        tile._adapterDirty = false;
+        this._farfieldAdapterDirty.delete(key);
+        continue;
+      }
+      if (!tile._adapter) this._ensureFarfieldAdapter(tile);
+      else {
+        this._updateFarfieldAdapter(tile);
+        tile._adapterDirty = false;
+        this._farfieldAdapterDirty.delete(key);
+      }
+      processed++;
     }
   }
   _forEachAxialRing(q0, r0, radius, step, cb) {
@@ -905,13 +959,16 @@ _stitchInteractiveToVisualEdges(tile, {
     tile.col.needsUpdate = true;
     if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
 
+    const wx = tile.grid.group.position.x + tile.pos.getX(idx);
+    const wy = height;
+    const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
     if (this.audio) {
-      const wx = tile.grid.group.position.x + tile.pos.getX(idx);
-      const wy = height;
-      const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
       this.audio.triggerScratch(wx, wy, wz, 0.9);
     }
-    if (tile.type === 'farfield') tile._adapterDirty = true;
+    if (this._heightListeners?.size) {
+      this._notifyHeightListeners(tile, idx, wx, wy, wz);
+    }
+    if (tile.type === 'farfield') this._markFarfieldAdapterDirty(tile);
   }
 
   _nearestAnchorFill(tile) {
@@ -1383,7 +1440,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this.tiles.set(id, tile);
     for (const [dq, dr] of HEX_DIRS) {
       const n = this._getTile(q + dq, r + dr);
-      if (n && n.type === 'farfield') n._adapterDirty = true;
+      if (n && n.type === 'farfield') this._markFarfieldAdapterDirty(n);
     }
 
     if (!this._tryLoadTileFromCache(tile)) {
@@ -3127,6 +3184,10 @@ _stitchInteractiveToVisualEdges(tile, {
   _discardTile(id) {
     const t = this.tiles.get(id);
     if (!t) return;
+    if (t.type === 'farfield') {
+      const key = this._farfieldAdapterKey(t);
+      if (key) this._farfieldAdapterDirty.delete(key);
+    }
     this.scene.remove(t.grid.group);
     try {
       if (t._adapter?.mesh) {
@@ -3159,6 +3220,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this._fetchPhase = 'interactive';
     this._deferredInteractive.clear();
     this._interactiveSecondPass = false;
+    this._farfieldAdapterDirty.clear();
   }
 
   dispose() {
@@ -3171,5 +3233,6 @@ _stitchInteractiveToVisualEdges(tile, {
       this._farfieldMat.dispose();
       this._farfieldMat = null;
     }
+    this._heightListeners?.clear?.();
   }
 }
