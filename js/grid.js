@@ -46,9 +46,9 @@ export class UniformHexGrid {
     mesh.castShadow = false;
 
     const wireMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
+      color: 0x222222,
       wireframe: true,
-      opacity: 0.1,
+      opacity: 0.0,
       transparent: true,
       depthWrite: false,
     });

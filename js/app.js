@@ -228,8 +228,12 @@ class App {
       terrainRelayClient: terrainClientProvider,
     });
 
+    const visualRing = Math.max(0, this.hexGridMgr?.VISUAL_RING ?? 0);
+    const tileRadius = Math.max(1, this.hexGridMgr?.tileRadius ?? 120);
+    const buildingRadius = Math.max(tileRadius * (visualRing + 3), tileRadius * 4);
+
     this.buildings = new BuildingManager({
-      radius: 3000,
+      radius: buildingRadius,
       scene: this.sceneMgr.scene,
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,

@@ -68,6 +68,10 @@
 
 <body>
   <div id="toastHost" aria-live="polite" aria-atomic="false"></div>
+  <div id="buildingHoverToast" class="building-toast" aria-live="polite" aria-atomic="true" role="status" hidden>
+    <div class="building-toast-name" data-role="toast-name"></div>
+    <div class="building-toast-address" data-role="toast-address">—</div>
+  </div>
   <div id="perfHud" aria-live="polite" aria-expanded="false" role="button" tabindex="0" title="Open control center">
     <div class="hud-overlay" id="hudDetail">
       <div class="hud-topline">

@@ -1,12 +1,15 @@
 import * as THREE from 'three';
 import { XRControllerModelFactory } from 'XRControllerModelFactory';
 import { rad, isMobile } from './utils.js';
+import { AudioEngine } from './audio.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
 
 export class Locomotion {
   constructor(sceneMgr, input, orientationRef) {
     this.sceneMgr = sceneMgr; this.input = input; this.orientationRef = orientationRef || { ready: false };
+    this.audio = new AudioEngine(sceneMgr);
+
     this.baseSpeed = 2; this.runMul = 3.5; this._spd = 0;
     this.GRAV = 20;
     this.baseEye = 1.6; this.crouchEye = 0.9; this.jumpPeak = 2.4;
@@ -52,11 +55,14 @@ export class Locomotion {
       this._headRoll = 0;
       this._xrHeadPoseReady = false;
       this._headQuatBody.identity();
+      this.audio?.stopHum();
+
       if (this.sceneMgr?.dolly) {
         this.sceneMgr.dolly.rotation.y = 0;
         this.sceneMgr.dolly.quaternion.setFromEuler(new THREE.Euler(0, 0, 0, 'YXZ'));
         this.sceneMgr.dolly.updateMatrixWorld?.(true);
       }
+      this.audio?.startHum();
       this._setupVRControllers();
     };
     this._onXRSessionEnd = () => {

@@ -1671,6 +1671,49 @@ canvas { touch-action: none; }
     opacity: 0;
     transform: translate3d(0, -12px, 0);
 }
+#buildingHoverToast {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    max-width: 360px;
+    padding: 0.85rem 1rem;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(12, 16, 24, 0.9);
+    color: #f5f7fb;
+    font-size: 13px;
+    line-height: 1.35;
+    letter-spacing: 0.02em;
+    opacity: 0;
+    transform: translate3d(0, 12px, 0);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    z-index: 45;
+    pointer-events: none;
+}
+
+#buildingHoverToast.show {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+}
+
+#buildingHoverToast .building-toast-name {
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.75);
+    margin-bottom: 0.25rem;
+}
+
+#buildingHoverToast .building-toast-name[hidden] {
+    display: none;
+}
+
+#buildingHoverToast .building-toast-address {
+    font-weight: 400;
+    letter-spacing: 0.03em;
+    color: #f5f7fb;
+    word-break: break-word;
+}
 #nameModal {
     position: fixed;
     inset: 0;

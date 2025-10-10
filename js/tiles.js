@@ -11,6 +11,7 @@ const DEFAULT_TERRAIN_DATASET = 'mapzen';
 const DM_BUDGET_BYTES = 2800;
 const MAX_LOCATIONS_PER_BATCH = 1000;
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
+const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
 
 // phased acquisition for interactive tiles
 const PHASE_SEED = 0; // center + 6 tips
@@ -35,9 +36,9 @@ export class TileManager {
     this._interactiveSecondPass = false;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 1;
+    this.INTERACTIVE_RING = 4;
     this.VISUAL_RING = 8;
-    this.FARFIELD_EXTRA = 50;
+    this.FARFIELD_EXTRA = 60;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
     this.VISUAL_CREATE_BUDGET = 4;
@@ -60,8 +61,8 @@ export class TileManager {
     this._lastRecolorAt = 0;
 
     // ---- wireframe colors ----
-    this.VISUAL_WIREFRAME_COLOR = 0xb5bcc6;
-    this.INTERACTIVE_WIREFRAME_COLOR = 0xb5bcc6;
+    this.VISUAL_WIREFRAME_COLOR = 0x222222;
+    this.INTERACTIVE_WIREFRAME_COLOR = 0x222222;
 
     // ---- caching config ----
     this.CACHE_VER = 'v1';
@@ -186,7 +187,7 @@ export class TileManager {
       color,
       wireframe: true,
       transparent: true,
-      opacity: 0.82,
+      opacity: 0,
       depthWrite: false
     });
 
@@ -398,6 +399,16 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     return this._terrainMat;
   }
+  _getFarfieldMaterial() {
+    if (!this._farfieldMat) {
+      this._farfieldMat = this._getTerrainMaterial().clone();
+      this._farfieldMat.polygonOffset = true;
+      this._farfieldMat.polygonOffsetFactor = 1;
+      this._farfieldMat.polygonOffsetUnits = 2;
+      this._farfieldMat.name = 'TileFarfieldMaterial';
+    }
+    return this._farfieldMat;
+  }
   _applyTerrainMaterial(mesh) {
     if (!mesh) return;
     const mat = this._getTerrainMaterial();
@@ -582,11 +593,122 @@ _stitchInteractiveToVisualEdges(tile, {
     }
 
     pos.needsUpdate = true;
+    tile._adapterDirty = true;
     try { tile.grid.geometry.computeVertexNormals(); } catch { }
   }
 
   // JS % is weird for negatives; normalize
   _divisible(n, k) { n = Math.round(n); k = Math.max(1, Math.round(k)); return ((n % k) + k) % k === 0; }
+  _barycentric2D(p, a, b, c) {
+    const v0x = b.x - a.x;
+    const v0z = b.z - a.z;
+    const v1x = c.x - a.x;
+    const v1z = c.z - a.z;
+    const v2x = p.x - a.x;
+    const v2z = p.z - a.z;
+    const denom = v0x * v1z - v1x * v0z;
+    if (Math.abs(denom) < 1e-6) return null;
+    const inv = 1 / denom;
+    const v = (v2x * v1z - v1x * v2z) * inv;
+    const w = (v0x * v2z - v2x * v0z) * inv;
+    const u = 1 - v - w;
+    return { u, v, w };
+  }
+  _approxTileHeight(tile, x, z) {
+    if (!tile || !tile.pos) return 0;
+    const pos = tile.pos;
+    const center = { x: pos.getX(0), y: pos.getY(0), z: pos.getZ(0) };
+    const target = { x, z };
+    for (let i = 1; i <= 6; i++) {
+      const j = (i === 6) ? 1 : i + 1;
+      const b = { x: pos.getX(i), y: pos.getY(i), z: pos.getZ(i) };
+      const c = { x: pos.getX(j), y: pos.getY(j), z: pos.getZ(j) };
+      const bary = this._barycentric2D(target, center, b, c);
+      if (!bary) continue;
+      const { u, v, w } = bary;
+      if (u >= -1e-4 && v >= -1e-4 && w >= -1e-4) {
+        return u * center.y + v * b.y + w * c.y;
+      }
+    }
+    return Number.isFinite(center.y) ? center.y : 0;
+  }
+  _ensureFarfieldAdapter(tile) {
+    if (!tile || tile.type !== 'farfield') return;
+    if (!tile._adapter) {
+      const geom = new THREE.BufferGeometry();
+      const posAttr = new THREE.BufferAttribute(new Float32Array(12 * 3), 3).setUsage(THREE.DynamicDrawUsage);
+      const colAttr = new THREE.BufferAttribute(new Float32Array(12 * 3), 3).setUsage(THREE.DynamicDrawUsage);
+      geom.setAttribute('position', posAttr);
+      geom.setAttribute('color', colAttr);
+      const idx = [];
+      for (let i = 0; i < 6; i++) {
+        const next = (i + 1) % 6;
+        idx.push(i, next, 6 + next);
+        idx.push(i, 6 + next, 6 + i);
+      }
+      geom.setIndex(idx);
+      const mesh = new THREE.Mesh(geom, this._getFarfieldMaterial());
+      mesh.frustumCulled = false;
+      mesh.renderOrder = tile.grid.mesh ? tile.grid.mesh.renderOrder - 1 : -5;
+      mesh.receiveShadow = false;
+      mesh.castShadow = false;
+      tile.grid.group.add(mesh);
+      const arr = colAttr.array;
+      for (let i = 0; i < arr.length; i += 3) {
+        arr[i] = arr[i + 1] = arr[i + 2] = 0.2;
+      }
+      colAttr.needsUpdate = true;
+      tile._adapter = { mesh, geometry: geom, posAttr, colAttr };
+    }
+    this._updateFarfieldAdapter(tile);
+    tile._adapterDirty = false;
+  }
+  _updateFarfieldAdapter(tile) {
+    const adapter = tile?._adapter;
+    if (!adapter) return;
+    const posAttr = adapter.posAttr;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const innerRadius = this.tileRadius * FARFIELD_ADAPTER_INNER_RATIO;
+    const neighbors = this._gatherNeighborMeshes(tile.q, tile.r);
+
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI / 3) * i;
+      const ix = innerRadius * Math.cos(angle);
+      const iz = innerRadius * Math.sin(angle);
+      const wx = base.x + ix;
+      const wz = base.z + iz;
+      let iy = null;
+      if (neighbors.length) {
+        this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+        const hits = this.ray.intersectObjects(neighbors, true);
+        if (hits && hits.length) {
+          const hit = hits[0];
+          if (Number.isFinite(hit.point.y)) iy = hit.point.y;
+        }
+      }
+      if (!Number.isFinite(iy)) {
+        iy = this._approxTileHeight(tile, ix, iz);
+      }
+      posAttr.setXYZ(i, ix, iy, iz);
+    }
+    for (let i = 0; i < 6; i++) {
+      const idx = 6 + i;
+      posAttr.setXYZ(idx, pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1));
+    }
+    posAttr.needsUpdate = true;
+    try { adapter.geometry.computeVertexNormals(); } catch { }
+  }
+  _refreshFarfieldAdapters(q0, r0) {
+    const seamMax = this.VISUAL_RING + 4;
+    for (const tile of this.tiles.values()) {
+      if (tile.type !== 'farfield') continue;
+      const dist = this._hexDist(tile.q, tile.r, q0, r0);
+      if (dist < this.VISUAL_RING) continue;
+      if (dist > seamMax) continue;
+      this._ensureFarfieldAdapter(tile);
+    }
+  }
   _forEachAxialRing(q0, r0, radius, step, cb) {
     step = Math.max(1, Math.floor(step));
     if (radius <= 0) { cb(q0, r0); return; }
@@ -789,6 +911,7 @@ _stitchInteractiveToVisualEdges(tile, {
       const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
       this.audio.triggerScratch(wx, wy, wz, 0.9);
     }
+    if (tile.type === 'farfield') tile._adapterDirty = true;
   }
 
   _nearestAnchorFill(tile) {
@@ -1055,8 +1178,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const wireMat = this._makeDisintegratingWireMaterial(this.INTERACTIVE_WIREFRAME_COLOR, interactiveFade);
     const wire = new THREE.Mesh(grid.geometry, wireMat);
     wire.frustumCulled = false; wire.renderOrder = 1;
-    grid.group.add(wire);
-    grid.wire = wire;
+    //grid.group.add(wire);
+    //grid.wire = wire;
 
     const pos = grid.geometry.attributes.position;
     const neighbors = this._buildAdjacency(grid.geometry.getIndex(), pos.count);
@@ -1238,8 +1361,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const wireMat = this._makeDisintegratingWireMaterial(this.VISUAL_WIREFRAME_COLOR, visualFade);
     const wire = new THREE.Mesh(low.geometry, wireMat);
     wire.frustumCulled = false; wire.renderOrder = 1;
-    low.group.add(wire);
-    low.wire = wire;
+    //low.group.add(wire);
+    //low.wire = wire;
 
     const tile = {
       type: 'visual',
@@ -1258,6 +1381,10 @@ _stitchInteractiveToVisualEdges(tile, {
       wire
     };
     this.tiles.set(id, tile);
+    for (const [dq, dr] of HEX_DIRS) {
+      const n = this._getTile(q + dq, r + dr);
+      if (n && n.type === 'farfield') n._adapterDirty = true;
+    }
 
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
@@ -1278,6 +1405,11 @@ _stitchInteractiveToVisualEdges(tile, {
     const radius = this.tileRadius * Math.max(1, Math.round(scale));
     const low = this._makeLowResHexMeshForRadius(radius);
     low.group.name = `tile-far-${id}`;
+    const farfieldMat = this._getFarfieldMaterial();
+    if (low.mesh) {
+      low.mesh.material = farfieldMat;
+      low.mesh.renderOrder = -10;
+    }
     const wp = this._axialWorld(q, r);
     low.group.position.set(wp.x, 0, wp.z);
     this.scene.add(low.group);
@@ -1307,12 +1439,15 @@ _stitchInteractiveToVisualEdges(tile, {
       _retryCounts: { full: 0 },
       scale,
       _radiusOverride: radius,
-      _farSampleMode: sampleMode
+      _farSampleMode: sampleMode,
+      _adapter: null,
+      _adapterDirty: true
     };
     this.tiles.set(id, tile);
 
     this._initColorsNearBlack(tile);
     this._invalidateHeightCache();
+    this._ensureFarfieldAdapter(tile);
 
     if (!this._nextFarfieldLog || this._nowMs() >= this._nextFarfieldLog) {
       console.log('[tiles.farfield] add', { id, verts: tile.pos.count, scale, sampleMode });
@@ -2572,6 +2707,8 @@ _stitchInteractiveToVisualEdges(tile, {
 
 
     // 4) prune/downgrade rings
+    this._refreshFarfieldAdapters(q0, r0);
+
     const toRemove = [];
     const toFarfield = [];
     for (const [id, t] of this.tiles) {
@@ -2992,10 +3129,15 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!t) return;
     this.scene.remove(t.grid.group);
     try {
+      if (t._adapter?.mesh) {
+        t._adapter.mesh.geometry?.dispose?.();
+      }
       t.grid.geometry?.dispose?.();
       t.grid.mat?.dispose?.();
       t.wire?.material?.dispose?.();
     } catch { }
+    t._adapter = null;
+    t._adapterDirty = false;
     this._deferredInteractive.delete(t);
     this.tiles.delete(id);
     this._markRelaxListDirty();
@@ -3025,5 +3167,9 @@ _stitchInteractiveToVisualEdges(tile, {
     if (this._rateTicker) { clearInterval(this._rateTicker); this._rateTicker = null; }
     this._resetAllTiles();
     this.tiles.clear();
+    if (this._farfieldMat) {
+      this._farfieldMat.dispose();
+      this._farfieldMat = null;
+    }
   }
 }

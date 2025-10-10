@@ -121,24 +121,24 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 160,
+    radius = 1000,
     tileSize,
     color = 0x333333,
     roadWidth = 3,
     roadOffset = 0.05,
     roadStep = 14,
-    roadAdaptive = false,
-    roadMinStep = 12,
+    roadAdaptive = true,
+    roadMinStep = 2,
     roadMaxStep = 28,
     roadAngleThresh = 0.35,
     roadMaxSegments = 36,
     roadLit = false,
     roadShadows = false,
     roadColor = 0x202020,
-    extraDepth = 0.1,
-    extensionHeight = 2,
+    extraDepth = 0.2,
+    extensionHeight = 1,
     inputEl = null,            // NEW
-    holdToOpenMs = 600,        // NEW (optional override)
+    holdToOpenMs = 200,        // NEW (optional override)
 
     maxConcurrentFetches = 1, // retained for API compatibility
   } = {}) {
@@ -148,10 +148,18 @@ export class BuildingManager {
     this.scene = scene;
     this.camera = camera;
     this.tileManager = tileManager;
-    this.radius = radius;
-    this._baseRadius = radius;
+    this._radiusOverride = Number.isFinite(radius) ? radius : null;
+    const visualRadius = this._computeVisualRingRadius();
+    const initialRadius = Number.isFinite(this._radiusOverride)
+      ? this._radiusOverride
+      : (Number.isFinite(visualRadius) ? visualRadius : 1000);
+    this.radius = initialRadius;
+    this._baseRadius = initialRadius;
     this._currentPerfQuality = 1;
     this.tileSize = tileSize || (tileManager?.tileRadius ? tileManager.tileRadius * 1.75 : 160);
+    this._tileDiagHalf = this.tileSize * Math.SQRT2 * 0.5;
+    const spanBase = Math.ceil((this.radius + this.tileSize) / Math.max(1, this.tileSize));
+    this._tileSpanCap = Math.max(6, spanBase + 2);
     this.color = color;
     this.roadWidth = roadWidth;
     this.roadOffset = roadOffset;
@@ -190,6 +198,10 @@ export class BuildingManager {
     this._hoverLabelTexture = null;
     this._hoverInfo = null;
     this.physics = null;
+    this._addressToast = null;
+    this._addressToastNameEl = null;
+    this._addressToastAddrEl = null;
+    this._addressToastHideTimer = null;
 
     // ---------- CSS3D panel (DuckDuckGo) ----------
     this._holdToOpenMs = holdToOpenMs;
@@ -354,9 +366,18 @@ export class BuildingManager {
     this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
     if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
 
-    const desiredRadius = this._baseRadius;
+    if (this._radiusOverride == null) {
+      const autoRadius = this._computeVisualRingRadius();
+      if (Number.isFinite(autoRadius) && autoRadius > 0) {
+        this._baseRadius = autoRadius;
+      }
+    }
+
+    const desiredRadius = this._radiusOverride ?? this._baseRadius;
     if (Math.abs(desiredRadius - this.radius) > 0.5) {
       this.radius = desiredRadius;
+      const spanBase = Math.ceil((this.radius + this.tileSize) / Math.max(1, this.tileSize));
+      this._tileSpanCap = Math.max(6, spanBase + 2);
       this._refreshRadiusVisibility();
     }
 
@@ -473,6 +494,7 @@ export class BuildingManager {
   dispose() {
     this.scene?.remove(this.group);
     this.clearHover();
+    this._hideAddressToast(true);
     this._clearAllTiles();
     this._edgeMaterial.dispose();
     this._highlightEdgeMaterial.dispose();
@@ -534,6 +556,7 @@ export class BuildingManager {
 
     // Hide CSS3D panel
     this._hideDuckDuckGoPanel();
+    this._hideAddressToast();
   }
 
   _showHover(info, point, camera) {
@@ -580,6 +603,8 @@ export class BuildingManager {
       this._hoverLabel.position.copy(labelPos);
       this._hoverLabel.visible = true;
     }
+
+    this._showAddressToast(info);
   }
   _bindPressListeners() {
     if (!this._inputEl || typeof window === 'undefined') return;
@@ -642,6 +667,81 @@ export class BuildingManager {
     } catch (e) {
       // no-op if popups are blocked; you could log if desired
     }
+  }
+
+  _computeVisualRingRadius() {
+    const tm = this.tileManager;
+    if (!tm) return null;
+    const tileRadius = Number.isFinite(tm?.tileRadius) ? tm.tileRadius : null;
+    const visualRing = Number.isFinite(tm?.VISUAL_RING) ? tm.VISUAL_RING : null;
+    if (!Number.isFinite(tileRadius) || tileRadius <= 0 || !Number.isFinite(visualRing)) return null;
+    const padding = 2;
+    return tileRadius * Math.max(0, visualRing + padding);
+  }
+
+  _ensureAddressToast() {
+    if (this._addressToast || typeof document === 'undefined') return this._addressToast;
+    const el = document.getElementById('buildingHoverToast');
+    if (!el) return null;
+    this._addressToast = el;
+    this._addressToastNameEl = el.querySelector('[data-role="toast-name"]') || null;
+    this._addressToastAddrEl = el.querySelector('[data-role="toast-address"]') || null;
+    return this._addressToast;
+  }
+
+  _formatBuildingName(info) {
+    if (!info?.tags) return '';
+    return info.tags.name
+      || info.tags['addr:housename']
+      || info.tags.amenity
+      || info.tags.shop
+      || (info.tags.building && info.tags.building !== 'yes' ? info.tags.building : '');
+  }
+
+  _showAddressToast(info) {
+    const toast = this._ensureAddressToast();
+    if (!toast) return;
+    if (this._addressToastHideTimer) {
+      clearTimeout(this._addressToastHideTimer);
+      this._addressToastHideTimer = null;
+    }
+    const name = this._formatBuildingName(info);
+    if (this._addressToastNameEl) {
+      if (name) {
+        this._addressToastNameEl.textContent = name;
+        this._addressToastNameEl.hidden = false;
+      } else {
+        this._addressToastNameEl.textContent = '';
+        this._addressToastNameEl.hidden = true;
+      }
+    }
+    if (this._addressToastAddrEl) {
+      this._addressToastAddrEl.textContent = info?.address || 'Unknown address';
+    }
+    toast.removeAttribute('hidden');
+    void toast.offsetWidth;
+    toast.classList.add('show');
+  }
+
+  _hideAddressToast(immediate = false) {
+    const toast = this._ensureAddressToast();
+    if (!toast) return;
+    if (this._addressToastHideTimer) {
+      clearTimeout(this._addressToastHideTimer);
+      this._addressToastHideTimer = null;
+    }
+    const finalize = () => {
+      toast.setAttribute('hidden', '');
+    };
+    toast.classList.remove('show');
+    if (immediate) {
+      finalize();
+      return;
+    }
+    this._addressToastHideTimer = setTimeout(() => {
+      finalize();
+      this._addressToastHideTimer = null;
+    }, 180);
   }
 
   /* ---------- CSS3D integration ---------- */
@@ -941,9 +1041,20 @@ export class BuildingManager {
 
     const [tx, tz] = key.split(',').map(Number);
     const needed = new Set();
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) needed.add(`${tx + dx},${tz + dz}`);
+    const span = this._tileSpanForRadius();
+    const tileDiag = this._tileDiagHalf || (this.tileSize * Math.SQRT2 * 0.5);
+    const radius = Math.max(this.radius || 0, this.tileSize * 0.5);
+    const maxDistSq = (radius + tileDiag) * (radius + tileDiag);
+    for (let dx = -span; dx <= span; dx++) {
+      for (let dz = -span; dz <= span; dz++) {
+        const dxMeters = dx * this.tileSize;
+        const dzMeters = dz * this.tileSize;
+        const distSq = dxMeters * dxMeters + dzMeters * dzMeters;
+        if (distSq > maxDistSq) continue;
+        needed.add(`${tx + dx},${tz + dz}`);
+      }
     }
+    if (!needed.size) needed.add(key);
     this._neededTiles = needed;
 
     const missing = [];
@@ -2262,6 +2373,14 @@ export class BuildingManager {
     const tx = Math.floor(x / this.tileSize);
     const tz = Math.floor(z / this.tileSize);
     return `${tx},${tz}`;
+  }
+
+  _tileSpanForRadius() {
+    const radius = Math.max(this.radius || 0, this.tileSize * 0.5);
+    const diag = this._tileDiagHalf || (this.tileSize * Math.SQRT2 * 0.5);
+    const rawSpan = Math.ceil((radius + diag) / this.tileSize);
+    const cap = Number.isFinite(this._tileSpanCap) ? this._tileSpanCap : rawSpan;
+    return Math.max(1, Math.min(rawSpan, cap));
   }
 
   _bboxForTile(tileKey) {
