@@ -71,6 +71,19 @@ const teleportToastHost = document.getElementById('teleportToastHost');
 const hudUsersToggle = document.getElementById('hudUsersToggle');
 const hudUserPanel = document.getElementById('hudUserPanel');
 const hudUserList = document.getElementById('hudUserList');
+const overviewBrowser = document.getElementById('overviewBrowser');
+const overviewPlatform = document.getElementById('overviewPlatform');
+const overviewResolution = document.getElementById('overviewResolution');
+const overviewUserAgent = document.getElementById('overviewUserAgent');
+const charAnimState = document.getElementById('charAnimState');
+const charSpeedValue = document.getElementById('charSpeedValue');
+const charElevationValue = document.getElementById('charElevationValue');
+const charEyeHeightValue = document.getElementById('charEyeHeightValue');
+const charCrouchState = document.getElementById('charCrouchState');
+const charJumpState = document.getElementById('charJumpState');
+const charFlipForward = document.getElementById('charFlipForward');
+const charFlipStrafe = document.getElementById('charFlipStrafe');
+const charFlipYaw = document.getElementById('charFlipYaw');
 const envInteractiveRing = document.getElementById('envInteractiveRing');
 const envInteractiveRingValue = document.getElementById('envInteractiveRingValue');
 const envInteractiveRingCurrent = document.getElementById('envInteractiveRingCurrent');
@@ -269,6 +282,9 @@ export const ui = {
   terrainModeGeohash, terrainModeLatLng,
   teleportToastHost,
   hudUsersToggle, hudUserPanel, hudUserList,
+  overviewBrowser, overviewPlatform, overviewResolution, overviewUserAgent,
+  charAnimState, charSpeedValue, charElevationValue, charEyeHeightValue, charCrouchState, charJumpState,
+  charFlipForward, charFlipStrafe, charFlipYaw,
   envInteractiveRing, envInteractiveRingValue, envInteractiveRingCurrent,
   envVisualRing, envVisualRingValue, envVisualRingCurrent,
   envFarfieldExtra, envFarfieldExtraValue, envFarfieldExtraCurrent,

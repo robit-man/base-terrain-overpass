@@ -1218,6 +1218,7 @@ export class Mesh {
     entry.reason = reason;
     entry.respondedAt = now();
     this.teleportOutbox.set(key, entry);
+    this._emitTeleportStatus(key, entry);
     this._renderPeers();
   }
 

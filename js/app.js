@@ -227,6 +227,12 @@ class App {
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
     });
+    this.sceneMgr.setTileRadiusSource(() => {
+      const tm = this.hexGridMgr;
+      if (!tm) return 4000;
+      const ring = Math.max(1, tm.FARFIELD_RING ?? tm.VISUAL_RING ?? 1);
+      return Math.max(200, tm.tileRadius * ring);
+    });
 
     const visualRing = Math.max(0, this.hexGridMgr?.VISUAL_RING ?? 0);
     const tileRadius = Math.max(1, this.hexGridMgr?.tileRadius ?? 120);
@@ -295,6 +301,8 @@ class App {
 
     // Motion / physics shim (jump, crouch, mobile drag, eye height)
     this.move = new Locomotion(this.sceneMgr, this.input, this.sensors.orient);
+    this._signConfig = this._loadSignFlips();
+    this.move.setSignConfig?.(this._signConfig);
     this.clock = new THREE.Clock();
     this._geoWatchId = null;
     this._mobileNav = isMobile ? {
@@ -530,6 +538,8 @@ class App {
     });
 
     this._setupEnvironmentControls();
+    this._setupCharacterControls();
+    this._populateDeviceInfo();
     this._syncEnvironmentAutoButtons();
 
     if (ui.hudUsersToggle) {
@@ -1108,6 +1118,34 @@ class App {
     this._syncEnvironmentAutoButtons();
   }
 
+  _setupCharacterControls() {
+    if (!ui.charFlipForward || !ui.charFlipStrafe || !ui.charFlipYaw) return;
+    const bind = (el, axis) => {
+      el.addEventListener('change', () => {
+        const value = el.checked ? -1 : 1;
+        const next = { ...this._signConfig, [axis]: value };
+        this._setSignFlips(next, { persist: true });
+      });
+    };
+    bind(ui.charFlipForward, 'forward');
+    bind(ui.charFlipStrafe, 'strafe');
+    bind(ui.charFlipYaw, 'yaw');
+    this._syncSignFlipControls();
+  }
+
+  _populateDeviceInfo() {
+    const nav = typeof navigator !== 'undefined' ? navigator : null;
+    const uaData = nav?.userAgentData;
+    const brand = uaData?.brands?.map((b) => `${b.brand} ${b.version}`).join(', ');
+    const ua = nav?.userAgent || 'unknown';
+    const platform = uaData?.platform || nav?.platform || 'unknown';
+    const res = `${window.innerWidth}×${window.innerHeight} @${(window.devicePixelRatio || 1).toFixed(2)}x`;
+    if (ui.overviewBrowser) ui.overviewBrowser.textContent = brand || ua.split(' ')[0] || 'unknown';
+    if (ui.overviewPlatform) ui.overviewPlatform.textContent = platform;
+    if (ui.overviewResolution) ui.overviewResolution.textContent = res;
+    if (ui.overviewUserAgent) ui.overviewUserAgent.textContent = ua;
+  }
+
   _syncEnvironmentAutoButtons() {
     if (ui.envTerrainAuto) {
       ui.envTerrainAuto.classList.toggle('on', !!this._terrainAuto);
@@ -1121,6 +1159,48 @@ class App {
       ui.envBuildingAuto.dataset.state = this._buildingAuto ? 'on' : 'off';
       ui.envBuildingAuto.textContent = this._buildingAuto ? 'Auto (On)' : 'Auto (Off)';
     }
+  }
+
+  _loadSignFlips() {
+    try {
+      const raw = localStorage.getItem('NKN_SIGN_FLIPS_V1');
+      if (!raw) return { forward: 1, strafe: 1, yaw: 1 };
+      const parsed = JSON.parse(raw);
+      const norm = (v) => (v === -1 ? -1 : 1);
+      return {
+        forward: norm(parsed.forward),
+        strafe: norm(parsed.strafe),
+        yaw: norm(parsed.yaw)
+      };
+    } catch {
+      return { forward: 1, strafe: 1, yaw: 1 };
+    }
+  }
+
+  _storeSignFlips() {
+    try {
+      localStorage.setItem('NKN_SIGN_FLIPS_V1', JSON.stringify(this._signConfig));
+    } catch { /* ignore quota */ }
+  }
+
+  _setSignFlips(next, { persist = false } = {}) {
+    if (!next) return;
+    const norm = (v) => (v === -1 ? -1 : 1);
+    this._signConfig = {
+      forward: norm(next.forward ?? this._signConfig.forward ?? 1),
+      strafe: norm(next.strafe ?? this._signConfig.strafe ?? 1),
+      yaw: norm(next.yaw ?? this._signConfig.yaw ?? 1),
+    };
+    this.move?.setSignConfig?.(this._signConfig);
+    if (persist) this._storeSignFlips();
+    this._syncSignFlipControls();
+  }
+
+  _syncSignFlipControls() {
+    if (!ui.charFlipForward || !ui.charFlipStrafe || !ui.charFlipYaw) return;
+    ui.charFlipForward.checked = (this._signConfig.forward ?? 1) === -1;
+    ui.charFlipStrafe.checked = (this._signConfig.strafe ?? 1) === -1;
+    ui.charFlipYaw.checked = (this._signConfig.yaw ?? 1) === -1;
   }
 
   _collectTerrainSettingsFromUi() {
@@ -1293,6 +1373,7 @@ class App {
     if (this._friends.has(key)) this._friends.delete(key);
     else this._friends.add(key);
     this._storeFriendList();
+    this.mesh?.sendStateSnapshot?.(key, { friend: this._friends.has(key) });
     if (this._lastHudUsers) this.updateHudUserList(this._lastHudUsers);
   }
 
@@ -1345,6 +1426,7 @@ class App {
       actions.className = 'hud-user-actions';
       const friendBtn = document.createElement('button');
       const isFriend = this.isFriend(user.pub);
+      if (isFriend) row.classList.add('is-friend');
       friendBtn.className = 'friend' + (isFriend ? ' active' : '');
       friendBtn.textContent = isFriend ? 'Remove Friend' : 'Add Friend';
       friendBtn.addEventListener('click', () => this._toggleFriend(user.pub));
@@ -2466,6 +2548,31 @@ class App {
     ui.lpPos.textContent = `${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`;
     ui.lpEul.textContent = `${deg(e.y).toFixed(1)}/${deg(e.x).toFixed(1)}/0.0`;
     ui.lpSpd.textContent = `${this.move.speed().toFixed(2)} m/s`;
+
+    const groundY = this.hexGridMgr?.getHeightAt?.(p.x, p.z);
+    const eyeHeight = Number.isFinite(groundY) ? p.y - groundY : null;
+    this._updateCharacterDiagnostics({
+      position: p,
+      speed: this.move.speed(),
+      groundY,
+      eyeHeight,
+      animation: this.localAvatar?.current || null,
+      crouch: this.move.isCrouching?.() ?? false,
+      jumpState: this.move.jumpState,
+    });
+  }
+
+  _updateCharacterDiagnostics({ position, speed, groundY, eyeHeight, animation, crouch, jumpState }) {
+    if (ui.charAnimState) ui.charAnimState.textContent = animation || '—';
+    if (ui.charSpeedValue) ui.charSpeedValue.textContent = `${Number.isFinite(speed) ? speed.toFixed(2) : '0.00'} m/s`;
+    if (ui.charElevationValue) ui.charElevationValue.textContent = Number.isFinite(groundY)
+      ? `${groundY.toFixed(2)} m`
+      : '—';
+    if (ui.charEyeHeightValue) ui.charEyeHeightValue.textContent = Number.isFinite(eyeHeight)
+      ? `${eyeHeight.toFixed(2)} m`
+      : '—';
+    if (ui.charCrouchState) ui.charCrouchState.textContent = crouch ? 'CROUCH' : 'STAND';
+    if (ui.charJumpState) ui.charJumpState.textContent = jumpState || 'idle';
   }
 
   /* ---------- Pose persistence ---------- */

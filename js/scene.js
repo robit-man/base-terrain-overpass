@@ -75,7 +75,7 @@ export class SceneManager {
     // You can override with setTileRadiusSource(number | () => number)
     this._tileRadiusSource = 4000; // fallback
 
-    // ---- Sky probe (offscreen) to sample horizon color ----
+    // ---- Sky probe (offscreen) to sample color just BELOW the horizon ----
     this._initSkyProbe();
 
     addEventListener('resize', () => {
@@ -93,7 +93,7 @@ export class SceneManager {
     if (this.currentSunAltitude !== undefined) this._syncFogToSky();
   }
 
-  // ---------- SKY PROBE: offscreen sampling ----------
+  // ---------- SKY PROBE: offscreen sampling (below the horizon) ----------
   _initSkyProbe() {
     // Small target; linear color (default), no depth/stencil needed
     const S = 64;
@@ -103,7 +103,9 @@ export class SceneManager {
       magFilter: THREE.NearestFilter,
       depthBuffer: false,
       stencilBuffer: false,
-      type: THREE.UnsignedByteType
+      type: THREE.UnsignedByteType // stays robust for readRenderTargetPixels
+      // Note: encoding of a RenderTarget is controlled by the renderer, so we
+      // temporarily force linear + no tone mapping while rendering the probe.
     });
 
     // Separate scene with a Sky sharing the SAME material (so uniforms track)
@@ -113,11 +115,16 @@ export class SceneManager {
     this._probeSky.material = this.sky.material; // share the material/uniforms
     this._probeScene.add(this._probeSky);
 
-    // Level camera; horizon sits at vertical center when level
+    // Level camera; the horizon sits at the vertical center when level.
+    // We look forward (-Z). The "below horizon" band is a few pixels *below* mid-height.
     this._probeCamera = new THREE.PerspectiveCamera(75, 1, 1, 100000);
     this._probeCamera.position.set(0, 0, 0);
     this._probeCamera.up.set(0, 1, 0);
     this._probeCamera.lookAt(new THREE.Vector3(0, 0, -1));
+
+    // How far beneath the horizon to sample (in degrees of vertical FOV).
+    // ~2–3° below the horizon matches human perception for distant fade.
+    this._horizonOffsetDeg = 2.5;
 
     // Buffer reused for reads
     this._probePixels = new Uint8Array(S * S * 4);
@@ -126,6 +133,12 @@ export class SceneManager {
     this._lastFogColor = new THREE.Color(0x223344);
   }
 
+  /**
+   * Sample a thin band a few degrees BELOW the horizon from the sky shader.
+   * This better matches perceived atmospheric color for distant fog/fade.
+   * We temporarily disable tone mapping and sRGB output to read a linear color.
+   * We also optionally ignore a narrow wedge around the sun if it's in front.
+   */
   _sampleSkyHorizonColor() {
     const rt = this._probeRT;
     const S = this._probeSize;
@@ -135,7 +148,19 @@ export class SceneManager {
     const prevAutoClear = this.renderer.autoClear;
     const prevClearColor = new THREE.Color();
     const prevClearAlpha = this.renderer.getClearAlpha();
+    const prevTone = this.renderer.toneMapping;
+    const prevOutEnc = this.renderer.outputEncoding ?? this.renderer.outputColorSpace;
+
     this.renderer.getClearColor(prevClearColor);
+
+    // Force linear pass-through for the probe render
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    if ('outputEncoding' in this.renderer) {
+      this.renderer.outputEncoding = THREE.LinearEncoding;
+    } else if ('outputColorSpace' in this.renderer) {
+      // @ts-ignore legacy/modern compat
+      this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // linear
+    }
 
     // Render sky-only to offscreen
     this.renderer.setRenderTarget(rt);
@@ -151,17 +176,66 @@ export class SceneManager {
     this.renderer.setRenderTarget(prevRT);
     this.renderer.setClearColor(prevClearColor, prevClearAlpha);
     this.renderer.autoClear = prevAutoClear;
+    this.renderer.toneMapping = prevTone;
+    if ('outputEncoding' in this.renderer) {
+      this.renderer.outputEncoding = prevOutEnc;
+    } else if ('outputColorSpace' in this.renderer) {
+      // @ts-ignore
+      this.renderer.outputColorSpace = prevOutEnc;
+    }
 
-    // Sample a thin band just BELOW the horizon (center - small offset)
-    const offset = Math.max(1, Math.floor(S * 0.02)); // ~2% of height
-    const horizonRow = Math.max(0, Math.min(S - 1, Math.floor(S * 0.5) - offset));
+    // Row just BELOW the horizon (center of image is horizon when level)
+    const pixelsPerDegree = S / this._probeCamera.fov;
+    const offsetPx = Math.max(1, Math.round(pixelsPerDegree * this._horizonOffsetDeg));
+    const baseRow = Math.min(S - 1, Math.max(0, Math.floor(S * 0.5) + offsetPx));
 
+    // Optional: ignore a thin vertical region around the sun when it's in front,
+    // to avoid biasing the average toward direct forward scattering.
+    let skipMinX = -1, skipMaxX = -1;
+    try {
+      const sunDir = this.sunLight.position.clone().normalize();
+
+      // Transform sun direction into probe camera clip space
+      const viewMat = this._probeCamera.matrixWorldInverse;
+      const projMat = this._probeCamera.projectionMatrix;
+
+      // Treat direction as a far-away point along that direction
+      const sunPosWS = sunDir.clone().multiplyScalar(1000); // any positive scalar
+      const sunPosVS = sunPosWS.clone().applyMatrix4(viewMat);
+      const sunPosClip = sunPosVS.clone().applyMatrix4(projMat);
+
+      if (sunPosClip.w !== 0) {
+        const ndcX = sunPosClip.x / sunPosClip.w;
+        const ndcY = sunPosClip.y / sunPosClip.w;
+
+        // In front and within view frustum?
+        const inFront = sunPosVS.z < 0; // camera looks down -Z
+        const onScreen = Math.abs(ndcX) <= 1 && Math.abs(ndcY) <= 1;
+
+        // Only mask if the sun is near the horizon (±15°) to reduce over-masking
+        const nearHorizon = Math.abs(this.currentSunAltitude ?? 0) <= THREE.MathUtils.degToRad(15);
+
+        if (inFront && onScreen && nearHorizon) {
+          const sunX = Math.round(((ndcX + 1) * 0.5) * (S - 1));
+          const half = Math.max(1, Math.floor(S * 0.08)); // ~8% of width
+          skipMinX = Math.max(0, sunX - half);
+          skipMaxX = Math.min(S - 1, sunX + half);
+        }
+      }
+    } catch (_) {
+      // non-fatal; just don't skip any columns
+      skipMinX = skipMaxX = -1;
+    }
+
+    // Average across a few rows to smooth, skip edges and (optionally) the sun band
     let rSum = 0, gSum = 0, bSum = 0, count = 0;
 
-    // Average across 3 rows to smooth, skip edges
-    for (let dy = 0; dy < 3; dy++) {
-      const y = Math.max(0, Math.min(S - 1, horizonRow - dy));
+    const rowsToAverage = 5;
+    for (let dy = 0; dy < rowsToAverage; dy++) {
+      // Sample a small cluster straddling the target row (below the horizon)
+      const y = Math.max(0, Math.min(S - 1, baseRow - Math.floor(rowsToAverage / 2) + dy));
       for (let x = 2; x < S - 2; x++) {
+        if (skipMinX >= 0 && x >= skipMinX && x <= skipMaxX) continue; // skip sun band
         const idx = (y * S + x) * 4;
         rSum += this._probePixels[idx + 0];
         gSum += this._probePixels[idx + 1];
@@ -170,9 +244,23 @@ export class SceneManager {
       }
     }
 
+    // If we skipped too much (e.g., everything), fall back to sampling without the mask
+    if (count === 0) {
+      for (let dy = 0; dy < 3; dy++) {
+        const y = Math.max(0, Math.min(S - 1, baseRow - dy));
+        for (let x = 2; x < S - 2; x++) {
+          const idx = (y * S + x) * 4;
+          rSum += this._probePixels[idx + 0];
+          gSum += this._probePixels[idx + 1];
+          bSum += this._probePixels[idx + 2];
+          count++;
+        }
+      }
+    }
+
     if (count === 0) return this._lastFogColor.clone();
 
-    // Pixels are in linear space (target encoding is LinearEncoding)
+    // Pixels are linear because we disabled tone mapping and sRGB conversion
     const r = (rSum / count) / 255;
     const g = (gSum / count) / 255;
     const b = (bSum / count) / 255;
@@ -193,22 +281,11 @@ export class SceneManager {
 
   // Start close for atmospheric perspective; scale far with tile radius; tighten at night/haze
   _computeFogDistances(tileRadius, altitude, turbidity) {
-    const R = tileRadius;
+    const R = Math.max(50, tileRadius);
 
-    const altDeg = THREE.MathUtils.radToDeg(altitude ?? 0);
-    const night = 1 - THREE.MathUtils.smoothstep(altDeg, -12, 10); // 0 day -> 1 night
-    const haze  = THREE.MathUtils.clamp((turbidity - 2) / 8, 0, 1);
-
-    const nearBase = THREE.MathUtils.clamp(R * 0.012, 10, 40);      // ~10–40m typical
-    let near = nearBase * (1 - 0.35 * haze) * (1 - 0.25 * night);
-
-    const farBase = R * 1.45;
-    let far = farBase * (1 - 0.18 * haze - 0.28 * night);
-
-    // Clamp and keep healthy separation
-    const EPS = 5;
-    near = THREE.MathUtils.clamp(near, this.camera.near + EPS, this.camera.far - EPS);
-    far  = THREE.MathUtils.clamp(far,  near + 150,          this.camera.far - EPS);
+    const far = Math.min(R, this.camera.far - 50);
+    let near = Math.max(this.camera.near + 10, Math.min(far - 20, R * 0.06));
+    if (near >= far - 5) near = Math.max(this.camera.near + 5, far - 5);
 
     return { near, far };
   }
@@ -216,7 +293,7 @@ export class SceneManager {
   _syncFogToSky() {
     const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
 
-    // 🔍 Sample the true horizon color from the Sky shader
+    // 🔍 Sample the true color just BELOW the horizon from the Sky shader
     const fogColor = this._sampleSkyHorizonColor();
 
     // Distances based on tile radius + atmosphere

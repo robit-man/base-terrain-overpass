@@ -92,18 +92,24 @@ export class Locomotion {
     this._snapYawActive = false;
     this._snapYawEpsilon = THREE.MathUtils.degToRad(1.5);
     this._tmpForward = new THREE.Vector3();
+
+    this._sign = { forward: 1, strafe: 1, yaw: 1 };
   }
 
   update(dt, groundY, xrPresenting) {
     const dol = this.sceneMgr.dolly;
 
     const isMobileDevice = isMobile;
+    const signForward = this._sign.forward;
+    const signStrafe = this._sign.strafe;
+    const signYaw = this._sign.yaw;
+
     let mobileDx = 0;
     let mobileDy = 0;
     let baseYaw = this._currentYaw();
     if (isMobileDevice) {
-      mobileDx = THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
-      mobileDy = THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
+      mobileDx = signYaw * THREE.MathUtils.clamp(this.input.touch.dxNorm, -1, 1);
+      mobileDy = signForward * THREE.MathUtils.clamp(this.input.touch.dyNorm, -1, 1);
       const yawDelta = mobileDx * this._touchYawRate * dt;
       if (Math.abs(yawDelta) > 1e-5) {
         this._touchYawOffset = THREE.MathUtils.euclideanModulo(this._touchYawOffset + yawDelta + Math.PI, Math.PI * 2) - Math.PI;
@@ -199,6 +205,8 @@ export class Locomotion {
       const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
       let mx = 0, mz = 0; const m = this.input.m;
       if (m.f) mz++; if (m.b) mz--; if (m.l) mx--; if (m.r) mx++;
+      mx *= signStrafe;
+      mz *= signForward;
       if (mx || mz) {
         const dir = new THREE.Vector3().addScaledVector(right, mx).addScaledVector(fwd, mz).normalize();
         const s = this.baseSpeed * (m.run ? this.runMul : 1);
@@ -357,22 +365,22 @@ export class Locomotion {
       const vertical = Math.abs(axisYRaw) > this._vrAxisDeadzone ? -axisYRaw : 0;
 
       if (handedness === 'right') {
-        rightAxes.horizontal = horizontal;
-        rightAxes.vertical = vertical;
+        rightAxes.horizontal = horizontal * signYaw;
+        rightAxes.vertical = vertical * signForward;
         rightPad = gamepad;
       } else if (handedness === 'left') {
-        leftAxes.horizontal = horizontal;
-        leftAxes.vertical = vertical;
+        leftAxes.horizontal = horizontal * signStrafe;
+        leftAxes.vertical = vertical * signForward;
         leftPad = gamepad;
       } else {
         if (!leftPad) {
           leftPad = gamepad;
-          leftAxes.horizontal = horizontal;
-          leftAxes.vertical = vertical;
+          leftAxes.horizontal = horizontal * signStrafe;
+          leftAxes.vertical = vertical * signForward;
         } else {
           rightPad = gamepad;
-          rightAxes.horizontal = horizontal;
-          rightAxes.vertical = vertical;
+          rightAxes.horizontal = horizontal * signYaw;
+          rightAxes.vertical = vertical * signForward;
         }
       }
 
@@ -612,6 +620,13 @@ export class Locomotion {
   popJumpStarted() { const j = this._jumpJustStarted; this._jumpJustStarted = false; return j; }
   jumpHangTime() { return this._pendingHangTime || 0; }
   baseEyeHeight() { return this.baseEye; }
+
+  setSignConfig(config = {}) {
+    const norm = (v) => (v === -1 ? -1 : 1);
+    if (config.forward != null) this._sign.forward = norm(config.forward);
+    if (config.strafe != null) this._sign.strafe = norm(config.strafe);
+    if (config.yaw != null) this._sign.yaw = norm(config.yaw);
+  }
 
   _extractFlatForward(source, target) {
     if (!source) return false;

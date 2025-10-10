@@ -1977,6 +1977,11 @@ canvas {
     padding: 0.55rem 0.75rem;
 }
 
+.hud-user.is-friend {
+    border-color: rgba(111, 148, 255, 0.6);
+    box-shadow: 0 0 12px rgba(111, 148, 255, 0.18);
+}
+
 .hud-user-top {
     display: flex;
     align-items: center;

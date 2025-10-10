@@ -191,6 +191,7 @@
         <button class="control-tab is-active" role="tab" aria-selected="true" aria-controls="tab-overview" data-tab="overview">Overview</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-navigation" data-tab="navigation">Navigation</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-networking" data-tab="networking">Networking</button>
+        <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-character" data-tab="character">Character</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-environment" data-tab="environment">Environment</button>
         <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-diagnostics" data-tab="diagnostics">Diagnostics</button>
       </div>
@@ -215,10 +216,11 @@
           </section>
 
           <section class="modal-section">
-            <h3 class="section-title">Local Pose</h3>
-            <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
-            <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
-            <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+            <h3 class="section-title">Device</h3>
+            <div class="kv"><span class="tiny">Browser</span>&nbsp;<span id="overviewBrowser" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Platform</span>&nbsp;<span id="overviewPlatform" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Resolution</span>&nbsp;<span id="overviewResolution" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">User Agent</span>&nbsp;<span id="overviewUserAgent" class="mono">—</span></div>
           </section>
         </div>
 
@@ -286,6 +288,51 @@
             <h3 class="section-title">Peers</h3>
             <div class="tiny" id="peerSummary">—</div>
             <div id="peerList" class="peer-list"></div>
+          </section>
+        </div>
+
+        <div class="tab-panel" id="tab-character" role="tabpanel" data-tab-panel="character" hidden>
+          <section class="modal-section">
+            <h3 class="section-title">Local Pose</h3>
+            <div class="kv"><span class="tiny">pos:</span>&nbsp;<span id="lpPos" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">euler°:</span>&nbsp;<span id="lpEul" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">speed:</span>&nbsp;<span id="lpSpd" class="mono">—</span></div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Model Diagnostics</h3>
+            <div class="kv"><span class="tiny">Animation</span>&nbsp;<span id="charAnimState" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Speed</span>&nbsp;<span id="charSpeedValue" class="mono">0.00 m/s</span></div>
+            <div class="kv"><span class="tiny">Elevation</span>&nbsp;<span id="charElevationValue" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Eye Height</span>&nbsp;<span id="charEyeHeightValue" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Crouch</span>&nbsp;<span id="charCrouchState" class="mono">—</span></div>
+            <div class="kv"><span class="tiny">Jump</span>&nbsp;<span id="charJumpState" class="mono">—</span></div>
+          </section>
+
+          <section class="modal-section">
+            <h3 class="section-title">Sign Flips</h3>
+            <p class="tiny">Invert axes on the fly to debug mismatched input devices.</p>
+            <label class="toggle-row" for="charFlipForward">
+              <input id="charFlipForward" type="checkbox">
+              <span class="toggle-text">
+                <span class="toggle-title">Invert Forward/Back</span>
+                <span class="tiny">Applies to keyboard, mobile, and VR forward motion.</span>
+              </span>
+            </label>
+            <label class="toggle-row" for="charFlipStrafe">
+              <input id="charFlipStrafe" type="checkbox">
+              <span class="toggle-text">
+                <span class="toggle-title">Invert Strafe</span>
+                <span class="tiny">Flips left/right movement inputs.</span>
+              </span>
+            </label>
+            <label class="toggle-row" for="charFlipYaw">
+              <input id="charFlipYaw" type="checkbox">
+              <span class="toggle-text">
+                <span class="toggle-title">Invert Yaw</span>
+                <span class="tiny">Reverses yaw input for touch and VR controllers.</span>
+              </span>
+            </label>
           </section>
         </div>
 
