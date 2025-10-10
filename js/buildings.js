@@ -1105,25 +1105,29 @@ export class BuildingManager {
     this._currentCenter = key;
 
     const [tx, tz] = key.split(',').map(Number);
-    const needed = new Set();
     const span = this._tileSpanForRadius();
     const tileDiag = this._tileDiagHalf || (this.tileSize * Math.SQRT2 * 0.5);
     const radius = Math.max(this.radius || 0, this.tileSize * 0.5);
     const maxDistSq = (radius + tileDiag) * (radius + tileDiag);
+
+    const tiles = [];
     for (let dx = -span; dx <= span; dx++) {
       for (let dz = -span; dz <= span; dz++) {
         const dxMeters = dx * this.tileSize;
         const dzMeters = dz * this.tileSize;
         const distSq = dxMeters * dxMeters + dzMeters * dzMeters;
         if (distSq > maxDistSq) continue;
-        needed.add(`${tx + dx},${tz + dz}`);
+        tiles.push({ key: `${tx + dx},${tz + dz}`, distSq });
       }
     }
-    if (!needed.size) needed.add(key);
+    if (!tiles.length) tiles.push({ key, distSq: 0 });
+    tiles.sort((a, b) => a.distSq - b.distSq);
+
+    const needed = new Set(tiles.map(t => t.key));
     this._neededTiles = needed;
 
     const missing = [];
-    for (const tileKey of needed) {
+    for (const { key: tileKey } of tiles) {
       let state = this._tileStates.get(tileKey);
       if (!state) {
         state = this._createTileState(tileKey);
@@ -1147,7 +1151,8 @@ export class BuildingManager {
     }
 
     if (missing.length && !this._patchInflight) {
-      this._fetchPatch(Array.from(needed), missing);
+      const allOrdered = tiles.map(t => t.key);
+      this._fetchPatch(allOrdered, missing);
     }
   }
 

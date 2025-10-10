@@ -3421,7 +3421,7 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const lift = eyeHeight + 3;
 
-     this._testBall = this.physics.spawnTestBall({ origin, lift });
+     //this._testBall = this.physics.spawnTestBall({ origin, lift });
   }
 }
 
