@@ -1094,7 +1094,7 @@ canvas {
 }
 
 #miniMapDock .mini-map-panel {
-    filter: saturate(0)contrast(1.2)brightness(1)contrast(0.8)opacity(0.5)
+    filter: brightness(0.5)contrast(2)invert(0)saturate(0);
 }
 
 #miniMapDock .mini-map-action-stack {
@@ -1147,6 +1147,7 @@ canvas {
     color: var(--hud-text-primary);
     z-index: 14;
     cursor: pointer;
+    mix-blend-mode: color-burn;
 }
 
 #perfHud:hover {
@@ -1173,6 +1174,7 @@ canvas {
     right: 1.5rem;
     top: 1.5rem;
     pointer-events: none;
+    mix-blend-mode: color-burn;
 }
 
 #perfHud .hud-topline {
@@ -1189,6 +1191,7 @@ canvas {
     left: 1.5rem;
     bottom: 1.5rem;
     z-index: 2;
+    mix-blend-mode: color-burn;
 }
 
 #metricStack .hud-clock {
@@ -1478,6 +1481,7 @@ canvas {
     opacity: 0.5;
     transition: opacity 0.2s ease;
     transition-delay: 3s;
+    mix-blend-mode: color-burn;
 }
 
 #miniMapDock:hover {
@@ -1822,6 +1826,19 @@ canvas {
     transform: translate3d(0, -12px, 0);
 }
 
+.blur {
+    pointer-events: none;
+    user-select: none;
+    position: fixed;
+    z-index: 1;
+    width: 100vw;
+    height: 100vh;
+    left: 0px;
+    top: 0px;
+    mask: radial-gradient(transparent,transparent,transparent,transparent, black, black);
+    backdrop-filter: blur(20px);
+}
+
 #buildingHoverToast {
     position: fixed;
     bottom: calc(50% - 20px);
@@ -1847,7 +1864,7 @@ canvas {
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color:var(--hud-text-primary);
+    color: var(--hud-text-primary);
     margin-bottom: 0.25rem;
 }
 
@@ -1858,7 +1875,7 @@ canvas {
 #buildingHoverToast .building-toast-address {
     font-weight: 300;
     letter-spacing: 0.03em;
-    color:var(--hud-text-primary);
+    color: var(--hud-text-primary);
     word-break: break-word;
 }
 
