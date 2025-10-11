@@ -23,7 +23,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 VENV_FLAG   = "--in-venv"
 VENV_DIR    = os.path.join(SCRIPT_DIR, "venv")
 HTTPS_PORT  = 443
-PORT_TRIES  = 10  # 443..(443+9)
+PORT_TRIES  = 100  # 443..(443+9)
 CERT_DIR    = os.path.join(SCRIPT_DIR, "certs")  # where we store non-LE outputs
 
 # Globals for cleanup

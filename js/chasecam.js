@@ -66,7 +66,7 @@ export class ChaseCam {
   _ensureParentedToDolly() {
     const { camera, dolly } = this.sceneMgr;
     if (camera.parent !== dolly) {
-      try { camera.parent?.remove(camera); } catch {}
+      try { camera.parent?.remove(camera); } catch { }
       dolly.add(camera);
     }
     camera.position.set(0, 0, 0);

@@ -945,24 +945,9 @@ export class BuildingManager {
     }
   }
 
-  _hideDuckDuckGoPanel() {
-    // If you keep your CSS3D panel in this._duck.group or similar, hide it here.
-    // Guarded so it’s safe if not created yet.
-    if (this._duck?.group) this._duck.group.visible = false;
-  }
-
   _toDuckUrl(q) {
     const encoded = encodeURIComponent(String(q || '').trim()).replace(/%20/g, '+');
     return `https://duckduckgo.com/?q=${encoded}&ia=web`;
-  }
-
-  _buildSearchQuery(info) {
-    const parts = [];
-    if (info?.address) parts.push(info.address);
-    if (info?.tags?.name) parts.push(info.tags.name);
-    if (info?.tags?.amenity) parts.push(info.tags.amenity);
-    if (info?.tags?.shop) parts.push(info.tags.shop);
-    return parts.filter(Boolean).join(' ');
   }
 
   _setDuckQuery(target) {
@@ -1139,12 +1124,15 @@ export class BuildingManager {
       let anyBuildingVisible = false;
       if (state.buildings?.length) {
         for (const building of state.buildings) {
-          const centre = building?.info?.centroid;
+          const info = building?.info;
+          if (!info) continue;
+          const centre = info.centroid;
           const inside = centre ? this._isInsideRadius(centre) : true;
-          if (building.render) building.render.visible = inside;
-          if (building.solid) building.solid.visible = inside;
-          if (building.pick) building.pick.visible = inside;
-          if (inside) anyBuildingVisible = true;
+          info.insideRadius = inside;
+          this._refreshBuildingVisibility(building);
+          if ((building.solid && building.solid.visible) || (building.render && building.render.visible)) {
+            anyBuildingVisible = true;
+          }
         }
       }
 
@@ -1154,7 +1142,12 @@ export class BuildingManager {
         for (const extra of state.extras) {
           const centre = extra?.userData?.center;
           const inside = centre ? this._isInsideRadius(centre) : true;
-          extra.visible = inside;
+          if (extra?.userData) extra.userData.insideRadius = inside;
+          if (extra?.userData?.type === 'road') {
+            this._refreshRoadVisibility(extra);
+          } else {
+            extra.visible = inside;
+          }
         }
       }
     }
@@ -1647,6 +1640,7 @@ export class BuildingManager {
         if (!building) return;
         const { render, solid, pick, info } = building;
         info.tile = tileKey;
+        info.insideRadius = this._isInsideRadius(info.centroid);
         this.group.add(render);
         if (solid) this.group.add(solid);
         this._pickerRoot.add(pick);
@@ -1657,6 +1651,7 @@ export class BuildingManager {
         this._refreshBuildingVisibility(building);
         if (solid && this.physics) this.physics.registerStaticMesh(solid, { forceUpdate: true });
         state.buildings.push(building);
+        this._enqueueDirtyResnap(tileKey);
         break;
       }
       case 'road': {
@@ -1665,6 +1660,8 @@ export class BuildingManager {
         road.userData.tile = tileKey;
         this.group.add(road);
         state.extras.push(road);
+        this._refreshRoadVisibility(road);
+        this._enqueueDirtyResnap(tileKey);
         break;
       }
       case 'water': {
@@ -1888,6 +1885,7 @@ export class BuildingManager {
       tile: null,
       resnapStableFrames: 0,
       resnapFrozen: false,
+      insideRadius: true,
       isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z)
     };
 
@@ -2312,12 +2310,44 @@ export class BuildingManager {
 
   _refreshBuildingVisibility(building) {
     if (!building || !building.info) return;
-    const frozen = !!building.info.resnapFrozen;
-    const showWire = this._wireframeMode;          // only when explicitly in wireframe mode
-    const showSolid = true;                         // always show solid once built
-    if (building.render) building.render.visible = showWire;
-    if (building.solid) building.solid.visible = showSolid;
-    if (building.pick) building.pick.visible = showSolid;
+    const info = building.info;
+    const inside = info.insideRadius !== false;
+    const snapped = !!info.resnapFrozen;
+    const shouldShow = inside && snapped;
+    const wireMode = !!this._wireframeMode;
+
+    if (building.render) building.render.visible = shouldShow && wireMode;
+    if (building.solid) building.solid.visible = shouldShow && !wireMode;
+    if (building.pick) building.pick.visible = shouldShow;
+    this._updateMergedGroupVisibility(info.tile);
+  }
+
+  _refreshRoadVisibility(road) {
+    if (!road) return;
+    const data = road.userData || {};
+    const inside = data.insideRadius !== false;
+    const snapped = !!data.resnapFrozen;
+    const shouldShow = inside && snapped;
+    const wireMode = !!this._wireframeMode;
+
+    road.visible = shouldShow && !wireMode;
+    if (data.wireframeLines) data.wireframeLines.visible = shouldShow && wireMode;
+  }
+
+  _updateMergedGroupVisibility(tileKey) {
+    if (!tileKey) return;
+    const state = this._tileStates.get(tileKey);
+    if (!state?.mergedGroup) return;
+    let visible = false;
+    if (state.buildings?.length) {
+      for (const building of state.buildings) {
+        if ((building?.solid && building.solid.visible) || (building?.render && building.render.visible)) {
+          visible = true;
+          break;
+        }
+      }
+    }
+    state.mergedGroup.visible = visible;
   }
 
   _applyGeometryColor(geometry, color) {
@@ -2395,6 +2425,9 @@ export class BuildingManager {
       if (!state) continue;
       for (const building of state.buildings) this._refreshBuildingVisibility(building);
       for (const extra of state.extras) {
+        if (extra?.userData?.type === 'road') {
+          this._refreshRoadVisibility(extra);
+        }
         if (extra?.material) {
           extra.material.wireframe = next;
           extra.material.needsUpdate = true;
@@ -2456,16 +2489,22 @@ export class BuildingManager {
     const base = mesh.userData.basePos;
     if (!attr || !base) return;
     const arr = attr.array;
+    const data = mesh.userData || (mesh.userData = {});
     let sumY = 0;
     let count = 0;
+    let changed = false;
+    const tolerance = 0.03;
     for (let i = 0; i < arr.length; i += 3) {
       const x = base[i];
       const z = base[i + 2];
       const h = this._groundHeight(x, z);
+      const newY = h + this.roadOffset + this.roadHeightOffset;
+      const prevY = arr[i + 1];
+      if (!Number.isFinite(prevY) || Math.abs(prevY - newY) > tolerance) changed = true;
       arr[i] = x;
-      arr[i + 1] = h + this.roadOffset + this.roadHeightOffset;
+      arr[i + 1] = newY;
       arr[i + 2] = z;
-      sumY += arr[i + 1];
+      sumY += newY;
       count++;
     }
     attr.needsUpdate = true;
@@ -2475,6 +2514,16 @@ export class BuildingManager {
       const avg = sumY / count;
       mesh.material?.color?.copy?.(this._elevationColor(avg));
     }
+
+    if (changed) {
+      data.resnapStableFrames = 0;
+      data.resnapFrozen = false;
+    } else {
+      data.resnapStableFrames = (data.resnapStableFrames || 0) + 1;
+      if (data.resnapStableFrames >= 2) data.resnapFrozen = true;
+    }
+
+    this._refreshRoadVisibility(mesh);
   }
 
   _resnapWater(mesh) {
@@ -2511,7 +2560,10 @@ export class BuildingManager {
     mesh.userData.osmId = id;
     mesh.userData.basePos = basePos;
     mesh.userData.center = center;
-    mesh.visible = this._isInsideRadius(center);
+    mesh.userData.resnapStableFrames = 0;
+    mesh.userData.resnapFrozen = false;
+    mesh.userData.insideRadius = this._isInsideRadius(center);
+    mesh.visible = false;
 
     if (this._debugEnabled && this._nowMs() >= this._nextRoadLogMs) {
       this._debugLog('road.mesh', {
