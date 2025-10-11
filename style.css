@@ -2040,14 +2040,13 @@ canvas {
 
 .hud-user {
     border-radius: 12px;
-    background:#ffffff33;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: var(--hud-button-bg);
+    border: 1px solid var(--hud-button-border);
     padding: 0.55rem 0.75rem;
 }
 
 .hud-user.is-friend {
     border-color: rgba(111, 148, 255, 0.6);
-    box-shadow: 0 0 12px rgba(111, 148, 255, 0.18);
 }
 
 .hud-user-top {
