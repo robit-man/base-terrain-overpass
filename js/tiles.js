@@ -36,8 +36,8 @@ export class TileManager {
     this._interactiveSecondPass = false;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 2;
-    this.VISUAL_RING = 4;
+    this.INTERACTIVE_RING = 3;
+    this.VISUAL_RING = 6;
     this.FARFIELD_EXTRA = 30;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
@@ -2740,28 +2740,31 @@ _stitchInteractiveToVisualEdges(tile, {
 
 
   /* ---------------- per-frame: ensure LOD, relax, prune ---------------- */
-
-  update(playerPos) {
+update(playerPos) {
   if (!this.origin) return;
+
+  // ⚙️ Safety floor: never allow 0 interactive ring
+  this.INTERACTIVE_RING = Math.max(1, (this.INTERACTIVE_RING | 0));
 
   const startMs = performance?.now ? performance.now() : Date.now();
   const nowMs = () => (performance?.now ? performance.now() : Date.now());
-
-  // Soft per-frame compute budget for this method (ms). If you already have a class prop, it will use it.
   const HARD_BUDGET_MS = (this.UPDATE_BUDGET_MS ?? 4.5);
 
-  const a = this.tileRadius;
+  const a  = this.tileRadius;
   const qf = (2 / 3 * playerPos.x) / a;
   const rf = ((-1 / 3 * playerPos.x) + (Math.sqrt(3) / 3 * playerPos.z)) / a;
   const q0 = Math.round(qf), r0 = Math.round(rf);
+  const key = `${q0},${r0}`;
 
   const tileChanged = !this._lastQR || this._lastQR.q !== q0 || this._lastQR.r !== r0;
+  if (tileChanged) {
+    this._lastQR = { q: q0, r: r0 };
+    this._pendingHeavySweep = true; // 🔁 ensure we continue filling ring next frames
+  }
 
-  // Always do minimal maintenance each frame
   const maintenance = () => {
     this._ensureRelaxList?.();
     this._drainRelaxQueue?.();
-
     if (this._globalDirty) {
       const t = (typeof now === 'function' ? now() : Date.now());
       if (!this._lastRecolorAt || (t - this._lastRecolorAt > 100)) {
@@ -2772,14 +2775,17 @@ _stitchInteractiveToVisualEdges(tile, {
     }
   };
 
-  // If we didn't cross into a new axial tile, skip the heavy ring sweeps.
-  if (!tileChanged) {
-    maintenance();
+  // Decide whether to do heavy work this frame
+  const doHeavy = tileChanged || this._pendingHeavySweep === true;
 
-    // Occasional light populate ping near the interactive ring edge (very small budget)
+  // Always do cheap maintenance each frame
+  maintenance();
+
+  if (!doHeavy) {
+    // Light populate ping near the edge to keep things lively without cost
     let created = 0;
     const MAX_PINGS = Math.max(1, Math.floor((this.VISUAL_CREATE_BUDGET || 4) * 0.25));
-    const R = Math.min(this.VISUAL_RING || 0, this.INTERACTIVE_RING ? (this.INTERACTIVE_RING + 1) : 1);
+    const R = Math.min(this.VISUAL_RING || 0, (this.INTERACTIVE_RING + 1));
     outerPing:
     for (let dq = -R; dq <= R; dq++) {
       const rMin = Math.max(-R, -dq - R);
@@ -2789,8 +2795,7 @@ _stitchInteractiveToVisualEdges(tile, {
         const q = q0 + dq, r = r0 + dr;
         const dist = this._hexDist(q, r, q0, r0);
         if (dist <= this.INTERACTIVE_RING) continue;
-        const id = `${q},${r}`;
-        const existing = this.tiles.get(id);
+        const existing = this.tiles.get(`${q},${r}`);
         if (!existing) {
           this._addVisualTile(q, r);
           if (++created >= MAX_PINGS) break outerPing;
@@ -2799,145 +2804,134 @@ _stitchInteractiveToVisualEdges(tile, {
         }
       }
     }
-
-    // Light telemetry/log
-    const dt = nowMs() - startMs;
-    if ((!this._perfUpdateNext || nowMs() >= this._perfUpdateNext) && dt > 5) {
-      console.log(`[tiles.update/light] tiles=${this.tiles.size} duration=${dt.toFixed(2)}ms`);
-      this._perfUpdateNext = nowMs() + 2000;
-    }
     return;
   }
 
-  // We crossed into a new axial tile: do the heavy work, but still respect a time budget.
-  this._lastQR = { q: q0, r: r0 };
+  // ────────────────────────────────────────────────────────────────────────────
+  // HEAVY SWEEP (runs on tile change AND keeps resuming while pending)
+  // ────────────────────────────────────────────────────────────────────────────
+  let budgetHit = false;
+  let workDone  = 0;
 
-  // 1) interactive ring (ensure/protect core)
+  // 1) interactive ring
   for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
+    if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
     const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
     const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
     for (let dr = rMin; dr <= rMax; dr++) {
-      if (nowMs() - startMs > HARD_BUDGET_MS) break;
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
       const q = q0 + dq, r = r0 + dr;
       const id = `${q},${r}`;
       const cur = this.tiles.get(id);
       if (!cur) {
-        this._addInteractiveTile(q, r);
+        this._addInteractiveTile(q, r); workDone++;
       } else if (cur.type === 'visual') {
-        this._promoteVisualToInteractive(q, r);
+        this._promoteVisualToInteractive(q, r); workDone++;
       } else if (cur.type === 'farfield') {
-        this._discardTile(id);
-        this._addInteractiveTile(q, r);
+        this._discardTile(id); this._addInteractiveTile(q, r); workDone++;
       }
     }
   }
 
-  // 2) visuals outward with budget
-  let created = 0;
-  outerVisual:
-  for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
-    const rMin = Math.max(-this.VISUAL_RING, -dq - this.VISUAL_RING);
-    const rMax = Math.min(this.VISUAL_RING, -dq + this.VISUAL_RING);
-    for (let dr = rMin; dr <= rMax; dr++) {
-      if (nowMs() - startMs > HARD_BUDGET_MS) break;
-      const q = q0 + dq, r = r0 + dr;
-      const dist = this._hexDist(q, r, q0, r0);
-      if (dist <= this.INTERACTIVE_RING) continue;
-      const id = `${q},${r}`;
-      const existing = this.tiles.get(id);
-      if (!existing) {
-        this._addVisualTile(q, r);
-        if (++created >= this.VISUAL_CREATE_BUDGET) break outerVisual;
-      } else {
-        if (existing.type === 'farfield') {
-          this._discardTile(id);
-          this._addVisualTile(q, r);
+  // 2) visual ring (respect budget)
+  if (!budgetHit) {
+    let created = 0;
+    outerVisual:
+    for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+      const rMin = Math.max(-this.VISUAL_RING, -dq - this.VISUAL_RING);
+      const rMax = Math.min(this.VISUAL_RING, -dq + this.VISUAL_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break outerVisual; }
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.INTERACTIVE_RING) continue;
+        const id = `${q},${r}`;
+        const existing = this.tiles.get(id);
+        if (!existing) {
+          this._addVisualTile(q, r); workDone++;
+          if (++created >= (this.VISUAL_CREATE_BUDGET || 6)) break outerVisual;
         } else {
+          if (existing.type === 'farfield') {
+            this._discardTile(id); this._addVisualTile(q, r); workDone++;
+          } else {
+            this._queuePopulateIfNeeded?.(existing, false);
+          }
+        }
+      }
+    }
+  }
+
+  // 3) farfield (strided + sparse) (respect budget)
+  if (!budgetHit) {
+    let farCreated = 0;
+    farOuter:
+    for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+      const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
+      const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
+      for (let dr = rMin; dr <= rMax; dr++) {
+        if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break farOuter; }
+        const q = q0 + dq, r = r0 + dr;
+        const dist = this._hexDist(q, r, q0, r0);
+        if (dist <= this.VISUAL_RING) continue;
+
+        const tier = this._farfieldTierForDist?.(dist) || { stride: 3, scale: 2, samples: 'sparse', minPrec: 6 };
+        const { stride, scale, samples, minPrec } = tier;
+        if (!this._divisible?.(q - q0, stride) || !this._divisible?.(r - r0, stride)) continue;
+
+        const id = `${q},${r}`;
+        const existing = this.tiles.get(id);
+
+        if (!existing) {
+          const t = this._addFarfieldTile(q, r, scale, samples);
+          t._farMinPrec = minPrec; workDone++;
+          if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
+        } else if (existing.type !== 'farfield' ||
+                   (existing.scale || 1) !== scale ||
+                   (existing._farSampleMode || 'all') !== samples) {
+          this._discardTile(id);
+          const t = this._addFarfieldTile(q, r, scale, samples);
+          t._farMinPrec = minPrec; workDone++;
+          if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
+        } else {
+          existing._farMinPrec = minPrec;
           this._queuePopulateIfNeeded?.(existing, false);
         }
       }
     }
   }
 
-  // 3) farfield outward with budget (strided + scaled + sparse sampling)
-  let farCreated = 0;
-  farOuter:
-  for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
-    const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
-    const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
-    for (let dr = rMin; dr <= rMax; dr++) {
-      if (nowMs() - startMs > HARD_BUDGET_MS) break;
-      const q = q0 + dq, r = r0 + dr;
-      const dist = this._hexDist(q, r, q0, r0);
-      if (dist <= this.VISUAL_RING) continue;
-
-      const tier = this._farfieldTierForDist?.(dist) || { stride: 3, scale: 2, samples: 'sparse', minPrec: 6 };
-      const { stride, scale, samples, minPrec } = tier;
-
-      if (!this._divisible?.(q - q0, stride) || !this._divisible?.(r - r0, stride)) continue;
-
-      const id = `${q},${r}`;
-      const existing = this.tiles.get(id);
-
-      if (!existing) {
-        const t = this._addFarfieldTile(q, r, scale, samples);
-        t._farMinPrec = minPrec;
-        if (++farCreated >= this.FARFIELD_CREATE_BUDGET) break farOuter;
-      } else if (existing.type !== 'farfield' ||
-                 (existing.scale || 1) !== scale ||
-                 (existing._farSampleMode || 'all') !== samples) {
+  // 4) prune/downgrade (respect budget)
+  if (!budgetHit) {
+    const toRemove = [];
+    const toFarfield = [];
+    for (const [id, t] of this.tiles) {
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+      const dist = this._hexDist(t.q, t.r, q0, r0);
+      if (dist > this.FARFIELD_RING) { toRemove.push(id); continue; }
+      if (dist > this.VISUAL_RING) { if (t.type !== 'farfield') toFarfield.push({ q: t.q, r: t.r }); }
+    }
+    for (const id of toRemove) {
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+      this._discardTile(id); workDone++;
+    }
+    if (!budgetHit) {
+      for (const { q, r } of toFarfield) {
+        if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+        const id = `${q},${r}`;
         this._discardTile(id);
-        const t = this._addFarfieldTile(q, r, scale, samples);
-        t._farMinPrec = minPrec;
-        if (++farCreated >= this.FARFIELD_CREATE_BUDGET) break farOuter;
-      } else {
-        existing._farMinPrec = minPrec;
-        this._queuePopulateIfNeeded?.(existing, false);
+        this._addFarfieldTile(q, r); workDone++;
       }
     }
+    this._refreshFarfieldAdapters?.(q0, r0);
   }
 
-  // 4) prune/downgrade rings (only when tile changed)
-  this._refreshFarfieldAdapters?.(q0, r0);
+  // Keep sweeping next frame if we hit the budget or we still did meaningful work
+  this._pendingHeavySweep = budgetHit || (workDone > 0);
 
-  const toRemove = [];
-  const toFarfield = [];
-  for (const [id, t] of this.tiles) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
-    const dist = this._hexDist(t.q, t.r, q0, r0);
-    if (dist > this.FARFIELD_RING) {
-      toRemove.push(id);
-      continue;
-    }
-    if (dist > this.VISUAL_RING) {
-      if (t.type !== 'farfield') toFarfield.push({ q: t.q, r: t.r });
-      continue;
-    }
-  }
-
-  for (const id of toRemove) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
-    this._discardTile(id);
-  }
-  for (const { q, r } of toFarfield) {
-    if (nowMs() - startMs > HARD_BUDGET_MS) break;
-    const id = `${q},${r}`;
-    this._discardTile(id);
-    this._addFarfieldTile(q, r);
-  }
-
-  // 5) cheap maintenance
-  maintenance();
-
-  // Telemetry/log
-  const dt = nowMs() - startMs;
-  if ((!this._perfUpdateNext || nowMs() >= this._perfUpdateNext) && dt > 5) {
-    console.log(`[tiles.update/heavy] tiles=${this.tiles.size} duration=${dt.toFixed(2)}ms`);
-    this._perfUpdateNext = nowMs() + 2000;
-  }
+  // (Optional) one-time faster fill: bump budget for first few frames after spawn
+  // if (this._spawnBoostUntil && nowMs() < this._spawnBoostUntil) this._pendingHeavySweep = true;
 }
 
 
