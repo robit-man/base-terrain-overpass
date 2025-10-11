@@ -268,6 +268,7 @@ export class BuildingManager {
     this._resnapDirtyTiles = new Set();
     this._resnapDirtyMaxPerFrame = 2;
     this._resnapHotBudgetMs = 0.6;
+    this._pendingTerrainTiles = new Set();
 
     this._waterMaterials = new Set();
 
@@ -1101,7 +1102,8 @@ export class BuildingManager {
     const anchor = this._resolveTrackingNode();
     anchor.getWorldPosition(this._tmpVec);
     const key = this._tileKeyForWorld(this._tmpVec.x, this._tmpVec.z);
-    if (!force && key === this._currentCenter) return;
+    const hasPendingWait = (this._pendingTerrainTiles?.size ?? 0) > 0;
+    if (!force && key === this._currentCenter && !hasPendingWait) return;
     this._currentCenter = key;
 
     const [tx, tz] = key.split(',').map(Number);
@@ -1117,13 +1119,25 @@ export class BuildingManager {
         const dzMeters = dz * this.tileSize;
         const distSq = dxMeters * dxMeters + dzMeters * dzMeters;
         if (distSq > maxDistSq) continue;
-        tiles.push({ key: `${tx + dx},${tz + dz}`, distSq });
+        const tileKey = `${tx + dx},${tz + dz}`;
+        const state = this._tileStates.get(tileKey);
+        if (!state && !this._terrainTileReady(tileKey)) {
+          this._pendingTerrainTiles?.add(tileKey);
+          continue;
+        }
+        if (this._pendingTerrainTiles) this._pendingTerrainTiles.delete(tileKey);
+        tiles.push({ key: tileKey, distSq });
       }
     }
-    if (!tiles.length) tiles.push({ key, distSq: 0 });
+
+    if (!tiles.length) {
+      const state = this._tileStates.get(key);
+      if (state || this._terrainTileReady(key)) tiles.push({ key, distSq: 0 });
+    }
+
     tiles.sort((a, b) => a.distSq - b.distSq);
 
-    const needed = new Set(tiles.map(t => t.key));
+    const needed = new Set(tiles.map((t) => t.key));
     this._neededTiles = needed;
 
     const missing = [];
@@ -1150,8 +1164,20 @@ export class BuildingManager {
       if (!needed.has(tileKey)) this._unloadTile(tileKey);
     }
 
+    if (this._pendingTerrainTiles && this._pendingTerrainTiles.size) {
+      for (const pendingKey of Array.from(this._pendingTerrainTiles)) {
+        if (!needed.has(pendingKey)) {
+          this._pendingTerrainTiles.delete(pendingKey);
+          continue;
+        }
+        if (this._terrainTileReady(pendingKey)) {
+          this._pendingTerrainTiles.delete(pendingKey);
+        }
+      }
+    }
+
     if (missing.length && !this._patchInflight) {
-      const allOrdered = tiles.map(t => t.key);
+      const allOrdered = tiles.map((t) => t.key);
       this._fetchPatch(allOrdered, missing);
     }
   }
@@ -1180,7 +1206,59 @@ export class BuildingManager {
       mergedGroup: null,
       raw: null,
       tileKey,
+      resnapFrozen: false,
     };
+  }
+
+  _terrainTileReady(tileKey) {
+    const tm = this.tileManager;
+    if (!tm || !tm.tiles || typeof tm._worldToAxialFloat !== 'function' || typeof tm._axialRound !== 'function') {
+      return false;
+    }
+
+    const parts = tileKey.split(',');
+    if (parts.length !== 2) return false;
+    const tx = Number(parts[0]);
+    const tz = Number(parts[1]);
+    if (!Number.isFinite(tx) || !Number.isFinite(tz)) return false;
+
+    const size = this.tileSize;
+    const centerX = (tx + 0.5) * size;
+    const centerZ = (tz + 0.5) * size;
+
+    const axialFloat = tm._worldToAxialFloat.call(tm, centerX, centerZ);
+    const axial = axialFloat ? tm._axialRound.call(tm, axialFloat.q, axialFloat.r) : null;
+    if (!axial || !Number.isFinite(axial.q) || !Number.isFinite(axial.r)) return false;
+
+    const OFFSETS = [
+      [0, 0],
+      [1, 0],
+      [1, -1],
+      [0, -1],
+      [-1, 0],
+      [-1, 1],
+      [0, 1]
+    ];
+
+    const centerTile = tm.tiles.get(`${axial.q},${axial.r}`);
+    if (!this._isTerrainTileReady(centerTile, true)) return false;
+
+    for (const [dq, dr] of OFFSETS) {
+      const tile = tm.tiles.get(`${axial.q + dq},${axial.r + dr}`);
+      if (!this._isTerrainTileReady(tile, false)) return false;
+    }
+    return true;
+  }
+
+  _isTerrainTileReady(tile, requireInteractive) {
+    if (!tile) return false;
+    if (requireInteractive && tile.type !== 'interactive') return false;
+    if (tile.type === 'interactive') {
+      if (!tile._phase?.seedDone) return false;
+    } else if (!tile._phase?.fullDone) {
+      return false;
+    }
+    return true;
   }
 
   async _fetchPatch(allTiles, targetTiles) {
@@ -1275,6 +1353,7 @@ export class BuildingManager {
     this._cancelMerge(tileKey);
     this._cancelBuildJob(tileKey);
     this._removeTileObjects(tileKey);
+    state.resnapFrozen = false;
 
     const nodeMap = new Map();
     for (const el of data?.elements || []) if (el.type === 'node') nodeMap.set(el.id, el);
@@ -1697,7 +1776,18 @@ export class BuildingManager {
 
     const centroid = averagePoint(rawFootprint);
     const address = formatAddress(tags);
-    const info = { id, address, rawFootprint, height: extrusion, baseHeight: groundBase, centroid, tags: { ...tags }, tile: null };
+    const info = {
+      id,
+      address,
+      rawFootprint,
+      height: extrusion,
+      baseHeight: groundBase,
+      centroid,
+      tags: { ...tags },
+      tile: null,
+      resnapStableFrames: 0,
+      resnapFrozen: false
+    };
 
     edges.userData.buildingInfo = info;
     pickMesh.userData.buildingInfo = info;
@@ -1923,6 +2013,14 @@ export class BuildingManager {
     if (this._resnapDirtyTiles.has(tileKey)) return;
     this._resnapDirtyTiles.add(tileKey);
     this._resnapDirtyQueue.push(tileKey);
+    const state = this._tileStates.get(tileKey);
+    if (state && Array.isArray(state.buildings)) {
+      for (const building of state.buildings) {
+        if (!building?.info) continue;
+        building.info.resnapFrozen = false;
+        building.info.resnapStableFrames = 0;
+      }
+    }
   }
 
   _drainDirtyResnapQueue(budgetMs = this._resnapHotBudgetMs) {
@@ -1951,7 +2049,9 @@ export class BuildingManager {
   _queueResnapSweep() {
     if (!this._tileStates.size) return;
     if (this._resnapQueue && this._resnapIndex < this._resnapQueue.length) return;
-    this._resnapQueue = Array.from(this._tileStates.keys());
+    this._resnapQueue = Array.from(this._tileStates.values())
+      .filter((state) => state && (!state.resnapFrozen || (state.extras && state.extras.length)))
+      .map((state) => state.tileKey);
     this._resnapIndex = 0;
   }
 
@@ -1973,7 +2073,7 @@ export class BuildingManager {
 
       const tileKey = this._resnapQueue[this._resnapIndex++];
       const state = this._tileStates.get(tileKey);
-      if (!state) continue;
+      if (!state || (state.resnapFrozen && (!state.extras || !state.extras.length))) continue;
       this._resnapTile(tileKey, state);
       processed++;
     }
@@ -1998,13 +2098,30 @@ export class BuildingManager {
   }
 
   _resnapTile(tileKey, state) {
+    const buildings = state.buildings || [];
+    const extras = state.extras || [];
+
+    if (buildings.length && buildings.every((b) => b?.info?.resnapFrozen)) {
+      if (!extras.length) {
+        state.resnapFrozen = true;
+        return;
+      }
+    } else {
+      state.resnapFrozen = false;
+    }
+
     let dirty = false;
-    for (const building of state.buildings) {
+    for (const building of buildings) {
       if (this._resnapBuilding(building)) dirty = true;
     }
-    if (dirty) this._rebuildMergedTile(tileKey, state);
+    if (dirty) {
+      state.resnapFrozen = false;
+      this._rebuildMergedTile(tileKey, state);
+    } else if (buildings.length && buildings.every((b) => b?.info?.resnapFrozen) && !extras.length) {
+      state.resnapFrozen = true;
+    }
 
-    for (const extra of state.extras) {
+    for (const extra of extras) {
       const type = extra.userData?.type;
       if (type === 'road') this._resnapRoad(extra);
       else if (type === 'water') this._resnapWater(extra);
@@ -2015,13 +2132,22 @@ export class BuildingManager {
   _resnapBuilding(building) {
     if (!building || !building.info) return false;
     const info = building.info;
+    if (info.resnapFrozen) return false;
     const baseline = this._lowestGround(info.rawFootprint) + this.extraDepth;
     const groundBase = baseline - this.extraDepth;
     const prev = info.baseHeight;
     const changed = !Number.isFinite(prev) || Math.abs(prev - groundBase) > 0.02;
     info.baseHeight = groundBase;
 
-    if (changed && building.render) {
+    if (!changed) {
+      info.resnapStableFrames = (info.resnapStableFrames || 0) + 1;
+      if (info.resnapStableFrames >= 2) info.resnapFrozen = true;
+      return false;
+    }
+
+    info.resnapStableFrames = 0;
+
+    if (building.render) {
       const newGeom = this._makeWireGeometry(info.rawFootprint, groundBase, info.height);
       building.render.geometry.dispose();
       building.render.geometry = newGeom;
@@ -2039,31 +2165,29 @@ export class BuildingManager {
       building.pick.position.y = baseline;
       building.pick.updateMatrixWorld(true);
     }
- if (changed && this._hoverInfo === info) {
-   // Rebuild hover artifacts to match the new base/height
-   if (this._hoverEdges) {
-     const g = this._buildHighlightGeometry(info);
-     this._hoverEdges.geometry.dispose();
-     this._hoverEdges.geometry = g;
-   }
-   // Recompute stem + label position facing camera
-   const anchorTop = this._chooseAnchorTop(info);
-   const camPos = this.camera.getWorldPosition(this._tmpVec2);
-   const dir = camPos.clone().sub(anchorTop); dir.y = 0; if (dir.lengthSq() < 1e-6) dir.set(1,0,0); dir.normalize();
-   const stemLength = 2;
-   const labelPos = anchorTop.clone().addScaledVector(dir, stemLength); labelPos.y += stemLength;
-   const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
-   if (this._hoverStem) {
-     this._hoverStem.geometry.dispose();
-     this._hoverStem.geometry = stemGeom;
-     this._hoverStem.visible = true;
-   }
-   if (this._hoverLabel) {
-     this._hoverLabel.position.copy(labelPos);
-     this._hoverLabel.visible = true;
-   }
-   this._hoverGroup.visible = true;
- }
+    if (this._hoverInfo === info) {
+      if (this._hoverEdges) {
+        const g = this._buildHighlightGeometry(info);
+        this._hoverEdges.geometry.dispose();
+        this._hoverEdges.geometry = g;
+      }
+      const anchorTop = this._chooseAnchorTop(info);
+      const camPos = this.camera.getWorldPosition(this._tmpVec2);
+      const dir = camPos.clone().sub(anchorTop); dir.y = 0; if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0); dir.normalize();
+      const stemLength = 2;
+      const labelPos = anchorTop.clone().addScaledVector(dir, stemLength); labelPos.y += stemLength;
+      const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
+      if (this._hoverStem) {
+        this._hoverStem.geometry.dispose();
+        this._hoverStem.geometry = stemGeom;
+        this._hoverStem.visible = true;
+      }
+      if (this._hoverLabel) {
+        this._hoverLabel.position.copy(labelPos);
+        this._hoverLabel.visible = true;
+      }
+      this._hoverGroup.visible = true;
+    }
     return changed;
   }
 
@@ -2657,6 +2781,7 @@ export class BuildingManager {
     this._cancelMerge(tileKey);
     this._removeTileObjects(tileKey);
     this._tileStates.delete(tileKey);
+    if (this._pendingTerrainTiles) this._pendingTerrainTiles.delete(tileKey);
     console.log(`[Buildings] purged tile ${tileKey}`);
   }
 
@@ -2673,6 +2798,7 @@ export class BuildingManager {
     this._resnapDirtyQueue.length = 0;
     this._resnapDirtyIndex = 0;
     this._resnapDirtyTiles.clear();
+    this._pendingTerrainTiles?.clear?.();
     for (const tileKey of Array.from(this._tileStates.keys())) this._removeTileObjects(tileKey);
     this._tileStates.clear();
   }

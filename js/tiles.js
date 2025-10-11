@@ -3279,6 +3279,19 @@ _stitchInteractiveToVisualEdges(tile, {
     return result;
   }
 
+  hasInteractiveTerrainAt(x, z) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return false;
+    const axialFloat = this._worldToAxialFloat(x, z);
+    if (!axialFloat) return false;
+    const axial = this._axialRound(axialFloat.q, axialFloat.r);
+    const tile = this.tiles.get(`${axial.q},${axial.r}`);
+    if (!tile || tile.type !== 'interactive') return false;
+    const phaseReady = tile._phase?.fullDone;
+    if (!phaseReady) return false;
+    if (!Number.isFinite(tile.unreadyCount)) return true;
+    return tile.unreadyCount <= 0;
+  }
+
   setRelayAddress(addr) {
     this.relayAddress = (addr || '').trim();
     this.terrainRelay?.setRelayAddress(this.relayAddress);
