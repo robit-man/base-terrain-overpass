@@ -672,10 +672,18 @@ export class BuildingManager {
     // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
-    // CSS3D panel orientation + render overlay
+// CSS3D panel: render only when visible, and throttle (big perf win)
     if (this._cssEnabled && this._cssRenderer && this._cssScene) {
-      this._updateCSS3DPanelFacing();
-      this._cssRenderer.render(this._cssScene, this.camera);
+      const anyVisible = (this._cssPanelVisible === true) || this._hoverGroup?.visible === true;
+      const nowMs = this._nowMs();
+      if (anyVisible) {
+        this._nextCssRenderMs = this._nextCssRenderMs || 0;
+        if (nowMs >= this._nextCssRenderMs) {
+          this._updateCSS3DPanelFacing?.();
+          this._cssRenderer.render(this._cssScene, this.camera);
+          this._nextCssRenderMs = nowMs + 90; // ~11 Hz
+        }
+      }
     }
   }
 
