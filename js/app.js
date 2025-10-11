@@ -176,7 +176,7 @@ class App {
     try {
       const pr = this._pixelRatioBounds.max;
       this.sceneMgr.renderer.setPixelRatio(pr);
-    } catch {}
+    } catch { }
 
     this._poseStoredState = null;
     this._poseLatestState = null;
@@ -200,6 +200,9 @@ class App {
     this._hudMetaCached = null;
     this._hudGeoCached = { lat: null, lon: null, hash: null };
 
+    this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
+    this._perfNextMs = 0;
+    this._perfUrge
     // === NEW: throttling state (non-breaking) ===
     this._hoverNextAllowedMs = 0;
     this._pointerLastMoveMs = 0;
@@ -271,13 +274,30 @@ class App {
     this._terrainUpdateTimer = null;
     this._buildingUpdateTimer = null;
 
-    this._perf = new AdaptiveQualityManager({ targetFps: 60, minQuality: 0.35, maxQuality: 1.05 });
+    this._perf = new AdaptiveQualityManager({
+      targetFps: 60,
+      minQuality: 0.35,
+      maxQuality: 1.05,
+
+      // calmer anti-thrash
+      qualityEps: 0.10,          // was 0.08
+      qualityQuantum: 0.05,      // was 0.02
+      applyMinMsDown: 1200,      // was 600 — degrade less often
+      applyMinMsUp: 4000,        // was 2000 — recover slower
+      allowPeriodicResyncMs: 8000
+    });
     const measuredApply = (label, fn) => (profile) => {
       if (!this._perfLogger) return fn(profile);
       return this._perfLogger.measure(label, () => fn(profile));
     };
     this._perf.registerSubsystem('terrain', {
-      apply: measuredApply('tiles.applyProfile', (profile) => this.hexGridMgr?.applyPerfProfile?.(profile) || null),
+      apply: (profile) => {
+        const now = performance.now();
+        if (this._terrainCooldownUntil && now < this._terrainCooldownUntil) return null;
+        const out = this.hexGridMgr?.applyPerfProfile?.(profile) || null;
+        this._terrainCooldownUntil = now + 500; // 0.5s cooldown
+        return out;
+      }
     });
     this._perf.registerSubsystem('buildings', {
       apply: measuredApply('buildings.applyProfile', (profile) => this.buildings?.applyPerfProfile?.(profile) || null),
@@ -378,7 +398,7 @@ class App {
         this.localAvatar.group.name = 'local-avatar';
         this.sceneMgr.remoteLayer.add(this.localAvatar.group);
       })
-      .catch(() => {});
+      .catch(() => { });
 
     // Third-person chase cam
     const sampleHeight = (x, z) => {
@@ -2352,35 +2372,35 @@ class App {
     const radius = 1.2;
     const lineOpacity = 0.15;
     const majorMat = new THREE.MeshPhysicalMaterial({
-          transmission: 1,
-          thickness: 2,
-          roughness: 0.65,
-          //metalness: 0,
-          iridescence: 0.2,
-          iridescenceIOR: 2.1,
-          clearcoat: 0.1,
-          clearcoatRoughness: 0.05,
-        });
+      transmission: 1,
+      thickness: 2,
+      roughness: 0.65,
+      //metalness: 0,
+      iridescence: 0.2,
+      iridescenceIOR: 2.1,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.05,
+    });
     const mediumMat = new THREE.MeshPhysicalMaterial({
-          transmission: 1,
-          thickness: 2,
-          roughness: 0.65,
-          //metalness: 0,
-          iridescence: 1,
-          iridescenceIOR: 2.2,
-          clearcoat: 0.1,
-          clearcoatRoughness: 0.05,
-        });
+      transmission: 1,
+      thickness: 2,
+      roughness: 0.65,
+      //metalness: 0,
+      iridescence: 1,
+      iridescenceIOR: 2.2,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.05,
+    });
     const minorMat = new THREE.MeshPhysicalMaterial({
-          transmission: 1,
-          thickness: 2,
-          roughness: 0.65,
-          //metalness: 0,
-          iridescence: 0.5,
-          iridescenceIOR: 1.2,
-          clearcoat: 0.1,
-          clearcoatRoughness: 0.05,
-        });
+      transmission: 1,
+      thickness: 2,
+      roughness: 0.65,
+      //metalness: 0,
+      iridescence: 0.5,
+      iridescenceIOR: 1.2,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.05,
+    });
 
     for (let deg = 0; deg < 360; deg += 5) {
       const rad = THREE.MathUtils.degToRad(deg);
@@ -2447,7 +2467,7 @@ class App {
     texture.generateMipmaps = false;
     texture.needsUpdate = true;
 
-    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity:0.5, depthTest: false, depthWrite: false });
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 0.5, depthTest: false, depthWrite: false });
     const sprite = new THREE.Sprite(material);
     const aspect = canvas.width / canvas.height;
     sprite.scale.set(size * aspect, size, 1);
@@ -2591,7 +2611,7 @@ class App {
       const cam = new THREE.PerspectiveCamera(75, oldCam.aspect || innerWidth / innerHeight, 0.05, 100000);
       cam.position.set(0, 0, 0);
       cam.rotation.set(0, 0, 0);
-      try { this.sceneMgr.dolly.remove(oldCam); } catch {}
+      try { this.sceneMgr.dolly.remove(oldCam); } catch { }
       this.sceneMgr.dolly.add(cam);
       this.sceneMgr.camera = cam;
     } else {
@@ -3115,7 +3135,7 @@ class App {
           this._poseDirty = false;
           this._poseSaveTimer = 0;
           this._poseRestored = true;
-        } catch {}
+        } catch { }
       };
       if ('requestIdleCallback' in window && !force) {
         requestIdleCallback(write, { timeout: 1000 });
@@ -3211,13 +3231,24 @@ class App {
     const logger = this._perfLogger;
     if (logger?.frameStart) logger.frameStart();
     const measure = logger ? (label, fn) => logger.measure(label, fn) : (label, fn) => fn();
-    const begin = logger ? (label) => logger.begin(label) : () => {};
+    const begin = logger ? (label) => logger.begin(label) : () => { };
     const end = logger ? (label) => logger.end(label) : () => 0;
 
     const dt = this.clock.getDelta();
     const currentTargetFps = this._perf.profile().targetFps;
     const fpsSample = dt > 0.5 ? currentTargetFps : (dt > 1e-4 ? 1 / dt : currentTargetFps);
-    const perfState = measure('perf.sample', () => this._perf.sample({ dt, fps: fpsSample }));
+    const now = (performance?.now ? performance.now() : Date.now());
+    const target = this._perf.profile().targetFps || 60;
+    const fpsEstimate = (dt > 1e-4) ? (1 / dt) : target;
+    const urgent = fpsEstimate < target * (1 - this._perfUrgentFrac);
+    const doPerf = urgent || now >= this._perfNextMs;
+
+    const perfState = doPerf
+      ? this._perf.sample({ dt, fps: fpsEstimate })
+      : this._perf.profile();           // read-only, no applies
+
+    if (doPerf) this._perfNextMs = now + (urgent ? 120 : this._perfCadenceMs);
+
 
     if (perfState.qualityChanged || perfState.hudReady) {
       const tileSummary = perfState.subsystems?.terrain ?? null;
@@ -3657,7 +3688,7 @@ class App {
 
     this.physics.ready.then(() => {
       this.buildings?.setPhysicsEngine(this.physics);
-    }).catch(() => {});
+    }).catch(() => { });
 
     this.physics.collidersReady.then(() => {
       this._physicsPrimed = true;
@@ -3665,10 +3696,10 @@ class App {
       if (this.physics?.configureCharacter) {
         this.physics
           .configureCharacter({ position: this.sceneMgr.dolly.position.clone(), eyeHeight })
-          .catch(() => {});
+          .catch(() => { });
       }
       this._spawnPhysicsProbe();
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   _spawnPhysicsProbe() {
@@ -3680,7 +3711,7 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const lift = eyeHeight + 3;
 
-     //this._testBall = this.physics.spawnTestBall({ origin, lift });
+    //this._testBall = this.physics.spawnTestBall({ origin, lift });
   }
 }
 

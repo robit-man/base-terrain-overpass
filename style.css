@@ -45,8 +45,8 @@ body.theme-twilight {
     --hud-text-primary: rgba(235, 240, 255, 0.92);
     --hud-text-muted: rgba(210, 222, 240, 0.65);
     --hud-accent: #8ad4ff;
-    --hud-button-bg: rgba(130, 170, 255, 0.18);
-    --hud-button-border: rgba(130, 170, 255, 0.42);
+    --hud-button-bg: rgba(255, 255, 255, 0.18);
+    --hud-button-border: rgba(255, 255, 255, 0.42);
     --hud-button-text: rgba(236, 242, 255, 0.9);
     --hud-shadow: 0 18px 34px rgba(18, 36, 72, 0.32);
     background: radial-gradient(circle at 20% 20%, rgba(38, 52, 88, 0.78), rgba(12, 18, 30, 0.92));
@@ -65,8 +65,8 @@ body.theme-day {
     --hud-status-warn: #ff9f32;
     --hud-status-error: #ff4b5e;
     --hud-shadow: 0 16px 30px rgba(48, 72, 120, 0.22);
-    --hud-button-bg: rgba(80, 120, 210, 0.18);
-    --hud-button-border: rgba(80, 120, 210, 0.38);
+    --hud-button-bg: rgba(80, 80, 80, 0.18);
+    --hud-button-border: rgba(80, 80, 80, 0.38);
     --hud-button-text: rgba(28, 40, 68, 0.82);
     background: radial-gradient(circle at 70% 20%, rgba(255, 255, 255, 0.95), rgba(220, 232, 255, 0.95));
     color: #1f2a40;
@@ -1064,8 +1064,8 @@ input[type=text] {
 
 @keyframes hudFlash {
     from {
-        color: var(--hud-accent);
-        text-shadow: 0 0 12px var(--hud-accent);
+        color: var(--hud-text-muted);
+        text-shadow: 0 0 12px var(--hud-text-muted);
     }
 
     to {
@@ -1082,13 +1082,11 @@ input[type=text] {
     width: auto;
     padding: 18px;
     border-radius: 26px;
-    border: 1px solid #ffffff1a;
     z-index: 11;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 14px;
-    backdrop-filter: blur(16px) saturate(150%);
 }
 
 canvas {
@@ -1146,7 +1144,7 @@ canvas {
     padding: 0;
     border: none;
     background: transparent;
-    color: inherit;
+    color: var(--hud-text-primary);
     z-index: 14;
     cursor: pointer;
 }
@@ -1199,7 +1197,7 @@ canvas {
     flex-direction: column;
     align-items: flex-end;
     gap: 4px;
-    margin-top:0.5rem;
+    margin-top: 0.5rem;
     width: fit-content;
 }
 
@@ -1223,14 +1221,14 @@ canvas {
     letter-spacing: 0.08em;
     text-align: right;
     width: 100%;
-    color: var(--hud-text-primary);
+    color: var(--hud-text-muted);
 }
 
 #metricStack .hud-astro {
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 2px;
+    gap: 8px;
     font-size: 11px;
     letter-spacing: 0.03em;
     color: var(--hud-text-primary);
@@ -1245,7 +1243,8 @@ canvas {
     letter-spacing: 0.03em;
     color: var(--hud-text-primary);
 }
-#metricStack .hud-astro-label {
+
+.hud-astro-row .hud-astro-label {
     text-transform: uppercase;
     color: var(--hud-text-muted);
 }
@@ -1332,8 +1331,8 @@ canvas {
 #perfHud .hud-status-row {
     display: flex;
     flex-wrap: wrap;
-    flex-flow:column;
-    width:fit-content;
+    flex-flow: column;
+    width: fit-content;
     gap: 8px;
 }
 
@@ -1374,6 +1373,7 @@ canvas {
 #perfHud .hud-chip-row {
     display: flex;
     flex-wrap: wrap;
+    flex-flow: column;
     gap: 8px;
 }
 
@@ -1475,7 +1475,7 @@ canvas {
     z-index: 13;
     display: block;
     pointer-events: auto;
-    opacity:0.5;
+    opacity: 0.5;
     transition: opacity 0.2s ease;
     transition-delay: 3s;
 }
@@ -1483,7 +1483,8 @@ canvas {
 #miniMapDock:hover {
     transition-delay: 0s;
 
-    opacity:1;}
+    opacity: 1;
+}
 
 #miniMapDock .mini-map-shell {
     width: 240px;
@@ -1798,11 +1799,10 @@ canvas {
     min-width: 160px;
     max-width: 420px;
     padding: 0.75rem 1.2rem;
-    border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(18, 22, 30, 0.92);
-    color: #f5f5f5;
-    box-shadow: 0 16px 32px rgba(0, 0, 0, 0.35);
+    border-radius: 4px;
+    border: 1px solid var(--hud-text-muted);
+    color: var(--hud-text-primary);
+    backdrop-filter: blur(12px);
     font-size: 13px;
     letter-spacing: 0.05em;
     text-transform: none;
@@ -1824,19 +1824,15 @@ canvas {
 
 #buildingHoverToast {
     position: fixed;
-    bottom: 24px;
-    left: 24px;
+    bottom: calc(50% - 20px);
+    left: 1.5rem;
     max-width: 360px;
-    padding: 0.85rem 1rem;
-    border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(12, 16, 24, 0.9);
-    color: #f5f7fb;
+    color: var(--hud-text-primary);
     font-size: 13px;
     line-height: 1.35;
     letter-spacing: 0.02em;
     opacity: 0;
-    transform: translate3d(0, 12px, 0);
+    transform: translate3d(-12px, 0, 0);
     transition: opacity 0.2s ease, transform 0.2s ease;
     z-index: 45;
     pointer-events: none;
@@ -1851,7 +1847,7 @@ canvas {
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: rgba(255, 255, 255, 0.75);
+    color:var(--hud-text-primary);
     margin-bottom: 0.25rem;
 }
 
@@ -1860,9 +1856,9 @@ canvas {
 }
 
 #buildingHoverToast .building-toast-address {
-    font-weight: 400;
+    font-weight: 300;
     letter-spacing: 0.03em;
-    color: #f5f7fb;
+    color:var(--hud-text-primary);
     word-break: break-word;
 }
 
