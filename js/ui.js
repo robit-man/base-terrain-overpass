@@ -58,6 +58,7 @@ const hudCompassNeedle = document.getElementById('hudCompassNeedle');
 const perfHud = document.getElementById('perfHud');
 const hudGpsReckon = document.getElementById('hudGpsReckon');
 const hudDebugToggle = document.getElementById('hudDebugToggle');
+const hudWireframeToggle = document.getElementById('hudWireframeToggle');
 const hudReset = document.getElementById('hudReset');
 const hudGeohash = document.getElementById('hudGeohash');
 const hudLat = document.getElementById('hudLat');
@@ -295,6 +296,7 @@ export const ui = {
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
   hudClockLocal, hudClockUtc, hudSunInfo, hudMoonInfo,
+  hudWireframeToggle,
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,

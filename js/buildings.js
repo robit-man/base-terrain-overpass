@@ -135,8 +135,8 @@ export class BuildingManager {
     roadLit = false,
     roadShadows = false,
     roadColor = 0x202020,
-    extraDepth = 0.2,
-    extensionHeight = 1,
+    extraDepth = -1.5,
+    extensionHeight = 2.5,
     inputEl = null,            // NEW
     holdToOpenMs = 200,        // NEW (optional override)
 
@@ -279,15 +279,54 @@ export class BuildingManager {
     this._resnapVerifyTolerance = 0.12;
     this._pendingTerrainTiles = new Set();
 
-    this._waterMaterials = new Set();
+    this._wireframeMode = false;
+
+    const envTexture = scene?.environment || null;
+    this._buildingMaterial = new THREE.MeshPhysicalMaterial({
+      //color: new THREE.Color(0xaeb6c2),
+      transmission: 1,
+      thickness: 0.6,
+      roughness: 0.65,
+      //metalness: 0,
+      //clearcoat: 0.1,
+      //clearcoatRoughness: 0.45,
+      //envMap: envTexture,
+      //envMapIntensity: 0.6,
+      //vertexColors: true,
+      //transparent: true,
+      //opacity: 0.96,
+      side: THREE.BackSide
+    });
+    this._roadMaterial = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(0x424a57),
+      envMap: envTexture,
+      envMapIntensity: 0.25,
+      transparent: true,
+      opacity: 0.6,
+      vertexColors: true,
+      side: THREE.FrontSide
+    });
+    this._waterMaterialShared = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(0x1f3f55),
+      envMap: envTexture,
+      envMapIntensity: 0.4,
+      transparent: true,
+      opacity: 0.65,
+      vertexColors: true,
+    });
+    this._areaMaterial = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(0x7c8b95),
+      transparent: true,
+      opacity: 0.35,
+      vertexColors: true,
+      depthWrite: false
+    });
 
     this._tmpVec = new THREE.Vector3();
     this._tmpVec2 = new THREE.Vector3();
     this._tmpVec3 = new THREE.Vector3();
 
-    this._waterTime = 0;
-
-    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xa7adb7, transparent: true, opacity: 0.45 });
+    this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xa7adb7, transparent: true, opacity: 0.05 });
     this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 1 });
     this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 0.9 });
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
@@ -566,9 +605,6 @@ export class BuildingManager {
     }
     this._drainPendingFetchQueue(nowMs);
 
-    this._waterTime += dt;
-    for (const mat of this._waterMaterials) mat.uniforms.uTime.value = this._waterTime;
-
     // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
@@ -592,6 +628,7 @@ export class BuildingManager {
     this._highlightEdgeMaterial.dispose();
     this._stemMaterial.dispose();
     this._pickMaterial.dispose();
+    this._buildingMaterial.dispose();
 
     // CSS3D teardown
     if (this._cssRenderer) {
@@ -659,7 +696,7 @@ export class BuildingManager {
       const highlightGeom = this._buildHighlightGeometry(info);
       this._hoverEdges.geometry.dispose();
       this._hoverEdges.geometry = highlightGeom;
-      this._hoverEdges.position.set(0, 0, 0);
+      this._hoverEdges.position.set(0, this.extraDepth, 0);
 
       // we keep the text label infra but keep it hidden (replaced by CSS3D)
       const labelText = info.address || 'Unknown';
@@ -1171,14 +1208,14 @@ export class BuildingManager {
       let state = this._tileStates.get(tileKey);
       if (!state) {
         state = this._createTileState(tileKey);
-      this._tileStates.set(tileKey, state);
+        this._tileStates.set(tileKey, state);
+      }
+
+      if (state.status !== 'pending' && state.status !== 'error') continue;
+
+      state.status = 'pending';
+      missing.push(tileKey);
     }
-
-    if (state.status !== 'pending' && state.status !== 'error') continue;
-
-    state.status = 'pending';
-    missing.push(tileKey);
-  }
 
     for (const tileKey of Array.from(this._tileStates.keys())) {
       if (!needed.has(tileKey)) this._unloadTile(tileKey);
@@ -1783,8 +1820,10 @@ export class BuildingManager {
     if (state.mergedGroup) {
       state.mergedGroup.geometry.dispose();
       state.mergedGroup.geometry = mergedGeom;
+      state.mergedGroup.position.y = this.extraDepth;
     } else {
       const merged = new THREE.LineSegments(mergedGeom, this._edgeMaterial);
+      merged.position.y = this.extraDepth;
       merged.name = `merged-${tileKey}`;
       merged.userData = { type: 'buildingMerged', tile: tileKey };
       this.group.add(merged);
@@ -1800,15 +1839,18 @@ export class BuildingManager {
     const rawFootprint = flat.slice();
     if (rawFootprint.length < 6) return null;
 
-    const height = this._chooseBuildingHeight(tags);
-    const extrusion = height + this.extensionHeight;
+    const h = this._chooseBuildingHeight(tags);
+    const buryBoost = Math.max(0, -this.extraDepth);          // compensate bury
+    const extrusion = h + this.extensionHeight + buryBoost;    // canonical top
 
-    const baseline = this._lowestGround(rawFootprint) + this.extraDepth;
-    const groundBase = baseline - this.extraDepth;
+    const groundBase = this._lowestGround(rawFootprint);       // no offset
+    const baseline = groundBase + this.extraDepth;             // where solids live
+
 
     // Wireframe (canonical reference)
     const wireGeom = this._makeWireGeometry(rawFootprint, groundBase, extrusion);
     const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
+    edges.position.y = this.extraDepth;
     edges.castShadow = false;
     edges.receiveShadow = false;
     edges.visible = false;
@@ -1820,17 +1862,7 @@ export class BuildingManager {
     pickMesh.position.set(0, baseline, 0);
     pickMesh.visible = false;
 
-    const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
-    const fillMat = new THREE.MeshStandardMaterial({
-      color: fillColor.clone(),
-      metalness: 0.12,
-      roughness: 0.7,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1,
-    });
-    const solidMesh = new THREE.Mesh(solidGeo.clone(), fillMat);
+    const solidMesh = new THREE.Mesh(solidGeo.clone(), this._buildingMaterial);
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
     solidMesh.castShadow = true;
@@ -1857,7 +1889,10 @@ export class BuildingManager {
     pickMesh.userData.buildingInfo = info;
     solidMesh.userData.buildingInfo = info;
 
-    return { render: edges, solid: solidMesh, pick: pickMesh, info };
+    const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
+    const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
+    this._applyGeometryColor(building.solid.geometry, fillColor);
+    return building;
   }
 
   _makeSolidGeometry(footprint, height) {
@@ -2038,14 +2073,14 @@ export class BuildingManager {
     for (let i = 0; i < pts.length; i += 2) {
       const vx = pts[i];
       const vz = pts[i + 1];
-      const world = this._tmpVec.set(vx, info.baseHeight, vz);
+      const world = this._tmpVec.set(vx, info.baseHeight + this.extraDepth, vz);
       const dist = point ? point.distanceToSquared(world) : world.distanceToSquared(this.camera.position);
       if (dist < bestDist) {
         bestDist = dist;
         best = world.clone();
       }
     }
-    if (!best) best = new THREE.Vector3(info.centroid.x, info.baseHeight, info.centroid.z);
+    if (!best) best = new THREE.Vector3(info.centroid.x, info.baseHeight + this.extraDepth, info.centroid.z);
     best.y += info.height;
     return best;
   }
@@ -2196,6 +2231,7 @@ export class BuildingManager {
   _resnapBuilding(building) {
     if (!building || !building.info) return false;
     const info = building.info;
+    info.isVisualEdge = this._isNearVisualEdge(info.centroid.x, info.centroid.z);
     if (info.resnapFrozen) return false;
     let baseline = this._lowestGround(info.rawFootprint);
     let groundBase = baseline;
@@ -2223,17 +2259,17 @@ export class BuildingManager {
     info.resnapStableFrames = 0;
 
     if (building.render) {
-      const newGeom = this._makeWireGeometry(info.rawFootprint, groundBase, info.height);
+      const newGeom = this._makeWireGeometry(info.rawFootprint, info.baseHeight, info.height);
       building.render.geometry.dispose();
       building.render.geometry = newGeom;
-      building.render.position.set(0, 0, 0);
+      building.render.position.set(0, this.extraDepth, 0);
       building.render.updateMatrixWorld(true);
     }
     if (building.solid) {
       building.solid.position.y = baseline;
       building.solid.updateMatrixWorld(true);
       const color = this._elevationColor(groundBase + info.height * 0.5);
-      building.solid.material?.color?.copy?.(color);
+      this._applyGeometryColor(building.solid.geometry, color);
       this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
     }
     if (building.pick) {
@@ -2245,6 +2281,7 @@ export class BuildingManager {
         const g = this._buildHighlightGeometry(info);
         this._hoverEdges.geometry.dispose();
         this._hoverEdges.geometry = g;
+        this._hoverEdges.position.y = this.extraDepth;
       }
       const anchorTop = this._chooseAnchorTop(info);
       const camPos = this.camera.getWorldPosition(this._tmpVec2);
@@ -2259,20 +2296,38 @@ export class BuildingManager {
       }
       if (this._hoverLabel) {
         this._hoverLabel.position.copy(labelPos);
-      this._hoverLabel.visible = true;
+        this._hoverLabel.visible = true;
+      }
+      this._hoverGroup.visible = true;
     }
-    this._hoverGroup.visible = true;
- }
     this._refreshBuildingVisibility(building);
     return changed;
   }
 
   _refreshBuildingVisibility(building) {
     if (!building || !building.info) return;
-    const visible = !!building.info.resnapFrozen;
-    if (building.render) building.render.visible = visible;
-    if (building.solid) building.solid.visible = visible;
-    if (building.pick) building.pick.visible = visible;
+    const frozen = !!building.info.resnapFrozen;
+    const showWire = this._wireframeMode;          // only when explicitly in wireframe mode
+    const showSolid = true;                         // always show solid once built
+    if (building.render) building.render.visible = showWire;
+    if (building.solid) building.solid.visible = showSolid;
+    if (building.pick) building.pick.visible = showSolid;
+  }
+
+  _applyGeometryColor(geometry, color) {
+    if (!geometry?.getAttribute) return;
+    const pos = geometry.getAttribute('position');
+    const count = pos?.count;
+    if (!Number.isFinite(count) || count <= 0) return;
+    let attr = geometry.getAttribute('color');
+    if (!attr || attr.count !== count) {
+      const array = new Float32Array(count * 3);
+      attr = new THREE.BufferAttribute(array, 3);
+      geometry.setAttribute('color', attr);
+    }
+    const r = color.r, g = color.g, b = color.b;
+    for (let i = 0; i < attr.count; i++) attr.setXYZ(i, r, g, b);
+    attr.needsUpdate = true;
   }
 
   _drainPendingFetchQueue(nowMs = this._nowMs()) {
@@ -2301,6 +2356,47 @@ export class BuildingManager {
     return dist >= visualRadius - mgr.spacing * 0.5;
   }
 
+  setEnvironment(envTexture) {
+    const texture = envTexture || null;
+    if (this._buildingMaterial && this._buildingMaterial.envMap !== texture) {
+      this._buildingMaterial.envMap = texture;
+      this._buildingMaterial.needsUpdate = true;
+    }
+    if (this._roadMaterial && this._roadMaterial.envMap !== texture) {
+      this._roadMaterial.envMap = texture;
+      this._roadMaterial.needsUpdate = true;
+    }
+    if (this._waterMaterialShared && this._waterMaterialShared.envMap !== texture) {
+      this._waterMaterialShared.envMap = texture;
+      this._waterMaterialShared.needsUpdate = true;
+    }
+    if (this._areaMaterial && this._areaMaterial.envMap !== texture) {
+      this._areaMaterial.envMap = texture;
+      this._areaMaterial.needsUpdate = true;
+    }
+  }
+
+  setWireframe(enabled) {
+    const next = !!enabled;
+    if (this._wireframeMode === next) return;
+    this._wireframeMode = next;
+    if (this._roadMaterial) { this._roadMaterial.wireframe = next; this._roadMaterial.needsUpdate = true; }
+    if (this._waterMaterialShared) { this._waterMaterialShared.wireframe = next; this._waterMaterialShared.needsUpdate = true; }
+    if (this._areaMaterial) { this._areaMaterial.wireframe = next; this._areaMaterial.needsUpdate = true; }
+    if (this._buildingMaterial) this._buildingMaterial.wireframe = false;
+
+    for (const state of this._tileStates.values()) {
+      if (!state) continue;
+      for (const building of state.buildings) this._refreshBuildingVisibility(building);
+      for (const extra of state.extras) {
+        if (extra?.material) {
+          extra.material.wireframe = next;
+          extra.material.needsUpdate = true;
+        }
+      }
+    }
+  }
+
   _verifyFloatingBuildings() {
     if (!this._tileStates || !this._tileStates.size) return;
     const tiles = Array.from(this._tileStates.values());
@@ -2322,7 +2418,12 @@ export class BuildingManager {
         if (!building?.info) continue;
         const info = building.info;
         if (!info.resnapFrozen) continue;
-        const baseline = this._lowestGround(info.rawFootprint) + this.extraDepth;
+        let baseSample = this._lowestGround(info.rawFootprint);
+        if (info.isVisualEdge && this.tileManager?.getHeightAt) {
+          const sample = this.tileManager.getHeightAt(info.centroid.x, info.centroid.z);
+          if (Number.isFinite(sample)) baseSample = sample;
+        }
+        const baseline = baseSample + this.extraDepth;
         const current = info.baseHeight + this.extraDepth;
         const diff = Math.abs(baseline - current);
         if (diff > this._resnapVerifyTolerance) {
@@ -2391,17 +2492,12 @@ export class BuildingManager {
     if (!geomData) return null;
     const { geo, basePos, center, avgHeight } = geomData;
 
-    const mat = new THREE.MeshStandardMaterial({
-      color: this.roadColor,
-      metalness: 0.25,
-      roughness: 0.9,
-      side: THREE.DoubleSide,
-    });
-    if (Number.isFinite(avgHeight)) {
-      mat.color.copy(this._elevationColor(avgHeight));
-    }
+    const color = Number.isFinite(avgHeight)
+      ? this._elevationColor(avgHeight)
+      : new THREE.Color(this.roadColor || 0x424a57);
 
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = new THREE.Mesh(geo, this._roadMaterial);
+    this._applyGeometryColor(mesh.geometry, color);
     mesh.castShadow = !!this.roadShadows;
     mesh.receiveShadow = true;
 
@@ -2433,13 +2529,10 @@ export class BuildingManager {
     shape.autoClose = true;
 
     const geo = new THREE.ShapeGeometry(shape).rotateX(-Math.PI / 2);
-    const mat = this._waterMaterial();
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = new THREE.Mesh(geo, this._waterMaterialShared);
     mesh.userData.type = 'water';
     mesh.userData.osmId = id;
     mesh.userData.basePts = flat.slice();
-    mesh.userData.waterMaterial = mat;
-    this._waterMaterials.add(mat);
 
     const base = this._lowestGround(flat) - 0.2;
     mesh.position.set(0, base, 0);
@@ -2447,6 +2540,8 @@ export class BuildingManager {
     const centre = averagePoint(flat);
     mesh.userData.center = centre;
     mesh.visible = this._isInsideRadius(centre);
+    const color = this._elevationColor(base + 0.5);
+    this._applyGeometryColor(mesh.geometry, color);
     return mesh;
   }
 
@@ -2461,8 +2556,7 @@ export class BuildingManager {
     shape.autoClose = true;
 
     const geo = new THREE.ShapeGeometry(shape).rotateX(-Math.PI / 2);
-    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, opacity: 0.4, transparent: true });
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = new THREE.Mesh(geo, this._areaMaterial);
     mesh.userData.type = 'area';
     mesh.userData.osmId = id;
     mesh.userData.basePts = flat.slice();
@@ -2473,6 +2567,9 @@ export class BuildingManager {
     const centre = averagePoint(flat);
     mesh.userData.center = centre;
     mesh.visible = this._isInsideRadius(centre);
+    const color = this._elevationColor(base + 0.2);
+    this._applyGeometryColor(mesh.geometry, color);
+    mesh.material.wireframe = this._wireframeMode;
     return mesh;
   }
 
@@ -2897,14 +2994,12 @@ export class BuildingManager {
       if (building.render) {
         this.group.remove(building.render);
         building.render.geometry?.dispose?.();
-        building.render.material?.dispose?.();
         building.render = null;
       }
       if (building.solid) {
         this.physics?.unregisterStaticMesh(building.solid);
         this.group.remove(building.solid);
         building.solid.geometry?.dispose?.();
-        building.solid.material?.dispose?.();
         building.solid = null;
       }
       if (building.pick) {
@@ -2918,7 +3013,6 @@ export class BuildingManager {
     for (const extra of state.extras) {
       this.group.remove(extra);
       if (extra.geometry) extra.geometry.dispose();
-      if (extra.material && extra.material.dispose) extra.material.dispose();
     }
     state.extras = [];
 
@@ -2960,7 +3054,6 @@ export class BuildingManager {
   _disposeObject(obj) {
     obj.traverse?.((child) => {
       if (child.isMesh) {
-        if (child.material?.uniforms?.uTime) this._waterMaterials.delete(child.material);
         child.geometry?.dispose?.();
         if (Array.isArray(child.material)) child.material.forEach((m) => m?.dispose?.());
         else child.material?.dispose?.();
@@ -2969,32 +3062,6 @@ export class BuildingManager {
   }
 
   _waterMaterial() {
-    return new THREE.ShaderMaterial({
-      uniforms: {
-        uTime: { value: this._waterTime },
-        uColor: { value: new THREE.Color(0x333333) },
-      },
-      vertexShader: `
-        uniform float uTime;
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          vec3 pos = position;
-          pos.y += 0.05 * sin((position.x + position.z) * 0.12 + uTime * 1.4);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform vec3 uColor;
-        varying vec2 vUv;
-        void main() {
-          float ripple = 0.4 + 0.2 * sin((vUv.x + vUv.y) * 14.0);
-          float alpha = 0.4;
-          gl_FragColor = vec4(uColor * (0.85 + ripple * 0.15), alpha);
-        }
-      `,
-      transparent: true,
-      side: THREE.DoubleSide,
-    });
+    return this._waterMaterialShared;
   }
 }

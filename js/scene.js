@@ -4,7 +4,7 @@ import { Sky } from 'Sky';
 
 export class SceneManager {
   constructor() {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true  });
     this.renderer.setSize(innerWidth, innerHeight);
     this.renderer.setPixelRatio(devicePixelRatio);
     this.renderer.outputEncoding = THREE.sRGBEncoding;

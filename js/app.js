@@ -254,6 +254,13 @@ class App {
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,
     });
+    this.buildings.setEnvironment(this.sceneMgr.scene.environment || null);
+    this._wireframeMode = false;
+    if (ui.hudWireframeToggle) {
+      ui.hudWireframeToggle.addEventListener('click', () => this._toggleWireframe());
+      this._syncWireframeUI();
+    }
+    this.buildings.setWireframe(this._wireframeMode);
 
     this._friends = new Set(this._loadFriendList());
     this._teleportToasts = new Map();
@@ -949,6 +956,23 @@ class App {
     ui.hudDebugToggle.dataset.state = on ? 'on' : 'off';
     ui.hudDebugToggle.textContent = 'Debug';
     ui.hudDebugToggle.title = on ? 'Debug visuals enabled' : 'Show debug visuals';
+  }
+
+  _toggleWireframe() {
+    this._wireframeMode = !this._wireframeMode;
+    this.buildings?.setWireframe?.(this._wireframeMode);
+    this._syncWireframeUI();
+  }
+
+  _syncWireframeUI() {
+    if (!ui.hudWireframeToggle) return;
+    const btn = ui.hudWireframeToggle;
+    const on = !!this._wireframeMode;
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.dataset.state = on ? 'on' : 'off';
+    btn.textContent = on ? 'Wire (On)' : 'Wire (Off)';
+    btn.title = on ? 'Wireframe mode active — surfaces hidden' : 'Toggle wireframe rendering';
   }
 
   _setupEnvironmentControls() {
@@ -3552,6 +3576,7 @@ class App {
       this._sunOrigin = { lat: origin.lat, lon: origin.lon };
       this._sunUpdateNextMs = nowMs + 60000;
       this._updateUiThemeBySun();
+      this.buildings?.setEnvironment?.(this.sceneMgr.scene.environment || null);
     }
   }
 
