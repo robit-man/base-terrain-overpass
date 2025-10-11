@@ -2808,13 +2808,13 @@ class App {
         : null;
 
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-      if (ui.hudSunInfo && ui.hudSunInfo.textContent !== 'Sun --° · --°') {
-        ui.hudSunInfo.textContent = 'Sun --° · --°';
-        ui.hudSunInfo.title = 'Sun position unavailable';
+      if (ui.hudSunInfo && ui.hudSunInfo.textContent !== ' --° · --°') {
+        ui.hudSunInfo.textContent = ' --° · --°';
+        ui.hudSunInfo.title = ' position unavailable';
       }
-      if (ui.hudMoonInfo && ui.hudMoonInfo.textContent !== 'Moon --° · --°') {
-        ui.hudMoonInfo.textContent = 'Moon --° · --°';
-        ui.hudMoonInfo.title = 'Moon position unavailable';
+      if (ui.hudMoonInfo && ui.hudMoonInfo.textContent !== ' --° · --°') {
+        ui.hudMoonInfo.textContent = ' --° · --°';
+        ui.hudMoonInfo.title = ' position unavailable';
       }
       return;
     }
@@ -2823,18 +2823,18 @@ class App {
     if (sun && ui.hudSunInfo) {
       const altDeg = deg(sun.altitude);
       const azDeg = this._wrapDegrees(deg(sun.azimuth));
-      const text = `Sun ${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
+      const text = `${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
       if (ui.hudSunInfo.textContent !== text) ui.hudSunInfo.textContent = text;
-      ui.hudSunInfo.title = `Sun altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
+      ui.hudSunInfo.title = `altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
     }
 
     const moon = this._computeMoonAstronomy(lat, lon, now);
     if (moon && ui.hudMoonInfo) {
       const altDeg = deg(moon.altitude);
       const azDeg = this._wrapDegrees(deg(moon.azimuth));
-      const text = `Moon ${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
+      const text = `${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
       if (ui.hudMoonInfo.textContent !== text) ui.hudMoonInfo.textContent = text;
-      ui.hudMoonInfo.title = `Moon altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
+      ui.hudMoonInfo.title = `altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
     }
   }
 

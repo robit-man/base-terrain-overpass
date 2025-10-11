@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cross-platform HTTPS dev server with robust venv bootstrap and safe prompts.
+
+Key upgrades vs original:
+- Cross-platform venv bootstrap that prefers a short, Windows-safe venv path.
+- Uses "python -m pip" (not pip.exe path) to avoid PATH/locking issues on Windows.
+- Safe input prompts: Enter accepts defaults reliably on Windows (no accidental exit).
+- POSIX-only sudo escalation for :443; Windows/macOS logic won't attempt sudo incorrectly.
+- Minor resilience/UX tweaks (clearer messages, safer fallbacks).
+"""
+
 import os
 import sys
 import subprocess
@@ -10,26 +22,56 @@ import time
 import socket
 import ssl
 import urllib.request
-import errno
 import signal
 import atexit
 import argparse
+import hashlib
+import platform
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 # ─── Constants ───────────────────────────────────────────────────────────────
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-VENV_FLAG   = "--in-venv"
-VENV_DIR    = os.path.join(SCRIPT_DIR, "venv")
-HTTPS_PORT  = 443
-PORT_TRIES  = 100  # 443..(443+9)
-CERT_DIR    = os.path.join(SCRIPT_DIR, "certs")  # where we store non-LE outputs
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH  = os.path.join(SCRIPT_DIR, "config.json")
+VENV_FLAG    = "--in-venv"
+DEFAULT_VENV = os.path.join(SCRIPT_DIR, ".venv")  # prefer shorter name
+HTTPS_PORT   = 443
+PORT_TRIES   = 100  # 443..(443+99)
+CERT_DIR     = os.path.join(SCRIPT_DIR, "certs")  # where we store non-LE outputs
 
 # Globals for cleanup
 _active_httpd = None
 _active_port  = None
 _child_proc   = None
+
+IS_WINDOWS = (os.name == "nt")
+IS_POSIX   = (os.name == "posix")
+PLATFORM   = platform.system().lower()  # 'windows', 'linux', 'darwin', etc.
+
+
+# ─── Small helpers ───────────────────────────────────────────────────────────
+def _short_hash(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()[:10]
+
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _venv_bin(venv_dir: str) -> str:
+    return os.path.join(venv_dir, "Scripts" if IS_WINDOWS else "bin")
+
+def _path_len(p: str) -> int:
+    try:
+        return len(os.path.abspath(p))
+    except Exception:
+        return len(p)
+
+def _is_tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
 
 # ─── Spinner ─────────────────────────────────────────────────────────────────
 class Spinner:
@@ -49,28 +91,111 @@ class Spinner:
     def __exit__(self, exc_type, exc, tb):
         self._stop.set(); self._thr.join()
 
-# ─── Venv bootstrap ──────────────────────────────────────────────────────────
+
+# ─── Robust user input (Windows-friendly) ────────────────────────────────────
+def ask(prompt: str, *, default=None, required=False, cast=str, validate=None):
+    """
+    Safe line-oriented prompt:
+    - Enter accepts default (if provided) or "" (if not required).
+    - required=True forces non-empty input.
+    - cast(value) and optional validate(value) hook.
+    Handles Windows consoles reliably so Enter won't "exit the script".
+    """
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        try:
+            s = input(f"{prompt}{suffix}: ")
+        except EOFError:
+            # If stdin is closed (rare), fallback to default or required retry
+            s = ""
+        except KeyboardInterrupt:
+            print("\n^C")
+            sys.exit(1)
+
+        s = s.strip()
+        if s == "":
+            if default is not None:
+                value = default
+            elif required:
+                print("Please enter a value.")
+                continue
+            else:
+                value = ""
+        else:
+            value = s
+
+        try:
+            value = cast(value)
+            if validate and not validate(value):
+                print("Invalid value.")
+                continue
+            return value
+        except ValueError as e:
+            print(str(e) or "Invalid format. Try again.")
+
+
+# ─── Venv bootstrap (cross-platform, Windows-safe) ───────────────────────────
+def _choose_venv_dir() -> str:
+    """
+    On Windows, long/spacey paths sometimes cause pip headaches (path/lock).
+    We prefer a stable, short path under %LOCALAPPDATA% if the script path is too long.
+    Else we use a local '.venv' next to the script (Linux/macOS typical).
+    """
+    # Heuristic: if script path is long or has spaces on Windows, use LOCALAPPDATA bucket
+    if IS_WINDOWS:
+        long_or_spacey = (_path_len(SCRIPT_DIR) > 90) or (" " in SCRIPT_DIR)
+        localapp = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or SCRIPT_DIR
+        if long_or_spacey and localapp:
+            bucket = _ensure_dir(os.path.join(localapp, "pyvenvs"))
+            folder = f"{os.path.basename(SCRIPT_DIR) or 'app'}-{_short_hash(SCRIPT_DIR)}"
+            return os.path.join(bucket, folder, "venv")
+    return DEFAULT_VENV
+
+def _exec_in_venv(venv_dir: str):
+    py = os.path.join(_venv_bin(venv_dir), "python.exe" if IS_WINDOWS else "python")
+    # Re-exec current script with a flag so we don't loop
+    os.execv(py, [py, __file__, VENV_FLAG] + sys.argv[1:])
+
 def bootstrap_and_run():
+    """
+    Ensure we are running inside a venv with required deps.
+    """
     if VENV_FLAG not in sys.argv:
-        if not os.path.isdir(VENV_DIR):
-            with Spinner("Creating virtualenv…"):
-                subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
-        pip = os.path.join(VENV_DIR, "Scripts" if os.name=="nt" else "bin", "pip")
-        with Spinner("Installing dependencies…"):
-            subprocess.check_call([pip, "install", "--upgrade", "pip", "cryptography"])
-        py = os.path.join(VENV_DIR, "Scripts" if os.name=="nt" else "bin", "python")
-        os.execv(py, [py, __file__, VENV_FLAG] + sys.argv[1:])
+        venv_dir = _choose_venv_dir()
+        created = False
+        if not os.path.isdir(venv_dir):
+            with Spinner(f"Creating virtualenv at {venv_dir}…"):
+                subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
+            created = True
+
+        py = os.path.join(_venv_bin(venv_dir), "python.exe" if IS_WINDOWS else "python")
+
+        # Always keep pip tooling current before packages
+        with Spinner("Upgrading pip/setuptools/wheel…"):
+            subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+
+        # Core deps needed by this script (add here if you introduce new imports)
+        with Spinner("Installing dependencies (cryptography)…"):
+            subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "cryptography"])
+
+        # Re-exec inside the venv
+        _exec_in_venv(venv_dir)
     else:
-        # remove our flag then continue
-        idx = sys.argv.index(VENV_FLAG)
-        sys.argv.pop(idx)
+        # Remove our sentinel and continue
+        try:
+            idx = sys.argv.index(VENV_FLAG)
+            sys.argv.pop(idx)
+        except ValueError:
+            pass
         main()
+
 
 # ─── Config I/O ──────────────────────────────────────────────────────────────
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
-            return json.load(open(CONFIG_PATH))
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
     # default config
@@ -93,8 +218,9 @@ def load_config():
     }
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4)
+
 
 # ─── Args ────────────────────────────────────────────────────────────────────
 def parse_args():
@@ -112,17 +238,19 @@ def parse_args():
     p.add_argument("--stepca-token", help="Step CA one-time token (optional).")
     # GCP CA options
     p.add_argument("--gcpca-pool", help="GCP Private CA pool ID.")
-    p.add_argument("--gcpca-location", help="GCP Private CA location (e.g. us-central1).")
+    p.add_argument("--gcpca-location", help="GCP Private CA location (e.g., us-central1).")
     p.add_argument("--gcpca-cert-id", help="Certificate ID to create (optional; defaults to domain+timestamp).")
     # Misc
     p.add_argument("--renew", action="store_true", help="Run provider-specific renew (LE only) then exit.")
     return p.parse_args()
 
+
 # ─── Net helpers ─────────────────────────────────────────────────────────────
 def get_lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("192.0.2.1", 80))  # TEST-NET-1, no packets sent
+        # TEST-NET-1, no packets actually sent; just picks interface
+        s.connect(("192.0.2.1", 80))
         ip = s.getsockname()[0]
     finally:
         s.close()
@@ -144,6 +272,7 @@ def wait_for_listen(port, host="127.0.0.1", timeout_s=8.0):
             time.sleep(0.15)
     return False
 
+
 # ─── Banner ──────────────────────────────────────────────────────────────────
 def print_banner(port):
     lan     = get_lan_ip()
@@ -157,6 +286,7 @@ def print_banner(port):
     for l in lines:
         print("║" + l.ljust(w) + "║")
     print("╚" + "═"*w + "╝\n")
+
 
 # ─── Self-signed generation ──────────────────────────────────────────────────
 def generate_self_signed(cert_file, key_file, extra_dns_sans):
@@ -174,14 +304,18 @@ def generate_self_signed(cert_file, key_file, extra_dns_sans):
     san_list = [DNSName("localhost"), IPAddress(ipa.ip_address("127.0.0.1"))]
     for ip in (lan_ip, public_ip):
         if ip:
-            try: san_list.append(IPAddress(ipa.ip_address(ip)))
-            except ValueError: pass
+            try:
+                san_list.append(IPAddress(ipa.ip_address(ip)))
+            except ValueError:
+                pass
     for host in (extra_dns_sans or []):
         host = str(host).strip()
-        if host: san_list.append(DNSName(host))
+        if host:
+            san_list.append(DNSName(host))
 
     san  = SubjectAlternativeName(san_list)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, lan_ip)])
+    cn   = lan_ip or "localhost"
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
 
     not_before = datetime.now(timezone.utc) - timedelta(minutes=5)
     not_after  = not_before + timedelta(days=365)
@@ -203,6 +337,7 @@ def generate_self_signed(cert_file, key_file, extra_dns_sans):
     with open(cert_file, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
+
 # ─── Signal/Cleanup ──────────────────────────────────────────────────────────
 def _cleanup():
     global _active_httpd, _child_proc
@@ -223,6 +358,7 @@ atexit.register(_cleanup)
 
 def _signal_handler(signum, frame):
     _cleanup()
+    # Let Ctrl+Z behave normally on POSIX
     if signum == getattr(signal, "SIGTSTP", None):
         try:
             signal.signal(signal.SIGTSTP, signal.SIG_DFL)
@@ -239,6 +375,7 @@ def install_signal_handlers():
     if hasattr(signal, "SIGHUP"):  signal.signal(signal.SIGHUP,  _signal_handler)
     if hasattr(signal, "SIGQUIT"): signal.signal(signal.SIGQUIT, _signal_handler)
 
+
 # ─── Server with reuse ───────────────────────────────────────────────────────
 class ReusableHTTPSServer(HTTPServer):
     allow_reuse_address = True
@@ -254,6 +391,7 @@ def bind_https_server(context, start_port=HTTPS_PORT, tries=PORT_TRIES):
             last_err = e
             continue
     raise RuntimeError(f"Unable to bind any port in {start_port}..{start_port+tries-1} (last error: {last_err})")
+
 
 # ─── Provider: Let's Encrypt (Certbot standalone) ────────────────────────────
 def ensure_le_cert(domains, email, agree_tos, staging, http01_port):
@@ -296,6 +434,7 @@ def renew_le_and_exit():
     print("✔ Renew complete.")
     sys.exit(0)
 
+
 # ─── Provider: Step CA ───────────────────────────────────────────────────────
 def ensure_stepca_cert(domains, url, fp, provisioner, token):
     if shutil.which("step") is None:
@@ -303,8 +442,7 @@ def ensure_stepca_cert(domains, url, fp, provisioner, token):
     if not domains:
         raise SystemExit("Step CA requires --domains.")
     primary = domains[0]
-    out_dir = os.path.join(CERT_DIR, "stepca", primary)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = _ensure_dir(os.path.join(CERT_DIR, "stepca", primary))
     cert_file = os.path.join(out_dir, "cert.pem")
     key_file  = os.path.join(out_dir, "key.pem")
 
@@ -323,6 +461,7 @@ def ensure_stepca_cert(domains, url, fp, provisioner, token):
         raise SystemExit("Step CA did not produce expected cert/key files.")
     return os.path.abspath(cert_file), os.path.abspath(key_file)
 
+
 # ─── Provider: Google Cloud Private CA ───────────────────────────────────────
 def ensure_gcpca_cert(domains, pool, location, cert_id):
     if shutil.which("gcloud") is None:
@@ -330,16 +469,13 @@ def ensure_gcpca_cert(domains, pool, location, cert_id):
     if not domains or not pool or not location:
         raise SystemExit("GCP CA requires --domains, --gcpca-pool, and --gcpca-location.")
     primary = domains[0]
-    out_dir = os.path.join(CERT_DIR, "gcpca", primary)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = _ensure_dir(os.path.join(CERT_DIR, "gcpca", primary))
     cert_file = os.path.join(out_dir, "cert.pem")
     key_file  = os.path.join(out_dir, "key.pem")
 
     if not cert_id:
         cert_id = f"{primary.replace('.','-')}-{int(time.time())}"
 
-    # This command pattern generates a key and a PEM cert (chain) for the domain.
-    # Adjust if your project/org flags are required in your environment.
     cmd = [
         "gcloud", "privateca", "certificates", "create", cert_id,
         f"--issuer-pool={pool}",
@@ -349,7 +485,6 @@ def ensure_gcpca_cert(domains, pool, location, cert_id):
         f"--key-output-file={key_file}",
         f"--pem-output-file={cert_file}",
     ]
-    # extra SANs
     if len(domains) > 1:
         for d in domains[1:]:
             cmd.append(f"--dns-san={d}")
@@ -360,6 +495,7 @@ def ensure_gcpca_cert(domains, pool, location, cert_id):
     if not (os.path.exists(cert_file) and os.path.exists(key_file)):
         raise SystemExit("GCP CA did not produce expected cert/key files.")
     return os.path.abspath(cert_file), os.path.abspath(key_file)
+
 
 # ─── Resolve certificate source ──────────────────────────────────────────────
 def resolve_domains(arg_domains, cfg_domains):
@@ -408,26 +544,32 @@ def ensure_certificates(cert_mode, cfg, args):
 
     raise SystemExit(f"Unknown cert mode: {cert_mode}")
 
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 def main():
     install_signal_handlers()
     args = parse_args()
 
-    # Need root to bind :443 (Linux) and for LE standalone.
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
+    # Need privileged rights to bind :443 on POSIX. On Windows/macOS, behavior differs.
+    if IS_POSIX and hasattr(os, "geteuid") and os.geteuid() != 0:
         print("⚠ Need root to bind port 443; re-running with sudo…")
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
     # Load config then overlay CLI
     cfg = load_config()
     updated = False
+
+    # First-run interactive config (robust prompts; Enter accepts default path)
     if not os.path.exists(CONFIG_PATH):
+        # default host path = current working directory at first run
         default_path = cfg.get("serve_path") or os.getcwd()
-        entered = input(f"Serve path [{default_path}]: ").strip() or default_path
-        cfg["serve_path"] = entered
-        extra = (input("Extra DNS SANs (comma-separated, optional): ").strip() or "")
-        if extra:
-            cfg["extra_dns_sans"] = [h.strip() for h in extra.split(",") if h.strip()]
+        serve_path = ask("Serve path", default=default_path, required=False)
+        if not serve_path:
+            serve_path = default_path
+        cfg["serve_path"] = serve_path
+
+        extra = ask("Extra DNS SANs (comma-separated, optional)", default="", required=False)
+        cfg["extra_dns_sans"] = [h.strip() for h in extra.split(",") if h.strip()] if extra else []
         updated = True
 
     # Apply CLI overrides into cfg for persistence convenience
@@ -443,13 +585,16 @@ def main():
     if args.gcpca_location:       cfg["gcpca_location"]= args.gcpca_location; updated = True
     if args.gcpca_cert_id:        cfg["gcpca_cert_id"]= args.gcpca_cert_id; updated = True
 
-    if updated: save_config(cfg)
+    if updated:
+        save_config(cfg)
 
     # Renew-only path (LE)
     if args.renew:
         renew_le_and_exit()
 
-    # cd into serve directory
+    # cd into serve directory (validate existence)
+    if not os.path.isdir(cfg["serve_path"]):
+        raise SystemExit(f"Serve path does not exist: {cfg['serve_path']}")
     os.chdir(cfg["serve_path"])
 
     # Get cert & key according to mode (may invoke external CLIs)
@@ -467,7 +612,7 @@ def main():
         patch_path = os.path.join(os.getcwd(), "tls_patch.js")
         CERT_ABS = os.path.abspath(cert_file)
         KEY_ABS  = os.path.abspath(key_file)
-        with open(patch_path, "w") as f:
+        with open(patch_path, "w", encoding="utf-8") as f:
             f.write(f"""\
 const fs = require('fs');
 const https = require('https');
@@ -531,6 +676,7 @@ http.Server.prototype = _Server.prototype;
         pass
     finally:
         _cleanup()
+
 
 if __name__ == "__main__":
     bootstrap_and_run()
