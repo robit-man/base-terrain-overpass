@@ -11,13 +11,18 @@ import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
 import { ui, applyHudStatusDot } from './ui.js';
-import { deg, fmtAgo, shortHex } from './utils.js';
+import { deg, rad, fmtAgo, shortHex } from './utils.js';
 import { AvatarFactory } from './avatars.js';
 import { ChaseCam } from './chasecam.js';
 import { BuildingManager } from './buildings.js';
 import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
 import { AdaptiveQualityManager } from './adaptiveQuality.js';
+
+const DAY_MS = 86400000;
+const J1970 = 2440588;
+const J2000 = 2451545;
+const OBLIQUITY = rad(23.4397);
 
 class PerfLogger {
   constructor({ slowFrameMs = 33, reportIntervalMs = 2000, labelLimit = 6 } = {}) {
@@ -218,6 +223,12 @@ class App {
     this._uiTheme = null;
     this._sunUpdateNextMs = 0;
     this._sunOrigin = null;
+    this._hudClockNextMs = 0;
+    this._timeOffsetMs = 0;
+    this._timeZoneName = null;
+    this._timeFetchPending = false;
+    this._timeFetchFailedUntil = 0;
+    this._fetchRemoteTime();
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -2676,6 +2687,199 @@ class App {
       ui.hudGeohash.title = geohashValue !== '--' ? `Geohash ${geohashValue}` : 'Geohash unavailable';
       this._hudGeoCached.hash = geohashValue;
     }
+
+    this._updateHudAltitude();
+    this._updateHudClock(true);
+  }
+
+  _updateHudAltitude() {
+    if (!ui.hudAltitude) return;
+    const dolly = this.sceneMgr?.dolly;
+    const mgr = this.hexGridMgr;
+    let ground = null;
+    if (dolly && mgr?.getHeightAt) {
+      const y = mgr.getHeightAt(dolly.position.x, dolly.position.z);
+      if (Number.isFinite(y)) ground = y;
+    }
+    const label = Number.isFinite(ground) ? `${ground.toFixed(1)} m` : '--';
+    if (ui.hudAltitude.textContent !== label) ui.hudAltitude.textContent = label;
+    ui.hudAltitude.title = Number.isFinite(ground)
+      ? `Terrain altitude ${ground.toFixed(2)} meters`
+      : 'Terrain altitude unavailable';
+  }
+
+  _updateHudClock(force = false) {
+    if (!ui.hudClockLocal) return;
+    const nowMs = Date.now();
+    if (!force && nowMs < this._hudClockNextMs) return;
+    this._hudClockNextMs = nowMs + 1000;
+
+    const nowReal = Date.now();
+    if (!this._timeFetchPending && nowReal >= this._timeFetchFailedUntil && this._timeOffsetMs === 0) {
+      this._fetchRemoteTime();
+    }
+
+    const adjustedMs = nowMs + this._timeOffsetMs;
+    const now = new Date(adjustedMs);
+
+    let localStr;
+    try {
+      localStr = new Intl.DateTimeFormat([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+        timeZone: this._timeZoneName || Intl.DateTimeFormat().resolvedOptions().timeZone,
+      }).format(now);
+    } catch {
+      localStr = now.toISOString().slice(11, 19);
+    }
+
+    const utcStr = new Date(adjustedMs).toISOString().slice(11, 19) + 'Z';
+    if (ui.hudClockLocal.textContent !== localStr) {
+      ui.hudClockLocal.textContent = localStr;
+      ui.hudClockLocal.title = now.toLocaleString();
+    }
+    if (ui.hudClockUtc.textContent !== utcStr) {
+      ui.hudClockUtc.textContent = utcStr;
+      ui.hudClockUtc.title = now.toUTCString();
+    }
+
+    const lat = Number.isFinite(this._locationState?.lat)
+      ? this._locationState.lat
+      : Number.isFinite(this.hexGridMgr?.origin?.lat)
+        ? this.hexGridMgr.origin.lat
+        : null;
+    const lon = Number.isFinite(this._locationState?.lon)
+      ? this._locationState.lon
+      : Number.isFinite(this.hexGridMgr?.origin?.lon)
+        ? this.hexGridMgr.origin.lon
+        : null;
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      if (ui.hudSunInfo && ui.hudSunInfo.textContent !== 'Sun --° · --°') {
+        ui.hudSunInfo.textContent = 'Sun --° · --°';
+        ui.hudSunInfo.title = 'Sun position unavailable';
+      }
+      if (ui.hudMoonInfo && ui.hudMoonInfo.textContent !== 'Moon --° · --°') {
+        ui.hudMoonInfo.textContent = 'Moon --° · --°';
+        ui.hudMoonInfo.title = 'Moon position unavailable';
+      }
+      return;
+    }
+
+    const sun = this._computeSunAstronomy(lat, lon, now);
+    if (sun && ui.hudSunInfo) {
+      const altDeg = deg(sun.altitude);
+      const azDeg = this._wrapDegrees(deg(sun.azimuth));
+      const text = `Sun ${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
+      if (ui.hudSunInfo.textContent !== text) ui.hudSunInfo.textContent = text;
+      ui.hudSunInfo.title = `Sun altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
+    }
+
+    const moon = this._computeMoonAstronomy(lat, lon, now);
+    if (moon && ui.hudMoonInfo) {
+      const altDeg = deg(moon.altitude);
+      const azDeg = this._wrapDegrees(deg(moon.azimuth));
+      const text = `Moon ${this._formatSignedAngle(altDeg)} · ${azDeg.toFixed(0)}°`;
+      if (ui.hudMoonInfo.textContent !== text) ui.hudMoonInfo.textContent = text;
+      ui.hudMoonInfo.title = `Moon altitude ${altDeg.toFixed(2)}°, azimuth ${azDeg.toFixed(2)}°`;
+    }
+  }
+
+  _formatSignedAngle(valueDeg) {
+    if (!Number.isFinite(valueDeg)) return '--°';
+    const sign = valueDeg > 0 ? '+' : '';
+    return `${sign}${valueDeg.toFixed(1)}°`;
+  }
+
+  _wrapDegrees(valueDeg) {
+    if (!Number.isFinite(valueDeg)) return 0;
+    const wrapped = valueDeg % 360;
+    return wrapped < 0 ? wrapped + 360 : wrapped;
+  }
+
+  async _fetchRemoteTime() {
+    if (this._timeFetchPending || this._timeFetchFailed) return;
+    this._timeFetchPending = true;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch('https://worldtimeapi.org/api/ip', { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data = await res.json();
+      const remoteMs = Date.parse(data?.datetime);
+      if (Number.isFinite(remoteMs)) {
+        this._timeOffsetMs = remoteMs - Date.now();
+        this._timeZoneName = data?.timezone || this._timeZoneName;
+        this._timeFetchFailedUntil = 0;
+        this._updateHudClock(true);
+      }
+    } catch (err) {
+      console.warn('[clock] remote time fetch failed', err);
+      this._timeFetchFailedUntil = Date.now() + 60000;
+    } finally {
+      this._timeFetchPending = false;
+    }
+  }
+
+  _computeSunAstronomy(lat, lon, date) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !date) return null;
+    const lw = rad(-lon);
+    const phi = rad(lat);
+    const d = (date.getTime() / DAY_MS - 0.5 + J1970) - J2000;
+
+    const solarMeanAnomaly = (d) => rad(357.5291 + 0.98560028 * d);
+    const eclipticLongitude = (M) => {
+      const C = rad(1.9148) * Math.sin(M) + rad(0.02) * Math.sin(2 * M) + rad(0.0003) * Math.sin(3 * M);
+      const P = rad(102.9372);
+      return M + C + P + Math.PI;
+    };
+    const declination = (L) => Math.asin(Math.sin(OBLIQUITY) * Math.sin(L));
+    const rightAscension = (L) => Math.atan2(Math.sin(L) * Math.cos(OBLIQUITY), Math.cos(L));
+    const siderealTime = (d, lw) => rad(280.16 + 360.9856235 * d) - lw;
+
+    const M = solarMeanAnomaly(d);
+    const L = eclipticLongitude(M);
+    const dec = declination(L);
+    const ra = rightAscension(L);
+    const H = siderealTime(d, lw) - ra;
+
+    const altitude = Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(H));
+    let azimuth = Math.atan2(Math.sin(H), Math.cos(H) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi));
+    azimuth = (azimuth + Math.PI * 2) % (Math.PI * 2);
+
+    return { altitude, azimuth };
+  }
+
+  _computeMoonAstronomy(lat, lon, date) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !date) return null;
+    const lw = rad(-lon);
+    const phi = rad(lat);
+    const d = (date.getTime() / DAY_MS - 0.5 + J1970) - J2000;
+
+    const L = rad(218.316 + 13.176396 * d);
+    const M = rad(134.963 + 13.064993 * d);
+    const F = rad(93.272 + 13.229350 * d);
+
+    const l = L + rad(6.289) * Math.sin(M);
+    const b = rad(5.128) * Math.sin(F);
+    const dt = 385001 - 20905 * Math.cos(M);
+
+    const ra = Math.atan2(Math.sin(l) * Math.cos(OBLIQUITY) - Math.tan(b) * Math.sin(OBLIQUITY), Math.cos(l));
+    const dec = Math.asin(Math.sin(b) * Math.cos(OBLIQUITY) + Math.cos(b) * Math.sin(OBLIQUITY) * Math.sin(l));
+
+    const siderealTime = (d, lw) => rad(280.16 + 360.9856235 * d) - lw;
+    const H = siderealTime(d, lw) - ra;
+
+    let altitude = Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(H));
+    altitude -= rad(0.017) / (dt || 1); // parallax
+
+    let azimuth = Math.atan2(Math.sin(H), Math.cos(H) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi));
+    azimuth = (azimuth + Math.PI * 2) % (Math.PI * 2);
+
+    return { altitude, azimuth };
   }
 
   _updateLocalPoseUI() {
@@ -2699,6 +2903,9 @@ class App {
       crouch: this.move.isCrouching?.() ?? false,
       jumpState: this.move.jumpState,
     });
+
+    this._updateHudAltitude();
+    this._updateHudClock();
   }
 
   _updateCharacterDiagnostics({ position, speed, groundY, eyeHeight, animation, crouch, jumpState }) {

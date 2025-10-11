@@ -268,6 +268,15 @@ export class BuildingManager {
     this._resnapDirtyTiles = new Set();
     this._resnapDirtyMaxPerFrame = 2;
     this._resnapHotBudgetMs = 0.6;
+    this._fetchBatchSize = 8;
+    this._fetchCooldownMs = 250;
+    this._lastFetchMs = -Infinity;
+    this._pendingFetchTiles = new Set();
+    this._resnapVerifyIntervalMs = 1500;
+    this._resnapVerifyNextMs = 0;
+    this._resnapVerifyCursor = 0;
+    this._resnapVerifyBatch = 12;
+    this._resnapVerifyTolerance = 0.12;
     this._pendingTerrainTiles = new Set();
 
     this._waterMaterials = new Set();
@@ -415,6 +424,16 @@ export class BuildingManager {
     const level = qualityClamp >= 0.82 ? 'high' : (qualityClamp >= 0.6 ? 'medium' : 'low');
     this._qosLevel = level;
 
+    const targetFps = Number.isFinite(target) && target > 0 ? target : TARGET_FPS;
+    const smoothedFps = Number.isFinite(this._smoothedFps) ? this._smoothedFps : targetFps;
+    const fpsRatio = THREE.MathUtils.clamp(smoothedFps / Math.max(1, targetFps), 0, 1.5);
+    const pressure = fpsRatio >= 1 ? 0 : (1 - fpsRatio);
+    const qualityNorm = THREE.MathUtils.clamp((qualityClamp - 0.3) / 0.8, 0, 1);
+    const headroom = THREE.MathUtils.clamp((qualityNorm + Math.min(fpsRatio, 1)) * 0.5, 0, 1);
+
+    this._fetchBatchSize = Math.max(2, Math.round(THREE.MathUtils.lerp(18, 6, pressure)));
+    this._fetchCooldownMs = Math.round(THREE.MathUtils.lerp(180, 900, pressure));
+
     return {
       quality: qualityClamp,
       level,
@@ -539,6 +558,13 @@ export class BuildingManager {
       this._queueResnapSweep();
     }
     this._drainResnapQueue(this._resnapFrameBudgetMs);
+
+    const nowMs = this._nowMs();
+    if (nowMs >= this._resnapVerifyNextMs) {
+      this._verifyFloatingBuildings();
+      this._resnapVerifyNextMs = nowMs + this._resnapVerifyIntervalMs;
+    }
+    this._drainPendingFetchQueue(nowMs);
 
     this._waterTime += dt;
     for (const mat of this._waterMaterials) mat.uniforms.uTime.value = this._waterTime;
@@ -1145,20 +1171,14 @@ export class BuildingManager {
       let state = this._tileStates.get(tileKey);
       if (!state) {
         state = this._createTileState(tileKey);
-        this._tileStates.set(tileKey, state);
-      }
-
-      if (state.status !== 'pending' && state.status !== 'error') continue;
-
-      const cached = this._loadTileFromCache(tileKey);
-      if (cached) {
-        this._applyTileData(tileKey, cached, true);
-        continue;
-      }
-
-      state.status = 'pending';
-      missing.push(tileKey);
+      this._tileStates.set(tileKey, state);
     }
+
+    if (state.status !== 'pending' && state.status !== 'error') continue;
+
+    state.status = 'pending';
+    missing.push(tileKey);
+  }
 
     for (const tileKey of Array.from(this._tileStates.keys())) {
       if (!needed.has(tileKey)) this._unloadTile(tileKey);
@@ -1176,9 +1196,41 @@ export class BuildingManager {
       }
     }
 
-    if (missing.length && !this._patchInflight) {
-      const allOrdered = tiles.map((t) => t.key);
-      this._fetchPatch(allOrdered, missing);
+    const cached = [];
+    const uncached = [];
+    for (const key of missing) {
+      const payload = this._loadTileFromCache(key);
+      if (payload) {
+        cached.push({ key, data: payload });
+      } else {
+        uncached.push(key);
+      }
+    }
+
+    if (cached.length) {
+      for (const entry of cached) {
+        const state = this._tileStates.get(entry.key) || this._createTileState(entry.key);
+        this._tileStates.set(entry.key, state);
+        this._applyTileData(entry.key, entry.data, true);
+        state.status = 'ready';
+        state.pendingSnapshot = entry.data;
+      }
+    }
+
+    if (uncached.length) {
+      const fetchNow = uncached.slice(0, Math.max(1, this._fetchBatchSize | 0));
+      const deferred = uncached.slice(fetchNow.length);
+      for (const key of deferred) this._pendingFetchTiles.add(key);
+
+      const nowMs = this._nowMs();
+      const canFetch = !this._patchInflight && fetchNow.length && (nowMs - this._lastFetchMs) >= this._fetchCooldownMs;
+      if (canFetch) {
+        const orderedFetch = tiles.map((t) => t.key).filter((key) => fetchNow.includes(key));
+        this._fetchPatch(orderedFetch.length ? orderedFetch : fetchNow, fetchNow);
+        this._lastFetchMs = nowMs;
+      } else {
+        for (const key of fetchNow) this._pendingFetchTiles.add(key);
+      }
     }
   }
 
@@ -1230,24 +1282,26 @@ export class BuildingManager {
     const axial = axialFloat ? tm._axialRound.call(tm, axialFloat.q, axialFloat.r) : null;
     if (!axial || !Number.isFinite(axial.q) || !Number.isFinite(axial.r)) return false;
 
-    const OFFSETS = [
-      [0, 0],
-      [1, 0],
-      [1, -1],
-      [0, -1],
-      [-1, 0],
-      [-1, 1],
-      [0, 1]
-    ];
-
-    const centerTile = tm.tiles.get(`${axial.q},${axial.r}`);
-    if (!this._isTerrainTileReady(centerTile, true)) return false;
-
-    for (const [dq, dr] of OFFSETS) {
-      const tile = tm.tiles.get(`${axial.q + dq},${axial.r + dr}`);
-      if (!this._isTerrainTileReady(tile, false)) return false;
+    if (typeof tm.hasInteractiveTerrainAt === 'function') {
+      if (tm.hasInteractiveTerrainAt(centerX, centerZ)) return true;
     }
-    return true;
+
+    const centerKey = `${axial.q},${axial.r}`;
+    const centerTile = tm.tiles.get(centerKey);
+    if (this._isTerrainTileReady(centerTile, true)) return true;
+    if (this._isTerrainTileReady(centerTile, false)) return true;
+
+    // Fallback: check immediate neighbors for a ready interactive/visual tile
+    const offsets = [
+      [1, 0], [1, -1], [0, -1],
+      [-1, 0], [-1, 1], [0, 1]
+    ];
+    for (const [dq, dr] of offsets) {
+      const neighbor = tm.tiles.get(`${axial.q + dq},${axial.r + dr}`);
+      if (this._isTerrainTileReady(neighbor, true)) return true;
+      if (this._isTerrainTileReady(neighbor, false)) return true;
+    }
+    return false;
   }
 
   _isTerrainTileReady(tile, requireInteractive) {
@@ -1255,6 +1309,10 @@ export class BuildingManager {
     if (requireInteractive && tile.type !== 'interactive') return false;
     if (tile.type === 'interactive') {
       if (!tile._phase?.seedDone) return false;
+      if (Number.isFinite(tile.unreadyCount)) {
+        const total = Number.isFinite(tile.pos?.count) ? tile.pos.count : Infinity;
+        if (tile.unreadyCount >= total) return false;
+      }
     } else if (!tile._phase?.fullDone) {
       return false;
     }
@@ -1349,6 +1407,7 @@ export class BuildingManager {
   _applyTileData(tileKey, data, fromCache) {
     const state = this._tileStates.get(tileKey);
     if (!state) return;
+    this._pendingFetchTiles?.delete(tileKey);
 
     this._cancelMerge(tileKey);
     this._cancelBuildJob(tileKey);
@@ -1552,6 +1611,7 @@ export class BuildingManager {
         pick.updateMatrixWorld(true);
         if (solid) solid.updateMatrixWorld(true);
         this._resnapBuilding(building);
+        this._refreshBuildingVisibility(building);
         if (solid && this.physics) this.physics.registerStaticMesh(solid, { forceUpdate: true });
         state.buildings.push(building);
         break;
@@ -1751,12 +1811,14 @@ export class BuildingManager {
     const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
     edges.castShadow = false;
     edges.receiveShadow = false;
+    edges.visible = false;
 
     // Solid + picker: generated directly from same footprint
     const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
 
     const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
     pickMesh.position.set(0, baseline, 0);
+    pickMesh.visible = false;
 
     const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
     const fillMat = new THREE.MeshStandardMaterial({
@@ -1773,6 +1835,7 @@ export class BuildingManager {
     solidMesh.renderOrder = 1;
     solidMesh.castShadow = true;
     solidMesh.receiveShadow = true;
+    solidMesh.visible = false;
 
     const centroid = averagePoint(rawFootprint);
     const address = formatAddress(tags);
@@ -1786,7 +1849,8 @@ export class BuildingManager {
       tags: { ...tags },
       tile: null,
       resnapStableFrames: 0,
-      resnapFrozen: false
+      resnapFrozen: false,
+      isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z)
     };
 
     edges.userData.buildingInfo = info;
@@ -2133,8 +2197,18 @@ export class BuildingManager {
     if (!building || !building.info) return false;
     const info = building.info;
     if (info.resnapFrozen) return false;
-    const baseline = this._lowestGround(info.rawFootprint) + this.extraDepth;
-    const groundBase = baseline - this.extraDepth;
+    let baseline = this._lowestGround(info.rawFootprint);
+    let groundBase = baseline;
+    if (info.isVisualEdge && this.tileManager?.getHeightAt) {
+      const sample = this.tileManager.getHeightAt(info.centroid.x, info.centroid.z);
+      if (Number.isFinite(sample)) {
+        baseline = sample + this.extraDepth;
+        groundBase = baseline - this.extraDepth;
+      }
+    } else {
+      baseline += this.extraDepth;
+      groundBase = baseline - this.extraDepth;
+    }
     const prev = info.baseHeight;
     const changed = !Number.isFinite(prev) || Math.abs(prev - groundBase) > 0.02;
     info.baseHeight = groundBase;
@@ -2142,6 +2216,7 @@ export class BuildingManager {
     if (!changed) {
       info.resnapStableFrames = (info.resnapStableFrames || 0) + 1;
       if (info.resnapStableFrames >= 2) info.resnapFrozen = true;
+      this._refreshBuildingVisibility(building);
       return false;
     }
 
@@ -2184,11 +2259,89 @@ export class BuildingManager {
       }
       if (this._hoverLabel) {
         this._hoverLabel.position.copy(labelPos);
-        this._hoverLabel.visible = true;
-      }
-      this._hoverGroup.visible = true;
+      this._hoverLabel.visible = true;
     }
+    this._hoverGroup.visible = true;
+ }
+    this._refreshBuildingVisibility(building);
     return changed;
+  }
+
+  _refreshBuildingVisibility(building) {
+    if (!building || !building.info) return;
+    const visible = !!building.info.resnapFrozen;
+    if (building.render) building.render.visible = visible;
+    if (building.solid) building.solid.visible = visible;
+    if (building.pick) building.pick.visible = visible;
+  }
+
+  _drainPendingFetchQueue(nowMs = this._nowMs()) {
+    if (!this._pendingFetchTiles || !this._pendingFetchTiles.size) return;
+    if (this._patchInflight) return;
+    if ((nowMs - this._lastFetchMs) < this._fetchCooldownMs) return;
+
+    const batch = [];
+    for (const key of this._pendingFetchTiles) {
+      batch.push(key);
+      this._pendingFetchTiles.delete(key);
+      if (batch.length >= this._fetchBatchSize) break;
+    }
+    if (!batch.length) return;
+
+    this._fetchPatch(batch, batch);
+    this._lastFetchMs = nowMs;
+  }
+
+  _isNearVisualEdge(x, z) {
+    const mgr = this.tileManager;
+    if (!mgr?.spacing) return false;
+    const dist = Math.hypot(x, z);
+    const visualRadius = Number.isFinite(mgr?.VISUAL_RING) ? mgr.VISUAL_RING * mgr.spacing : null;
+    if (!Number.isFinite(visualRadius)) return false;
+    return dist >= visualRadius - mgr.spacing * 0.5;
+  }
+
+  _verifyFloatingBuildings() {
+    if (!this._tileStates || !this._tileStates.size) return;
+    const tiles = Array.from(this._tileStates.values());
+    if (!tiles.length) return;
+
+    let cursor = this._resnapVerifyCursor % tiles.length;
+    let processed = 0;
+
+    while (processed < this._resnapVerifyBatch && processed < tiles.length) {
+      const state = tiles[cursor];
+      cursor = (cursor + 1) % tiles.length;
+      if (!state || !Array.isArray(state.buildings) || !state.buildings.length) {
+        processed++;
+        continue;
+      }
+
+      let needsResnap = false;
+      for (const building of state.buildings) {
+        if (!building?.info) continue;
+        const info = building.info;
+        if (!info.resnapFrozen) continue;
+        const baseline = this._lowestGround(info.rawFootprint) + this.extraDepth;
+        const current = info.baseHeight + this.extraDepth;
+        const diff = Math.abs(baseline - current);
+        if (diff > this._resnapVerifyTolerance) {
+          info.resnapFrozen = false;
+          info.resnapStableFrames = 0;
+          this._refreshBuildingVisibility(building);
+          needsResnap = true;
+        }
+      }
+
+      if (needsResnap && state.buildings.length) {
+        const tileKey = state.buildings[0]?.info?.tile || state.tileKey;
+        if (tileKey) this._enqueueDirtyResnap(tileKey);
+      }
+
+      processed++;
+    }
+
+    this._resnapVerifyCursor = cursor;
   }
 
   _resnapRoad(mesh) {
@@ -2743,7 +2896,8 @@ export class BuildingManager {
     for (const building of state.buildings) {
       if (building.render) {
         this.group.remove(building.render);
-        building.render.geometry.dispose();
+        building.render.geometry?.dispose?.();
+        building.render.material?.dispose?.();
         building.render = null;
       }
       if (building.solid) {
@@ -2755,7 +2909,7 @@ export class BuildingManager {
       }
       if (building.pick) {
         this._pickerRoot.remove(building.pick);
-        building.pick.geometry.dispose();
+        building.pick.geometry?.dispose?.();
         building.pick = null;
       }
     }

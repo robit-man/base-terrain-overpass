@@ -272,6 +272,9 @@ _stitchInteractiveToVisualEdges(tile, {
     return (hit && hit.length) ? hit[0].point.y : null;
   };
 
+  const newLocks = new Set();
+  let visualNeighborFound = false;
+
   // For each of the 6 sides, if neighbor is visual/farfield, collate a side band and blend to a straight line.
   for (let s = 0; s < 6; s++) {
     // neighbor across side s
@@ -279,6 +282,7 @@ _stitchInteractiveToVisualEdges(tile, {
     const nr = tile.r + HEX_DIRS[s][1];
     const nTile = this._getTile(nq, nr);
     if (!nTile || (nTile.type === 'interactive')) continue; // only stitch to visual/farfield
+    visualNeighborFound = true;
 
     const nMesh = this._getMeshForTile(nTile);
 
@@ -327,6 +331,7 @@ _stitchInteractiveToVisualEdges(tile, {
         // true rim: snap exactly to straight line and keep it pinned
         pos.setY(i, yLine);
         if (tile.locked) tile.locked[i] = 1; // prevent relax from curving it later
+        newLocks.add(i);
       } else {
         // inside the rim: we'll feather in pass 2
         bandIdx.push({ i, r, yLine });
@@ -344,6 +349,8 @@ _stitchInteractiveToVisualEdges(tile, {
         w = w * w * (3 - 2 * w); // smoothstep
         const y = y0 + (yLine - y0) * w;
         pos.setY(i, y);
+        if (tile.locked) tile.locked[i] = 1;
+        newLocks.add(i);
       }
     }
   }
@@ -355,6 +362,20 @@ _stitchInteractiveToVisualEdges(tile, {
   // keep CPU buffers in sync for relax/coloring:
   this._pullGeometryToBuffers(tile);
   this._applyAllColorsGlobal(tile);
+
+  if (!tile._visualEdgeLocks) tile._visualEdgeLocks = new Set();
+  if (!visualNeighborFound) {
+    for (const idx of tile._visualEdgeLocks) {
+      if (tile.locked) tile.locked[idx] = 0;
+    }
+    tile._visualEdgeLocks.clear();
+    return;
+  }
+
+  for (const idx of tile._visualEdgeLocks) {
+    if (!newLocks.has(idx) && tile.locked) tile.locked[idx] = 0;
+  }
+  tile._visualEdgeLocks = newLocks;
 }
 
   _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
@@ -1298,6 +1319,7 @@ _stitchInteractiveToVisualEdges(tile, {
       _phase: { seedDone: false, edgeDone: false, fullDone: false },
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
+      _visualEdgeLocks: new Set(),
       relaxEnabled: false,
       _retryCounts: { seed: 0, edge: 0, full: 0 },
       wire
@@ -3286,10 +3308,11 @@ _stitchInteractiveToVisualEdges(tile, {
     const axial = this._axialRound(axialFloat.q, axialFloat.r);
     const tile = this.tiles.get(`${axial.q},${axial.r}`);
     if (!tile || tile.type !== 'interactive') return false;
-    const phaseReady = tile._phase?.fullDone;
-    if (!phaseReady) return false;
+    const seedDone = tile._phase?.seedDone;
+    if (!seedDone) return false;
     if (!Number.isFinite(tile.unreadyCount)) return true;
-    return tile.unreadyCount <= 0;
+    const total = Number.isFinite(tile.pos?.count) ? tile.pos.count : Infinity;
+    return tile.unreadyCount < total;
   }
 
   setRelayAddress(addr) {

@@ -1180,6 +1180,48 @@ canvas {
     gap: 16px;
 }
 
+#perfHud .hud-clock {
+    margin-left: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    min-width: 120px;
+}
+
+#perfHud .hud-clock-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+#perfHud .hud-clock-time {
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    color: rgba(255, 255, 255, 0.92);
+}
+
+#perfHud .hud-clock-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+#perfHud .hud-astro {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    font-size: 11px;
+    letter-spacing: 0.03em;
+    color: rgba(255, 255, 255, 0.78);
+}
+
+#perfHud .hud-astro-item {
+    white-space: nowrap;
+}
+
 #perfHud .hud-compass {
     position: relative;
     width: 44px;

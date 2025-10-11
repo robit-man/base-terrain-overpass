@@ -64,6 +64,10 @@ const hudLat = document.getElementById('hudLat');
 const hudLon = document.getElementById('hudLon');
 const hudAltitude = document.getElementById('hudAltitude');
 const hudPeerCount = document.getElementById('hudPeerCount');
+const hudClockLocal = document.getElementById('hudClockLocal');
+const hudClockUtc = document.getElementById('hudClockUtc');
+const hudSunInfo = document.getElementById('hudSunInfo');
+const hudMoonInfo = document.getElementById('hudMoonInfo');
 const hudStatusNknDot = document.getElementById('hudStatusNknDot');
 const hudStatusTerrainDot = document.getElementById('hudStatusTerrainDot');
 const hudStatusSigDot = document.getElementById('hudStatusSigDot');
@@ -290,6 +294,7 @@ export const ui = {
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
+  hudClockLocal, hudClockUtc, hudSunInfo, hudMoonInfo,
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,
