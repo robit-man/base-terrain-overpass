@@ -12,13 +12,13 @@ const FEATURES = {
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
 const CACHE_PREFIX = 'bm.tile';
-const CACHE_LIMIT = 320;
+const CACHE_LIMIT = 1320;
 const CACHE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
-const MERGE_BUDGET_MS = 2; // milliseconds per idle slice
-const BUILD_FRAME_BUDGET_MS = 3.5; // ms budget to spend per frame on feature builds
-const BUILD_IDLE_BUDGET_MS = 4.0; // ms budget when we have idle time available
-const RESNAP_INTERVAL = 2.0; // seconds between ground rescan passes
-const RESNAP_FRAME_BUDGET_MS = 0.8; // ms per frame allotted to resnap tiles
+const MERGE_BUDGET_MS = 8; // milliseconds per idle slice
+const BUILD_FRAME_BUDGET_MS = 8; // ms budget to spend per frame on feature builds
+const BUILD_IDLE_BUDGET_MS = 8; // ms budget when we have idle time available
+const RESNAP_INTERVAL = 0.2; // seconds between ground rescan passes
+const RESNAP_FRAME_BUDGET_MS = 10; // ms per frame allotted to resnap tiles
 const TARGET_FPS = 60;
 
 /* ---------------- helpers ---------------- */
@@ -128,15 +128,15 @@ export class BuildingManager {
     roadOffset = 0.05,
     roadStep = 14,
     roadAdaptive = true,
-    roadMinStep = 2,
+    roadMinStep = 1,
     roadMaxStep = 28,
-    roadAngleThresh = 0.35,
+    roadAngleThresh = 0.15,
     roadMaxSegments = 36,
     roadLit = false,
     roadShadows = false,
     roadColor = 0x202020,
-    extraDepth = -1.5,
-    extensionHeight = 2.5,
+    extraDepth = -3.5,
+    extensionHeight = 3.5,
     inputEl = null,            // NEW
     holdToOpenMs = 200,        // NEW (optional override)
 
@@ -285,25 +285,31 @@ export class BuildingManager {
     this._buildingMaterial = new THREE.MeshPhysicalMaterial({
       //color: new THREE.Color(0xaeb6c2),
       transmission: 1,
-      thickness: 0.6,
+      thickness: 2,
       roughness: 0.65,
       //metalness: 0,
-      //clearcoat: 0.1,
-      //clearcoatRoughness: 0.45,
-      //envMap: envTexture,
-      //envMapIntensity: 0.6,
+      iridescence: 1,
+      iridescenceIOR: 1.2,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.05,
+      envMap: envTexture,
+      envMapIntensity: 0.6,
       //vertexColors: true,
       //transparent: true,
       //opacity: 0.96,
       side: THREE.BackSide
     });
-    this._roadMaterial = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0x424a57),
+    this._roadMaterial = new THREE.MeshPhysicalMaterial({
+      transmission: 1,
+      thickness: 2,
+      roughness: 0.65,
+      //metalness: 0,
+      iridescence: 1,
+      iridescenceIOR: 1.2,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.05,
       envMap: envTexture,
-      envMapIntensity: 0.25,
-      transparent: true,
-      opacity: 0.6,
-      vertexColors: true,
+      envMapIntensity: 0.6,
       side: THREE.FrontSide
     });
     this._waterMaterialShared = new THREE.MeshBasicMaterial({
@@ -327,8 +333,8 @@ export class BuildingManager {
     this._tmpVec3 = new THREE.Vector3();
 
     this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xa7adb7, transparent: true, opacity: 0.05 });
-    this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 1 });
-    this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffd166, linewidth: 1, transparent: true, opacity: 0.9 });
+    this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 1, transparent: true, opacity: 1 });
+    this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 1, transparent: true, opacity: 0.9 });
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
     this._pickMaterial.depthWrite = false;
     this._pickMaterial.depthTest = false;

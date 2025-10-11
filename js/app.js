@@ -2351,9 +2351,36 @@ class App {
 
     const radius = 1.2;
     const lineOpacity = 0.15;
-    const majorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
-    const mediumMat = new THREE.MeshBasicMaterial({ color: 0xb8c4ff, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
-    const minorMat = new THREE.MeshBasicMaterial({ color: 0x6f758c, transparent: true, opacity: lineOpacity, depthTest: false, depthWrite: false });
+    const majorMat = new THREE.MeshPhysicalMaterial({
+          transmission: 1,
+          thickness: 2,
+          roughness: 0.65,
+          //metalness: 0,
+          iridescence: 0.2,
+          iridescenceIOR: 2.1,
+          clearcoat: 0.1,
+          clearcoatRoughness: 0.05,
+        });
+    const mediumMat = new THREE.MeshPhysicalMaterial({
+          transmission: 1,
+          thickness: 2,
+          roughness: 0.65,
+          //metalness: 0,
+          iridescence: 1,
+          iridescenceIOR: 2.2,
+          clearcoat: 0.1,
+          clearcoatRoughness: 0.05,
+        });
+    const minorMat = new THREE.MeshPhysicalMaterial({
+          transmission: 1,
+          thickness: 2,
+          roughness: 0.65,
+          //metalness: 0,
+          iridescence: 0.5,
+          iridescenceIOR: 1.2,
+          clearcoat: 0.1,
+          clearcoatRoughness: 0.05,
+        });
 
     for (let deg = 0; deg < 360; deg += 5) {
       const rad = THREE.MathUtils.degToRad(deg);
@@ -2390,7 +2417,7 @@ class App {
       dial.add(label);
     }
 
-    const readout = this._makeCompassLabel('000°', { color: '#ffe082', size: 0.05, fontSize: 50, weight: '600' });
+    const readout = this._makeCompassLabel('000°', { color: '#ffffff', size: 0.04, fontSize: 50, weight: '600' });
     readout.position.set(0, 0.45, 0);
     readout.renderOrder = 1000;
     dial.add(readout);
@@ -2420,7 +2447,7 @@ class App {
     texture.generateMipmaps = false;
     texture.needsUpdate = true;
 
-    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false });
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity:0.5, depthTest: false, depthWrite: false });
     const sprite = new THREE.Sprite(material);
     const aspect = canvas.width / canvas.height;
     sprite.scale.set(size * aspect, size, 1);
