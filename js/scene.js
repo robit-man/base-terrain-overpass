@@ -50,7 +50,8 @@ export class SceneManager {
     this.sunLight = new THREE.DirectionalLight(0xffffff, 4);
     this.sunLight.position.set(1000, 500, -800);
     this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.set(4096, 4096);
+    this.sunLight.shadow.mapSize.set(1024, 1024);
+    this.renderer.shadowMap.autoUpdate = false;   // add this
     this.sunLight.shadow.camera.near = 10;
     this.sunLight.shadow.camera.far = 1800;
     this.sunLight.shadow.camera.left = -600;
