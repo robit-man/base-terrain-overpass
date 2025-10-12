@@ -36,14 +36,14 @@ export class TileManager {
     this._interactiveSecondPass = false;
 
     // ---- LOD configuration ----
-    this.INTERACTIVE_RING = 3;
-    this.VISUAL_RING = 6;
-    this.FARFIELD_EXTRA = 30;
+    this.INTERACTIVE_RING = 2;
+    this.VISUAL_RING = 4;
+    this.FARFIELD_EXTRA = 20;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
-    this.VISUAL_CREATE_BUDGET = 4;
+    this.VISUAL_CREATE_BUDGET = 60;
     this.FARFIELD_CREATE_BUDGET = 60;
-    this.FARFIELD_BATCH_SIZE = 48;
+    this.FARFIELD_BATCH_SIZE = 60;
     this.FARFIELD_NEAR_PAD = 6;
 
     // ---- interactive (high-res) relaxation ----

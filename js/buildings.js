@@ -121,7 +121,7 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 1000,
+    radius = 600,
     tileSize,
     color = 0x333333,
     roadWidth = 3,
@@ -420,135 +420,135 @@ export class BuildingManager {
   }
 
   applyPerfProfile(profile = {}) {
-  const nowMs = performance?.now ? performance.now() : Date.now();
+    const nowMs = performance?.now ? performance.now() : Date.now();
 
-  // ── Inputs + clamps ──────────────────────────────────────────────────────────
-  const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._currentPerfQuality;
-  const qualityClamp = THREE.MathUtils.clamp(qualityRaw ?? 1, 0.3, 1.1);
-  this._currentPerfQuality = qualityClamp;
+    // ── Inputs + clamps ──────────────────────────────────────────────────────────
+    const qualityRaw = Number.isFinite(profile?.quality) ? profile.quality : this._currentPerfQuality;
+    const qualityClamp = THREE.MathUtils.clamp(qualityRaw ?? 1, 0.3, 1.1);
+    this._currentPerfQuality = qualityClamp;
 
-  const fps = Number.isFinite(profile?.smoothedFps) ? profile.smoothedFps : this._smoothedFps;
-  if (Number.isFinite(fps)) this._smoothedFps = fps;
+    const fps = Number.isFinite(profile?.smoothedFps) ? profile.smoothedFps : this._smoothedFps;
+    if (Number.isFinite(fps)) this._smoothedFps = fps;
 
-  const target = Number.isFinite(profile?.targetFps) && profile.targetFps > 0
-    ? profile.targetFps
-    : (this._qosTargetFps || TARGET_FPS);
-  this._qosTargetFps = target;
+    const target = Number.isFinite(profile?.targetFps) && profile.targetFps > 0
+      ? profile.targetFps
+      : (this._qosTargetFps || TARGET_FPS);
+    this._qosTargetFps = target;
 
-  // ── Hysteresis on quality (avoid flapping) ───────────────────────────────────
-  // Round quality to 0.05 steps and only "apply" when step changes.
-  const QUALITY_STEP = (this._qualityStep ?? 0.05);
-  const qMin = 0.3, qMax = 1.05;
-  const qNorm = THREE.MathUtils.clamp((qualityClamp - qMin) / (qMax - qMin), 0, 1);
-  const qStep = Math.round(THREE.MathUtils.clamp(qualityClamp, qMin, qMax) / QUALITY_STEP) * QUALITY_STEP;
+    // ── Hysteresis on quality (avoid flapping) ───────────────────────────────────
+    // Round quality to 0.05 steps and only "apply" when step changes.
+    const QUALITY_STEP = (this._qualityStep ?? 0.05);
+    const qMin = 0.3, qMax = 1.05;
+    const qNorm = THREE.MathUtils.clamp((qualityClamp - qMin) / (qMax - qMin), 0, 1);
+    const qStep = Math.round(THREE.MathUtils.clamp(qualityClamp, qMin, qMax) / QUALITY_STEP) * QUALITY_STEP;
 
-  const lastStep = this._lastAppliedQualityStep;
-  const stepChanged = (lastStep == null) || (Math.abs(qStep - lastStep) >= QUALITY_STEP);
+    const lastStep = this._lastAppliedQualityStep;
+    const stepChanged = (lastStep == null) || (Math.abs(qStep - lastStep) >= QUALITY_STEP);
 
-  // ── Budgets scale with normalized quality (safe to adjust every call) ───────
-  this._frameBudgetMs       = THREE.MathUtils.lerp(0.35, BUILD_FRAME_BUDGET_MS, qNorm);
-  this._idleBudgetMs        = THREE.MathUtils.lerp(1.8,  BUILD_IDLE_BUDGET_MS, qNorm);
-  this._mergeBudgetMs       = THREE.MathUtils.lerp(1.1,  MERGE_BUDGET_MS, qNorm);
-  this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm);
-  this._resnapInterval      = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, qNorm);
-  this._resnapHotBudgetMs   = THREE.MathUtils.lerp(0.18, 0.8, qNorm);
-  this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, qNorm)));
-  this._tileUpdateInterval  = THREE.MathUtils.lerp(0.65, 0.08, qNorm);
-  this._tileUpdateTimer     = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
-  if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
+    // ── Budgets scale with normalized quality (safe to adjust every call) ───────
+    this._frameBudgetMs = THREE.MathUtils.lerp(0.35, BUILD_FRAME_BUDGET_MS, qNorm);
+    this._idleBudgetMs = THREE.MathUtils.lerp(1.8, BUILD_IDLE_BUDGET_MS, qNorm);
+    this._mergeBudgetMs = THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, qNorm);
+    this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm);
+    this._resnapInterval = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, qNorm);
+    this._resnapHotBudgetMs = THREE.MathUtils.lerp(0.18, 0.8, qNorm);
+    this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, qNorm)));
+    this._tileUpdateInterval = THREE.MathUtils.lerp(0.65, 0.08, qNorm);
+    this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
+    if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
 
-  // ── QoS level (for UI/telemetry) ────────────────────────────────────────────
-  const level = qualityClamp >= 0.82 ? 'high' : (qualityClamp >= 0.6 ? 'medium' : 'low');
-  this._qosLevel = level;
+    // ── QoS level (for UI/telemetry) ────────────────────────────────────────────
+    const level = qualityClamp >= 0.82 ? 'high' : (qualityClamp >= 0.6 ? 'medium' : 'low');
+    this._qosLevel = level;
 
-  // ── Pressure metrics (fetch cadence) ─────────────────────────────────────────
-  const targetFps = Number.isFinite(target) && target > 0 ? target : TARGET_FPS;
-  const smoothedFps = Number.isFinite(this._smoothedFps) ? this._smoothedFps : targetFps;
-  const fpsRatio = THREE.MathUtils.clamp(smoothedFps / Math.max(1, targetFps), 0, 1.5);
-  const pressure = fpsRatio >= 1 ? 0 : (1 - fpsRatio);
-  const qualityNorm = THREE.MathUtils.clamp((qualityClamp - 0.3) / 0.8, 0, 1);
+    // ── Pressure metrics (fetch cadence) ─────────────────────────────────────────
+    const targetFps = Number.isFinite(target) && target > 0 ? target : TARGET_FPS;
+    const smoothedFps = Number.isFinite(this._smoothedFps) ? this._smoothedFps : targetFps;
+    const fpsRatio = THREE.MathUtils.clamp(smoothedFps / Math.max(1, targetFps), 0, 1.5);
+    const pressure = fpsRatio >= 1 ? 0 : (1 - fpsRatio);
+    const qualityNorm = THREE.MathUtils.clamp((qualityClamp - 0.3) / 0.8, 0, 1);
 
-  this._fetchBatchSize  = Math.max(2, Math.round(THREE.MathUtils.lerp(18, 6, pressure)));
-  this._fetchCooldownMs = Math.round(THREE.MathUtils.lerp(180, 900, pressure));
+    this._fetchBatchSize = Math.max(2, Math.round(THREE.MathUtils.lerp(18, 6, pressure)));
+    this._fetchCooldownMs = Math.round(THREE.MathUtils.lerp(180, 900, pressure));
 
-  // ── Compute desired radius for this quality (but don't thrash) ───────────────
-  // We only recompute base radius when no manual override is in place.
-  if (this._radiusOverride == null) {
-    const baseline = this._computeVisualRingRadius();
-    const baseRadius = Number.isFinite(baseline) && baseline > 0 ? baseline : this._defaultRadius;
-    const scaledRadius = Math.max(
-      200,
-      Math.round(THREE.MathUtils.lerp(baseRadius * 0.45, baseRadius * 1.2, qNorm))
-    );
-    if (Number.isFinite(scaledRadius) && scaledRadius > 0) {
-      this._baseRadius = scaledRadius;
-    }
-  }
-
-  const desiredRadius = this._radiusOverride ?? this._baseRadius;
-
-  // ── Cooldown + hysteresis gate for heavy updates ─────────────────────────────
-  // Prevents _refreshRadiusVisibility/_updateTiles(true) stampede.
-  const COOLDOWN_MS = Number.isFinite(this._applyCooldownMs) ? this._applyCooldownMs : 800;
-  const inCooldown  = (this._applyCooldownUntil && nowMs < this._applyCooldownUntil);
-
-  // Only consider applying heavy changes if:
-  //  - quality step changed (avoids tiny oscillations), AND
-  //  - we are not in cooldown.
-  let appliedHeavy = false;
-
-  // Determine whether radius change is "meaningful" (>= 1 tile or >= 5%).
-  // This avoids reflow when change is tiny.
-  const prevRadius = Number.isFinite(this.radius) ? this.radius : desiredRadius;
-  const radiusDelta = Math.abs(desiredRadius - prevRadius);
-  const radiusMeaningful = radiusDelta >= Math.max(1, prevRadius * 0.05);
-
-  if (!inCooldown && (stepChanged || radiusMeaningful)) {
-    // Update state that tracks quality hysteresis:
-    this._lastAppliedQualityStep = qStep;
-
-    // Apply radius if it meaningfully changed.
-    if (radiusMeaningful) {
-      this.radius = desiredRadius;
-
-      // Span cap derived from radius & tile size, with minimum safety floor.
-      const spanBase = Math.ceil((this.radius + this.tileSize) / Math.max(1, this.tileSize));
-      this._tileSpanCap = Math.max(6, spanBase + 2);
-
-      // Visibility recompute is cheap; defer heavy tile graph updates unless radius really changed.
-      this._refreshRadiusVisibility?.();
-
-      // If your pipeline expects a tiles rebuild on radius change, call it here,
-      // but only when the change was meaningful (we already checked).
-      this._updateTiles?.(true);
+    // ── Compute desired radius for this quality (but don't thrash) ───────────────
+    // We only recompute base radius when no manual override is in place.
+    if (this._radiusOverride == null) {
+      const baseline = this._computeVisualRingRadius();
+      const baseRadius = Number.isFinite(baseline) && baseline > 0 ? baseline : this._defaultRadius;
+      const scaledRadius = Math.max(
+        200,
+        Math.round(THREE.MathUtils.lerp(baseRadius * 0.45, baseRadius * 1.2, qNorm))
+      );
+      if (Number.isFinite(scaledRadius) && scaledRadius > 0) {
+        this._baseRadius = scaledRadius;
+      }
     }
 
-    // Start cooldown to avoid thrash.
-    this._applyCooldownUntil = nowMs + COOLDOWN_MS;
-    appliedHeavy = radiusMeaningful || stepChanged;
+    const desiredRadius = this._radiusOverride ?? this._baseRadius;
+
+    // ── Cooldown + hysteresis gate for heavy updates ─────────────────────────────
+    // Prevents _refreshRadiusVisibility/_updateTiles(true) stampede.
+    const COOLDOWN_MS = Number.isFinite(this._applyCooldownMs) ? this._applyCooldownMs : 800;
+    const inCooldown = (this._applyCooldownUntil && nowMs < this._applyCooldownUntil);
+
+    // Only consider applying heavy changes if:
+    //  - quality step changed (avoids tiny oscillations), AND
+    //  - we are not in cooldown.
+    let appliedHeavy = false;
+
+    // Determine whether radius change is "meaningful" (>= 1 tile or >= 5%).
+    // This avoids reflow when change is tiny.
+    const prevRadius = Number.isFinite(this.radius) ? this.radius : desiredRadius;
+    const radiusDelta = Math.abs(desiredRadius - prevRadius);
+    const radiusMeaningful = radiusDelta >= Math.max(1, prevRadius * 0.05);
+
+    if (!inCooldown && (stepChanged || radiusMeaningful)) {
+      // Update state that tracks quality hysteresis:
+      this._lastAppliedQualityStep = qStep;
+
+      // Apply radius if it meaningfully changed.
+      if (radiusMeaningful) {
+        this.radius = desiredRadius;
+
+        // Span cap derived from radius & tile size, with minimum safety floor.
+        const spanBase = Math.ceil((this.radius + this.tileSize) / Math.max(1, this.tileSize));
+        this._tileSpanCap = Math.max(6, spanBase + 2);
+
+        // Visibility recompute is cheap; defer heavy tile graph updates unless radius really changed.
+        this._refreshRadiusVisibility?.();
+
+        // If your pipeline expects a tiles rebuild on radius change, call it here,
+        // but only when the change was meaningful (we already checked).
+        this._updateTiles?.(true);
+      }
+
+      // Start cooldown to avoid thrash.
+      this._applyCooldownUntil = nowMs + COOLDOWN_MS;
+      appliedHeavy = radiusMeaningful || stepChanged;
+    }
+
+    // If we were in cooldown or nothing meaningful changed, we still return a summary,
+    // but we skip heavy work. This keeps budgets updated while avoiding tile thrash.
+    const summary = {
+      quality: qualityClamp,
+      qualityStep: qStep,
+      level,
+      frameBudget: this._frameBudgetMs,
+      idleBudget: this._idleBudgetMs,
+      mergeBudget: this._mergeBudgetMs,
+      resnapBudget: this._resnapFrameBudgetMs,
+      resnapInterval: this._resnapInterval,
+      radius: this.radius,
+      desiredRadius,
+      tileUpdateInterval: this._tileUpdateInterval,
+      throttled: !!inCooldown,
+      cooldownMsRemaining: inCooldown ? Math.max(0, Math.round(this._applyCooldownUntil - nowMs)) : 0,
+      appliedHeavy,
+    };
+
+    return summary;
   }
-
-  // If we were in cooldown or nothing meaningful changed, we still return a summary,
-  // but we skip heavy work. This keeps budgets updated while avoiding tile thrash.
-  const summary = {
-    quality: qualityClamp,
-    qualityStep: qStep,
-    level,
-    frameBudget: this._frameBudgetMs,
-    idleBudget: this._idleBudgetMs,
-    mergeBudget: this._mergeBudgetMs,
-    resnapBudget: this._resnapFrameBudgetMs,
-    resnapInterval: this._resnapInterval,
-    radius: this.radius,
-    desiredRadius,
-    tileUpdateInterval: this._tileUpdateInterval,
-    throttled: !!inCooldown,
-    cooldownMsRemaining: inCooldown ? Math.max(0, Math.round(this._applyCooldownUntil - nowMs)) : 0,
-    appliedHeavy,
-  };
-
-  return summary;
-}
 
   getBuildingSettings() {
     return {
@@ -672,7 +672,7 @@ export class BuildingManager {
     // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
-// CSS3D panel: render only when visible, and throttle (big perf win)
+    // CSS3D panel: render only when visible, and throttle (big perf win)
     if (this._cssEnabled && this._cssRenderer && this._cssScene) {
       const anyVisible = (this._cssPanelVisible === true) || this._hoverGroup?.visible === true;
       const nowMs = this._nowMs();
