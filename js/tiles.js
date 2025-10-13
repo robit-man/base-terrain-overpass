@@ -135,7 +135,8 @@ export class TileManager {
     this._populateQueue = [];          // entries: { tile, phase, priority }
     this._populateInflight = 0;
     this._populateBusy = false;        // legacy flag
-    this.MAX_CONCURRENT_POPULATES = 12; // try 16–24 if the relay tolerates it
+    this._populateDrainPending = false;
+    this.MAX_CONCURRENT_POPULATES = 8; // lower concurrency to soften bursts
     this._encoder = new TextEncoder();
 
     // ---- network governor (token bucket) ----
@@ -143,12 +144,8 @@ export class TileManager {
     this.RATE_BPS = 256 * 1024;       // max payload bytes per second
     this._rateTokensQ = this.RATE_QPS;
     this._rateTokensB = this.RATE_BPS;
-    this._rateBucketResetAt = (performance?.now?.() ?? Date.now());
-    this._rateTicker = setInterval(() => {
-      this._rateTokensQ = this.RATE_QPS;
-      this._rateTokensB = this.RATE_BPS;
-      this._drainPopulateQueue();
-    }, 1000);
+    this._rateLastRefillAt = this._nowMs();
+    this._rateTicker = null;
 
     // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
@@ -2221,7 +2218,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const entry = { tile, phase, priority: !!priority };
     if (priority) this._populateQueue.unshift(entry);
     else this._populateQueue.push(entry);
-    this._drainPopulateQueue();
+    this._drainPopulateQueue({ budgetMs: 2.8, maxBatch: 3 });
+    if (this._populateQueue.length) this._schedulePopulateDrain();
   }
 
   _handleInteractivePhaseCompletion(tile, phase) {
@@ -2244,27 +2242,58 @@ _stitchInteractiveToVisualEdges(tile, {
     }
   }
 
+  _refillRateTokens(nowMs = this._nowMs()) {
+    if (!Number.isFinite(this._rateLastRefillAt)) {
+      this._rateLastRefillAt = nowMs;
+      return;
+    }
+    const elapsed = Math.max(0, nowMs - this._rateLastRefillAt);
+    if (elapsed <= 0) return;
+    const seconds = elapsed / 1000;
+    this._rateTokensQ = Math.min(this.RATE_QPS, this._rateTokensQ + this.RATE_QPS * seconds);
+    this._rateTokensB = Math.min(this.RATE_BPS, this._rateTokensB + this.RATE_BPS * seconds);
+    this._rateLastRefillAt = nowMs;
+  }
+
   async _acquireNetBudget(bytes) {
+    const bytesCost = Math.max(0, bytes | 0);
     while (true) {
-      const nowT = (performance?.now?.() ?? Date.now());
-      if (!this._rateBucketResetAt || nowT - this._rateBucketResetAt >= 1000) {
-        this._rateBucketResetAt = nowT;
-        this._rateTokensQ = this.RATE_QPS;
-        this._rateTokensB = this.RATE_BPS;
-      }
-      if (this._rateTokensQ > 0 && this._rateTokensB >= bytes) {
-        this._rateTokensQ -= 1;
-        this._rateTokensB -= Math.max(0, bytes | 0);
+      const nowT = this._nowMs();
+      this._refillRateTokens(nowT);
+      if (this._rateTokensQ > 0 && this._rateTokensB >= bytesCost) {
+        this._rateTokensQ = Math.max(0, this._rateTokensQ - 1);
+        this._rateTokensB = Math.max(0, this._rateTokensB - bytesCost);
         return;
       }
       await new Promise(r => setTimeout(r, 8));
     }
   }
 
-  _drainPopulateQueue() {
+  _schedulePopulateDrain() {
+    this._populateDrainPending = true;
+  }
+
+  _drainPopulateQueue({ budgetMs = 3.2, maxBatch = 4 } = {}) {
+    if (!this._populateQueue.length && this._populateInflight < this.MAX_CONCURRENT_POPULATES) {
+      this._populateDrainPending = false;
+      return;
+    }
+
+    const budget = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 0;
+    const batchLimit = Number.isFinite(maxBatch) ? Math.max(1, Math.floor(maxBatch)) : 4;
+    const start = this._nowMs();
+    let startedThisPass = 0;
+
+    this._populateDrainPending = false;
+    this._refillRateTokens(start);
+
     while (this._populateInflight < this.MAX_CONCURRENT_POPULATES && this._populateQueue.length) {
+      const elapsed = this._nowMs() - start;
+      if (budget > 0 && elapsed > budget) break;
+      if (startedThisPass >= batchLimit) break;
+
       const next = this._populateQueue.shift();
-      if (!next) break;
+      if (!next) continue;
 
       const { tile, phase } = next;
       if (!tile) continue;
@@ -2289,6 +2318,7 @@ _stitchInteractiveToVisualEdges(tile, {
 
       this._populateInflight++;
       tile.populating = true;
+      startedThisPass++;
 
       this._populateTilePhase(tile, phase)
         .catch(() => { /* ignore; backfill will retry */ })
@@ -2297,8 +2327,12 @@ _stitchInteractiveToVisualEdges(tile, {
           tile._queuedPhases?.delete(k);
           tile.populating = false;
           this._populateInflight = Math.max(0, this._populateInflight - 1);
-          this._drainPopulateQueue();
+          this._schedulePopulateDrain();
         });
+    }
+
+    if (this._populateQueue.length && this._populateInflight < this.MAX_CONCURRENT_POPULATES) {
+      this._schedulePopulateDrain();
     }
   }
 
@@ -2749,6 +2783,11 @@ update(playerPos) {
   const startMs = performance?.now ? performance.now() : Date.now();
   const nowMs = () => (performance?.now ? performance.now() : Date.now());
   const HARD_BUDGET_MS = (this.UPDATE_BUDGET_MS ?? 4.5);
+
+  this._refillRateTokens(startMs);
+  if (this._populateDrainPending || (this._populateQueue.length && this._populateInflight < this.MAX_CONCURRENT_POPULATES)) {
+    this._drainPopulateQueue({ budgetMs: 3.6, maxBatch: 4 });
+  }
 
   const a  = this.tileRadius;
   const qf = (2 / 3 * playerPos.x) / a;

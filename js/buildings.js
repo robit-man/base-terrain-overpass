@@ -272,6 +272,12 @@ export class BuildingManager {
     this._fetchCooldownMs = 250;
     this._lastFetchMs = -Infinity;
     this._pendingFetchTiles = new Set();
+    this._pendingFetchDrainPending = false;
+    this._pendingFetchBudgetMs = 3.2;
+    this._maxFetchBatchPerDrain = 6;
+    this._fetchTokens = 1;
+    this._fetchTokenCapacity = 1;
+    this._fetchLastTokenRefill = this._nowMs();
     this._resnapVerifyIntervalMs = 1500;
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
@@ -470,6 +476,8 @@ export class BuildingManager {
 
     this._fetchBatchSize = Math.max(2, Math.round(THREE.MathUtils.lerp(18, 6, pressure)));
     this._fetchCooldownMs = Math.round(THREE.MathUtils.lerp(180, 900, pressure));
+    this._fetchTokenCapacity = 1;
+    this._fetchTokens = Math.min(this._fetchTokens ?? 1, this._fetchTokenCapacity);
 
     // ── Compute desired radius for this quality (but don't thrash) ───────────────
     // We only recompute base radius when no manual override is in place.
@@ -667,7 +675,9 @@ export class BuildingManager {
       this._verifyFloatingBuildings();
       this._resnapVerifyNextMs = nowMs + this._resnapVerifyIntervalMs;
     }
-    this._drainPendingFetchQueue(nowMs);
+    if (this._pendingFetchDrainPending || (this._pendingFetchTiles?.size && !this._patchInflight)) {
+      this._drainPendingFetchQueue(nowMs);
+    }
 
     // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
@@ -1323,15 +1333,19 @@ export class BuildingManager {
       const fetchNow = uncached.slice(0, Math.max(1, this._fetchBatchSize | 0));
       const deferred = uncached.slice(fetchNow.length);
       for (const key of deferred) this._pendingFetchTiles.add(key);
+      if (deferred.length) this._schedulePendingFetchDrain();
 
       const nowMs = this._nowMs();
-      const canFetch = !this._patchInflight && fetchNow.length && (nowMs - this._lastFetchMs) >= this._fetchCooldownMs;
-      if (canFetch) {
+      this._refillFetchTokens(nowMs);
+      const canImmediateFetch = !this._patchInflight && fetchNow.length && this._fetchTokens >= 1;
+      if (canImmediateFetch) {
         const orderedFetch = tiles.map((t) => t.key).filter((key) => fetchNow.includes(key));
+        this._fetchTokens = Math.max(0, this._fetchTokens - 1);
         this._fetchPatch(orderedFetch.length ? orderedFetch : fetchNow, fetchNow);
         this._lastFetchMs = nowMs;
       } else {
         for (const key of fetchNow) this._pendingFetchTiles.add(key);
+        if (fetchNow.length) this._schedulePendingFetchDrain();
       }
     }
   }
@@ -1442,6 +1456,7 @@ export class BuildingManager {
       }
     } finally {
       this._patchInflight = false;
+      if (this._pendingFetchTiles?.size) this._schedulePendingFetchDrain();
     }
   }
 
@@ -2432,19 +2447,65 @@ export class BuildingManager {
     attr.needsUpdate = true;
   }
 
+  _schedulePendingFetchDrain() {
+    this._pendingFetchDrainPending = true;
+  }
+
+  _refillFetchTokens(nowMs = this._nowMs()) {
+    if (!Number.isFinite(this._fetchLastTokenRefill)) {
+      this._fetchLastTokenRefill = nowMs;
+      return;
+    }
+    const cooldown = Math.max(1, this._fetchCooldownMs);
+    const elapsed = Math.max(0, nowMs - this._fetchLastTokenRefill);
+    if (elapsed <= 0) return;
+    const tokens = elapsed / cooldown;
+    const capacity = Number.isFinite(this._fetchTokenCapacity) && this._fetchTokenCapacity > 0
+      ? this._fetchTokenCapacity
+      : 1;
+    this._fetchTokens = Math.min(capacity, this._fetchTokens + tokens);
+    this._fetchLastTokenRefill = nowMs;
+  }
+
   _drainPendingFetchQueue(nowMs = this._nowMs()) {
-    if (!this._pendingFetchTiles || !this._pendingFetchTiles.size) return;
-    if (this._patchInflight) return;
-    if ((nowMs - this._lastFetchMs) < this._fetchCooldownMs) return;
+    if (!this._pendingFetchTiles || !this._pendingFetchTiles.size) {
+      this._pendingFetchDrainPending = false;
+      return;
+    }
+    if (this._patchInflight) {
+      this._pendingFetchDrainPending = true;
+      return;
+    }
+
+    this._refillFetchTokens(nowMs);
+    if (this._fetchTokens < 1) {
+      this._pendingFetchDrainPending = true;
+      return;
+    }
+
+    const budget = Number.isFinite(this._pendingFetchBudgetMs) ? Math.max(0, this._pendingFetchBudgetMs) : 0;
+    const preferredBatch = Number.isFinite(this._maxFetchBatchPerDrain)
+      ? this._maxFetchBatchPerDrain
+      : ((this._fetchBatchSize | 0) || 1);
+    const adaptiveBatch = Math.max(1, (this._fetchBatchSize | 0) || 1);
+    const maxBatch = Math.max(1, Math.min(preferredBatch, adaptiveBatch));
 
     const batch = [];
+    const start = nowMs;
     for (const key of this._pendingFetchTiles) {
       batch.push(key);
       this._pendingFetchTiles.delete(key);
-      if (batch.length >= this._fetchBatchSize) break;
+      if (batch.length >= maxBatch) break;
+      if (budget > 0 && (this._nowMs() - start) > budget) break;
     }
-    if (!batch.length) return;
 
+    if (!batch.length) {
+      this._pendingFetchDrainPending = this._pendingFetchTiles.size > 0;
+      return;
+    }
+
+    this._fetchTokens = Math.max(0, this._fetchTokens - 1);
+    this._pendingFetchDrainPending = this._pendingFetchTiles.size > 0;
     this._fetchPatch(batch, batch);
     this._lastFetchMs = nowMs;
   }

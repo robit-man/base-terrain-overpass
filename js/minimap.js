@@ -56,6 +56,8 @@ export class MiniMap {
     this.peerMarkers = new Map();
     this._lastFollowLatLon = null;
     this._autoFollowThreshold = 0.0001; // ≈10–12 m on Earth
+    this._followRecenterThreshold = 0.00005;
+    this._followRecenterThresholdSq = this._followRecenterThreshold * this._followRecenterThreshold;
     this._pendingHeadingDeg = null;
     this._headingCssCurrent = null;
     this._pendingTeleport = null;
@@ -259,9 +261,7 @@ export class MiniMap {
       if (this.playerMarker) this.playerMarker.setLatLng(toLeafletLatLng(latLon));
 
       if (this.followEnabled && this.map) {
-        const zoom = this.map.getZoom() || DEFAULT_CENTER.zoom;
-        this.map.setView([latLon.lat, latLon.lon], zoom, { animate: false });
-        this.viewCenter = { ...latLon };
+        this._maybeRecenterMap(latLon, { animate: false });
       }
     }
 
@@ -289,12 +289,8 @@ export class MiniMap {
     }
 
     if (this.playerMarker) this.playerMarker.setLatLng(toLeafletLatLng(entry));
-    if (this.map) {
-      if (this.followEnabled || teleported) {
-        const zoom = this.map.getZoom() || DEFAULT_CENTER.zoom;
-        this.map.setView([entry.lat, entry.lon], zoom, { animate: !teleported });
-        this.viewCenter = { ...entry };
-      }
+    if (this.map && (this.followEnabled || teleported)) {
+      this._maybeRecenterMap(entry, { animate: !teleported, force: teleported });
     }
 
     if (!this.followEnabled && !this.viewCenter) {
@@ -345,9 +341,7 @@ export class MiniMap {
 
   _centerOnPlayer(force = false) {
     if (!this.map || !this.currentLatLon) return;
-    const zoom = this.map.getZoom() || DEFAULT_CENTER.zoom;
-    this.map.setView([this.currentLatLon.lat, this.currentLatLon.lon], zoom, { animate: !force });
-    this.viewCenter = { ...this.currentLatLon };
+    this._maybeRecenterMap(this.currentLatLon, { animate: !force, force: true });
     this.userHasPanned = false;
     this._updateMoveButton();
   }
@@ -526,6 +520,32 @@ export class MiniMap {
       const triggerAuto = this.activeSource !== 'manual';
       this._setFollow(true, { triggerAuto });
     }
+  }
+
+  _needsFollowRecentre(latLon, { force = false } = {}) {
+    if (force) return true;
+    if (!latLon) return false;
+    const center = this.viewCenter;
+    if (!center || !Number.isFinite(center.lat) || !Number.isFinite(center.lon)) return true;
+    const dLat = latLon.lat - center.lat;
+    const dLon = latLon.lon - center.lon;
+    const distSq = (dLat * dLat) + (dLon * dLon);
+    const thresholdSq = this._followRecenterThresholdSq ?? (this._followRecenterThreshold * this._followRecenterThreshold) ?? 0;
+    if (thresholdSq <= 0) return distSq > 0;
+    return distSq >= thresholdSq;
+  }
+
+  _maybeRecenterMap(latLon, { animate = false, force = false } = {}) {
+    if (!this.map || !latLon) return;
+    const lat = clampLat(Number.isFinite(latLon.lat) ? latLon.lat : 0);
+    const lonValue = Number.isFinite(latLon.lon) ? latLon.lon
+      : (Number.isFinite(latLon.lng) ? latLon.lng : 0);
+    const lon = clampLon(lonValue);
+    const target = { lat, lon };
+    if (!this._needsFollowRecentre(target, { force })) return;
+    const zoom = this.map.getZoom?.() || DEFAULT_CENTER.zoom;
+    this.map.setView([target.lat, target.lon], zoom, { animate });
+    this.viewCenter = { ...target };
   }
 
   _applyPlayerHeading(deg) {
