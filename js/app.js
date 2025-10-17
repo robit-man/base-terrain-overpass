@@ -728,7 +728,7 @@ class App {
     if (allowRecenter && !skipRecenterForStoredPose) {
       this._resetPlayerPosition();
       if (isManualRequest) {
-        this.hexGridMgr?.update(this.sceneMgr?.dolly?.position || new THREE.Vector3());
+        this.hexGridMgr?.update(0, this.sceneMgr?.camera, this.sceneMgr?.dolly);
       }
     }
 
@@ -855,7 +855,7 @@ class App {
       this.sceneMgr.camera.rotation.set(0, 0, 0);
       this.sceneMgr.camera.up.set(0, 1, 0);
       this.physics?.setCharacterPosition?.(dolly.position, eye);
-      this.hexGridMgr?.update(dolly.position);
+      this.hexGridMgr?.update(0, this.sceneMgr?.camera, dolly);
 
       this._poseStoredState = null;
       this._poseLatestState = null;
@@ -3211,7 +3211,7 @@ class App {
       dolly.position.y = groundY + eyeHeight;
     }
 
-    this.hexGridMgr?.update?.(dolly.position);
+    this.hexGridMgr?.update?.(0, camera, dolly);
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
 
     const refreshedPose = this._clonePoseSnapshot(this._capturePose());
@@ -3428,7 +3428,7 @@ class App {
     const timeOk = hexNow >= this._nextHexUpdateMs;
     if (movedEnough || timeOk) {
       if (performance?.mark) performance.mark('hex-update-start');
-      measure('tiles.update', () => this.hexGridMgr.update(dolly.position));
+      measure('tiles.update', () => this.hexGridMgr.update(dt, this.sceneMgr?.camera, dolly));
       if (performance?.mark) {
         performance.mark('hex-update-end');
         performance.measure('hex-update', 'hex-update-start', 'hex-update-end');

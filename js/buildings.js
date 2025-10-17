@@ -20,6 +20,7 @@ const BUILD_IDLE_BUDGET_MS = 8; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 0.2; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 10; // ms per frame allotted to resnap tiles
 const TARGET_FPS = 60;
+const BUILD_FEATURES_PER_SLICE = 12;
 
 /* ---------------- helpers ---------------- */
 // --- DuckDuckGo helpers (use HTML/Lite for embeddable results) ---
@@ -377,6 +378,7 @@ export class BuildingManager {
     this._mergeBudgetMs = MERGE_BUDGET_MS;
     this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
     this._resnapInterval = RESNAP_INTERVAL;
+    this._buildFeaturesPerSlice = BUILD_FEATURES_PER_SLICE;
     this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
     this._tileUpdateTimer = 0;
     this._resnapTimer = 0;
@@ -457,6 +459,7 @@ export class BuildingManager {
     this._mergeBudgetMs = THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, qNorm);
     this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm);
     this._resnapInterval = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, qNorm);
+    this._buildFeaturesPerSlice = Math.max(4, Math.round(THREE.MathUtils.lerp(6, 24, qNorm)));
     this._resnapHotBudgetMs = THREE.MathUtils.lerp(0.18, 0.8, qNorm);
     this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, qNorm)));
     this._tileUpdateInterval = THREE.MathUtils.lerp(0.65, 0.08, qNorm);
@@ -1380,7 +1383,13 @@ export class BuildingManager {
 
   _terrainTileReady(tileKey) {
     const tm = this.tileManager;
-    if (!tm || !tm.tiles || typeof tm._worldToAxialFloat !== 'function' || typeof tm._axialRound !== 'function') {
+    if (!tm) return false;
+
+    if (typeof tm.isTerrainReady === 'function' && tm.isTerrainReady()) {
+      return true;
+    }
+
+    if (!tm.tiles || typeof tm._worldToAxialFloat !== 'function' || typeof tm._axialRound !== 'function') {
       return false;
     }
 
@@ -1662,6 +1671,8 @@ export class BuildingManager {
         this._activeBuildJob = null;
       }
 
+      if (featuresProcessed >= Math.max(1, this._buildFeaturesPerSlice || 1)) break;
+
       if (timeRemaining() <= 0) break;
     }
 
@@ -1698,17 +1709,21 @@ export class BuildingManager {
     if (!state) {
       job.cancelled = true;
       job.done = true;
-      return true;
+      return false;
     }
 
-    while (job.featureIndex < job.features.length && timeRemainingFn() > 0) {
+    const quota = Math.max(1, this._buildFeaturesPerSlice | 0);
+    let processed = 0;
+
+    while (job.featureIndex < job.features.length && timeRemainingFn() > 0 && processed < quota) {
       const feature = job.features[job.featureIndex++];
       this._instantiateFeature(state, job, feature);
+      processed++;
       if (timeRemainingFn() <= 0) break;
     }
 
     if (job.featureIndex >= job.features.length) job.done = true;
-    return true;
+    return processed > 0;
   }
 
   _instantiateFeature(state, job, feature) {
@@ -1941,12 +1956,13 @@ export class BuildingManager {
 
     // Solid + picker: generated directly from same footprint
     const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
+    if (!solidGeo) return null;
 
-    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
+    const pickMesh = new THREE.Mesh(solidGeo, this._pickMaterial);
     pickMesh.position.set(0, baseline, 0);
     pickMesh.visible = false;
 
-    const solidMesh = new THREE.Mesh(solidGeo.clone(), this._buildingMaterial);
+    const solidMesh = new THREE.Mesh(solidGeo, this._buildingMaterial);
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
     solidMesh.castShadow = true;
@@ -1974,26 +1990,116 @@ export class BuildingManager {
     pickMesh.userData.buildingInfo = info;
     solidMesh.userData.buildingInfo = info;
 
-    const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
+    const building = { render: edges, solid: solidMesh, pick: pickMesh, info, sharedGeometry: solidGeo };
     const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
     this._applyGeometryColor(building.solid.geometry, fillColor);
     return building;
   }
 
   _makeSolidGeometry(footprint, height) {
-    const shape = new THREE.Shape();
+    const vertCount = footprint.length / 2;
+    if (vertCount < 3 || !Number.isFinite(height) || height <= 0) return null;
+
+    const points2d = [];
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
     for (let i = 0; i < footprint.length; i += 2) {
       const x = footprint[i];
       const z = footprint[i + 1];
-      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
+      points2d.push(new THREE.Vector2(x, z));
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
     }
-    shape.autoClose = true;
 
-    const geo = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
-    geo.rotateX(-Math.PI / 2).scale(1, 1, -1);
-    geo.computeBoundingSphere();
-    geo.computeBoundingBox();
-    return geo;
+    const faceIndices = THREE.ShapeUtils.triangulateShape(points2d, []);
+    if (!faceIndices || !faceIndices.length) return null;
+
+    const spanX = Math.max(1e-3, maxX - minX);
+    const spanZ = Math.max(1e-3, maxZ - minZ);
+
+    const positions = [];
+    const normals = [];
+    const uvs = [];
+    const indices = [];
+    const bottomMap = [];
+    const topMap = [];
+
+    const pushVertex = (x, y, z, nx, ny, nz, u, v) => {
+      positions.push(x, y, z);
+      normals.push(nx, ny, nz);
+      uvs.push(u, v);
+      return (positions.length / 3) - 1;
+    };
+
+    for (let i = 0; i < points2d.length; i++) {
+      const pt = points2d[i];
+      const u = (pt.x - minX) / spanX;
+      const v = (pt.y - minZ) / spanZ;
+      bottomMap[i] = pushVertex(pt.x, 0, pt.y, 0, -1, 0, u, v);
+    }
+    for (let i = 0; i < points2d.length; i++) {
+      const pt = points2d[i];
+      const u = (pt.x - minX) / spanX;
+      const v = (pt.y - minZ) / spanZ;
+      topMap[i] = pushVertex(pt.x, height, pt.y, 0, 1, 0, u, v);
+    }
+
+    for (const tri of faceIndices) {
+      const a = tri[0], b = tri[1], c = tri[2];
+      indices.push(topMap[a], topMap[b], topMap[c]);
+      indices.push(bottomMap[c], bottomMap[b], bottomMap[a]);
+    }
+
+    let perimeter = 0;
+    const edgeLengths = new Array(points2d.length);
+    for (let i = 0; i < points2d.length; i++) {
+      const next = (i + 1) % points2d.length;
+      const ax = points2d[i].x;
+      const az = points2d[i].y;
+      const bx = points2d[next].x;
+      const bz = points2d[next].y;
+      const len = Math.hypot(bx - ax, bz - az);
+      edgeLengths[i] = len;
+      perimeter += len;
+    }
+    const safePerimeter = Math.max(perimeter, 1e-3);
+
+    let accum = 0;
+    for (let i = 0; i < points2d.length; i++) {
+      const next = (i + 1) % points2d.length;
+      const ax = points2d[i].x;
+      const az = points2d[i].y;
+      const bx = points2d[next].x;
+      const bz = points2d[next].y;
+      const edgeLen = edgeLengths[i];
+      const nx = az - bz;
+      const nz = bx - ax;
+      const invLen = 1 / Math.max(edgeLen, 1e-6);
+      const nnx = nx * invLen;
+      const nnz = nz * invLen;
+      const u0 = accum / safePerimeter;
+      const u1 = (accum + edgeLen) / safePerimeter;
+      accum += edgeLen;
+
+      const baseIndex = positions.length / 3;
+      pushVertex(ax, 0, az, nnx, 0, nnz, u0, 0);
+      pushVertex(bx, 0, bz, nnx, 0, nnz, u1, 0);
+      pushVertex(ax, height, az, nnx, 0, nnz, u0, 1);
+      pushVertex(bx, height, bz, nnx, 0, nnz, u1, 1);
+
+      indices.push(baseIndex, baseIndex + 1, baseIndex + 3);
+      indices.push(baseIndex, baseIndex + 3, baseIndex + 2);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geometry.setIndex(indices);
+    geometry.computeBoundingSphere();
+    geometry.computeBoundingBox();
+    return geometry;
   }
 
   /* ---------------- resnap & hover visuals ---------------- */
@@ -3176,6 +3282,7 @@ export class BuildingManager {
     }
 
     for (const building of state.buildings) {
+      const sharedGeo = building.sharedGeometry || null;
       if (building.render) {
         this.group.remove(building.render);
         building.render.geometry?.dispose?.();
@@ -3184,14 +3291,16 @@ export class BuildingManager {
       if (building.solid) {
         this.physics?.unregisterStaticMesh(building.solid);
         this.group.remove(building.solid);
-        building.solid.geometry?.dispose?.();
+        if (!sharedGeo) building.solid.geometry?.dispose?.();
         building.solid = null;
       }
       if (building.pick) {
         this._pickerRoot.remove(building.pick);
-        building.pick.geometry?.dispose?.();
+        if (!sharedGeo) building.pick.geometry?.dispose?.();
         building.pick = null;
       }
+      if (sharedGeo) sharedGeo.dispose();
+      building.sharedGeometry = null;
     }
     state.buildings = [];
 

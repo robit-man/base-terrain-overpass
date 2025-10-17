@@ -100,7 +100,35 @@ export class PhysicsEngine {
   }
 
   _syncInteractiveTileColliders() {
-    const tiles = this.tileManager?.tiles;
+    const tm = this.tileManager;
+    const unifiedMesh = tm?.getTerrainMesh?.();
+    if (unifiedMesh) {
+      const ready = tm?.isTerrainReady?.() ?? true;
+      const unifiedId = '__unified__';
+
+      if (ready && !this.tileColliderMap.has(unifiedId)) {
+        this.registerStaticMesh(unifiedMesh);
+        this.tileColliderMap.set(unifiedId, unifiedMesh);
+        if (this._resolveCollidersReady) {
+          this._resolveCollidersReady(unifiedMesh);
+          this._resolveCollidersReady = null;
+        }
+      } else if (!ready && this.tileColliderMap.has(unifiedId)) {
+        const mesh = this.tileColliderMap.get(unifiedId);
+        if (mesh) this.unregisterStaticMesh(mesh);
+        this.tileColliderMap.delete(unifiedId);
+      }
+
+      for (const [id, mesh] of [...this.tileColliderMap.entries()]) {
+        if (id !== unifiedId) {
+          this.unregisterStaticMesh(mesh);
+          this.tileColliderMap.delete(id);
+        }
+      }
+      return;
+    }
+
+    const tiles = tm?.tiles;
     if (!tiles || typeof tiles.values !== 'function') return;
 
     for (const tile of tiles.values()) {
