@@ -22,7 +22,7 @@ export class ChaseCam {
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
-    this.maxBoom = 2500.0;
+    this.maxBoom = 5e7;
     this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
     this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
@@ -48,18 +48,15 @@ export class ChaseCam {
       active: false,
       startDist: 0,
       startBoom: this.targetBoom,
-      scale: 0.02
+      scale: 0.25,
+      lastDist: 0
     };
     this._pinchTouches = new Map();
     this._setupPinchGestures();
 
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
-      this.targetBoom = THREE.MathUtils.clamp(
-        this.targetBoom + e.deltaY * 0.1,
-        this.minBoom,
-        this.maxBoom
-      );
+      this._applyZoomDelta(e.deltaY);
     }, { passive: true });
   }
 
@@ -84,9 +81,12 @@ export class ChaseCam {
       const dy = touches[0].y - touches[1].y;
       const dist = Math.hypot(dx, dy);
       if (!isFinite(dist) || dist <= 0) return;
-      const delta = dist - this._pinch.startDist;
-      const target = this._pinch.startBoom + delta * this._pinch.scale;
-      this.targetBoom = THREE.MathUtils.clamp(target, this.minBoom, this.maxBoom);
+      if (!isFinite(this._pinch.lastDist) || this._pinch.lastDist <= 0) {
+        this._pinch.lastDist = dist;
+      }
+      const delta = dist - this._pinch.lastDist;
+      this._pinch.lastDist = dist;
+      this._applyZoomDelta(delta * this._pinch.scale);
     };
 
     const endPinch = () => {
@@ -94,6 +94,7 @@ export class ChaseCam {
       this._pinch.active = false;
       this._pinch.startDist = 0;
       this._pinch.startBoom = this.targetBoom;
+      this._pinch.lastDist = 0;
     };
 
     const pointerDown = (e) => {
@@ -105,6 +106,7 @@ export class ChaseCam {
         const dy = touches[0].y - touches[1].y;
         this._pinch.startDist = Math.max(1, Math.hypot(dx, dy));
         this._pinch.startBoom = this.targetBoom;
+        this._pinch.lastDist = this._pinch.startDist;
         this._pinch.active = true;
       }
     };
@@ -142,6 +144,33 @@ export class ChaseCam {
     canvas.addEventListener('pointerup', pointerUp, { passive: true });
     canvas.addEventListener('pointercancel', pointerCancel, { passive: true });
     canvas.addEventListener('pointerout', pointerCancel, { passive: true });
+  }
+
+  _applyZoomDelta(delta) {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    const threshold = 100;
+    let boom = this.targetBoom;
+    if (boom < threshold) {
+      let next = boom + delta * 0.1;
+      if (next < threshold) {
+        boom = next;
+      } else {
+        const overshoot = Math.max(0, next - threshold);
+        const log = overshoot * 0.005;
+        boom = threshold * Math.exp(log);
+      }
+    } else {
+      let logBoom = Math.log(Math.max(boom, threshold) / threshold);
+      logBoom += delta * 0.002;
+      if (logBoom <= 0) {
+        const scaled = threshold * Math.exp(Math.max(logBoom, -8));
+        boom = threshold - (threshold - scaled);
+      } else {
+        boom = threshold * Math.exp(logBoom);
+      }
+    }
+    if (!Number.isFinite(boom)) return;
+    this.targetBoom = THREE.MathUtils.clamp(boom, this.minBoom, this.maxBoom);
   }
 
   isFirstPerson() { return this.targetBoom <= this.FIRST_THRESHOLD; }

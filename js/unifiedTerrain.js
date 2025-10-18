@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { now } from './utils.js';
-import { worldToLatLon, latLonToWorld } from './geolocate.js';
+import { worldToLatLon, latLonToECEF, computeLocalFrame } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 
 const SQRT3 = Math.sqrt(3);
@@ -27,7 +27,7 @@ const ANGULAR_SPACING_MULTIPLIER = 1.75;
 const RADIAL_SPACING_MULTIPLIER = 8;
 
 export class UnifiedTerrainMesh {
-  constructor(scene, {
+  constructor(sceneOrRoot, {
     origin = { lat: 0, lon: 0 },
     innerRadius = DEFAULT_INNER_RADIUS,
     outerRadius = DEFAULT_OUTER_RADIUS,
@@ -43,11 +43,11 @@ export class UnifiedTerrainMesh {
     cacheTtlMs = DEFAULT_CACHE_TTL_MS,
     materialFactory = null,
   } = {}) {
-    if (!scene || !scene.isScene) {
-      throw new Error('UnifiedTerrainMesh requires a THREE.Scene reference');
+    if (!sceneOrRoot || !(sceneOrRoot.isScene || sceneOrRoot.isObject3D)) {
+      throw new Error('UnifiedTerrainMesh requires a THREE.Scene or Object3D reference');
     }
 
-    this.scene = scene;
+    this.scene = sceneOrRoot;
     this.origin = {
       lat: Number.isFinite(origin?.lat) ? origin.lat : 0,
       lon: Number.isFinite(origin?.lon) ? origin.lon : 0,
@@ -77,6 +77,11 @@ export class UnifiedTerrainMesh {
     this._center = new THREE.Vector3();
     this._meshPosition = new THREE.Vector3();
     this._prevQuantized = new THREE.Vector2(Infinity, Infinity);
+    this._originECEF = new THREE.Vector3();
+    this._originEast = new THREE.Vector3(1, 0, 0);
+    this._originNorth = new THREE.Vector3(0, 0, -1);
+    this._originUp = new THREE.Vector3(0, 1, 0);
+    this._tmpVec = new THREE.Vector3();
     this._quantizeStep = Math.max(this.baseStep * 8, this.innerRadius / 12);
     this._heightListeners = new Set();
     this._heightDirtyWorldBounds = null;
@@ -104,11 +109,24 @@ export class UnifiedTerrainMesh {
     this._requestQueue = [];
     this._maxRequestsPerFrame = 4;
     this._lastRequestPump = 0;
+    this._highResolutionRadius = this.innerRadius * 1.2;
+    this._coarsePrecisionFloor = 5;
+    this._coarsePrecisionBias = 2;
 
     this._normalDirty = new Set();
     this._normalTimer = 0;
     this._normalCadence = 200; // ms
 
+    this._debugStats = {
+      elevationsFetched: 0,
+      elevationsApplied: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      verticesUpdated: 0,
+    };
+    this._lastStatsLog = 0;
+
+    this._updateLocalFrame();
     this._buildGeometry();
     this._scheduleFullRefresh();
   }
@@ -140,13 +158,35 @@ export class UnifiedTerrainMesh {
       while (L > 180) L -= 360;
       return L;
     };
-    const updated = (Math.abs(clampedLat - this.origin.lat) > 1e-6) ||
-      (Math.abs(wrapLon(lon) - this.origin.lon) > 1e-6);
-    if (!updated) return false;
+
+    // Check if origin changed significantly (more than ~1 meter in lat/lon)
+    const latDelta = Math.abs(clampedLat - this.origin.lat);
+    const lonDelta = Math.abs(wrapLon(lon) - this.origin.lon);
+    const significantChange = latDelta > 0.00001 || lonDelta > 0.00001; // ~1 meter
+
+    if (!significantChange) return false;
+
+    console.log('[UnifiedTerrain] Origin changed significantly:', {
+      oldOrigin: this.origin,
+      newOrigin: { lat: clampedLat, lon: wrapLon(lon) },
+      latDelta,
+      lonDelta
+    });
+
     this.origin = { lat: clampedLat, lon: wrapLon(lon) };
-    this._cache.clear();
-    this._pendingRequests.clear();
-    this._requestQueue.length = 0;
+
+    // IMPORTANT: Only clear cache if origin moved very far (>0.01 degrees, ~1km)
+    // For small origin adjustments, keep the cache to retain terrain
+    if (latDelta > 0.01 || lonDelta > 0.01) {
+      console.log('[UnifiedTerrain] Origin moved far - clearing cache');
+      this._cache.clear();
+      this._pendingRequests.clear();
+      this._requestQueue.length = 0;
+    } else {
+      console.log('[UnifiedTerrain] Origin moved nearby - keeping cache');
+    }
+
+    this._updateLocalFrame();
     this._scheduleFullRefresh();
     return true;
   }
@@ -176,20 +216,25 @@ export class UnifiedTerrainMesh {
 
   getHeightAt(x, z) {
     if (!Number.isFinite(x) || !Number.isFinite(z) || !this._positionAttr) return 0;
-    const tmp = { best: null, distSq: Infinity };
-    const arr = this._positionAttr.array;
-    for (let i = 0; i < arr.length; i += 3) {
-      const vx = arr[i] + this._meshPosition.x;
-      const vz = arr[i + 2] + this._meshPosition.z;
+    const posArray = this._positionAttr.array;
+    let closestIndex = -1;
+    let closestDist = Infinity;
+    for (let i = 0; i < this._vertexRecords.length; i++) {
+      const rec = this._vertexRecords[i];
+      if (!rec) continue;
+      const vx = rec.localX + this._meshPosition.x;
+      const vz = rec.localZ + this._meshPosition.z;
       const dx = vx - x;
       const dz = vz - z;
       const dSq = dx * dx + dz * dz;
-      if (dSq < tmp.distSq) {
-        tmp.distSq = dSq;
-        tmp.best = arr[i + 1];
+      if (dSq < closestDist) {
+        closestDist = dSq;
+        closestIndex = i;
       }
     }
-    return tmp.best ?? 0;
+    if (closestIndex < 0) return 0;
+    const i3 = closestIndex * 3;
+    return posArray[i3 + 1] ?? 0;
   }
 
   update(dt, camera, dolly) {
@@ -207,7 +252,6 @@ export class UnifiedTerrainMesh {
     if (quantChanged) {
       this._prevQuantized.set(qx, qz);
       this._meshPosition.set(qx, 0, qz);
-      if (this._mesh) this._mesh.position.copy(this._meshPosition);
       this._scheduleFullRefresh();
     }
 
@@ -218,6 +262,33 @@ export class UnifiedTerrainMesh {
     if ((nowMs - this._normalTimer) > this._normalCadence) {
       this._recomputeNormalsIncremental();
       this._normalTimer = nowMs;
+    }
+
+    // Log debug stats every 5 seconds
+    if ((nowMs - this._lastStatsLog) > 5000) {
+      this._logDebugStats();
+      this._lastStatsLog = nowMs;
+    }
+  }
+
+  _logDebugStats() {
+    const stats = this._debugStats;
+    const cacheSize = this._cache.size;
+    const queueSize = this._updateQueue.length;
+    const pendingReqs = this._pendingRequests.size;
+
+    if (stats.elevationsFetched > 0 || stats.elevationsApplied > 0) {
+      console.log('[UnifiedTerrain] Stats:', {
+        fetched: stats.elevationsFetched,
+        applied: stats.elevationsApplied,
+        cacheHits: stats.cacheHits,
+        cacheMisses: stats.cacheMisses,
+        verticesUpdated: stats.verticesUpdated,
+        cacheSize,
+        queueSize,
+        pendingReqs,
+        heightRange: `${this.GLOBAL_MIN_Y.toFixed(2)} to ${this.GLOBAL_MAX_Y.toFixed(2)}`,
+      });
     }
   }
 
@@ -271,6 +342,15 @@ export class UnifiedTerrainMesh {
     }
     if (out[out.length - 1] < outer) out[out.length - 1] = outer;
     return out;
+  }
+
+  _updateLocalFrame() {
+    const frame = computeLocalFrame(this.origin.lat, this.origin.lon);
+    this._originEast.set(frame.east.x, frame.east.y, frame.east.z).normalize();
+    this._originNorth.set(frame.north.x, frame.north.y, frame.north.z).normalize();
+    this._originUp.set(frame.up.x, frame.up.y, frame.up.z).normalize();
+    const ecef = latLonToECEF(this.origin.lat, this.origin.lon, 0);
+    this._originECEF.set(ecef.x, ecef.y, ecef.z);
   }
 
   _buildGeometry() {
@@ -362,6 +442,7 @@ export class UnifiedTerrainMesh {
         localX: 0,
         localZ: 0,
         feather: 1,
+        lastLatLon: null,
       });
       ring.vertexCount = 1;
       return ring;
@@ -411,6 +492,7 @@ export class UnifiedTerrainMesh {
           localX: x,
           localZ: z,
           feather: ensureFeatherWeight(radius, bandIndex),
+          lastLatLon: null,
         });
       }
       ring.vertexCount = angularSegments;
@@ -492,8 +574,6 @@ export class UnifiedTerrainMesh {
     this._colorAttr = colorAttr;
     this._index = geometry.index;
 
-    this._mesh.position.copy(this._meshPosition);
-
     const count = this._vertexRecords.length;
     this._yCurrent = new Float32Array(count);
     this._yLow = new Float32Array(count);
@@ -514,6 +594,14 @@ export class UnifiedTerrainMesh {
     }
     this._updateCursor = 0;
     this._heightDirtyWorldBounds = null;
+
+    console.log('[UnifiedTerrain] Scheduled full refresh:', {
+      vertexCount: this._vertexRecords.length,
+      queueSize: this._updateQueue.length,
+      origin: this.origin,
+      relayAddress: this.relayAddress,
+      relayDataset: this.relayDataset
+    });
   }
 
   _pumpUpdateQueue(dt) {
@@ -525,11 +613,17 @@ export class UnifiedTerrainMesh {
     const positionArray = this._positionAttr.array;
     const colorArray = this._colorAttr.array;
 
+    let verticesUpdated = 0;
+    const minVerticesPerFrame = 10; // Always update at least this many vertices
+
     while (this._updateCursor < this._updateQueue.length) {
       const idx = this._updateQueue[this._updateCursor++];
       this._sampleVertex(idx, positionArray, colorArray);
       this._normalDirty.add(idx);
-      if ((now() - start) >= budgetMs) break;
+      verticesUpdated++;
+
+      // Check budget, but always process minimum vertices
+      if (verticesUpdated >= minVerticesPerFrame && (now() - start) >= budgetMs) break;
     }
 
     if (this._updateCursor >= this._updateQueue.length) {
@@ -537,24 +631,59 @@ export class UnifiedTerrainMesh {
       this._updateCursor = 0;
     }
 
-    this._positionAttr.needsUpdate = true;
-    this._colorAttr.needsUpdate = true;
+    // Only mark for update if vertices were actually modified
+    if (verticesUpdated > 0) {
+      this._positionAttr.needsUpdate = true;
+      this._colorAttr.needsUpdate = true;
+    }
   }
 
   _pumpHeightRequests() {
-    if (!this._requestQueue.length) return;
-    if (!this.terrainRelay || typeof this.terrainRelay.queryBatch !== 'function') return;
-    if (!this.relayAddress) return;
+    if (!this._requestQueue.length) {
+      // Log why we're not processing requests
+      if (!this._lastEmptyQueueLog || (now() - this._lastEmptyQueueLog) > 10000) {
+        console.log('[UnifiedTerrain] No height requests queued. Terrain relay idle.');
+        this._lastEmptyQueueLog = now();
+      }
+      return;
+    }
+    if (!this.terrainRelay || typeof this.terrainRelay.queryBatch !== 'function') {
+      console.warn('[UnifiedTerrain] Terrain relay not available or missing queryBatch method');
+      return;
+    }
+    if (!this.relayAddress) {
+      console.warn('[UnifiedTerrain] No relay address configured');
+      return;
+    }
 
     const nowMs = now();
     const maxPerFrame = Math.max(1, this._maxRequestsPerFrame | 0);
     let sent = 0;
 
+    const pickNextEntry = () => {
+      let priorityIdx = -1;
+      for (let i = 0; i < this._requestQueue.length; i++) {
+        const candidate = this._requestQueue[i];
+        if (!candidate) continue;
+        if (candidate.priority) {
+          priorityIdx = i;
+          break;
+        }
+      }
+      if (priorityIdx >= 0) {
+        return this._requestQueue.splice(priorityIdx, 1)[0];
+      }
+      return this._requestQueue.shift();
+    };
+
     const nextBatch = [];
     while (this._requestQueue.length && sent < maxPerFrame) {
-      const entry = this._requestQueue.shift();
+      const entry = pickNextEntry();
       if (!entry) continue;
-      if (entry.inflight) continue;
+      if (entry.inflight) {
+        nextBatch.push(entry);
+        continue;
+      }
       if (!entry.vertices || entry.vertices.size === 0) {
         this._pendingRequests.delete(entry.key);
         continue;
@@ -577,11 +706,27 @@ export class UnifiedTerrainMesh {
         payload.locations = [{ lat: entry.latLon.lat, lng: entry.latLon.lon }];
       }
 
+      // Log first request to verify relay communication
+      if (!this._loggedFirstRequest) {
+        console.log('[UnifiedTerrain] Sending first terrain query:', {
+          relayAddress: this.relayAddress,
+          dataset: this.relayDataset,
+          mode: this.relayMode,
+          payload,
+          timeout: this.relayTimeoutMs
+        });
+        this._loggedFirstRequest = true;
+      }
+
       const finalize = () => {
         entry.inflight = false;
         if (!this._pendingRequests.has(entry.key)) return;
         if (entry.vertices.size) {
-          this._requestQueue.push(entry);
+          if (entry.priority) {
+            this._requestQueue.unshift(entry);
+          } else {
+            this._requestQueue.push(entry);
+          }
         } else {
           this._pendingRequests.delete(entry.key);
         }
@@ -594,20 +739,50 @@ export class UnifiedTerrainMesh {
           const raw = results[0];
           const value = Number(raw?.elev ?? raw?.height ?? raw?.z ?? raw?.value ?? raw?.h);
           if (!Number.isFinite(value)) return;
+
+          // Update cache with new elevation data
           this._cache.set(entry.key, { y: value, t: now() });
+          this._debugStats.elevationsFetched++;
+
+          // Log first few successful elevations
+          if (this._debugStats.elevationsFetched <= 3) {
+            console.log(`[UnifiedTerrain] Received elevation #${this._debugStats.elevationsFetched}:`, {
+              key: entry.key,
+              elevation: value,
+              vertexCount: entry.vertices.size,
+              cacheSize: this._cache.size
+            });
+          }
+
+          // Schedule all affected vertices for immediate update
+          // This ensures the new elevation is applied smoothly
           for (const vert of entry.vertices) {
-            this._updateQueue.push(vert);
+            if (!this._updateQueue.includes(vert)) {
+              this._updateQueue.push(vert);
+            }
           }
           entry.vertices.clear();
         })
         .catch(() => {
-          // swallow
+          // swallow network errors
         })
         .finally(() => finalize());
     }
 
     if (nextBatch.length) {
-      this._requestQueue.push(...nextBatch);
+      nextBatch.sort((a, b) => {
+        const ap = a?.priority ? 1 : 0;
+        const bp = b?.priority ? 1 : 0;
+        return bp - ap;
+      });
+      for (const entry of nextBatch) {
+        if (!entry) continue;
+        if (entry.priority) {
+          this._requestQueue.unshift(entry);
+        } else {
+          this._requestQueue.push(entry);
+        }
+      }
     }
   }
 
@@ -620,31 +795,82 @@ export class UnifiedTerrainMesh {
     const worldX = this._meshPosition.x + localX;
     const worldZ = this._meshPosition.z + localZ;
 
-    const height = this._fetchHeight(worldX, worldZ, record, index);
     const prevHeight = this._yCurrent[index];
-    const newHeight = Number.isFinite(height) ? height : prevHeight;
+    const sample = this._fetchHeight(worldX, worldZ, record, index) || {};
+    const newHeight = Number.isFinite(sample.value) ? sample.value : prevHeight;
+    const source = sample.source || 'pending';
+    const latLon = sample.latLon || worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon);
 
-    this._yHigh[index] = newHeight;
-    this._yLow[index] = Number.isFinite(prevHeight) ? prevHeight : newHeight;
-    const feather = this._featherWeights[index] ?? 1;
-    const blended = this._mixHeights(index, feather);
+    const currentReference = Number.isFinite(prevHeight) ? prevHeight : 0;
+    const targetHeight = Number.isFinite(newHeight) ? newHeight : currentReference;
+    const delta = Math.abs(targetHeight - currentReference);
+    const significantChange = delta > 0.01;
+    const isCoarse = source === 'coarse';
+    const isFine = source === 'fine';
+
+    let blended = targetHeight;
+
+    if (isCoarse) {
+      this._yLow[index] = targetHeight;
+      this._yHigh[index] = targetHeight;
+    } else {
+      if (significantChange) {
+        this._yLow[index] = Number.isFinite(prevHeight) ? prevHeight : targetHeight;
+        this._yHigh[index] = targetHeight;
+      } else {
+        this._yLow[index] = targetHeight;
+        this._yHigh[index] = targetHeight;
+      }
+
+      const feather = this._featherWeights[index] ?? 1;
+      blended = this._mixHeights(index, feather, source);
+      this._yLow[index] = blended;
+    }
+
     this._yCurrent[index] = blended;
+    if (latLon) {
+      record.lastLatLon = latLon;
+    }
 
     const i3 = index * 3;
-    positionArray[i3] = localX;
-    positionArray[i3 + 1] = blended;
-    positionArray[i3 + 2] = localZ;
+    if (latLon) {
+      const ecef = latLonToECEF(latLon.lat, latLon.lon, blended);
+      this._tmpVec.set(ecef.x, ecef.y, ecef.z).sub(this._originECEF);
+      const xLocal = this._tmpVec.dot(this._originEast);
+      const yLocal = this._tmpVec.dot(this._originUp);
+      const zLocal = -this._tmpVec.dot(this._originNorth);
+      positionArray[i3] = xLocal;
+      positionArray[i3 + 1] = yLocal;
+      positionArray[i3 + 2] = zLocal;
+    } else {
+      positionArray[i3] = localX;
+      positionArray[i3 + 1] = blended;
+      positionArray[i3 + 2] = localZ;
+    }
 
     this._updateGlobalMinMax(blended);
     this._applyColor(index, blended, colorArray);
     this._markHeightDirty(worldX, blended, worldZ);
+
+    // Track vertices updated
+    this._debugStats.verticesUpdated++;
+    if (significantChange && (isCoarse || isFine)) {
+      this._debugStats.elevationsApplied++;
+    }
   }
 
-  _mixHeights(index, feather) {
-    if (feather == null) return this._yHigh[index];
+  _mixHeights(index, feather, source = 'fine') {
     const low = this._yLow[index];
     const high = this._yHigh[index];
-    const t = feather;
+    if (!Number.isFinite(high) && Number.isFinite(low)) return low;
+    if (!Number.isFinite(low) && Number.isFinite(high)) return high;
+    if (!Number.isFinite(low) && !Number.isFinite(high)) return 0;
+
+    const clampedFeather = Math.max(0, Math.min(1, feather == null ? 1 : feather));
+    const spatialInfluence = 0.4 + clampedFeather * 0.6; // ensure outer rings still move forward
+    const baseProgress = source === 'fine' ? 0.85 : 0.6;
+    const t = Math.max(0.05, Math.min(1, baseProgress * spatialInfluence));
+
     return low + (high - low) * t;
   }
 
@@ -715,31 +941,121 @@ export class UnifiedTerrainMesh {
   }
 
   _fetchHeight(worldX, worldZ, record, vertexIndex) {
-    if (!Number.isFinite(worldX) || !Number.isFinite(worldZ)) return 0;
-    if (!Number.isFinite(this.origin.lat) || !Number.isFinite(this.origin.lon)) return 0;
-
-    const latLon = worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon);
-    if (!latLon) return 0;
-
-    const spacing = record ? this._bandInfo[record.band]?.step ?? this.baseStep : this.baseStep;
-    const precision = pickGeohashPrecision(spacing * (record?.band ?? 1));
-    const key = (this.relayMode === 'geohash')
-      ? geohashEncode(latLon.lat, latLon.lon, precision)
-      : `${latLon.lat.toFixed(5)},${latLon.lon.toFixed(5)}`;
-
-    const nowMs = now();
-    const cached = this._cache.get(key);
-    if (cached && (nowMs - cached.t) < this.cacheTtlMs) {
-      return cached.y;
+    if (!Number.isFinite(worldX) || !Number.isFinite(worldZ)) {
+      return { value: 0, source: 'invalid', latLon: null };
+    }
+    if (!Number.isFinite(this.origin.lat) || !Number.isFinite(this.origin.lon)) {
+      return { value: 0, source: 'invalid', latLon: null };
     }
 
-    this._queueHeightRequest(key, latLon, vertexIndex, record.band, precision);
-    return cached ? cached.y : 0;
+    const latLon = worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon);
+    if (!latLon) return { value: 0, source: 'invalid', latLon: null };
+
+    const spacing = record ? this._bandInfo[record.band]?.step ?? this.baseStep : this.baseStep;
+    const finePrecision = pickGeohashPrecision(spacing * (record?.band ?? 1));
+    let coarsePrecision = finePrecision - this._coarsePrecisionBias;
+    const coarseFloor = Math.max(4, this._coarsePrecisionFloor);
+    if (coarsePrecision >= finePrecision) coarsePrecision = finePrecision - 1;
+    if (coarsePrecision < coarseFloor) coarsePrecision = coarseFloor;
+    if (coarsePrecision < 1) coarsePrecision = 1;
+    if (coarsePrecision >= finePrecision) coarsePrecision = finePrecision;
+
+    const fineKey = (this.relayMode === 'geohash')
+      ? geohashEncode(latLon.lat, latLon.lon, finePrecision)
+      : `${latLon.lat.toFixed(5)},${latLon.lon.toFixed(5)}`;
+
+    const coarseKey = (this.relayMode === 'geohash' && coarsePrecision < finePrecision)
+      ? geohashEncode(latLon.lat, latLon.lon, coarsePrecision)
+      : null;
+
+    const nowMs = now();
+    let cached = this._cache.get(fineKey);
+    let source = 'fine';
+
+    if (!cached || !Number.isFinite(cached.y)) {
+      cached = null;
+      source = 'none';
+      if (coarseKey) {
+        const coarseCached = this._cache.get(coarseKey);
+        if (coarseCached && Number.isFinite(coarseCached.y)) {
+          cached = coarseCached;
+          source = 'coarse';
+        }
+      }
+    }
+
+    const isPriority = record ? record.radius <= this._highResolutionRadius : true;
+    const bandIndex = record?.band ?? 0;
+
+    if (cached) {
+      this._debugStats.cacheHits++;
+
+      if (this._debugStats.cacheHits <= 10) {
+        console.log(`[UnifiedTerrain] Cache HIT #${this._debugStats.cacheHits}:`, {
+          key: source === 'fine' ? fineKey : coarseKey,
+          elevation: cached.y,
+          age: nowMs - cached.t,
+          vertex: vertexIndex,
+          source,
+        });
+      }
+
+      if (source === 'fine') {
+        if ((nowMs - cached.t) >= this.cacheTtlMs) {
+          this._queueHeightRequest(fineKey, latLon, vertexIndex, bandIndex, finePrecision, { priority: isPriority, quality: 'fine' });
+        }
+      } else if (source === 'coarse') {
+        // Always ensure a fine request follows coarse approximations
+        this._queueHeightRequest(fineKey, latLon, vertexIndex, bandIndex, finePrecision, { priority: isPriority, quality: 'fine' });
+        if ((nowMs - cached.t) >= this.cacheTtlMs * 0.5 && coarseKey) {
+          this._queueHeightRequest(coarseKey, latLon, vertexIndex, bandIndex, coarsePrecision, { priority: false, quality: 'coarse' });
+        }
+      }
+
+      return { value: cached.y, source, latLon };
+    }
+
+    this._debugStats.cacheMisses++;
+
+    if (this._debugStats.cacheMisses <= 10) {
+      const currentHeight = this._yCurrent?.[vertexIndex];
+      console.log(`[UnifiedTerrain] Cache MISS #${this._debugStats.cacheMisses}:`, {
+        fineKey,
+        coarseKey,
+        vertex: vertexIndex,
+        currentHeight,
+        cacheSize: this._cache.size,
+        latLon,
+      });
+    }
+
+    if (coarseKey) {
+      this._queueHeightRequest(coarseKey, latLon, vertexIndex, bandIndex, coarsePrecision, { priority: true, quality: 'coarse' });
+    }
+    this._queueHeightRequest(fineKey, latLon, vertexIndex, bandIndex, finePrecision, { priority: isPriority, quality: 'fine' });
+
+    const currentHeight = this._yCurrent?.[vertexIndex];
+    return {
+      value: Number.isFinite(currentHeight) ? currentHeight : 0,
+      source: 'pending',
+      latLon
+    };
   }
 
-  _queueHeightRequest(key, latLon, vertexIndex, bandIndex, precision) {
-    if (!this.terrainRelay || !this.relayAddress) return;
+  _queueHeightRequest(key, latLon, vertexIndex, bandIndex, precision, options = {}) {
+    if (!this.terrainRelay || !this.relayAddress) {
+      if (!this._loggedNoRelay) {
+        console.warn('[UnifiedTerrain] Cannot queue height request - no relay configured');
+        this._loggedNoRelay = true;
+      }
+      return;
+    }
     if (!key) return;
+
+    const {
+      priority = false,
+      quality = 'fine',
+    } = options;
 
     let entry = this._pendingRequests.get(key);
     if (!entry) {
@@ -751,9 +1067,51 @@ export class UnifiedTerrainMesh {
         vertices: new Set(),
         inflight: false,
         lastAttempt: 0,
+        priority: !!priority,
+        quality,
       };
       this._pendingRequests.set(key, entry);
-      this._requestQueue.push(entry);
+      if (entry.priority) {
+        this._requestQueue.unshift(entry);
+      } else {
+        this._requestQueue.push(entry);
+      }
+
+      if (!this._requestQueueCount) this._requestQueueCount = 0;
+      this._requestQueueCount++;
+      if (this._requestQueueCount <= 5) {
+        console.log(`[UnifiedTerrain] Queued height request #${this._requestQueueCount}:`, {
+          key,
+          latLon,
+          precision,
+          band: bandIndex,
+          queueSize: this._requestQueue.length,
+          priority: entry.priority,
+          quality: entry.quality,
+        });
+      }
+    } else {
+      entry.latLon = latLon;
+      entry.precision = precision;
+      entry.priority = entry.priority || !!priority;
+      entry.quality = entry.quality || quality;
+
+      if (!entry.inflight) {
+        const queued = this._requestQueue.includes(entry);
+        if (!queued) {
+          if (entry.priority) {
+            this._requestQueue.unshift(entry);
+          } else {
+            this._requestQueue.push(entry);
+          }
+        } else if (queued && entry.priority) {
+          const idx = this._requestQueue.indexOf(entry);
+          if (idx > 0) {
+            this._requestQueue.splice(idx, 1);
+            this._requestQueue.unshift(entry);
+          }
+        }
+      }
     }
     entry.vertices.add(vertexIndex);
   }

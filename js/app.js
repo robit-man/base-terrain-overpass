@@ -239,6 +239,7 @@ class App {
     const terrainClientProvider = () => this._getMeshClient();
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
+      planetSurface: this.sceneMgr.planetSurface,
     });
     this.sceneMgr.setTileRadiusSource(() => {
       const tm = this.hexGridMgr;
@@ -253,7 +254,7 @@ class App {
 
     this.buildings = new BuildingManager({
       radius: buildingRadius,
-      scene: this.sceneMgr.scene,
+      scene: this.sceneMgr.surfaceAnchor,
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,
     });
@@ -713,6 +714,7 @@ class App {
 
     this.hexGridMgr?.setOrigin(lat, lon, { immediate: isManualRequest });
     this.buildings?.setOrigin(lat, lon, { forceRefresh: isManualRequest });
+    this.sceneMgr?.updatePlanetFrame?.(lat, lon, 0);
     if (isManualRequest) {
       this.physics?.resetTerrain?.();
       this._poseStoredState = null;

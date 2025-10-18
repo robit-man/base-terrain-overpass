@@ -1094,7 +1094,6 @@ canvas {
 }
 
 #miniMapDock .mini-map-panel {
-    filter: brightness(0.5)contrast(2)invert(0)saturate(0);
 }
 
 #miniMapDock .mini-map-action-stack {

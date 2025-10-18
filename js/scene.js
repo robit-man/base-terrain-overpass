@@ -1,10 +1,16 @@
 import * as THREE from 'three';
 import { VRButton } from 'VRButton';
 import { Sky } from 'Sky';
+import { EARTH_RADIUS_METERS } from './geolocate.js';
+import { PlanetSurface } from './planetSurface.js';
 
 export class SceneManager {
   constructor() {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true  });
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      logarithmicDepthBuffer: true,
+    });
     this.renderer.setSize(innerWidth, innerHeight);
     this.renderer.setPixelRatio(devicePixelRatio);
     this.renderer.outputEncoding = THREE.sRGBEncoding;
@@ -26,8 +32,20 @@ export class SceneManager {
     this.pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene = new THREE.Scene();
 
+    this.planetSurface = new PlanetSurface({
+      scene: this.scene,
+      renderer: this.renderer,
+      radius: EARTH_RADIUS_METERS,
+    });
+    this.planetRadius = EARTH_RADIUS_METERS;
+    this.planetRoot = this.planetSurface.group;
+
+    this.surfaceAnchor = new THREE.Group();
+    this.surfaceAnchor.name = 'planet-surface-anchor';
+    this.scene.add(this.surfaceAnchor);
+
     // 🎯 Camera stays at (0,0,0) in dolly local space; dolly handles eye height
-    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
+    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, EARTH_RADIUS_METERS * 4);
     this.camera.position.set(0, 0, 0);
     this.camera.up.set(0, 1, 0);
 
@@ -35,30 +53,23 @@ export class SceneManager {
     this.dolly = new THREE.Group();
     this.dolly.name = 'player-dolly';
     this.dolly.add(this.camera);
-    this.scene.add(this.dolly);
+    this.surfaceAnchor.add(this.dolly);
 
     // Sky & sun lighting
     this.sky = new Sky();
-    this.sky.scale.setScalar(60000);
-    this.scene.add(this.sky);
+    this.sky.scale.setScalar(EARTH_RADIUS_METERS * 3);
+    this.surfaceAnchor.add(this.sky);
     const skyUniforms = this.sky.material.uniforms;
     skyUniforms['turbidity'].value = 2.5;
     skyUniforms['rayleigh'].value = 1.2;
     skyUniforms['mieCoefficient'].value = 0.004;
     skyUniforms['mieDirectionalG'].value = 0.95;
 
-    this.sunLight = new THREE.DirectionalLight(0xffffff, 4);
-    this.sunLight.position.set(1000, 500, -800);
-    this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.set(1024, 1024);
-    this.renderer.shadowMap.autoUpdate = false;   // add this
-    this.sunLight.shadow.camera.near = 10;
-    this.sunLight.shadow.camera.far = 1800;
-    this.sunLight.shadow.camera.left = -600;
-    this.sunLight.shadow.camera.right = 600;
-    this.sunLight.shadow.camera.top = 600;
-    this.sunLight.shadow.camera.bottom = -600;
-    this.sunLight.shadow.bias = -0.00015;
+    this.AU = 149597870700; // meters
+    const sunIntensity = 1361 / Math.PI;
+    this.sunLight = new THREE.DirectionalLight(0xffffff, sunIntensity);
+    this.sunLight.position.set(this.AU, 0, 0);
+    this.sunLight.target.position.set(0, 0, 0);
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
@@ -68,13 +79,14 @@ export class SceneManager {
     // Where remote avatars live
     this.remoteLayer = new THREE.Group();
     this.remoteLayer.name = 'remote-layer';
-    this.scene.add(this.remoteLayer);
+    this.surfaceAnchor.add(this.remoteLayer);
 
     this._skyEnvTarget = null;
 
     // ---- Tile radius sampling (used for fog near/far) ----
     // You can override with setTileRadiusSource(number | () => number)
     this._tileRadiusSource = 4000; // fallback
+    this.enableFog = false;
 
     // ---- Sky probe (offscreen) to sample color just BELOW the horizon ----
     this._initSkyProbe();
@@ -85,6 +97,7 @@ export class SceneManager {
       this.renderer.setSize(innerWidth, innerHeight);
     });
 
+    this.updatePlanetFrame(0, 0, 0);
     this.updateSun({ lat: 0, lon: 0, date: new Date() });
   }
 
@@ -92,6 +105,23 @@ export class SceneManager {
   setTileRadiusSource(src) {
     this._tileRadiusSource = src;
     if (this.currentSunAltitude !== undefined) this._syncFogToSky();
+  }
+
+  updatePlanetFrame(lat = 0, lon = 0, height = 0) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    this.planetSurface?.setOrigin(lat, lon, { height });
+    const anchor = this.planetSurface?.getAnchorTransform?.();
+    if (anchor) {
+      this.surfaceAnchor.position.copy(anchor.position);
+      this.surfaceAnchor.quaternion.copy(anchor.quaternion);
+    } else {
+      this.surfaceAnchor.position.set(0, 0, 0);
+      this.surfaceAnchor.quaternion.identity();
+    }
+    this.sky.position.set(0, 0, 0);
+    this.surfaceAnchor.updateMatrixWorld(true);
+    this.remoteLayer.position.set(0, 0, 0);
+    this.remoteLayer.quaternion.identity();
   }
 
   // ---------- SKY PROBE: offscreen sampling (below the horizon) ----------
@@ -292,6 +322,15 @@ export class SceneManager {
   }
 
   _syncFogToSky() {
+    if (!this.enableFog) {
+      this.scene.fog = null;
+      if (this.scene.background && this.scene.background.isColor) {
+        this.scene.background = null;
+      }
+      this.renderer.setClearColor(0x000000, 1);
+      return;
+    }
+
     const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
 
     // 🔍 Sample the true color just BELOW the horizon from the Sky shader
@@ -330,14 +369,14 @@ export class SceneManager {
     const { direction, altitude } = this._computeSunDirection(lat, lon, date);
     const target = new THREE.Vector3(0, 0, 0);
 
-    this.sunLight.position.copy(direction).multiplyScalar(4000);
+    this.sunLight.position.copy(direction).multiplyScalar(this.AU);
     this.sunLight.target.position.copy(target);
     this.sunLight.target.updateMatrixWorld();
 
     const sunStrength = Math.max(0, Math.sin(altitude));
-    this.sunLight.intensity = THREE.MathUtils.lerp(0.05, 6.5, THREE.MathUtils.clamp(sunStrength + 0.2, 0, 1));
-    this.sunLight.visible = altitude > -0.35;
-    this.ambient.intensity = THREE.MathUtils.lerp(0.05, 0.22, THREE.MathUtils.clamp(sunStrength + 0.3, 0, 1));
+    this.sunLight.intensity = 1361 / Math.PI;
+    this.sunLight.visible = altitude > -0.2;
+    this.ambient.intensity = THREE.MathUtils.lerp(0.04, 0.18, THREE.MathUtils.clamp(sunStrength + 0.3, 0, 1));
 
     const uniforms = this.sky.material.uniforms;
     uniforms['turbidity'].value = turbidity;

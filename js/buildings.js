@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
-import { metresPerDegree } from './geolocate.js';
+import { latLonToWorld, worldToLatLon } from './geolocate.js';
 
 const FEATURES = {
   BUILDINGS: true,
@@ -3046,11 +3046,10 @@ export class BuildingManager {
   }
 
   _worldToLatLon(x, z) {
-    const { dLat, dLon } = metresPerDegree(this.lat0);
-    return {
-      lat: this.lat0 - z / dLat,
-      lon: this.lon0 + x / dLon,
-    };
+    if (this.tileManager?.planetSurface) {
+      return this.tileManager.planetSurface.localDeltaToLatLon(x, z);
+    }
+    return worldToLatLon(x, z, this.lat0, this.lon0) || { lat: this.lat0, lon: this.lon0 };
   }
 
   /* ---------------- densify/smooth helpers ---------------- */
@@ -3169,24 +3168,35 @@ export class BuildingManager {
     const maxX = (tx + 1) * this.tileSize;
     const minZ = tz * this.tileSize;
     const maxZ = (tz + 1) * this.tileSize;
-    const { dLat, dLon } = metresPerDegree(this.lat0);
-    const lonA = this.lon0 + minX / dLon;
-    const lonB = this.lon0 + maxX / dLon;
-    const latA = this.lat0 - minZ / dLat;
-    const latB = this.lat0 - maxZ / dLat;
-    const minLat = Math.min(latA, latB);
-    const maxLat = Math.max(latA, latB);
-    const minLon = Math.min(lonA, lonB);
-    const maxLon = Math.max(lonA, lonB);
+    const corners = [
+      worldToLatLon(minX, minZ, this.lat0, this.lon0),
+      worldToLatLon(maxX, minZ, this.lat0, this.lon0),
+      worldToLatLon(minX, maxZ, this.lat0, this.lon0),
+      worldToLatLon(maxX, maxZ, this.lat0, this.lon0),
+    ].filter(Boolean);
+    if (!corners.length) {
+      return [this.lat0, this.lon0, this.lat0, this.lon0];
+    }
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    let minLon = Infinity;
+    let maxLon = -Infinity;
+    for (const c of corners) {
+      if (c.lat < minLat) minLat = c.lat;
+      if (c.lat > maxLat) maxLat = c.lat;
+      if (c.lon < minLon) minLon = c.lon;
+      if (c.lon > maxLon) maxLon = c.lon;
+    }
     return [minLat, minLon, maxLat, maxLon];
   }
 
   _latLonToWorld(lat, lon) {
-    const { dLat, dLon } = metresPerDegree(this.lat0);
-    return {
-      x: (lon - this.lon0) * dLon,
-      z: (this.lat0 - lat) * dLat,
-    };
+    if (this.tileManager?.planetSurface) {
+      return this.tileManager.planetSurface.latLonToLocal(lat, lon);
+    }
+    const world = latLonToWorld(lat, lon, this.lat0, this.lon0);
+    if (!world) return { x: 0, z: 0 };
+    return { x: world.x, z: world.z };
   }
 
   _isInsideRadius({ x, z }) {

@@ -39,9 +39,10 @@ function clamp(value, min, max) {
 export class TileManager {
   constructor(scene, spacing = 20, tileRadius = 100, audio = null, {
     terrainRelayClient = null,
+    planetSurface = null,
   } = {}) {
-    if (!scene || !scene.isScene) {
-      throw new Error('TileManager requires a THREE.Scene');
+    if (!scene || !(scene.isScene || scene.isObject3D)) {
+      throw new Error('TileManager requires a THREE.Scene or Object3D root');
     }
 
     this.scene = scene;
@@ -88,6 +89,8 @@ export class TileManager {
       },
       clientProvider: this._terrainRelayClientFactory,
     });
+
+    this.planetSurface = planetSurface ?? null;
 
     this._config = cloneConfig(CONFIG_DEFAULTS);
     this._lastProfile = null;
@@ -319,7 +322,9 @@ export class TileManager {
   }
 
   dispose() {
-    this.unified?.dispose?.();
+    if (this.unified && this.unified !== this.planetSurface) {
+      this.unified.dispose?.();
+    }
     this.unified = null;
     this.tiles.clear();
     this._compatTile = null;
@@ -395,24 +400,41 @@ export class TileManager {
   }
 
   _buildUnifiedMesh() {
-    if (this.unified) {
+    if (this.unified && this.unified !== this.planetSurface) {
       this.unified.dispose();
       this.unified = null;
     }
 
-    this.unified = new UnifiedTerrainMesh(this.scene, {
-      origin: this.origin,
-      innerRadius: this._config.innerRadius,
-      outerRadius: this._config.outerRadius,
-      baseStep: this._config.baseStep,
-      bands: this._config.bands,
-      ringFeather: this._config.ringFeather,
-      maxUpdateMs: this._config.maxUpdateMs,
+    if (this.planetSurface) {
+      this.unified = this.planetSurface;
+    } else {
+      this.unified = new UnifiedTerrainMesh(this.scene, {
+        origin: this.origin,
+        innerRadius: this._config.innerRadius,
+        outerRadius: this._config.outerRadius,
+        baseStep: this._config.baseStep,
+        bands: this._config.bands,
+        ringFeather: this._config.ringFeather,
+        maxUpdateMs: this._config.maxUpdateMs,
+        terrainRelay: this.terrainRelay,
+        relayAddress: this.relayAddress,
+        relayDataset: this.relayDataset,
+        relayMode: this.relayMode,
+        relayTimeoutMs: this.relayTimeoutMs,
+      });
+    }
+
+    this.unified?.setRelay?.({
       terrainRelay: this.terrainRelay,
       relayAddress: this.relayAddress,
       relayDataset: this.relayDataset,
       relayMode: this.relayMode,
       relayTimeoutMs: this.relayTimeoutMs,
+    });
+    this.unified?.setDetailConfig?.({
+      radiusMeters: Math.max(60000, this.tileRadius * 6),
+      spacingMeters: Math.max(40, this._config.baseStep * 20),
+      maxRequestsPerFrame: 8,
     });
 
     this.origin = this.unified?.origin
