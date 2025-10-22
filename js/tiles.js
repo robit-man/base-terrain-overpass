@@ -1,5 +1,6 @@
 // tiles.js
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { UniformHexGrid, HexCenterPoint } from './grid.js';
 import { now } from './utils.js';
 import { worldToLatLon } from './geolocate.js';
@@ -71,12 +72,23 @@ export class TileManager {
     this._fetchPhase = 'interactive';
 
     this.ray = new THREE.Raycaster();
+    this.ray.layers.enable(1);
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._lastHeight = 0;
 
     this._relaxKeys = [];
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
+    this._roadStamps = [];
+    this._roadStampIndex = new Map();
+    this._farfieldMerge = {
+      mesh: null,
+      dirty: false,
+      nextBuild: 0,
+      debounceMs: 220,
+      lastBuildCount: 0,
+      lastBuildTime: 0,
+    };
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -695,6 +707,94 @@ _stitchInteractiveToVisualEdges(tile, {
     tile._adapterDirty = true;
     const key = this._farfieldAdapterKey(tile);
     if (key) this._farfieldAdapterDirty.add(key);
+    this._markFarfieldMergeDirty(tile);
+  }
+
+  _markFarfieldMergeDirty(tile = null) {
+    if (!this._farfieldMerge) return;
+    const t = (typeof now === 'function') ? now() : Date.now();
+    const debounce = Math.max(30, this._farfieldMerge.debounceMs || 0);
+    this._farfieldMerge.dirty = true;
+    this._farfieldMerge.nextBuild = t + debounce;
+    if (tile) tile._mergedDirty = true;
+  }
+
+  _disposeFarfieldMergedMesh() {
+    if (!this._farfieldMerge?.mesh) return;
+    try {
+      this.scene.remove(this._farfieldMerge.mesh);
+      this._farfieldMerge.mesh.geometry?.dispose?.();
+    } catch { }
+    this._farfieldMerge.mesh = null;
+    this._farfieldMerge.dirty = false;
+    this._farfieldMerge.nextBuild = 0;
+    this._farfieldMerge.lastBuildCount = 0;
+  }
+
+  _updateFarfieldMergedMesh({ force = false } = {}) {
+    if (!this._farfieldMerge) return;
+    const state = this._farfieldMerge;
+    const tNow = (typeof now === 'function') ? now() : Date.now();
+    if (!force) {
+      if (!state.dirty) return;
+      if (tNow < (state.nextBuild || 0)) return;
+    }
+
+    const geometries = [];
+    const farTiles = [];
+    for (const tile of this.tiles.values()) {
+      if (!tile || tile.type !== 'farfield') continue;
+      const geom = tile.grid?.geometry;
+      const group = tile.grid?.group;
+      if (!geom || !group) continue;
+      group.updateMatrixWorld(true);
+      const clone = geom.clone();
+      clone.applyMatrix4(group.matrixWorld);
+      geometries.push(clone);
+      farTiles.push(tile);
+    }
+
+    if (!geometries.length) {
+      this._disposeFarfieldMergedMesh();
+      state.dirty = false;
+      state.lastBuildTime = tNow;
+      return;
+    }
+
+    const merged = mergeGeometries(geometries, false);
+    merged.computeVertexNormals();
+    for (const g of geometries) {
+      g.dispose?.();
+    }
+
+    const material = this._getFarfieldMaterial();
+    let mesh = state.mesh;
+    if (!mesh) {
+      mesh = new THREE.Mesh(merged, material);
+      mesh.name = 'tile-farfield-merged';
+      mesh.frustumCulled = false;
+      mesh.renderOrder = -12;
+      mesh.matrixAutoUpdate = false;
+      mesh.layers.enable(0);
+      mesh.updateMatrix();
+      this.scene.add(mesh);
+      state.mesh = mesh;
+    } else {
+      mesh.geometry?.dispose?.();
+      mesh.geometry = merged;
+      if (mesh.material !== material) mesh.material = material;
+      mesh.layers.enable(0);
+      mesh.visible = true;
+      mesh.updateMatrix();
+    }
+
+    for (const tile of farTiles) {
+      tile._mergedDirty = false;
+    }
+
+    state.dirty = false;
+    state.lastBuildTime = tNow;
+    state.lastBuildCount = farTiles.length;
   }
   _resetFarfieldTileState(tile) {
     if (!tile || tile.type !== 'farfield') return;
@@ -702,6 +802,9 @@ _stitchInteractiveToVisualEdges(tile, {
     tile.unreadyCount = tile.pos?.count ?? 0;
     if (tile.fetched) tile.fetched.clear();
     tile.populating = false;
+    this._ensureRoadMask(tile, { reset: true });
+    if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
+    else this._applyAllColorsGlobal(tile);
   }
   _fallbackFarfieldTile(tile) {
     if (!tile || tile.type !== 'farfield') return false;
@@ -853,8 +956,22 @@ _stitchInteractiveToVisualEdges(tile, {
     tile.col = col;
     return col;
   }
+  _ensureRoadMask(tile, { reset = false } = {}) {
+    if (!tile || !tile.pos) return null;
+    const count = tile.pos.count;
+    if (!(count > 0)) return null;
+    if (!tile._roadMask || tile._roadMask.length !== count) {
+      tile._roadMask = new Float32Array(count);
+      reset = true;
+    }
+    if (reset) {
+      tile._roadMask.fill(1);
+    }
+    return tile._roadMask;
+  }
   _initColorsNearBlack(tile) {
     const col = this._ensureColorAttr(tile);
+    this._ensureRoadMask(tile, { reset: true });
     const arr = col.array;
     for (let i = 0; i < tile.pos.count; i++) {
       const o = 3 * i;
@@ -864,6 +981,7 @@ _stitchInteractiveToVisualEdges(tile, {
   }
   _initFarfieldColors(tile) {
     const col = this._ensureColorAttr(tile);
+    this._ensureRoadMask(tile, { reset: true });
     const arr = col.array;
     for (let i = 0; i < tile.pos.count; i++) {
       const o = 3 * i;
@@ -902,6 +1020,7 @@ _stitchInteractiveToVisualEdges(tile, {
   }
   _applyAllColorsGlobal(tile) {
     this._ensureColorAttr(tile);
+    const roadMask = this._ensureRoadMask(tile);
     const arr = tile.col.array;
     const pos = tile.pos;
     for (let i = 0; i < pos.count; i++) {
@@ -909,12 +1028,347 @@ _stitchInteractiveToVisualEdges(tile, {
       const t = this._normalizedHeight(y);
       const color = this._colorFromNormalized(t);
       const o = 3 * i;
-      arr[o] = color.r;
-      arr[o + 1] = color.g;
-      arr[o + 2] = color.b;
+      let r = color.r;
+      let g = color.g;
+      let b = color.b;
+      if (roadMask) {
+        const mask = THREE.MathUtils.clamp(roadMask[i] ?? 1, 0, 1);
+        r *= mask;
+        g *= mask;
+        b *= mask;
+      }
+      arr[o] = r;
+      arr[o + 1] = g;
+      arr[o + 2] = b;
     }
     tile.col.needsUpdate = true;
     if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
+  }
+  _prepareRoadStamp(stamp) {
+    if (!stamp || !Array.isArray(stamp.points) || stamp.points.length < 2) return null;
+
+    let minX = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxZ = -Infinity;
+
+    for (const pt of stamp.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.z < minZ) minZ = pt.z;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.z > maxZ) maxZ = pt.z;
+    }
+
+    const preparedSegments = [];
+    if (Array.isArray(stamp.rawSegments) && stamp.rawSegments.length) {
+      for (const seg of stamp.rawSegments) {
+        if (!seg) continue;
+        const ax = Number(seg.ax);
+        const ay = Number(seg.ay);
+        const az = Number(seg.az);
+        const bx = Number(seg.bx);
+        const by = Number(seg.by);
+        const bz = Number(seg.bz);
+        if (![ax, ay, az, bx, by, bz].every(Number.isFinite)) continue;
+        let dirX = bx - ax;
+        let dirZ = bz - az;
+        const lenSq = dirX * dirX + dirZ * dirZ;
+        if (lenSq < 1e-6) continue;
+        const len = Math.sqrt(lenSq);
+        dirX /= len;
+        dirZ /= len;
+        const perpX = -dirZ;
+        const perpZ = dirX;
+        const halfWidth = Math.max(0.1, Number.isFinite(seg.halfWidth) ? seg.halfWidth : (stamp.width * 0.5));
+        preparedSegments.push({
+          ax, ay, az, bx, by, bz,
+          dirX,
+          dirZ,
+          len,
+          perpX,
+          perpZ,
+          halfWidth,
+        });
+        const offsetX = perpX * halfWidth;
+        const offsetZ = perpZ * halfWidth;
+        const candidates = [
+          { x: ax + offsetX, z: az + offsetZ },
+          { x: ax - offsetX, z: az - offsetZ },
+          { x: bx + offsetX, z: bz + offsetZ },
+          { x: bx - offsetX, z: bz - offsetZ },
+        ];
+        for (const c of candidates) {
+          if (c.x < minX) minX = c.x;
+          if (c.z < minZ) minZ = c.z;
+          if (c.x > maxX) maxX = c.x;
+          if (c.z > maxZ) maxZ = c.z;
+        }
+      }
+    }
+
+    if (!preparedSegments.length) {
+      const centerSegments = [];
+      for (let i = 0; i < stamp.points.length - 1; i++) {
+        const a = stamp.points[i];
+        const b = stamp.points[i + 1];
+        const dx = b.x - a.x;
+        const dz = b.z - a.z;
+        const lenSq = dx * dx + dz * dz;
+        if (lenSq < 1e-8) continue;
+        centerSegments.push({
+          ax: a.x,
+          az: a.z,
+          bx: b.x,
+          bz: b.z,
+          dx,
+          dz,
+          lenSq,
+        });
+      }
+      stamp.centerSegments = centerSegments;
+      const pad = Math.max(0.1, (stamp.width ?? this.tileRadius * 0.6) * 0.5);
+      minX -= pad;
+      maxX += pad;
+      minZ -= pad;
+      maxZ += pad;
+    } else {
+      stamp.centerSegments = null;
+    }
+
+    if (!Number.isFinite(minX)) minX = stamp.points[0]?.x ?? 0;
+    if (!Number.isFinite(minZ)) minZ = stamp.points[0]?.z ?? 0;
+    if (!Number.isFinite(maxX)) maxX = minX;
+    if (!Number.isFinite(maxZ)) maxZ = minZ;
+
+    stamp.segmentData = preparedSegments;
+    stamp.bounds = { minX, minZ, maxX, maxZ };
+
+    const minHalf = preparedSegments.reduce((acc, seg) => Math.min(acc, seg.halfWidth), Infinity);
+    const maxHalf = preparedSegments.reduce((acc, seg) => Math.max(acc, seg.halfWidth), 0);
+    const baseWidth = Math.max(0.5, stamp.width ?? 1);
+    const coreRadius = Number.isFinite(minHalf) ? Math.max(0.15, minHalf) : Math.max(0.15, baseWidth * 0.5);
+    const falloffBase = Number.isFinite(stamp.falloff) ? stamp.falloff : (Number.isFinite(maxHalf) && maxHalf > 0 ? maxHalf * 1.1 : baseWidth * 0.65);
+    const falloff = Math.max(coreRadius + 0.2, falloffBase);
+
+    stamp.coreRadius = coreRadius;
+    stamp.falloff = falloff;
+    stamp.falloffSq = falloff * falloff;
+    stamp.strength = THREE.MathUtils.clamp(stamp.strength ?? 0.6, 0, 0.95);
+    return stamp;
+  }
+  _minDistanceSqToStamp(stamp, x, z) {
+    if (stamp?.segmentData?.length) {
+      let min = Infinity;
+      for (const seg of stamp.segmentData) {
+        const relX = x - seg.ax;
+        const relZ = z - seg.az;
+        const rawProj = relX * seg.dirX + relZ * seg.dirZ;
+        const proj = THREE.MathUtils.clamp(rawProj, 0, seg.len);
+        const px = seg.ax + seg.dirX * proj;
+        const pz = seg.az + seg.dirZ * proj;
+        const offX = x - px;
+        const offZ = z - pz;
+        const lateral = offX * seg.perpX + offZ * seg.perpZ;
+        const radial = Math.max(0, Math.abs(lateral) - seg.halfWidth);
+        const longitudinal = Math.abs(rawProj - proj);
+        const dist = Math.hypot(radial, longitudinal);
+        const distSq = dist * dist;
+        if (distSq < min) min = distSq;
+        if (min <= 0) break;
+      }
+      return min;
+    }
+    if (stamp?.centerSegments?.length) {
+      let minSq = Infinity;
+      for (const seg of stamp.centerSegments) {
+        const vx = x - seg.ax;
+        const vz = z - seg.az;
+        const t = THREE.MathUtils.clamp((vx * seg.dx + vz * seg.dz) / seg.lenSq, 0, 1);
+        const px = seg.ax + seg.dx * t;
+        const pz = seg.az + seg.dz * t;
+        const dx = x - px;
+        const dz = z - pz;
+        const distSq = dx * dx + dz * dz;
+        if (distSq < minSq) minSq = distSq;
+        if (minSq <= 0) break;
+      }
+      return minSq;
+    }
+    return Infinity;
+  }
+  _roadMaskValueForDistance(dist, stamp) {
+    const core = stamp.coreRadius;
+    const fall = stamp.falloff;
+    const strength = stamp.strength;
+    if (dist <= core) {
+      return Math.max(0.15, 1 - strength);
+    }
+    const span = Math.max(1e-5, fall - core);
+    const t = THREE.MathUtils.clamp((dist - core) / span, 0, 1);
+    const smooth = t * t * (3 - 2 * t);
+    const base = Math.max(0.15, 1 - strength);
+    return THREE.MathUtils.clamp(base + strength * smooth, 0.1, 1);
+  }
+  _applyRoadStampToTile(tile, stamp) {
+    if (!tile || !stamp) return false;
+    if (!tile.pos || !tile.grid?.group) return false;
+    const mask = this._ensureRoadMask(tile);
+    if (!mask) return false;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const bounds = stamp.bounds || null;
+    const pad = Number.isFinite(stamp.falloff) ? stamp.falloff : 0;
+    let changed = false;
+    for (let i = 0; i < pos.count; i++) {
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+      if (bounds) {
+        if (wx < bounds.minX - pad || wx > bounds.maxX + pad) continue;
+        if (wz < bounds.minZ - pad || wz > bounds.maxZ + pad) continue;
+      }
+      const distSq = this._minDistanceSqToStamp(stamp, wx, wz);
+      if (distSq > stamp.falloffSq) continue;
+      const dist = Math.sqrt(distSq);
+      const value = this._roadMaskValueForDistance(dist, stamp);
+      if (value < mask[i]) {
+        mask[i] = value;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  _applyExistingRoadStampsToTile(tile) {
+    if (!this._roadStamps.length) return;
+    this._repaintTileRoadMask(tile);
+  }
+  _reapplyAllRoadStamps() {
+    if (!this._roadStamps.length) {
+      for (const tile of this.tiles.values()) {
+        if (!tile || !tile.pos) continue;
+        this._ensureRoadMask(tile, { reset: true });
+        this._applyAllColorsGlobal(tile);
+      }
+      return;
+    }
+
+    for (const tile of this.tiles.values()) {
+      if (!tile || !tile.pos) continue;
+      this._ensureRoadMask(tile, { reset: true });
+    }
+
+    for (const tile of this.tiles.values()) {
+      if (!tile || !tile.pos || !tile.grid?.group) continue;
+      this._repaintTileRoadMask(tile);
+    }
+  }
+  _reapplyRoadStampsForStamp(stamp) {
+    if (!stamp) return;
+    const hasSegments = stamp.segmentData?.length || stamp.centerSegments?.length;
+    if (!hasSegments) return;
+    const pad = Number.isFinite(stamp.falloff) ? stamp.falloff : 0;
+    for (const tile of this.tiles.values()) {
+      if (!tile || tile.type !== 'interactive' || !tile.pos || !tile.grid?.group) continue;
+      const center = tile.grid.group.position;
+      const tileRadiusWorld = tile._radiusOverride ?? this.tileRadius;
+      const radius = tileRadiusWorld + pad;
+      const radiusSq = radius * radius;
+      const distSq = this._minDistanceSqToStamp(stamp, center.x, center.z);
+      if (distSq > radiusSq) continue;
+      this._repaintTileRoadMask(tile);
+    }
+  }
+  _repaintTileRoadMask(tile) {
+    if (!tile || !tile.pos || !tile.grid?.group) return;
+    this._ensureRoadMask(tile, { reset: true });
+    if (tile.type !== 'interactive') {
+      this._applyAllColorsGlobal(tile);
+      return;
+    }
+    const center = tile.grid.group.position;
+    const tileRadiusWorld = tile._radiusOverride ?? this.tileRadius;
+    for (const stamp of this._roadStamps) {
+      if (!stamp) continue;
+      const hasSegments = stamp.segmentData?.length || stamp.centerSegments?.length;
+      if (!hasSegments) continue;
+      const radius = tileRadiusWorld + stamp.falloff;
+      const radiusSq = radius * radius;
+      const distSq = this._minDistanceSqToStamp(stamp, center.x, center.z);
+      if (distSq > radiusSq) continue;
+      this._applyRoadStampToTile(tile, stamp);
+    }
+    this._applyAllColorsGlobal(tile);
+  }
+  applyRoadPaint({
+    id = null,
+    points = [],
+    segments = [],
+    width = this.tileRadius * 0.6,
+    strength = 0.6,
+    falloff = null,
+  } = {}) {
+    if (!Array.isArray(points) || points.length < 2) return;
+    const sanitizedPoints = [];
+    for (const p of points) {
+      if (!p) continue;
+      const x = Number.isFinite(p.x) ? p.x : (Array.isArray(p) && Number.isFinite(p[0]) ? p[0] : null);
+      const z = Number.isFinite(p.z) ? p.z : (Array.isArray(p) && Number.isFinite(p[1]) ? p[1] : null);
+      if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+      sanitizedPoints.push({ x, z });
+    }
+    if (sanitizedPoints.length < 2) return;
+
+    const sanitizedSegments = Array.isArray(segments)
+      ? segments
+        .map((seg) => {
+          if (!seg) return null;
+          const ax = Number(seg.ax);
+          const ay = Number(seg.ay);
+          const az = Number(seg.az);
+          const bx = Number(seg.bx);
+          const by = Number(seg.by);
+          const bz = Number(seg.bz);
+          const halfWidth = Number(seg.halfWidth);
+          if (![ax, ay, az, bx, by, bz].every(Number.isFinite)) return null;
+          return {
+            ax, ay, az,
+            bx, by, bz,
+            halfWidth: Number.isFinite(halfWidth) ? halfWidth : undefined,
+          };
+        })
+        .filter(Boolean)
+      : [];
+
+    const stampId = id || `road-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const existed = this._roadStampIndex.has(stampId);
+    let stamp = existed ? (this._roadStamps[this._roadStampIndex.get(stampId)] || null) : null;
+    if (existed && !stamp) return;
+
+    const widthClamped = Math.max(0.5, width);
+    const strengthClamped = THREE.MathUtils.clamp(strength ?? 0.6, 0, 0.95);
+
+    if (existed) {
+      stamp.points = sanitizedPoints;
+      stamp.rawSegments = sanitizedSegments;
+      stamp.width = widthClamped;
+      stamp.strength = strengthClamped;
+      stamp.falloff = falloff;
+      stamp.id = stampId;
+    } else {
+      stamp = {
+        id: stampId,
+        points: sanitizedPoints,
+        rawSegments: sanitizedSegments,
+        width: widthClamped,
+        strength: strengthClamped,
+        falloff,
+      };
+      this._roadStampIndex.set(stampId, this._roadStamps.length);
+      this._roadStamps.push(stamp);
+    }
+
+    this._prepareRoadStamp(stamp);
+    if (existed) this._reapplyAllRoadStamps();
+    else this._reapplyRoadStampsForStamp(stamp);
   }
 
   _collectTileLatLon(tile) {
@@ -1325,6 +1779,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this.tiles.set(id, tile);
 
     this._initColorsNearBlack(tile);
+    if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._markRelaxListDirty();
     this._invalidateHeightCache();
 
@@ -1498,6 +1953,8 @@ _stitchInteractiveToVisualEdges(tile, {
       wire
     };
     this.tiles.set(id, tile);
+    this._ensureRoadMask(tile, { reset: true });
+    if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     for (const [dq, dr] of HEX_DIRS) {
       const n = this._getTile(q + dq, r + dr);
       if (n && n.type === 'farfield') this._markFarfieldAdapterDirty(n);
@@ -1530,6 +1987,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const wp = this._axialWorld(q, r);
     low.group.position.set(wp.x, 0, wp.z);
     this.scene.add(low.group);
+    low.group.layers.set(1);
+    low.mesh.layers.set(1);
 
     // keep farfield out of height raycasts so near queries stay fast
     if (low.mesh) low.mesh.raycast = function () { };
@@ -1563,6 +2022,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this.tiles.set(id, tile);
 
     this._initColorsNearBlack(tile);
+    if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._invalidateHeightCache();
     this._ensureFarfieldAdapter(tile);
     for (const [dq, dr] of HEX_DIRS) {
@@ -1578,6 +2038,7 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
     }
+    this._markFarfieldMergeDirty(tile);
     return tile;
   }
 
@@ -2812,6 +3273,7 @@ update(playerPos) {
         this._lastRecolorAt = t;
       }
     }
+    this._updateFarfieldMergedMesh();
   };
 
   // Decide whether to do heavy work this frame
@@ -3478,6 +3940,7 @@ update(playerPos) {
     if (t.type === 'farfield') {
       const key = this._farfieldAdapterKey(t);
       if (key) this._farfieldAdapterDirty.delete(key);
+      this._markFarfieldMergeDirty(t);
     }
     this.scene.remove(t.grid.group);
     try {
@@ -3498,6 +3961,7 @@ update(playerPos) {
   _resetAllTiles() {
     for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
     this.tiles.clear();
+    this._disposeFarfieldMergedMesh();
     this._populateQueue.length = 0;
     this._populateBusy = false;
     this.GLOBAL_MIN_Y = +Infinity;

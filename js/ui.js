@@ -54,6 +54,7 @@ const hudHeadingText = document.getElementById('hudHeadingText');
 const hudDetailTiles = document.getElementById('hudDetailTiles');
 const hudDetailBuild = document.getElementById('hudDetailBuild');
 const hudDetailRadius = document.getElementById('hudDetailRadius');
+const hudDetailRender = document.getElementById('hudDetailRender');
 const hudCompassNeedle = document.getElementById('hudCompassNeedle');
 const perfHud = document.getElementById('perfHud');
 const hudGpsReckon = document.getElementById('hudGpsReckon');
@@ -69,6 +70,12 @@ const hudClockLocal = document.getElementById('hudClockLocal');
 const hudClockUtc = document.getElementById('hudClockUtc');
 const hudSunInfo = document.getElementById('hudSunInfo');
 const hudMoonInfo = document.getElementById('hudMoonInfo');
+const hudScale = document.getElementById('hudScale');
+const hudScaleTrack = document.getElementById('hudScaleTrack');
+const hudScaleLine1 = document.getElementById('hudScaleLine1');
+const hudScaleLine10 = document.getElementById('hudScaleLine10');
+const hudScaleMarker1 = document.getElementById('hudScaleMarker1');
+const hudScaleMarker10 = document.getElementById('hudScaleMarker10');
 const hudStatusNknDot = document.getElementById('hudStatusNknDot');
 const hudStatusTerrainDot = document.getElementById('hudStatusTerrainDot');
 const hudStatusSigDot = document.getElementById('hudStatusSigDot');
@@ -284,7 +291,7 @@ export const ui = {
   menuBtn, menuPane, backdrop,
   dotNkn, txtNkn, dotSig, txtSig, txtSigMeta,
   myAddr, myPub,
-  hudDetailTiles, hudDetailBuild, hudDetailRadius,
+  hudDetailTiles, hudDetailBuild, hudDetailRadius, hudDetailRender,
   poseHzEl, poseSentEl, poseDropEl, poseRateEl,
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
@@ -294,6 +301,7 @@ export const ui = {
   diagPidKp, diagPidKi, diagPidKd, diagPidGain, diagPidDeadband, diagPidSmoothing, diagPidApply, diagPidReset,
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
+  hudScale, hudScaleTrack, hudScaleLine1, hudScaleLine10, hudScaleMarker1, hudScaleMarker10,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
   hudClockLocal, hudClockUtc, hudSunInfo, hudMoonInfo,
   hudWireframeToggle,

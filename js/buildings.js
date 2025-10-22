@@ -2672,7 +2672,7 @@ export class BuildingManager {
   _buildRoad(flat, tags, id) {
     const geomData = this._makeRoadGeometry(flat);
     if (!geomData) return null;
-    const { geo, basePos, center, avgHeight } = geomData;
+    const { geo, basePos, center, avgHeight, path: roadPath, segments: roadSegments } = geomData;
 
     const color = Number.isFinite(avgHeight)
       ? this._elevationColor(avgHeight)
@@ -2691,6 +2691,29 @@ export class BuildingManager {
     mesh.userData.resnapFrozen = false;
     mesh.userData.insideRadius = this._isInsideRadius(center);
     mesh.visible = false;
+
+    if (roadPath && roadPath.length >= 2 && typeof this.tileManager?.applyRoadPaint === 'function') {
+      const projected = roadPath.map((pt) => ({ x: pt.x, z: pt.z }));
+      const segmentPayload = Array.isArray(roadSegments)
+        ? roadSegments.map((seg) => ({
+          ax: seg.ax,
+          ay: seg.ay,
+          az: seg.az,
+          bx: seg.bx,
+          by: seg.by,
+          bz: seg.bz,
+          halfWidth: seg.halfWidth,
+        }))
+        : [];
+      this.tileManager.applyRoadPaint({
+        id: id != null ? `road:${id}` : null,
+        points: projected,
+        segments: segmentPayload,
+        width: this.roadWidth,
+        strength: 0.72,
+        falloff: this.roadWidth * 0.65,
+      });
+    }
 
     if (this._debugEnabled && this._nowMs() >= this._nextRoadLogMs) {
       this._debugLog('road.mesh', {
@@ -2873,6 +2896,8 @@ export class BuildingManager {
     const pos = [];
     const idx = [];
     const centres = [];
+    const leftEdge = [];
+    const rightEdge = [];
 
     for (let i = 0, j = 0; i < segments; i++, j += 2) {
       const cx = line[j], cz = line[j + 1], cy = smH[i];
@@ -2887,6 +2912,8 @@ export class BuildingManager {
       const left = cur.clone().addScaledVector(perp, halfW);
       const right = cur.clone().addScaledVector(perp, -halfW);
       pos.push(left.x, left.y, left.z, right.x, right.y, right.z);
+      leftEdge.push(left.clone());
+      rightEdge.push(right.clone());
       if (i < segments - 1) {
         const a = i * 2;
         idx.push(a, a + 2, a + 1, a + 2, a + 3, a + 1);
@@ -2903,6 +2930,28 @@ export class BuildingManager {
     const centre = centres[Math.floor(centres.length / 2)] ?? { x: 0, z: 0 };
     const avgY = centres.reduce((acc, v) => acc + v.y, 0) / Math.max(1, centres.length);
 
+    const segmentInfo = [];
+    for (let i = 0; i < centres.length - 1; i++) {
+      const a = centres[i];
+      const b = centres[i + 1];
+      const leftA = leftEdge[i];
+      const leftB = leftEdge[i + 1] ?? leftA;
+      const rightA = rightEdge[i];
+      const rightB = rightEdge[i + 1] ?? rightA;
+      const halfWidth = (() => {
+        const la = leftA ? leftA.distanceTo(a) : halfW;
+        const lb = leftB ? leftB.distanceTo(b) : la;
+        const ra = rightA ? rightA.distanceTo(a) : halfW;
+        const rb = rightB ? rightB.distanceTo(b) : ra;
+        return Math.max(0.1, (la + lb + ra + rb) * 0.25);
+      })();
+      segmentInfo.push({
+        ax: a.x, ay: a.y, az: a.z,
+        bx: b.x, by: b.y, bz: b.z,
+        halfWidth,
+      });
+    }
+
     if (this._debugEnabled) {
       const duration = this._nowMs() - start;
       const vertexCount = pos.length / 3;
@@ -2918,7 +2967,7 @@ export class BuildingManager {
       }
     }
 
-    return { geo, basePos, center: centre, avgHeight: avgY };
+    return { geo, basePos, center: centre, avgHeight: avgY, path: centres, segments: segmentInfo };
   }
 
   /* ---------------- ground & coords ---------------- */

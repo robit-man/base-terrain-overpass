@@ -5,7 +5,7 @@ import { Sensors, GeoButton } from './sensors.js';
 import { Input } from './input.js';
 import { AudioEngine } from './audio.js';
 import { TileManager } from './tiles.js';
-import { ipLocate, latLonToWorld, worldToLatLon } from './geolocate.js';
+import { ipLocate, latLonToWorld, worldToLatLon, metresPerDegree } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
@@ -168,14 +168,19 @@ class App {
     this.sceneMgr = new SceneManager();
 
     // === NEW: cap pixel ratio to avoid overdraw on HiDPI ===
+    const devicePixelRatioSafe = window.devicePixelRatio || 1;
     this._pixelRatioBounds = {
-      min: 1,
-      max: Math.min(window.devicePixelRatio || 1, 1.5),
+      min: Math.min(0.55, devicePixelRatioSafe),
+      max: Math.min(devicePixelRatioSafe, 1.5),
     };
     this._pixelRatioState = 'high';
+    this._pixelRatioTarget = this._pixelRatioBounds.max;
+    this._pixelRatioApplied = null;
     try {
-      const pr = this._pixelRatioBounds.max;
+      const pr = Math.max(this._pixelRatioBounds.min, this._pixelRatioBounds.max);
       this.sceneMgr.renderer.setPixelRatio(pr);
+      this._pixelRatioTarget = pr;
+      this._pixelRatioApplied = pr;
     } catch { }
 
     this._poseStoredState = null;
@@ -195,7 +200,7 @@ class App {
     this._physicsPrimed = false;
     this._xrPoseActive = false;
 
-    this._perfSnapshots = { tiles: null, buildings: null };
+    this._perfSnapshots = { tiles: null, buildings: null, render: null };
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
     this._hudGeoCached = { lat: null, lon: null, hash: null };
@@ -274,7 +279,7 @@ class App {
     this._terrainUpdateTimer = null;
     this._buildingUpdateTimer = null;
 
-    this._perf = new AdaptiveQualityManager({
+    const perfConfig = {
       targetFps: 60,
       minQuality: 0.35,
       maxQuality: 1.05,
@@ -285,7 +290,12 @@ class App {
       applyMinMsDown: 1200,      // was 600 — degrade less often
       applyMinMsUp: 4000,        // was 2000 — recover slower
       allowPeriodicResyncMs: 8000
-    });
+    };
+    this._perfQualityRange = {
+      min: perfConfig.minQuality,
+      max: perfConfig.maxQuality,
+    };
+    this._perf = new AdaptiveQualityManager(perfConfig);
     const measuredApply = (label, fn) => (profile) => {
       if (!this._perfLogger) return fn(profile);
       return this._perfLogger.measure(label, () => fn(profile));
@@ -302,12 +312,17 @@ class App {
     this._perf.registerSubsystem('buildings', {
       apply: measuredApply('buildings.applyProfile', (profile) => this.buildings?.applyPerfProfile?.(profile) || null),
     });
+    this._perf.registerSubsystem('render', {
+      apply: measuredApply('render.applyProfile', (profile) => this._applyRenderPerfProfile(profile)),
+    });
 
     const initialState = this._perf.applyAll({ force: true });
     const initialTerrain = initialState.subsystems?.terrain || null;
     const initialBuildings = initialState.subsystems?.buildings || null;
+    const initialRender = initialState.subsystems?.render || null;
     if (initialTerrain) this._perfSnapshots.tiles = initialTerrain;
     if (initialBuildings) this._perfSnapshots.buildings = initialBuildings;
+    if (initialRender) this._perfSnapshots.render = initialRender;
     this._updateHudMeta(initialState);
     this._updatePidDiagnostics(initialState, { forceInputs: true });
     this._updateHudCompass();
@@ -328,6 +343,20 @@ class App {
     const storedCompass = this._loadCompassPref();
     if (storedCompass != null) this._compassEnabled = storedCompass;
     this._debugMode = this._loadDebugPref();
+
+    this._gpsFilter = {
+      samples: [],
+      maxSamples: 8,
+      avgLat: null,
+      avgLon: null,
+      lastWorld: null,
+    };
+    this._gpsDeadzoneMeters = 1.5;
+    this._gpsMaxStepMeters = 6;
+    this._gpsRecenterMeters = 800;
+    this._gpsOutlierMeters = 80;
+    this._tmpGpsWorld = new THREE.Vector3();
+    this._tmpGpsDelta = new THREE.Vector3();
 
     if (ui.yawOffsetRange) {
       ui.yawOffsetRange.addEventListener('input', () => {
@@ -440,6 +469,15 @@ class App {
     this._tmpVec4 = new THREE.Vector3();
     this._tmpVec5 = new THREE.Vector3();
     this._tmpVec6 = new THREE.Vector3();
+    this._tmpScaleForward = new THREE.Vector3();
+    this._tmpScaleRight = new THREE.Vector3();
+    this._tmpScaleBase = new THREE.Vector3();
+    this._tmpScaleOne = new THREE.Vector3();
+    this._tmpScaleTen = new THREE.Vector3();
+    this._tmpScaleProject = new THREE.Vector3();
+    this._tmpScaleScreenA = new THREE.Vector2();
+    this._tmpScaleScreenB = new THREE.Vector2();
+    this._tmpScaleScreenC = new THREE.Vector2();
     this._tmpCamForward = new THREE.Vector3();
     this._tmpQuat = new THREE.Quaternion();
     this._tmpQuat2 = new THREE.Quaternion();
@@ -448,6 +486,8 @@ class App {
     this._tmpHeadBodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
+    this._upUnit = new THREE.Vector3(0, 1, 0);
+    this._hudScaleVisible = false;
 
     const compassDial = this._createCompassDial();
     this._compassDialMount = compassDial?.mount ?? null;
@@ -634,6 +674,10 @@ class App {
       });
     }
 
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', () => this._refreshRendererPixelRatio(), { passive: true });
+    }
+
     this._initPosePersistence();
     this.sceneMgr.renderer.setAnimationLoop(() => this._tick());
 
@@ -650,6 +694,11 @@ class App {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
     const source = detail.source || 'unknown';
+    const isManual = source === 'manual';
+    const lockActive = this._gpsLockEnabled && !isManual;
+    let effectiveLat = lat;
+    let effectiveLon = lon;
+    let sampleInfo = null;
 
     if (detail.incremental && isMobile && this._mobileNav) {
       if (this._gpsLockEnabled) {
@@ -666,21 +715,30 @@ class App {
       return;
     }
 
+    if (lockActive) {
+      sampleInfo = this._ingestGpsSample(lat, lon);
+      if (!sampleInfo) return;
+      if (Number.isFinite(sampleInfo.lat) && Number.isFinite(sampleInfo.lon)) {
+        effectiveLat = sampleInfo.lat;
+        effectiveLon = sampleInfo.lon;
+      }
+    }
+
     const rank = this._locationRank?.[source] ?? this._locationRank.unknown;
     const currentRank = this._locationRank?.[this._locationSource] ?? this._locationRank.unknown;
     const force = detail.force === true;
 
     if (!force && rank < currentRank) {
       if (source !== 'manual') {
-        this._lastAutoLocation = { lat, lon, source };
-        this._locationState = { lat, lon };
+        this._lastAutoLocation = { lat: effectiveLat, lon: effectiveLon, source };
+        this._locationState = { lat: effectiveLat, lon: effectiveLon };
       }
       return;
     }
 
     if (!force && rank === currentRank && this._locationState) {
-      const deltaLat = Math.abs(lat - this._locationState.lat);
-      const deltaLon = Math.abs(lon - this._locationState.lon);
+      const deltaLat = Math.abs(effectiveLat - this._locationState.lat);
+      const deltaLon = Math.abs(effectiveLon - this._locationState.lon);
       const sameCoords = deltaLat < 1e-7 && deltaLon < 1e-7;
       if (sameCoords && source !== 'manual') return;
     }
@@ -691,11 +749,20 @@ class App {
       detailForApply.recenter = false;
     }
 
-    this._applyLocation({ lat, lon, source, detail: detailForApply });
+    if (lockActive) {
+      this._applySmoothedGps({
+        lat: effectiveLat,
+        lon: effectiveLon,
+        source,
+        rawDetail: detail,
+      });
+    } else {
+      this._applyLocation({ lat: effectiveLat, lon: effectiveLon, source, detail: detailForApply });
+    }
 
     if (isMobile && this._mobileNav && source !== 'manual') {
       if (this._gpsLockEnabled) {
-        this._updateMobileNavFromGps({ ...detail, lat, lon, incremental: false });
+        this._updateMobileNavFromGps({ ...detail, lat: effectiveLat, lon: effectiveLon, incremental: false });
       } else {
         this._mobileNav.active = false;
       }
@@ -710,10 +777,20 @@ class App {
     if (this._manualLonInput) this._manualLonInput.value = lon.toFixed(6);
 
     const isManualRequest = source === 'manual' || detail.manual === true;
+    const skipOrigin = detail.skipOrigin === true;
 
-    this.hexGridMgr?.setOrigin(lat, lon, { immediate: isManualRequest });
-    this.buildings?.setOrigin(lat, lon, { forceRefresh: isManualRequest });
-    if (isManualRequest) {
+    if (!skipOrigin && this._gpsFilter) {
+      this._gpsFilter.samples.length = 0;
+      this._gpsFilter.avgLat = lat;
+      this._gpsFilter.avgLon = lon;
+      this._gpsFilter.lastWorld = null;
+    }
+
+    if (!skipOrigin) {
+      this.hexGridMgr?.setOrigin(lat, lon, { immediate: isManualRequest });
+      this.buildings?.setOrigin(lat, lon, { forceRefresh: isManualRequest });
+    }
+    if (isManualRequest && !skipOrigin) {
       this.physics?.resetTerrain?.();
       this._poseStoredState = null;
       this._poseLatestState = null;
@@ -723,7 +800,7 @@ class App {
       this._pendingPoseRestore = null;
     }
 
-    const allowRecenter = detail.recenter !== false && (this._gpsLockEnabled || source === 'manual');
+    const allowRecenter = !skipOrigin && detail.recenter !== false && (this._gpsLockEnabled || source === 'manual');
     const skipRecenterForStoredPose = this._poseRestored && detail.force !== true && !isManualRequest;
     if (allowRecenter && !skipRecenterForStoredPose) {
       this._resetPlayerPosition();
@@ -752,6 +829,119 @@ class App {
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
+  }
+
+  _ingestGpsSample(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (!this._gpsFilter) {
+      this._gpsFilter = { samples: [], maxSamples: 8, avgLat: null, avgLon: null, lastWorld: null };
+    }
+    const filter = this._gpsFilter;
+    if (!Array.isArray(filter.samples)) filter.samples = [];
+
+    if (Number.isFinite(filter.avgLat) && Number.isFinite(filter.avgLon)) {
+      const { dLat, dLon } = metresPerDegree(filter.avgLat);
+      const dLatMeters = Math.abs(lat - filter.avgLat) * dLat;
+      const dLonMeters = Math.abs(lon - filter.avgLon) * dLon;
+      const distMeters = Math.hypot(dLatMeters, dLonMeters);
+      if (Number.isFinite(this._gpsOutlierMeters) && distMeters > this._gpsOutlierMeters) {
+        filter.samples = [{ lat, lon }];
+        filter.avgLat = lat;
+        filter.avgLon = lon;
+        return { lat, lon, count: 1, reset: true };
+      }
+    }
+
+    filter.samples.push({ lat, lon });
+    if (filter.samples.length > (filter.maxSamples || 8)) filter.samples.shift();
+
+    let sumLat = 0;
+    let sumLon = 0;
+    for (const s of filter.samples) {
+      sumLat += s.lat;
+      sumLon += s.lon;
+    }
+    filter.avgLat = sumLat / filter.samples.length;
+    filter.avgLon = sumLon / filter.samples.length;
+
+    return { lat: filter.avgLat, lon: filter.avgLon, count: filter.samples.length };
+  }
+
+  _applySmoothedGps({ lat, lon, source = 'gps', rawDetail = {} } = {}) {
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    const origin = this.hexGridMgr?.origin || null;
+    const detailBase = { ...rawDetail, source };
+
+    if (!origin) {
+      this._applyLocation({
+        lat,
+        lon,
+        source,
+        detail: { ...detailBase, recenter: true, skipOrigin: false, preserveManual: true }
+      });
+      if (this._gpsFilter) {
+        this._gpsFilter.lastWorld = new THREE.Vector3(0, 0, 0);
+      }
+      return;
+    }
+
+    const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+    if (!world) return;
+
+    const target = this._tmpGpsWorld.set(world.x, 0, world.z);
+    const radial = target.length();
+    const recenterLimit = Number.isFinite(this._gpsRecenterMeters) ? this._gpsRecenterMeters : 800;
+
+    if (radial > recenterLimit) {
+      if (this._gpsFilter) {
+        this._gpsFilter.samples = [];
+        this._gpsFilter.avgLat = lat;
+        this._gpsFilter.avgLon = lon;
+        this._gpsFilter.lastWorld = null;
+      }
+      this._applyLocation({
+        lat,
+        lon,
+        source,
+        detail: { ...detailBase, recenter: true, skipOrigin: false, preserveManual: true }
+      });
+      return;
+    }
+
+    const deltaVec = this._tmpGpsDelta.set(target.x - dolly.position.x, 0, target.z - dolly.position.z);
+    const planar = deltaVec.length();
+    const deadzone = Math.max(0.2, this._gpsDeadzoneMeters || 0);
+    const maxStep = Math.max(deadzone, this._gpsMaxStepMeters || 6);
+
+    if (planar > deadzone) {
+      const stepRatio = planar > maxStep ? (maxStep / planar) : 1;
+      dolly.position.x += deltaVec.x * stepRatio;
+      dolly.position.z += deltaVec.z * stepRatio;
+    }
+
+    const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
+    const groundY = this.hexGridMgr?.getHeightAt?.(dolly.position.x, dolly.position.z);
+    if (Number.isFinite(groundY)) {
+      dolly.position.y = groundY + eyeHeight;
+      this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
+    }
+
+    if (this._gpsFilter) {
+      if (!this._gpsFilter.lastWorld) this._gpsFilter.lastWorld = new THREE.Vector3();
+      this._gpsFilter.lastWorld.set(target.x, 0, target.z);
+    }
+
+    this._applyLocation({
+      lat,
+      lon,
+      source,
+      detail: { ...detailBase, skipOrigin: true, preserveManual: true, recenter: false }
+    });
+
+    this.hexGridMgr?.update?.(dolly.position);
+    this._nextHexUpdateMs = 0;
   }
 
   _handleMiniMapTeleport({ lat, lon } = {}) {
@@ -2643,6 +2833,105 @@ class App {
     return `${Math.round(delta / 3600000)}h ago`;
   }
 
+  _qualityToPixelRatio(quality) {
+    const bounds = this._pixelRatioBounds || { min: 0.55, max: 1 };
+    const range = this._perfQualityRange || { min: 0.35, max: 1.05 };
+    const minQ = Number.isFinite(range.min) ? range.min : 0.35;
+    const maxQ = Number.isFinite(range.max) ? range.max : 1.05;
+    const denom = Math.max(1e-3, maxQ - minQ);
+    const q = Number.isFinite(quality) ? THREE.MathUtils.clamp(quality, minQ, maxQ) : maxQ;
+    const t = THREE.MathUtils.clamp((q - minQ) / denom, 0, 1);
+    if (!Number.isFinite(bounds.min) || !Number.isFinite(bounds.max)) return q;
+    if (Math.abs(bounds.max - bounds.min) < 1e-3) return bounds.max;
+    return THREE.MathUtils.lerp(bounds.min, bounds.max, t);
+  }
+
+  _setRendererPixelRatio(next, {
+    force = false,
+    reason = 'auto',
+    degrade = false,
+    upgrade = false,
+  } = {}) {
+    const renderer = this.sceneMgr?.renderer;
+    if (!renderer) return { changed: false, applied: null, reason };
+
+    const bounds = this._pixelRatioBounds || { min: 0.55, max: 1 };
+    let target = Number.isFinite(next) ? next : bounds.max;
+    target = THREE.MathUtils.clamp(target, Math.min(bounds.min, bounds.max), Math.max(bounds.min, bounds.max));
+
+    const current = renderer.getPixelRatio ? renderer.getPixelRatio() : (this._pixelRatioApplied ?? target);
+    const ratioEps = 0.015;
+
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    this._pixelRatioTarget = target;
+
+    if (renderer.xr?.isPresenting && !force) {
+      return { changed: false, applied: current, reason: `${reason}-xr` };
+    }
+
+    if (!force && Math.abs(target - current) < ratioEps) {
+      return { changed: false, applied: current, reason };
+    }
+
+    let width = window.innerWidth || 1;
+    let height = window.innerHeight || 1;
+    const canvas = renderer.domElement;
+    if (canvas) {
+      width = canvas.clientWidth || width;
+      height = canvas.clientHeight || height;
+    }
+
+    renderer.setPixelRatio(target);
+    renderer.setSize(Math.max(1, width), Math.max(1, height), false);
+
+    this._pixelRatioApplied = target;
+    this._pixelRatioLastChangeMs = now;
+    if (canvas?.style) {
+      canvas.style.setProperty('--render-scale', target.toFixed(3));
+    }
+
+    if (degrade) {
+      this._pixelRatioState = 'degraded';
+    } else if (upgrade) {
+      this._pixelRatioState = 'high';
+    }
+
+    return { changed: Math.abs(target - current) >= ratioEps, applied: target, reason };
+  }
+
+  _applyRenderPerfProfile(profile = {}) {
+    const renderer = this.sceneMgr?.renderer;
+    if (!renderer) return null;
+
+    const profileSnapshot = (this._perf && typeof this._perf.profile === 'function')
+      ? this._perf.profile()
+      : null;
+    const quality = Number.isFinite(profile?.quality) ? profile.quality : profileSnapshot?.quality;
+    let targetRatio = this._qualityToPixelRatio(quality);
+    const xrOn = !!renderer.xr?.isPresenting;
+    if (xrOn) targetRatio = Math.max(1, targetRatio);
+
+    const aqm = profile?.aqm || {};
+    const change = this._setRendererPixelRatio(targetRatio, {
+      force: aqm.applyReason === 'force' || aqm.applyReason === 'periodic',
+      reason: aqm.applyReason || 'auto',
+      degrade: !!aqm.degrade,
+      upgrade: !!aqm.upgrade,
+    });
+
+    return {
+      pixelRatio: change.applied ?? renderer.getPixelRatio?.() ?? targetRatio,
+      target: targetRatio,
+      changed: change.changed,
+      reason: change.reason,
+    };
+  }
+
+  _refreshRendererPixelRatio() {
+    const target = Number.isFinite(this._pixelRatioTarget) ? this._pixelRatioTarget : this._pixelRatioBounds?.max;
+    this._setRendererPixelRatio(target, { force: true, reason: 'resize' });
+  }
+
   _formatPerfLabel(perfState) {
     const pct = Math.round(THREE.MathUtils.clamp(perfState?.quality ?? 1, 0, 1.05) * 100);
     const level = perfState?.level ? perfState.level.charAt(0).toUpperCase() + perfState.level.slice(1) : 'Adaptive';
@@ -2652,11 +2941,13 @@ class App {
   _formatPerfDetail(perfState, snapshots = {}) {
     const tileSnap = snapshots.tiles || {};
     const buildingSnap = snapshots.buildings || {};
+    const renderSnap = snapshots.render || {};
     const tileNear = Number.isFinite(tileSnap.interactiveRing) ? tileSnap.interactiveRing : null;
     const tileFar = Number.isFinite(tileSnap.visualRing) ? tileSnap.visualRing : null;
     const buildBudget = Number.isFinite(buildingSnap.frameBudget) ? buildingSnap.frameBudget : null;
     const mergeBudget = Number.isFinite(buildingSnap.mergeBudget) ? buildingSnap.mergeBudget : null;
     const radiusMeters = Number.isFinite(buildingSnap.radius) ? Math.round(buildingSnap.radius) : null;
+    const pixelRatio = Number.isFinite(renderSnap.pixelRatio) ? renderSnap.pixelRatio : null;
 
     const formatMs = (value) => (Number.isFinite(value) ? value.toFixed(2) : '--');
 
@@ -2664,6 +2955,7 @@ class App {
       tiles: `${tileNear != null ? tileNear : '--'} / ${tileFar != null ? tileFar : '--'}`,
       build: `${formatMs(buildBudget)} / ${formatMs(mergeBudget)} ms`,
       radius: radiusMeters != null ? `${radiusMeters} m` : '--',
+      renderScale: pixelRatio != null ? `${pixelRatio.toFixed(2)}×` : '--',
     };
   }
 
@@ -2683,6 +2975,10 @@ class App {
 
     if (ui.hudDetailRadius && detail.radius !== cached.radius) {
       ui.hudDetailRadius.textContent = detail.radius;
+    }
+
+    if (ui.hudDetailRender && detail.renderScale !== cached.renderScale) {
+      ui.hudDetailRender.textContent = detail.renderScale;
     }
 
     this._hudMetaCached = { ...detail };
@@ -2718,6 +3014,128 @@ class App {
       needle.dataset.source = headingSource;
       needle.title = hasHeading ? `Heading source: ${headingSource}` : 'Heading unavailable';
     }
+  }
+
+  _setHudScaleVisible(visible) {
+    const root = ui.hudScale;
+    if (!root) return;
+    if (visible) {
+      if (!this._hudScaleVisible) {
+        root.classList.remove('is-hidden');
+        root.setAttribute('aria-hidden', 'false');
+        this._hudScaleVisible = true;
+      }
+    } else if (this._hudScaleVisible || !root.classList.contains('is-hidden')) {
+      root.classList.add('is-hidden');
+      root.setAttribute('aria-hidden', 'true');
+      this._hudScaleVisible = false;
+    }
+  }
+
+  _projectHudScalePoint(worldVec, camera, renderer, outVec) {
+    if (!worldVec || !camera || !renderer || !outVec) return null;
+    const canvas = renderer.domElement;
+    const width = (canvas?.clientWidth || canvas?.width || window.innerWidth || 0);
+    const height = (canvas?.clientHeight || canvas?.height || window.innerHeight || 0);
+    if (width <= 0 || height <= 0) return null;
+    const projected = this._tmpScaleProject.copy(worldVec).project(camera);
+    if (!Number.isFinite(projected.z) || projected.z < -1 || projected.z > 1) return null;
+    const x = (projected.x * 0.5 + 0.5) * width;
+    const y = (1 - (projected.y * 0.5 + 0.5)) * height;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    outVec.set(x, y);
+    return outVec;
+  }
+
+  _updateHudScale({ groundY = null } = {}) {
+    const track = ui.hudScaleTrack;
+    const line1 = ui.hudScaleLine1;
+    const line10 = ui.hudScaleLine10;
+    const marker1 = ui.hudScaleMarker1;
+    const marker10 = ui.hudScaleMarker10;
+    if (!track || !line1 || !line10 || !marker1 || !marker10) return;
+
+    const renderer = this.sceneMgr?.renderer;
+    const camera = this.sceneMgr?.camera;
+    const dolly = this.sceneMgr?.dolly;
+    if (!renderer || !camera || !dolly || renderer.xr?.isPresenting) {
+      this._setHudScaleVisible(false);
+      return;
+    }
+
+    const forward = this._tmpScaleForward;
+    camera.getWorldDirection(forward);
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+    forward.normalize();
+
+    const right = this._tmpScaleRight;
+    right.crossVectors(forward, this._upUnit);
+    if (right.lengthSq() < 1e-6) {
+      this._setHudScaleVisible(false);
+      return;
+    }
+    right.normalize();
+
+    const base = this._tmpScaleBase.copy(dolly.position);
+    let ground = groundY;
+    if (!Number.isFinite(ground)) {
+      ground = this.hexGridMgr?.getHeightAt?.(base.x, base.z);
+    }
+    if (Number.isFinite(ground)) base.y = ground;
+
+    const sampleDist = Math.max(4, Math.min(60, this.hexGridMgr?.tileRadius ?? 26));
+    base.addScaledVector(forward, sampleDist);
+
+    const point1 = this._tmpScaleOne.copy(base).addScaledVector(right, 1);
+    const point10 = this._tmpScaleTen.copy(base).addScaledVector(right, 10);
+
+    const screenBase = this._projectHudScalePoint(base, camera, renderer, this._tmpScaleScreenA);
+    const screenOne = this._projectHudScalePoint(point1, camera, renderer, this._tmpScaleScreenB);
+    const screenTen = this._projectHudScalePoint(point10, camera, renderer, this._tmpScaleScreenC);
+
+    if (!screenBase || !screenOne || !screenTen) {
+      this._setHudScaleVisible(false);
+      return;
+    }
+
+    let width1 = Math.abs(screenOne.x - screenBase.x);
+    let width10 = Math.abs(screenTen.x - screenBase.x);
+
+    if (!Number.isFinite(width1) || !Number.isFinite(width10) || width1 <= 0 || width10 <= 0) {
+      this._setHudScaleVisible(false);
+      return;
+    }
+
+    if (width10 <= width1) {
+      width10 = width1 * 10;
+    }
+
+    const maxWidth = 320;
+    const minWidth = 4;
+    if (width10 > maxWidth) {
+      const scale = maxWidth / width10;
+      width10 = maxWidth;
+      width1 = Math.max(minWidth, width1 * scale);
+    }
+
+    if (width10 < minWidth || width1 < 0.5) {
+      this._setHudScaleVisible(false);
+      return;
+    }
+
+    const width1Px = width1.toFixed(2);
+    const width10Px = width10.toFixed(2);
+
+    track.style.width = `${width10Px}px`;
+    line1.style.width = `${width1Px}px`;
+    line10.style.width = `${width10Px}px`;
+    marker1.style.left = `${width1Px}px`;
+    marker10.style.left = `${width10Px}px`;
+    marker1.textContent = '1u';
+    marker10.textContent = '10u';
+
+    this._setHudScaleVisible(true);
   }
 
   _updateHudGeo({ lat, lon } = {}) {
@@ -3253,8 +3671,10 @@ class App {
     if (perfState.qualityChanged || perfState.hudReady) {
       const tileSummary = perfState.subsystems?.terrain ?? null;
       const buildingSummary = perfState.subsystems?.buildings ?? null;
+      const renderSummary = perfState.subsystems?.render ?? null;
       if (tileSummary && this._terrainAuto) this._perfSnapshots.tiles = tileSummary;
       if (buildingSummary && this._buildingAuto) this._perfSnapshots.buildings = buildingSummary;
+      if (renderSummary) this._perfSnapshots.render = renderSummary;
       if (tileSummary) this._refreshEnvironmentTerrainSummary(tileSummary);
       if (buildingSummary) this._refreshEnvironmentBuildingSummary(buildingSummary);
       this._updatePidDiagnostics(perfState);
@@ -3356,17 +3776,19 @@ class App {
     if (!xrOn) {
       measure('orientation', () => {
         if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-          const q = this._deviceQuatForFPV(this.sensors.orient);
+          const deviceQuat = this._deviceQuatForFPV(this.sensors.orient);
           const compassOffset = this._getCompassYawOffset() || 0;
           const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
           const totalOffset = this._wrapAngle(compassOffset + manualOffset);
-          if (Math.abs(totalOffset) > 1e-4) {
-            const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), totalOffset);
-            q.multiply(yawQuat);
-          }
-          dolly.quaternion.copy(q);
-          camera.rotation.set(0, 0, 0);
+          const deviceEuler = this._tmpEuler.setFromQuaternion(deviceQuat, 'YXZ');
+          let yaw = this._wrapAngle(deviceEuler.y + totalOffset);
+          const pitch = THREE.MathUtils.clamp(deviceEuler.x, this._pitchMin, this._pitchMax);
+          const roll = THREE.MathUtils.clamp(deviceEuler.z, -Math.PI / 2, Math.PI / 2);
+          const bodyQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ'));
+          dolly.quaternion.copy(bodyQuat);
+          camera.rotation.set(pitch, 0, roll);
           camera.up.set(0, 1, 0);
+          this._pitch = pitch;
         } else {
           const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
           const yawAbs = e.y;
@@ -3454,6 +3876,7 @@ class App {
     groundY = measure('height.final', () => this.hexGridMgr.getHeightAt(pos.x, pos.z));
     dolly.position.y = groundY + eyeHeight;
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
+    measure('hud.scale', () => this._updateHudScale({ groundY }));
 
     const locomotionWorldYaw = xrOn && typeof this.move?.getXRWorldYaw === 'function'
       ? this.move.getXRWorldYaw()

@@ -1373,6 +1373,61 @@ canvas {
     color: var(--hud-text-muted);
 }
 
+#perfHud .hud-scale {
+    display: flex;
+    justify-content: flex-start;
+    margin: 8px 0 6px;
+}
+
+#perfHud .hud-scale.is-hidden {
+    display: none;
+}
+
+#perfHud .hud-scale-track {
+    position: relative;
+    min-width: 48px;
+    height: 8px;
+    padding-bottom: 20px;
+    pointer-events: none;
+}
+
+#perfHud .hud-scale-line {
+    position: absolute;
+    left: 0;
+    height: 2px;
+    background: var(--hud-text-primary);
+    border-radius: 2px;
+    transition: width 0.12s ease-out;
+}
+
+#perfHud .hud-scale-line-one {
+    top: 0;
+    opacity: 0.9;
+}
+
+#perfHud .hud-scale-line-ten {
+    top: 6px;
+    opacity: 0.35;
+}
+
+#perfHud .hud-scale-marker {
+    position: absolute;
+    transform: translateX(-50%);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--hud-text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+#perfHud .hud-scale-marker-one {
+    top: -12px;
+}
+
+#perfHud .hud-scale-marker-ten {
+    top: 12px;
+}
+
 #perfHud .hud-chip-row {
     display: flex;
     flex-wrap: wrap;
