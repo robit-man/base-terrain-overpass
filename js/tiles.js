@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { UniformHexGrid, HexCenterPoint } from './grid.js';
 import { now } from './utils.js';
-import { worldToLatLon } from './geolocate.js';
+import { worldToLatLon, latLonToWorld } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { TerrainRelay } from './terrainRelay.js';
 
@@ -89,6 +89,13 @@ export class TileManager {
       lastBuildCount: 0,
       lastBuildTime: 0,
     };
+    this._overlayEnabled = true;
+    this._overlayZoom = 16;
+    this._overlayCache = new Map();
+    this._overlayCanvas = null;
+    this._overlayCtx = null;
+    this._treeEnabled = true;
+    this._treeAssets = null;
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -1044,6 +1051,640 @@ _stitchInteractiveToVisualEdges(tile, {
     tile.col.needsUpdate = true;
     if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
   }
+  _slippyLonLatToTile(lon, lat, zoom) {
+    const n = Math.pow(2, zoom);
+    const latClamped = THREE.MathUtils.clamp(lat, -85, 85);
+    const lonWrapped = ((lon + 180) % 360 + 360) % 360 - 180;
+    const xt = Math.floor(((lonWrapped + 180) / 360) * n);
+    const latRad = THREE.MathUtils.degToRad(latClamped);
+    const yt = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+    return { x: xt, y: yt };
+  }
+  _slippyTileToLon(x, zoom) {
+    return (x / Math.pow(2, zoom)) * 360 - 180;
+  }
+  _slippyTileToLat(y, zoom) {
+    const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, zoom);
+    return THREE.MathUtils.radToDeg(Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
+  }
+  _ensureTileOverlay(tile) {
+    if (!this._overlayEnabled || !tile || tile.type !== 'interactive') return;
+    if (!this.origin) return;
+    if (tile._overlay && (tile._overlay.status === 'loading' || tile._overlay.status === 'ready')) return;
+
+    const center = this._tileCenterLatLon(tile);
+    if (!center) return;
+    const zoom = this._overlayZoom;
+    const slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
+    const key = `${zoom}/${slippy.x}/${slippy.y}`;
+
+    let entry = this._overlayCache.get(key);
+    if (entry && entry.status === 'ready') {
+      this._applyOverlayEntryToTile(tile, entry);
+      return;
+    }
+    if (!entry) {
+      entry = {
+        status: 'loading',
+        waiters: new Set(),
+        zoom,
+        x: slippy.x,
+        y: slippy.y,
+      };
+      this._overlayCache.set(key, entry);
+      this._fetchOverlayTile(key, entry);
+    }
+    entry.waiters.add(tile);
+    tile._overlay = { status: 'loading', cacheKey: key };
+  }
+  _fetchOverlayTile(cacheKey, entry) {
+    const { zoom, x, y } = entry;
+    const lonMin = this._slippyTileToLon(x, zoom);
+    const lonMax = this._slippyTileToLon(x + 1, zoom);
+    const latMax = this._slippyTileToLat(y, zoom);
+    const latMin = this._slippyTileToLat(y + 1, zoom);
+    const url = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+    if (typeof Image === 'undefined') {
+      entry.status = 'error';
+      if (entry.waiters) {
+        const waiters = Array.from(entry.waiters);
+        entry.waiters.clear();
+        for (const tile of waiters) {
+          if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
+          tile._overlay = null;
+        }
+      }
+      return;
+    }
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.onload = () => {
+      const texture = new THREE.Texture(image);
+      texture.needsUpdate = true;
+      texture.flipY = false;
+      texture.anisotropy = 4;
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      const overlayData = this._processOverlayImage(image, {
+        lonMin,
+        lonMax,
+        latMin,
+        latMax,
+      });
+      entry.status = 'ready';
+      entry.texture = texture;
+      entry.bounds = { lonMin, lonMax, latMin, latMax };
+      entry.samples = overlayData.samples;
+      entry.imageSize = overlayData.imageSize;
+      const waiters = entry.waiters ? Array.from(entry.waiters) : [];
+      entry.waiters?.clear?.();
+      for (const tile of waiters) {
+        if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
+        this._applyOverlayEntryToTile(tile, entry);
+      }
+    };
+    image.onerror = () => {
+      entry.status = 'error';
+      if (entry.waiters) {
+        const waiters = Array.from(entry.waiters);
+        entry.waiters.clear();
+        for (const tile of waiters) {
+          if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
+          tile._overlay = null;
+          setTimeout(() => {
+            if (this.tiles.get(`${tile.q},${tile.r}`) === tile) this._ensureTileOverlay(tile);
+          }, 6000);
+        }
+      }
+    };
+    image.src = url;
+  }
+  _tileCenterLatLon(tile) {
+    if (!tile || !this.origin) return null;
+    const group = tile.grid?.group;
+    if (!group) return null;
+    const wx = group.position.x;
+    const wz = group.position.z;
+    return worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+  }
+  _applyOverlayEntryToTile(tile, entry) {
+    if (!tile || !entry || entry.status !== 'ready') return;
+    const bounds = entry.bounds;
+    if (!bounds) return;
+    this._ensureTileUv(tile, bounds);
+    this._installOverlayMesh(tile, entry.texture);
+    if (this._treeEnabled) this._applyTreeSeeds(tile, entry);
+    else this._clearTileTrees(tile);
+    tile._overlay = { status: 'ready', cacheKey: `${entry.zoom}/${entry.x}/${entry.y}` };
+  }
+  _ensureTileUv(tile, bounds) {
+    if (!tile || !bounds || !this.origin) return;
+    const geom = tile.grid?.geometry;
+    const pos = tile.pos;
+    if (!geom || !pos) return;
+    let uv = geom.getAttribute('uv');
+    if (!uv || uv.count !== pos.count) {
+      uv = new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2).setUsage(THREE.DynamicDrawUsage);
+      geom.setAttribute('uv', uv);
+    }
+    const data = uv.array;
+    const lonSpan = bounds.lonMax - bounds.lonMin || 1;
+    const latSpan = bounds.latMax - bounds.latMin || 1;
+    for (let i = 0; i < pos.count; i++) {
+      const wx = tile.grid.group.position.x + pos.getX(i);
+      const wz = tile.grid.group.position.z + pos.getZ(i);
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      const lon = Number.isFinite(ll?.lon) ? ll.lon : bounds.lonMin;
+      const lat = Number.isFinite(ll?.lat) ? ll.lat : bounds.latMin;
+      const u = THREE.MathUtils.clamp((lon - bounds.lonMin) / lonSpan, 0, 1);
+      const v = THREE.MathUtils.clamp((bounds.latMax - lat) / latSpan, 0, 1);
+      data[i * 2] = u;
+      data[i * 2 + 1] = v;
+    }
+    uv.needsUpdate = true;
+  }
+  _installOverlayMesh(tile, texture) {
+    if (!tile || !texture) return;
+    let mesh = tile._overlayMesh;
+    if (!mesh) {
+      const mat = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        opacity: 0.8,
+        depthWrite: false,
+        side: THREE.BackSide,
+        toneMapped: false,
+      });
+      mat.polygonOffset = true;
+      mat.polygonOffsetFactor = -0.5;
+      mat.polygonOffsetUnits = -0.5;
+      mesh = new THREE.Mesh(tile.grid.geometry, mat);
+      mesh.renderOrder = 0.2;
+      mesh.frustumCulled = false;
+      tile.grid.group.add(mesh);
+      tile._overlayMesh = mesh;
+    } else {
+      mesh.material.map = texture;
+      mesh.material.needsUpdate = true;
+      mesh.visible = true;
+    }
+  }
+  _processOverlayImage(image, bounds) {
+    if (typeof document === 'undefined') {
+      const w = image.naturalWidth || image.width || 256;
+      const h = image.naturalHeight || image.height || 256;
+      return { samples: [], imageSize: { width: w, height: h }, bounds };
+    }
+    const canvas = this._overlayCanvas || document.createElement('canvas');
+    const ctx = this._overlayCtx || canvas.getContext('2d', { willReadFrequently: true });
+    this._overlayCanvas = canvas;
+    this._overlayCtx = ctx;
+    const w = image.naturalWidth || image.width;
+    const h = image.naturalHeight || image.height;
+    canvas.width = w;
+    canvas.height = h;
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(image, 0, 0, w, h);
+    let samples = [];
+    try {
+      const imgData = ctx.getImageData(0, 0, w, h).data;
+      samples = this._extractGreenSamples(imgData, w, h);
+    } catch {
+      samples = [];
+    }
+    return { samples, imageSize: { width: w, height: h }, bounds };
+  }
+  _extractGreenSamples(data, width, height) {
+    const step = Math.max(2, Math.floor(Math.min(width, height) / 64));
+    const maxSamples = 180;
+    const out = [];
+    for (let y = 0; y < height; y += step) {
+      for (let x = 0; x < width; x += step) {
+        const idx = (y * width + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        const a = data[idx + 3];
+        if (a < 180) continue;
+        const brightness = (r + g + b) / 3;
+        if (brightness < 45) continue;
+        if (g < 90) continue;
+        if (g < r * 1.15 || g < b * 1.25) continue;
+        if (Math.random() > 0.35) continue;
+        out.push({ u: x / width, v: y / height });
+        if (out.length >= maxSamples) return out;
+      }
+    }
+    return out;
+  }
+  _randGaussian(mu = 0, sigma = 1) {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    const mag = Math.sqrt(-2 * Math.log(u));
+    const z = mag * Math.cos(2 * Math.PI * v);
+    return mu + z * sigma;
+  }
+  _applyTreeSeeds(tile, entry) {
+    if (!tile || !entry || !Array.isArray(entry.samples) || !entry.samples.length) {
+      this._clearTileTrees(tile);
+      return;
+    }
+    const bounds = entry.bounds;
+    if (!bounds || !this.origin) return;
+    const samples = entry.samples;
+    const worldPositions = [];
+    const maxCount = 40;
+    const center = tile.grid.group.position;
+    const radius = tile._radiusOverride ?? this.tileRadius;
+    const lonSpan = bounds.lonMax - bounds.lonMin || 1;
+    const latSpan = bounds.latMax - bounds.latMin || 1;
+    const used = new Set();
+    for (let i = 0; i < samples.length && worldPositions.length < maxCount; i++) {
+      const s = samples[i];
+      const distCenter = Math.hypot(s.u - 0.5, s.v - 0.5);
+      const densityWeight = Math.max(0, 1 - distCenter);
+      if (Math.random() > densityWeight) continue;
+
+      const lon = bounds.lonMin + lonSpan * s.u;
+      const lat = bounds.latMax - latSpan * s.v;
+      const world = latLonToWorld(lat, lon, this.origin.lat, this.origin.lon);
+      if (!world) continue;
+      const wx = world.x;
+      const wz = world.z;
+      const dx = wx - center.x;
+      const dz = wz - center.z;
+      if ((dx * dx + dz * dz) > radius * radius * 1.05) continue;
+      const height = this.getHeightAt(wx, wz);
+      if (!Number.isFinite(height)) continue;
+      const key = `${Math.round(wx * 2)},${Math.round(wz * 2)}`;
+      if (used.has(key)) continue;
+      used.add(key);
+      worldPositions.push({ x: wx, y: height, z: wz });
+    }
+    this._spawnTreesForTile(tile, worldPositions);
+  }
+  _ensureTreeAssets() {
+    if (this._treeAssets) return this._treeAssets;
+    const barkTex = null;
+    const trunkMat = new THREE.MeshStandardMaterial({
+      color: 0x5c3b1f,
+      roughness: 0.85,
+      metalness: 0.02,
+      map: barkTex,
+    });
+    const foliageMatBroad = new THREE.MeshStandardMaterial({
+      color: 0x295f3a,
+      roughness: 0.6,
+      metalness: 0.05,
+      emissive: 0x072810,
+      emissiveIntensity: 0.08,
+    });
+    const foliageMatConifer = new THREE.MeshStandardMaterial({
+      color: 0x184d2d,
+      roughness: 0.55,
+      metalness: 0.04,
+      emissive: 0x052015,
+      emissiveIntensity: 0.06,
+    });
+    const branchMat = new THREE.MeshStandardMaterial({
+      color: 0x6d4523,
+      roughness: 0.8,
+      metalness: 0.05,
+    });
+    this._treeAssets = { trunkMat, foliageMatBroad, foliageMatConifer, branchMat };
+    return this._treeAssets;
+  }
+  _createTreeMesh(type, assets) {
+    const tree = new THREE.Group();
+    tree.name = 'tree';
+
+    const addCylinder = (radiusTop, radiusBottom, height, radialSegments = 7) => {
+      return new THREE.CylinderGeometry(radiusTop, radiusBottom, height, radialSegments, 1, false);
+    };
+
+    const addSphere = (radius, segments = 6) => new THREE.IcosahedronGeometry(radius, segments);
+
+    const buildBranch = (config) => {
+      const {
+        origin,
+        length,
+        radiusBase,
+        depth,
+        parent,
+        density = 2,
+        upBias = 0.25,
+        twist = Math.PI / 3,
+        spread = Math.PI / 4,
+      } = config;
+      if (depth <= 0 || length <= 0.25) return;
+
+      const radiusTop = radiusBase * THREE.MathUtils.randFloat(0.46, 0.63);
+      const geom = addCylinder(radiusTop, radiusBase, length, 6);
+      const mesh = new THREE.Mesh(geom, assets.branchMat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(origin);
+      const tilt = THREE.MathUtils.randFloat(-spread, spread);
+      const yaw = THREE.MathUtils.randFloatSpread(twist * 2);
+      const tipPitch = THREE.MathUtils.randFloat(upBias * 0.4, upBias * 1.2);
+      mesh.rotation.set(tilt, yaw, tipPitch);
+      mesh.translateY(length * 0.5);
+      parent.add(mesh);
+
+      const childOrigin = new THREE.Vector3().copy(mesh.position);
+      childOrigin.y += length * THREE.MathUtils.randFloat(0.5, 0.85);
+      const nextLength = length * THREE.MathUtils.randFloat(0.55, 0.82);
+      const childRadius = radiusTop * THREE.MathUtils.randFloat(0.4, 0.7);
+      const branchCount = THREE.MathUtils.randInt(1, density + 1);
+
+      for (let i = 0; i < branchCount; i++) {
+        buildBranch({
+          origin: childOrigin,
+          length: nextLength * THREE.MathUtils.randFloat(0.75, 1.15),
+          radiusBase: childRadius,
+          depth: depth - 1,
+          parent,
+          density: THREE.MathUtils.clamp(density - 1, 1, 3),
+          upBias: THREE.MathUtils.randFloat(upBias * 0.8, upBias * 1.2),
+          twist: twist * THREE.MathUtils.randFloat(0.65, 0.9),
+          spread: spread * THREE.MathUtils.randFloat(0.65, 0.95),
+        });
+      }
+      return mesh;
+    };
+
+    const buildDeciduous = () => {
+      const trunkHeight = THREE.MathUtils.randFloat(6, 9.5);
+      const trunkRadius = THREE.MathUtils.randFloat(0.18, 0.28);
+      const trunkGeom = addCylinder(trunkRadius * 0.58, trunkRadius, trunkHeight, 8);
+      const trunk = new THREE.Mesh(trunkGeom, assets.trunkMat.clone());
+      trunk.castShadow = true;
+      trunk.receiveShadow = true;
+      const buryDepth = THREE.MathUtils.randFloat(0.28, 0.48);
+      trunk.position.y = trunkHeight / 2 - buryDepth;
+      trunk.rotation.z = THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(2.2));
+      trunk.material.color.offsetHSL(THREE.MathUtils.randFloatSpread(0.02), THREE.MathUtils.randFloat(-0.04, 0.04), THREE.MathUtils.randFloat(-0.06, 0.08));
+      tree.add(trunk);
+
+      const canopyHeight = THREE.MathUtils.randFloat(3.2, 3.9);
+      const canopyRadius = THREE.MathUtils.randFloat(2.6, 3.6);
+      const canopy = new THREE.Group();
+      canopy.position.y = trunkHeight * THREE.MathUtils.randFloat(0.68, 0.78);
+      const pointCount = 480;
+      const positionArray = new Float32Array(pointCount * 3);
+      const colorArray = new Float32Array(pointCount * 3);
+      for (let i = 0; i < pointCount; i++) {
+        const r = canopyRadius * Math.sqrt(Math.random());
+        const theta = Math.random() * Math.PI * 2;
+        const u = this._randGaussian(0, 0.35);
+        const x = r * Math.cos(theta) + THREE.MathUtils.randFloatSpread(0.4);
+        const z = r * Math.sin(theta) + THREE.MathUtils.randFloatSpread(0.4);
+        const y = this._randGaussian(canopyHeight * 0.4, canopyHeight * 0.28) + Math.abs(u) * canopyHeight * 0.5;
+        positionArray[i * 3] = x;
+        positionArray[i * 3 + 1] = y;
+        positionArray[i * 3 + 2] = z;
+        const baseColor = new THREE.Color(0x295f3d);
+        baseColor.offsetHSL(
+          THREE.MathUtils.randFloatSpread(0.08),
+          THREE.MathUtils.randFloat(-0.08, 0.12),
+          THREE.MathUtils.randFloat(-0.12, 0.08)
+        );
+        colorArray[i * 3] = baseColor.r;
+        colorArray[i * 3 + 1] = baseColor.g;
+        colorArray[i * 3 + 2] = baseColor.b;
+      }
+      const canopyGeom = new THREE.BufferGeometry();
+      canopyGeom.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
+      canopyGeom.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+      const canopyMat = new THREE.PointsMaterial({
+        size: THREE.MathUtils.randFloat(0.28, 0.42),
+        sizeAttenuation: true,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.96,
+        depthWrite: false,
+      });
+      const canopyPoints = new THREE.Points(canopyGeom, canopyMat);
+      canopy.add(canopyPoints);
+      tree.add(canopy);
+
+      const branchBase = new THREE.Vector3(0, trunkHeight * 0.64, 0);
+      const primaryBranches = THREE.MathUtils.randInt(4, 6);
+      const branchNodes = [];
+      for (let i = 0; i < primaryBranches; i++) {
+        const base = branchBase.clone();
+        base.x += this._randGaussian(0, trunkRadius * 0.8);
+        base.z += this._randGaussian(0, trunkRadius * 0.8);
+        const length = THREE.MathUtils.randFloat(2.6, 3.8);
+        const radius = trunkRadius * THREE.MathUtils.randFloat(0.32, 0.58);
+        const branch = buildBranch({
+          origin: base,
+          length,
+          radiusBase: radius,
+          depth: 4,
+          parent: tree,
+          density: 3,
+          upBias: THREE.MathUtils.randFloat(0.22, 0.35),
+          twist: Math.PI / 2,
+          spread: Math.PI / 3,
+        });
+        if (branch) {
+          branchNodes.push({
+            origin: branch.position.clone(),
+            direction: new THREE.Vector3(0, 1, 0).applyEuler(branch.rotation),
+            radius: radius * 0.65,
+            depth: 3,
+            level: 1,
+          });
+        }
+      }
+
+      const subBranchCount = THREE.MathUtils.randInt(5, 9);
+      for (let i = 0; i < subBranchCount && branchNodes.length; i++) {
+        const node = branchNodes[THREE.MathUtils.randInt(0, branchNodes.length - 1)];
+        const offset = node.direction.clone().multiplyScalar(THREE.MathUtils.randFloat(0.6, 1.1));
+        const origin = node.origin.clone().add(offset);
+        const subLength = THREE.MathUtils.randFloat(1.4, 2.1);
+        const subRadius = node.radius * THREE.MathUtils.randFloat(0.45, 0.7);
+        const child = buildBranch({
+          origin,
+          length: subLength,
+          radiusBase: subRadius,
+          depth: node.depth - 1,
+          parent: tree,
+          density: 2,
+          upBias: THREE.MathUtils.randFloat(0.28, 0.4),
+          twist: Math.PI / 2,
+          spread: Math.PI / 3.4,
+        });
+        if (child) {
+          branchNodes.push({
+            origin: child.position.clone(),
+            direction: new THREE.Vector3(0, 1, 0).applyEuler(child.rotation),
+            radius: subRadius * 0.55,
+            depth: Math.max(1, (node.depth - 1)),
+            level: (node.level || 1) + 1,
+          });
+        }
+      }
+    };
+
+    const buildConifer = () => {
+      const trunkHeight = THREE.MathUtils.randFloat(8, 11.5);
+      const trunkRadius = THREE.MathUtils.randFloat(0.18, 0.24);
+      const trunkGeom = addCylinder(trunkRadius * 0.55, trunkRadius, trunkHeight, 9);
+      const trunk = new THREE.Mesh(trunkGeom, assets.trunkMat.clone());
+      trunk.castShadow = true;
+      trunk.receiveShadow = true;
+      const buryDepth = THREE.MathUtils.randFloat(0.3, 0.48);
+      trunk.position.y = trunkHeight / 2 - buryDepth;
+      tree.add(trunk);
+
+      const branchLevels = THREE.MathUtils.randInt(6, 8);
+      const radiusFalloff = THREE.MathUtils.randFloat(0.78, 0.88);
+      let currentRadius = THREE.MathUtils.randFloat(2.1, 2.8);
+      const branchNodes = [];
+      for (let i = 0; i < branchLevels; i++) {
+        const heightRatio = i / (branchLevels - 1);
+        const ringY = trunkHeight * (0.15 + heightRatio * 0.78);
+        const branches = THREE.MathUtils.randInt(5, 7);
+        for (let j = 0; j < branches; j++) {
+          const yaw = (j / branches) * Math.PI * 2 + THREE.MathUtils.randFloatSpread(Math.PI / branches);
+          const pitch = THREE.MathUtils.randFloat(0.28, 0.55);
+          const length = currentRadius * THREE.MathUtils.randFloat(0.6, 1.05);
+          const origin = new THREE.Vector3(0, ringY, 0);
+          const branch = buildBranch({
+            origin,
+            length,
+            radiusBase: trunkRadius * THREE.MathUtils.randFloat(0.3, 0.45),
+            depth: 2,
+            parent: tree,
+            density: 2,
+            upBias: THREE.MathUtils.randFloat(0.05, 0.12),
+            twist: Math.PI / 3,
+            spreadFan: Math.PI / 6,
+            yaw,
+            pitch,
+          });
+          if (branch) {
+            branchNodes.push({
+              origin: branch.position.clone(),
+              direction: new THREE.Vector3(0, 1, 0).applyEuler(branch.rotation),
+              radius: trunkRadius * THREE.MathUtils.randFloat(0.18, 0.25),
+              depth: 2,
+            });
+          }
+        }
+        currentRadius *= radiusFalloff;
+      }
+
+      const needleCount = 520;
+      const needlePositions = new Float32Array(needleCount * 3);
+      const needleColors = new Float32Array(needleCount * 3);
+      for (let i = 0; i < needleCount; i++) {
+        const node = branchNodes[THREE.MathUtils.randInt(0, branchNodes.length - 1)];
+        if (!node) continue;
+        const offsetDist = THREE.MathUtils.randFloat(0.25, 1.4);
+        const offsetVec = node.direction.clone().multiplyScalar(offsetDist);
+        const swirl = THREE.MathUtils.randFloatSpread(Math.PI / 2.5);
+        const tilt = THREE.MathUtils.randFloat(0.3, 1.1);
+        const rot = new THREE.Quaternion().setFromEuler(new THREE.Euler(tilt, swirl, THREE.MathUtils.randFloat(-0.2, 0.2)));
+        offsetVec.applyQuaternion(rot);
+        const base = node.origin.clone().add(offsetVec);
+        base.y += THREE.MathUtils.randFloat(-0.25, 0.35);
+        needlePositions[i * 3] = base.x - trunk.position.x;
+        needlePositions[i * 3 + 1] = base.y;
+        needlePositions[i * 3 + 2] = base.z - trunk.position.z;
+        const baseColor = new THREE.Color(0x193a22);
+        baseColor.offsetHSL(
+          THREE.MathUtils.randFloatSpread(0.03),
+          THREE.MathUtils.randFloat(-0.02, 0.05),
+          THREE.MathUtils.randFloat(-0.03, 0.02)
+        );
+        needleColors[i * 3] = baseColor.r;
+        needleColors[i * 3 + 1] = baseColor.g;
+        needleColors[i * 3 + 2] = baseColor.b;
+      }
+      const needlesGeom = new THREE.BufferGeometry();
+      needlesGeom.setAttribute('position', new THREE.BufferAttribute(needlePositions, 3));
+      needlesGeom.setAttribute('color', new THREE.BufferAttribute(needleColors, 3));
+      const needlesMat = new THREE.PointsMaterial({
+        size: THREE.MathUtils.randFloat(0.11, 0.16),
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.85,
+        vertexColors: true,
+        depthWrite: false,
+      });
+      const needleCloud = new THREE.Points(needlesGeom, needlesMat);
+      needleCloud.position.y = trunkHeight * 0.08;
+      tree.add(needleCloud);
+
+      const tipNeedles = new THREE.BufferGeometry();
+      const tips = new Float32Array(branchNodes.length * 3);
+      for (let i = 0; i < branchNodes.length; i++) {
+        const tip = branchNodes[i].origin.clone().add(branchNodes[i].direction.clone().multiplyScalar(0.6));
+        tips[i * 3] = tip.x - trunk.position.x;
+        tips[i * 3 + 1] = tip.y;
+        tips[i * 3 + 2] = tip.z - trunk.position.z;
+      }
+      tipNeedles.setAttribute('position', new THREE.BufferAttribute(tips, 3));
+      const tipMat = new THREE.PointsMaterial({
+        size: THREE.MathUtils.randFloat(0.16, 0.24),
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.92,
+        color: 0x1e4625,
+        depthWrite: false,
+      });
+      const tipCloud = new THREE.Points(tipNeedles, tipMat);
+      tipCloud.position.y = trunkHeight * 0.06;
+      tree.add(tipCloud);
+    };
+
+    if (type === 'conifer') buildConifer();
+    else buildDeciduous();
+
+    return tree;
+  }
+  _spawnTreesForTile(tile, worldPositions = []) {
+    this._clearTileTrees(tile);
+    if (!worldPositions.length) return;
+    const assets = this._ensureTreeAssets();
+    const basePos = tile.grid.group.position;
+    const group = new THREE.Group();
+    group.name = 'tile-trees';
+    for (const pos of worldPositions) {
+      const species = Math.random() < 0.55 ? 'deciduous' : 'conifer';
+      const tree = this._createTreeMesh(species, assets);
+      const scale = species === 'conifer'
+        ? THREE.MathUtils.randFloat(0.8, 1.2)
+        : THREE.MathUtils.randFloat(0.75, 1.35);
+      tree.scale.setScalar(scale);
+      const localX = pos.x - basePos.x + THREE.MathUtils.randFloatSpread(1.5);
+      const localZ = pos.z - basePos.z + THREE.MathUtils.randFloatSpread(1.5);
+      const worldX = basePos.x + localX;
+      const worldZ = basePos.z + localZ;
+      let groundY = this.getHeightAt(worldX, worldZ);
+      if (!Number.isFinite(groundY)) groundY = pos.y;
+      if (!tile._treeSamples) tile._treeSamples = [];
+      tile._treeSamples.push({ x: worldX, z: worldZ });
+      tree.position.set(localX, groundY, localZ);
+      tree.rotation.y = Math.random() * Math.PI * 2;
+      group.add(tree);
+    }
+    tile.grid.group.add(group);
+    tile._treeGroup = group;
+  }
+  _clearTileTrees(tile) {
+    if (!tile || !tile._treeGroup) return;
+    try {
+      tile.grid.group.remove(tile._treeGroup);
+    } catch { }
+    tile._treeGroup = null;
+    if (tile._treeSamples) tile._treeSamples.length = 0;
+  }
   _prepareRoadStamp(stamp) {
     if (!stamp || !Array.isArray(stamp.points) || stamp.points.length < 2) return null;
 
@@ -1780,6 +2421,7 @@ _stitchInteractiveToVisualEdges(tile, {
 
     this._initColorsNearBlack(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
+    this._ensureTileOverlay(tile);
     this._markRelaxListDirty();
     this._invalidateHeightCache();
 
@@ -2105,6 +2747,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this._pullGeometryToBuffers(t);
     this._initColorsNearBlack(t);
     this._applyAllColorsGlobal(t);
+    this._ensureTileOverlay(t);
 
     // Swap into map, dispose low-res
     this.tiles.set(id, t);
@@ -3937,6 +4580,22 @@ update(playerPos) {
   _discardTile(id) {
     const t = this.tiles.get(id);
     if (!t) return;
+    if (t._treeGroup) this._clearTileTrees(t);
+    if (t._overlay?.cacheKey) {
+      const entry = this._overlayCache.get(t._overlay.cacheKey);
+      entry?.waiters?.delete?.(t);
+    }
+    if (t._overlayMesh) {
+      try {
+        t.grid.group.remove(t._overlayMesh);
+        if (t._overlayMesh.material) {
+          t._overlayMesh.material.map = null;
+          t._overlayMesh.material.dispose?.();
+        }
+      } catch { }
+      t._overlayMesh = null;
+    }
+    if (t._overlay) t._overlay = null;
     if (t.type === 'farfield') {
       const key = this._farfieldAdapterKey(t);
       if (key) this._farfieldAdapterDirty.delete(key);
