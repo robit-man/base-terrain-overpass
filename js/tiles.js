@@ -176,10 +176,11 @@ export class TileManager {
 
     this._heightCache = new Map();
     this._heightCacheTTL = 250;
-    this._heightCacheScale = 2;
-    this._heightMeshesFallback = [];
-    this._heightListeners = new Set();
-    this._farfieldAdapterDirty = new Set();
+   this._heightCacheScale = 2;
+   this._heightMeshesFallback = [];
+   this._heightListeners = new Set();
+   this._farfieldAdapterDirty = new Set();
+    this._tmpSampleVec = new THREE.Vector3();
   }
 
   /* ---------------- small helpers ---------------- */
@@ -2430,8 +2431,10 @@ _stitchInteractiveToVisualEdges(tile, {
     };
     this._ensureTileBuffers(tile);
     this.tiles.set(id, tile);
+    const seededFromNeighbors = this._seedTileFromNeighbors(tile);
 
     this._initColorsNearBlack(tile);
+    if (seededFromNeighbors) this._applyAllColorsGlobal(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._ensureTileOverlay(tile);
     this._markRelaxListDirty();
@@ -2609,7 +2612,9 @@ _stitchInteractiveToVisualEdges(tile, {
       wire
     };
     this.tiles.set(id, tile);
+    const seededFromNeighbors = this._seedTileFromNeighbors(tile);
     this._ensureRoadMask(tile, { reset: true });
+    if (seededFromNeighbors) this._applyAllColorsGlobal(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._ensureTileOverlay(tile);
     for (const [dq, dr] of HEX_DIRS) {
@@ -2677,8 +2682,10 @@ _stitchInteractiveToVisualEdges(tile, {
       _adapterDirty: true
     };
     this.tiles.set(id, tile);
+    const seededFromNeighbors = this._seedTileFromNeighbors(tile);
 
     this._initColorsNearBlack(tile);
+    if (seededFromNeighbors) this._applyAllColorsGlobal(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._ensureTileOverlay(tile);
     this._invalidateHeightCache();
@@ -4470,6 +4477,45 @@ update(playerPos) {
       }
     }
     return this._heightMeshesFallback;
+  }
+
+  _sampleHeightFromNeighbors(x, z, excludeTile = null) {
+    const meshes = this._collectHeightMeshesNear(x, z).slice();
+    if (excludeTile?.grid?.mesh) {
+      const idx = meshes.indexOf(excludeTile.grid.mesh);
+      if (idx !== -1) meshes.splice(idx, 1);
+    }
+    if (!meshes.length) return null;
+    this._tmpSampleVec.set(x, 10000, z);
+    this.ray.set(this._tmpSampleVec, this.DOWN);
+    const hits = this.ray.intersectObjects(meshes, true);
+    if (!hits.length) return null;
+    return hits[0].point.y;
+  }
+
+  _seedTileFromNeighbors(tile) {
+    if (!tile || !this.origin || !tile.pos || !tile.grid?.group) return false;
+    const pos = tile.pos;
+    const ready = tile.ready;
+    const base = tile.grid.group.position;
+    let seeded = 0;
+    for (let i = 0; i < pos.count; i++) {
+      if (ready && ready[i]) continue;
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+      const sampled = this._sampleHeightFromNeighbors(wx, wz, tile);
+      if (!Number.isFinite(sampled)) continue;
+      const current = pos.getY(i);
+      if (Number.isFinite(current) && Math.abs(current - sampled) < 0.01) continue;
+      pos.setY(i, sampled);
+      this._updateGlobalFromValue(sampled);
+      seeded++;
+    }
+    if (seeded) {
+      pos.needsUpdate = true;
+      tile.grid.geometry?.computeVertexNormals?.();
+    }
+    return seeded > 0;
   }
 
   _heightCacheKey(x, z) {
