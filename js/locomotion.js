@@ -266,6 +266,27 @@ export class Locomotion {
     return true;
   }
 
+  setExternalHeading(targetRad, { allowWhileXR = false } = {}) {
+    if (!Number.isFinite(targetRad)) return false;
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return false;
+
+    const xr = this.sceneMgr?.renderer?.xr;
+    if (!allowWhileXR && xr?.isPresenting) return false;
+
+    const yaw = this._normalizeAngle(targetRad);
+    const euler = new THREE.Euler(0, yaw, 0, 'YXZ');
+    dolly.rotation.set(0, yaw, 0);
+    dolly.quaternion.setFromEuler(euler);
+    dolly.updateMatrixWorld?.(true);
+
+    this._bodyYaw = yaw;
+    this._worldYaw = yaw;
+    this._snapYawTarget = null;
+    this._snapYawActive = false;
+    return true;
+  }
+
   isSnapActive() {
     return this._snapYawTarget != null || this._snapYawActive;
   }

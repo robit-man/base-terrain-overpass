@@ -30,6 +30,7 @@ export class SceneManager {
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
     this.camera.position.set(0, 0, 0);
     this.camera.up.set(0, 1, 0);
+    this.camera.rotation.order = 'YXZ';
 
     // Dolly = player rig; add camera as a child (critical for chasecam & FPV)
     this.dolly = new THREE.Group();

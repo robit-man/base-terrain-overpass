@@ -352,12 +352,14 @@ class App {
       avgLon: null,
       lastWorld: null,
     };
-    this._gpsDeadzoneMeters = 1.5;
-    this._gpsMaxStepMeters = 6;
     this._gpsRecenterMeters = 800;
     this._gpsOutlierMeters = 80;
     this._tmpGpsWorld = new THREE.Vector3();
-    this._tmpGpsDelta = new THREE.Vector3();
+    this._gpsLastWorld = new THREE.Vector3();
+    this._gpsLastWorldValid = false;
+    this._lastGpsHeading = null;
+    this._gpsHeadingMinMeters = 0.25;
+    this._gpsHeadingVelocityMin = 0.12;
 
     if (ui.yawOffsetRange) {
       ui.yawOffsetRange.addEventListener('input', () => {
@@ -787,6 +789,9 @@ class App {
       this._gpsFilter.avgLat = lat;
       this._gpsFilter.avgLon = lon;
       this._gpsFilter.lastWorld = null;
+      this._gpsLastWorldValid = false;
+      this._gpsLastWorld?.set(0, 0, 0);
+      this._lastGpsHeading = null;
     }
 
     if (!skipOrigin) {
@@ -913,15 +918,19 @@ class App {
       return;
     }
 
-    const deltaVec = this._tmpGpsDelta.set(target.x - dolly.position.x, 0, target.z - dolly.position.z);
-    const planar = deltaVec.length();
-    const deadzone = Math.max(0.2, this._gpsDeadzoneMeters || 0);
-    const maxStep = Math.max(deadzone, this._gpsMaxStepMeters || 6);
+    const allowHeading = this._gpsLockEnabled && source !== 'manual';
+    let moveDx = 0;
+    let moveDz = 0;
+    if (this._gpsLastWorldValid) {
+      moveDx = target.x - this._gpsLastWorld.x;
+      moveDz = target.z - this._gpsLastWorld.z;
+    }
 
-    if (planar > deadzone) {
-      const stepRatio = planar > maxStep ? (maxStep / planar) : 1;
-      dolly.position.x += deltaVec.x * stepRatio;
-      dolly.position.z += deltaVec.z * stepRatio;
+    dolly.position.x = target.x;
+    dolly.position.z = target.z;
+
+    if (allowHeading && this._gpsLastWorldValid) {
+      this._applyMotionHeadingFromVector(moveDx, moveDz, { minDistance: this._gpsHeadingMinMeters });
     }
 
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
@@ -930,6 +939,9 @@ class App {
       dolly.position.y = groundY + eyeHeight;
       this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
     }
+
+    this._gpsLastWorld.set(target.x, 0, target.z);
+    this._gpsLastWorldValid = true;
 
     if (this._gpsFilter) {
       if (!this._gpsFilter.lastWorld) this._gpsFilter.lastWorld = new THREE.Vector3();
@@ -945,6 +957,46 @@ class App {
 
     this.hexGridMgr?.update?.(dolly.position);
     this._nextHexUpdateMs = 0;
+  }
+
+  _applyMotionHeadingFromVector(dx, dz, { minDistance = null } = {}) {
+    if (!this._gpsLockEnabled) return;
+    if (!Number.isFinite(dx) || !Number.isFinite(dz)) return;
+    const threshold = Number.isFinite(minDistance) ? Math.max(0, minDistance) : Math.max(0, this._gpsHeadingMinMeters || 0);
+    const magnitudeSq = dx * dx + dz * dz;
+    if (threshold > 0 && magnitudeSq < threshold * threshold) return;
+    if (magnitudeSq < 1e-6) return;
+    const heading = Math.atan2(dx, -dz);
+    this._applyMotionHeading(heading);
+  }
+
+  _applyMotionHeading(headingRad) {
+    if (!Number.isFinite(headingRad)) return;
+    const renderer = this.sceneMgr?.renderer;
+    if (renderer?.xr?.isPresenting) return;
+
+    const yaw = this._wrapAngle(headingRad);
+    if (Number.isFinite(this._lastGpsHeading)) {
+      const delta = Math.abs(this._wrapAngle(yaw - this._lastGpsHeading));
+      if (delta < THREE.MathUtils.degToRad(0.35)) return;
+    }
+
+    const applied = this.move?.setExternalHeading?.(yaw);
+    let headingApplied = applied === true;
+
+    if (!headingApplied) {
+      const dolly = this.sceneMgr?.dolly;
+      if (!dolly) return;
+      const euler = this._tmpEuler.set(0, yaw, 0, 'YXZ');
+      dolly.rotation.set(0, yaw, 0);
+      dolly.quaternion.setFromEuler(euler);
+      dolly.updateMatrixWorld?.(true);
+      headingApplied = true;
+    }
+
+    if (headingApplied) {
+      this._lastGpsHeading = yaw;
+    }
   }
 
   _handleMiniMapTeleport({ lat, lon } = {}) {
@@ -1045,6 +1097,7 @@ class App {
       dolly.rotation.set(0, yawVal, 0);
       dolly.quaternion.setFromEuler(new THREE.Euler(0, yawVal, 0, 'YXZ'));
       this._pitch = 0;
+      this.sceneMgr.camera.quaternion.identity();
       this.sceneMgr.camera.rotation.set(0, 0, 0);
       this.sceneMgr.camera.up.set(0, 1, 0);
       this.physics?.setCharacterPosition?.(dolly.position, eye);
@@ -1096,6 +1149,10 @@ class App {
         this._mobileNav.active = false;
         this._mobileNav.initialized = false;
         this._mobileNav.velocity?.set?.(0, 0, 0);
+      }
+      if (!this._gpsLockEnabled) {
+        this._gpsLastWorldValid = false;
+        this._lastGpsHeading = null;
       }
     }
 
@@ -2381,11 +2438,12 @@ class App {
     nav.lastPredictTs = now;
     nav.accuracy = detail.accuracy ?? nav.accuracy;
 
-    this._updateCompassCorrection({
-      headingRad: headingRadFromDetail,
-      deltaWorld,
-      speed: Number.isFinite(nav.speed) ? nav.speed : null,
-    });
+    if (deltaWorld && detail?.source !== 'manual') {
+      this._applyMotionHeadingFromVector(deltaWorld.dx, deltaWorld.dz, { minDistance: this._gpsHeadingMinMeters });
+    }
+
+    this._gpsLastWorld.set(nav.positionWorld.x, 0, nav.positionWorld.z);
+    this._gpsLastWorldValid = true;
 
     this._locationState = { lat, lon };
     if (detail.source) this._locationSource = detail.source;
@@ -2438,20 +2496,19 @@ class App {
     dolly.position.x = THREE.MathUtils.damp(dolly.position.x, nav.predictedWorld.x, 6, elapsed);
     dolly.position.z = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
 
-    const yawInfo = this.sensors.getYawPitch?.();
-    const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
-    const compassOffset = this._getCompassYawOffset() || 0;
-    const totalOffset = this._wrapAngle(compassOffset + manualOffset);
-
-    if (yawInfo?.ready && Number.isFinite(yawInfo.yaw)) {
-      this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = this._wrapAngle(yawInfo.yaw + totalOffset);
-      dolly.quaternion.setFromEuler(this._tmpEuler);
-    } else if (Number.isFinite(nav.headingRad)) {
-      this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
-      this._tmpEuler.y = this._wrapAngle(nav.headingRad + totalOffset);
-      dolly.quaternion.setFromEuler(this._tmpEuler);
+    if (Number.isFinite(nav.velocity.x) && Number.isFinite(nav.velocity.z)) {
+      const speedSq = nav.velocity.x * nav.velocity.x + nav.velocity.z * nav.velocity.z;
+      if (speedSq > 1e-6) {
+        nav.headingRad = Math.atan2(nav.velocity.x, -nav.velocity.z);
+      }
     }
+
+    this._applyMotionHeadingFromVector(nav.velocity.x, nav.velocity.z, {
+      minDistance: this._gpsHeadingVelocityMin,
+    });
+
+    this._gpsLastWorld.set(dolly.position.x, 0, dolly.position.z);
+    this._gpsLastWorldValid = true;
 
     if (this.hexGridMgr?.origin) {
       const fused = worldToLatLon(dolly.position.x, dolly.position.z, this.hexGridMgr.origin.lat, this.hexGridMgr.origin.lon);
@@ -2709,43 +2766,6 @@ class App {
   _getCompassYawOffset() {
     if (!this._gpsLockEnabled || !this._compassEnabled || this._compassYawConfidence <= 0) return 0;
     return this._compassYawOffset;
-  }
-
-  _updateCompassCorrection({ headingRad = null, deltaWorld = null, speed = null }) {
-    if (!this._gpsLockEnabled || !this._compassEnabled) return;
-    const yawInfo = this.sensors.getYawPitch?.();
-    if (!yawInfo?.ready) return;
-    const sensorYaw = yawInfo.yaw;
-    if (!Number.isFinite(sensorYaw)) return;
-
-    let targetYaw = Number.isFinite(headingRad) ? headingRad : null;
-
-    if (!Number.isFinite(targetYaw) && deltaWorld) {
-      const { dx = 0, dz = 0 } = deltaWorld;
-      const distSq = dx * dx + dz * dz;
-      if (distSq > 0.09) {
-        targetYaw = Math.atan2(dx, -dz);
-      }
-    }
-
-    if (!Number.isFinite(targetYaw)) return;
-
-    const diff = this._wrapAngle(targetYaw - sensorYaw);
-    if (this._compassYawConfidence <= 0) {
-      this._compassYawOffset = diff;
-    } else {
-      const delta = this._wrapAngle(diff - this._compassYawOffset);
-      const weight = Number.isFinite(speed)
-        ? THREE.MathUtils.clamp(Math.abs(speed) / 5, 0.08, 0.3)
-        : 0.12;
-      this._compassYawOffset = this._wrapAngle(this._compassYawOffset + delta * weight);
-    }
-
-    this._compassYawConfidence = Math.min(1, this._compassYawConfidence + 0.2);
-    const now = (typeof performance !== 'undefined' && performance.now)
-      ? performance.now()
-      : Date.now();
-    this._compassLastUpdate = now;
   }
 
   _updateCompassDial() {
@@ -3622,7 +3642,7 @@ class App {
     } else if (Number.isFinite(pose.pitch)) {
       const clamped = THREE.MathUtils.clamp(pose.pitch, this._pitchMin, this._pitchMax);
       this._pitch = clamped;
-      camera.rotation.set(clamped, 0, 0);
+      camera.quaternion.setFromEuler(new THREE.Euler(clamped, 0, 0, 'YXZ'));
     }
     camera.up.set(0, 1, 0);
 
@@ -3789,7 +3809,9 @@ class App {
           const roll = THREE.MathUtils.clamp(deviceEuler.z, -Math.PI / 2, Math.PI / 2);
           const bodyQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ'));
           dolly.quaternion.copy(bodyQuat);
-          camera.rotation.set(pitch, 0, roll);
+          dolly.rotation.set(0, yaw, 0);
+          const camEuler = new THREE.Euler(pitch, 0, roll, 'YXZ');
+          camera.quaternion.setFromEuler(camEuler);
           camera.up.set(0, 1, 0);
           this._pitch = pitch;
         } else {
@@ -3797,8 +3819,11 @@ class App {
           const yawAbs = e.y;
           const pitchDelta = e.x;
           this._pitch = THREE.MathUtils.clamp(this._pitch + pitchDelta, this._pitchMin, this._pitchMax);
+          const yawEuler = this._tmpEuler.set(0, yawAbs, 0, 'YXZ');
+          dolly.quaternion.setFromEuler(yawEuler);
           dolly.rotation.set(0, yawAbs, 0);
-          camera.rotation.set(this._pitch, 0, 0);
+          const camEuler = this._tmpEuler.set(this._pitch, 0, 0, 'YXZ');
+          camera.quaternion.setFromEuler(camEuler);
           camera.up.set(0, 1, 0);
         }
       });

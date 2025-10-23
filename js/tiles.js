@@ -9,8 +9,9 @@ import { TerrainRelay } from './terrainRelay.js';
 
 const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
-const DM_BUDGET_BYTES = 2800;
-const MAX_LOCATIONS_PER_BATCH = 1000;
+const DM_BUDGET_BYTES = 9600;
+const MAX_LOCATIONS_PER_BATCH = 1800;
+const TERRAIN_FETCH_BOOST = 2;
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
 
@@ -42,9 +43,9 @@ export class TileManager {
     this.FARFIELD_EXTRA = 20;
     this.FARFIELD_RING = this.VISUAL_RING + this.FARFIELD_EXTRA;
     // turbo: do not throttle per-frame visual tile creation
-    this.VISUAL_CREATE_BUDGET = 60;
-    this.FARFIELD_CREATE_BUDGET = 60;
-    this.FARFIELD_BATCH_SIZE = 60;
+    this.VISUAL_CREATE_BUDGET = 120;
+    this.FARFIELD_CREATE_BUDGET = 180;
+    this.FARFIELD_BATCH_SIZE = 180;
     this.FARFIELD_NEAR_PAD = 6;
 
     // ---- interactive (high-res) relaxation ----
@@ -96,6 +97,7 @@ export class TileManager {
     this._overlayCtx = null;
     this._treeEnabled = true;
     this._treeAssets = null;
+    this.TREE_LOD_DISTANCES = { medium: 55, low: 140, cull: 240 };
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -155,12 +157,12 @@ export class TileManager {
     this._populateInflight = 0;
     this._populateBusy = false;        // legacy flag
     this._populateDrainPending = false;
-    this.MAX_CONCURRENT_POPULATES = 8; // lower concurrency to soften bursts
+    this.MAX_CONCURRENT_POPULATES = 18; // allow aggressive concurrent fetch/populate passes
     this._encoder = new TextEncoder();
 
     // ---- network governor (token bucket) ----
-    this.RATE_QPS = 12;               // max terrainRelay calls per second
-    this.RATE_BPS = 256 * 1024;       // max payload bytes per second
+    this.RATE_QPS = 36;               // max terrainRelay calls per second
+    this.RATE_BPS = 768 * 1024;       // max payload bytes per second
     this._rateTokensQ = this.RATE_QPS;
     this._rateTokensB = this.RATE_BPS;
     this._rateLastRefillAt = this._nowMs();
@@ -176,11 +178,12 @@ export class TileManager {
 
     this._heightCache = new Map();
     this._heightCacheTTL = 250;
-   this._heightCacheScale = 2;
-   this._heightMeshesFallback = [];
-   this._heightListeners = new Set();
-   this._farfieldAdapterDirty = new Set();
+    this._heightCacheScale = 2;
+    this._heightMeshesFallback = [];
+    this._heightListeners = new Set();
+    this._farfieldAdapterDirty = new Set();
     this._tmpSampleVec = new THREE.Vector3();
+    this._treeHeightListener = this.addHeightListener((sample) => this._onTreeHeightSample(sample));
   }
 
   /* ---------------- small helpers ---------------- */
@@ -1365,10 +1368,38 @@ _stitchInteractiveToVisualEdges(tile, {
       roughness: 0.8,
       metalness: 0.05,
     });
-    this._treeAssets = { trunkMat, foliageMatBroad, foliageMatConifer, branchMat };
+    const trunkMatSimple = new THREE.MeshStandardMaterial({
+      color: 0x4f341c,
+      roughness: 0.9,
+      metalness: 0.02,
+    });
+    const foliageMatSimple = new THREE.MeshStandardMaterial({
+      color: 0x2a5c36,
+      roughness: 0.7,
+      metalness: 0.03,
+      emissive: 0x062512,
+      emissiveIntensity: 0.04,
+    });
+    const foliageBillboardMat = new THREE.MeshBasicMaterial({
+      color: 0x2f6b3c,
+      transparent: true,
+      opacity: 0.78,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    foliageBillboardMat.toneMapped = false;
+    this._treeAssets = {
+      trunkMat,
+      trunkMatSimple,
+      foliageMatBroad,
+      foliageMatConifer,
+      foliageMatSimple,
+      foliageBillboardMat,
+      branchMat,
+    };
     return this._treeAssets;
   }
-  _createTreeMesh(type, assets) {
+  _createTreeDetailedMesh(type, assets) {
     const tree = new THREE.Group();
     tree.name = 'tree';
 
@@ -1661,41 +1692,182 @@ _stitchInteractiveToVisualEdges(tile, {
 
     return tree;
   }
+
+  _createTreeSimplifiedMesh(type, assets) {
+    const group = new THREE.Group();
+    group.name = 'tree-medium';
+
+    const trunkHeight = type === 'conifer'
+      ? THREE.MathUtils.randFloat(5.8, 7.4)
+      : THREE.MathUtils.randFloat(4.6, 6.2);
+    const trunkRadius = type === 'conifer'
+      ? THREE.MathUtils.randFloat(0.14, 0.18)
+      : THREE.MathUtils.randFloat(0.16, 0.22);
+    const trunkGeom = new THREE.CylinderGeometry(trunkRadius * 0.6, trunkRadius, trunkHeight, 5, 1);
+    const trunk = new THREE.Mesh(trunkGeom, assets.trunkMatSimple);
+    trunk.castShadow = true;
+    trunk.receiveShadow = true;
+    trunk.position.y = trunkHeight / 2;
+    group.add(trunk);
+
+    if (type === 'conifer') {
+      const coneGeom = new THREE.ConeGeometry(trunkHeight * 0.45, trunkHeight * 0.95, 6, 1, true);
+      const canopy = new THREE.Mesh(coneGeom, assets.foliageMatSimple);
+      canopy.castShadow = true;
+      canopy.receiveShadow = true;
+      canopy.position.y = trunkHeight * 0.62;
+      canopy.rotation.x = THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(1.5));
+      group.add(canopy);
+    } else {
+      const sphereGeom = new THREE.IcosahedronGeometry(trunkHeight * 0.36, 1);
+      const canopy = new THREE.Mesh(sphereGeom, assets.foliageMatSimple);
+      canopy.castShadow = true;
+      canopy.receiveShadow = true;
+      canopy.position.y = trunkHeight * 0.78;
+      canopy.scale.set(THREE.MathUtils.randFloat(0.95, 1.1), THREE.MathUtils.randFloat(1, 1.15), THREE.MathUtils.randFloat(0.95, 1.1));
+      group.add(canopy);
+    }
+
+    return group;
+  }
+
+  _createTreeBillboard(type, assets) {
+    const group = new THREE.Group();
+    group.name = 'tree-low';
+
+    const trunkHeight = type === 'conifer'
+      ? THREE.MathUtils.randFloat(4.5, 5.6)
+      : THREE.MathUtils.randFloat(3.6, 4.5);
+    const trunkRadius = THREE.MathUtils.randFloat(0.12, 0.16);
+    const trunkGeom = new THREE.CylinderGeometry(trunkRadius * 0.55, trunkRadius, trunkHeight, 4, 1);
+    const trunk = new THREE.Mesh(trunkGeom, assets.trunkMatSimple);
+    trunk.castShadow = false;
+    trunk.receiveShadow = false;
+    trunk.position.y = trunkHeight / 2;
+    group.add(trunk);
+
+    const canopyHeight = type === 'conifer' ? trunkHeight * 1.55 : trunkHeight * 1.25;
+    const canopyWidth = type === 'conifer' ? canopyHeight * 0.42 : canopyHeight * 0.66;
+    const planeGeom = new THREE.PlaneGeometry(canopyWidth, canopyHeight);
+    const planes = [0, Math.PI / 2];
+    for (const ang of planes) {
+      const plane = new THREE.Mesh(planeGeom, assets.foliageBillboardMat);
+      plane.position.y = trunkHeight * 0.65;
+      plane.rotation.y = ang;
+      plane.renderOrder = 2;
+      group.add(plane);
+    }
+
+    return group;
+  }
+
+  _buildTreeLod(type, assets, scale = 1) {
+    const lod = new THREE.LOD();
+    const detailed = this._createTreeDetailedMesh(type, assets);
+    const medium = this._createTreeSimplifiedMesh(type, assets);
+    const low = this._createTreeBillboard(type, assets);
+
+    detailed.scale.setScalar(scale);
+    medium.scale.setScalar(scale);
+    low.scale.setScalar(scale);
+
+    lod.addLevel(detailed, 0);
+    lod.addLevel(medium, this.TREE_LOD_DISTANCES.medium);
+    lod.addLevel(low, this.TREE_LOD_DISTANCES.low);
+    const culled = new THREE.Object3D();
+    culled.visible = false;
+    lod.addLevel(culled, this.TREE_LOD_DISTANCES.cull);
+
+    lod.userData.species = type;
+    lod.userData.lodChildren = { detailed, medium, low };
+
+    return lod;
+  }
+
   _spawnTreesForTile(tile, worldPositions = []) {
     this._clearTileTrees(tile);
-    if (!worldPositions.length) return;
+    if (!this._treeEnabled || !worldPositions.length) return;
+
     const assets = this._ensureTreeAssets();
     const basePos = tile.grid.group.position;
     const group = new THREE.Group();
     group.name = 'tile-trees';
+
+    tile._treeInstances = [];
+    tile._treeSamples = [];
+
     for (const pos of worldPositions) {
       const species = Math.random() < 0.55 ? 'deciduous' : 'conifer';
-      const tree = this._createTreeMesh(species, assets);
       const scale = species === 'conifer'
         ? THREE.MathUtils.randFloat(0.8, 1.2)
         : THREE.MathUtils.randFloat(0.75, 1.35);
-      tree.scale.setScalar(scale);
-      const localX = pos.x - basePos.x + THREE.MathUtils.randFloatSpread(1.5);
-      const localZ = pos.z - basePos.z + THREE.MathUtils.randFloatSpread(1.5);
+
+      const jitterX = THREE.MathUtils.randFloatSpread(1.6);
+      const jitterZ = THREE.MathUtils.randFloatSpread(1.6);
+      const localX = pos.x - basePos.x + jitterX;
+      const localZ = pos.z - basePos.z + jitterZ;
       const worldX = basePos.x + localX;
       const worldZ = basePos.z + localZ;
-      let groundY = this.getHeightAt(worldX, worldZ);
-      if (!Number.isFinite(groundY)) groundY = pos.y;
-      if (!tile._treeSamples) tile._treeSamples = [];
-      tile._treeSamples.push({ x: worldX, z: worldZ });
+      const groundY = this.getHeightAt(worldX, worldZ);
+      if (!Number.isFinite(groundY)) continue;
+
+      const tree = this._buildTreeLod(species, assets, scale);
       tree.position.set(localX, groundY, localZ);
       tree.rotation.y = Math.random() * Math.PI * 2;
+      tree.userData.anchor = { worldX, worldZ };
+
       group.add(tree);
+      tile._treeInstances.push({ object: tree, worldX, worldZ });
+      tile._treeSamples.push({ x: worldX, z: worldZ });
     }
+
+    if (!tile._treeInstances.length) {
+      tile._treeInstances = null;
+      tile._treeSamples = null;
+      return;
+    }
+
     tile.grid.group.add(group);
     tile._treeGroup = group;
+    this._resnapTreesForTile(tile);
   }
+
+  _resnapTreesForTile(tile) {
+    if (!tile || !tile._treeInstances || !tile._treeInstances.length) return;
+    let anyVisible = false;
+    for (const inst of tile._treeInstances) {
+      const height = this.getHeightAt(inst.worldX, inst.worldZ);
+      if (!Number.isFinite(height)) {
+        inst.object.visible = false;
+        continue;
+      }
+      inst.object.visible = true;
+      inst.object.position.y = height;
+      anyVisible = true;
+    }
+    if (tile._treeGroup) tile._treeGroup.visible = anyVisible;
+  }
+
+  _onTreeHeightSample(sample = {}) {
+    const tile = sample?.tile;
+    if (!tile || !tile._treeInstances || !tile._treeInstances.length) return;
+    if (tile._treeSnapScheduled) return;
+    tile._treeSnapScheduled = true;
+    requestAnimationFrame(() => {
+      tile._treeSnapScheduled = false;
+      this._resnapTreesForTile(tile);
+    });
+  }
+
   _clearTileTrees(tile) {
-    if (!tile || !tile._treeGroup) return;
-    try {
-      tile.grid.group.remove(tile._treeGroup);
-    } catch { }
+    if (!tile) return;
+    if (tile._treeGroup) {
+      try { tile.grid.group.remove(tile._treeGroup); } catch { }
+    }
     tile._treeGroup = null;
+    tile._treeSnapScheduled = false;
+    if (tile._treeInstances) tile._treeInstances.length = 0;
+    tile._treeInstances = null;
     if (tile._treeSamples) tile._treeSamples.length = 0;
   }
   _prepareRoadStamp(stamp) {
@@ -4174,17 +4346,17 @@ update(playerPos) {
     const heartbeatFail = metrics?.heartbeatFail ?? 0;
 
     if (!isConnected) {
-      this.MAX_CONCURRENT_POPULATES = 4;
-      this.RATE_QPS = 4; this.RATE_BPS = 96 * 1024;
-    } else if (consecutive >= 6 || heartbeatFail > 2) {
-      this.MAX_CONCURRENT_POPULATES = 4;
-      this.RATE_QPS = 4; this.RATE_BPS = 96 * 1024;
-    } else if (consecutive > 0 || heartbeatFail > 0) {
       this.MAX_CONCURRENT_POPULATES = 6;
-      this.RATE_QPS = 6; this.RATE_BPS = 128 * 1024;
-    } else {
+      this.RATE_QPS = 6; this.RATE_BPS = 160 * 1024;
+    } else if (consecutive >= 6 || heartbeatFail > 2) {
+      this.MAX_CONCURRENT_POPULATES = 6;
+      this.RATE_QPS = 6; this.RATE_BPS = 160 * 1024;
+    } else if (consecutive > 0 || heartbeatFail > 0) {
       this.MAX_CONCURRENT_POPULATES = 12;
-      this.RATE_QPS = 12; this.RATE_BPS = 256 * 1024;
+      this.RATE_QPS = 18; this.RATE_BPS = 384 * 1024;
+    } else {
+      this.MAX_CONCURRENT_POPULATES = 18;
+      this.RATE_QPS = 36; this.RATE_BPS = 768 * 1024;
     }
 
     if (isConnected && !this._relayWasConnected) {
@@ -4292,10 +4464,18 @@ update(playerPos) {
       this._scheduleBackfill(0);
     }
 
-    const visualBudget = Math.max(1, Math.round(THREE.MathUtils.lerp(baseVisualBudget * 0.25, baseVisualBudget, norm)));
-    this.VISUAL_CREATE_BUDGET = visualBudget;
-    this.FARFIELD_CREATE_BUDGET = Math.max(4, Math.round(THREE.MathUtils.lerp(baseFarfieldBudget * 0.35, baseFarfieldBudget * 1.15, norm)));
-    this.FARFIELD_BATCH_SIZE = Math.max(4, Math.round(THREE.MathUtils.lerp(Math.max(8, baseFarfieldBatch * 0.5), baseFarfieldBatch * 1.1, norm)));
+    const visualBudgetBase = Math.max(1, Math.round(THREE.MathUtils.lerp(baseVisualBudget * 0.25, baseVisualBudget, norm)));
+    const farfieldCreateBase = Math.max(4, Math.round(THREE.MathUtils.lerp(baseFarfieldBudget * 0.35, baseFarfieldBudget * 1.15, norm)));
+    const farfieldBatchBase = Math.max(4, Math.round(THREE.MathUtils.lerp(Math.max(8, baseFarfieldBatch * 0.5), baseFarfieldBatch * 1.1, norm)));
+
+    const fetchBoost = TERRAIN_FETCH_BOOST;
+    const boostedVisualBudget = Math.max(visualBudgetBase, Math.round(baseVisualBudget * fetchBoost));
+    const boostedFarfieldCreate = Math.max(farfieldCreateBase, Math.round(baseFarfieldBudget * fetchBoost));
+    const boostedFarfieldBatch = Math.max(farfieldBatchBase, Math.round(baseFarfieldBatch * fetchBoost));
+
+    this.VISUAL_CREATE_BUDGET = boostedVisualBudget;
+    this.FARFIELD_CREATE_BUDGET = boostedFarfieldCreate;
+    this.FARFIELD_BATCH_SIZE = boostedFarfieldBatch;
 
     this.RELAX_ITERS_PER_FRAME = Math.max(1, Math.round(THREE.MathUtils.lerp(Math.max(4, baseRelaxIters * 0.45), baseRelaxIters * 1.25, norm)));
     this.RELAX_FRAME_BUDGET_MS = +(THREE.MathUtils.lerp(Math.max(0.6, baseRelaxBudget * 0.6), baseRelaxBudget * 1.45, norm).toFixed(2));
