@@ -177,7 +177,7 @@
     </div>
 
     <div class="hud-userlist-footer">
-      <button id="hudUsersToggle" type="button" aria-expanded="false">Users ▸</button>
+      <button id="hudUsersToggle" class="ghost" type="button" aria-expanded="false">Users ▸</button>
       <div id="hudUserPanel" class="hud-user-panel" hidden>
         <div id="hudUserList" class="hud-user-list"></div>
       </div>
@@ -236,7 +236,7 @@
     <div class="wrapper">
       <header class="modal-header">
         <h2>Control Center</h2>
-        <button id="closeButton" type="button" aria-label="Close Control Center">&times;</button>
+        <button id="closeButton" class="ghost" type="button" aria-label="Close Control Center">&times;</button>
       </header>
 
       <div class="control-tabs" id="controlTabs">
@@ -271,7 +271,7 @@
               <div class="input-row">
                 <input id="displayNameInput" type="text" maxlength="24" autocomplete="off" spellcheck="false"
                   placeholder="Choose how others see you" />
-                <button id="displayNameSave" type="button">Save</button>
+                <button id="displayNameSave" class="secondary" type="button">Save</button>
               </div>
               <p class="tiny">Pick a short prefix shown to other players instead of your full NKN address.</p>
               <div class="kv">terrain: <span class="mono" id="terrainRelayStatus">idle</span></div>
@@ -310,13 +310,13 @@
             <section class="modal-section">
               <h3 class="section-title">Navigation &amp; Sensors</h3>
               <div class="button-row">
-                <button id="request" type="button">Enable Sensors</button>
-                <button id="geo" type="button">Enable Geolocation</button>
+                <button id="request" class="ghost" type="button">Enable Sensors</button>
+                <button id="geo" class="ghost" type="button">Enable Geolocation</button>
               </div>
               <div class="mini-map-controls">
-                <button id="miniMapRecenter" type="button">Follow: On</button>
-                <button id="miniMapSet" type="button">Set Location</button>
-                <button id="yawAssistToggle" type="button">Yaw Corr: On</button>
+                <button id="miniMapRecenter" class="ghost" type="button">Follow: On</button>
+                <button id="miniMapSet" class="ghost" type="button">Set Location</button>
+                <button id="yawAssistToggle" class="ghost" type="button">Yaw Corr: On</button>
               </div>
               <div class="slider-row">
                 <label for="yawOffsetRange">Yaw Offset <span id="yawOffsetValue">0°</span></label>
@@ -337,7 +337,7 @@
               <div class="mini-map-manual">
                 <input id="miniMapLat" type="text" class="mono" placeholder="Manual lat" spellcheck="false" />
                 <input id="miniMapLon" type="text" class="mono" placeholder="Manual lon" spellcheck="false" />
-                <button id="miniMapApply" type="button">Apply Manual</button>
+                <button id="miniMapApply" class="ghost" type="button">Apply Manual</button>
               </div>
               <div id="miniMapStatus" class="tiny">Determining location…</div>
             </section>
@@ -383,7 +383,7 @@
                 <div class="hybrid-chat-controls">
                   <input id="hybridChatInput" type="text" placeholder="Message" autocomplete="off"
                     spellcheck="false">
-                  <button id="hybridChatSend" type="button">Send</button>
+                  <button id="hybridChatSend" class="secondary" type="button">Send</button>
                 </div>
               </div>
             </section>
@@ -482,8 +482,8 @@
                 <input id="envTileRadius" type="range" min="60" max="180" step="5" value="100" />
               </div>
               <div class="button-row">
-                <button id="envTerrainApply" type="button">Update Terrain</button>
-                <button id="envTerrainAuto" type="button" data-state="on">Auto (On)</button>
+                <button id="envTerrainApply" class="secondary" type="button">Update Terrain</button>
+                <button id="envTerrainAuto" class="ghost" type="button" data-state="on">Auto (On)</button>
               </div>
               <div class="slider-row">
                 <label for="envTerrainTargetFps">Target FPS <span class="mono" id="envTerrainTargetFpsValue">60
@@ -501,8 +501,8 @@
                 <input id="envBuildingRadius" type="range" min="400" max="8000" step="100" value="3000" />
               </div>
               <div class="button-row">
-                <button id="envBuildingApply" type="button">Update Buildings</button>
-                <button id="envBuildingAuto" type="button" data-state="on">Auto (On)</button>
+                <button id="envBuildingApply" class="secondary" type="button">Update Buildings</button>
+                <button id="envBuildingAuto" class="ghost" type="button" data-state="on">Auto (On)</button>
               </div>
               <div class="slider-row">
                 <label for="envBuildingTargetFps">Target FPS <span class="mono" id="envBuildingTargetFpsValue">60
@@ -515,7 +515,7 @@
           <div class="tab-panel" id="tab-diagnostics" role="tabpanel" data-tab-panel="diagnostics" hidden>
             <section class="modal-section">
               <h3 class="section-title">Wallet</h3>
-              <button id="nuke" title="Hard reset identity &amp; caches">
+              <button id="nuke" class="ghost" title="Hard reset identity &amp; caches">
                 <span class="sub">NUKE CREDENTIALS — hard reset identity &amp; caches</span>
               </button>
               <div class="modal-note">Generates a new NKN seed and clears caches. You will appear as a fresh peer.</div>
@@ -549,8 +549,8 @@
                     min="0.01" /></label>
               </div>
               <div class="button-row">
-                <button id="diagPidApply" type="button">Apply Gains</button>
-                <button id="diagPidReset" type="button">Reset Integrator</button>
+                <button id="diagPidApply" class="secondary" type="button">Apply Gains</button>
+                <button id="diagPidReset" class="ghost" type="button">Reset Integrator</button>
               </div>
             </section>
 
@@ -559,7 +559,7 @@
               <div id="processLeaderboard" class="process-leaderboard">
                 <div class="process-header">
                   <div class="tiny">Sorted by average latency</div>
-                  <button id="processReset" type="button" class="process-reset" title="Clear collected metrics">Reset
+                  <button id="processReset" type="button" class="process-reset ghost" title="Clear collected metrics">Reset
                     Metrics</button>
                 </div>
                 <div id="processCards" class="process-cards"></div>
@@ -582,7 +582,7 @@
       <input id="nameModalInput" type="text" maxlength="24" autocomplete="off" spellcheck="false"
         placeholder="Enter a short name" />
       <div class="name-modal-actions">
-        <button id="nameModalSave" type="button">Save</button>
+        <button id="nameModalSave" class="secondary" type="button">Save</button>
       </div>
     </div>
   </div>
