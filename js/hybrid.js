@@ -1,4 +1,6 @@
+import * as THREE from 'three';
 import { ui, pushToast } from './ui.js';
+import { latLonToWorld } from './geolocate.js';
 
 const NETWORKS = {
   NOCLIP: 'noclip',
@@ -36,6 +38,7 @@ class EventHub {
 export class HybridHub {
   constructor({ mesh }) {
     this.mesh = mesh;
+    this.app = mesh?.app || null;
     this.state = {
       network: NETWORKS.NOCLIP,
       selectedKey: null,
@@ -51,6 +54,9 @@ export class HybridHub {
     };
     this._disposers = [];
     this._uiBound = false;
+    this.resources = new Map();
+    this.resourceLayer = null;
+    this._stateTimer = null;
   }
 
   init() {
@@ -89,10 +95,12 @@ export class HybridHub {
     if (this.mesh?.on) {
       this._disposers.push(this.mesh.on('noclip-peer', (data) => this._handleNoclipPeer(data?.peer)));
       this._disposers.push(this.mesh.on('noclip-chat', (data) => this._handleNoclipChat(data)));
+      this._disposers.push(this.mesh.on('noclip-bridge', (data) => this._handleBridgeEvent(data)));
     }
 
     // seed with current peers
     this._primeNoclipPeers();
+    this._ensureResourceLayer();
     this.setNetwork(this.state.network);
   }
 
@@ -105,6 +113,11 @@ export class HybridHub {
       }
     });
     this._disposers = [];
+    if (this._stateTimer) {
+      clearTimeout(this._stateTimer);
+      this._stateTimer = null;
+    }
+    this._clearResources();
     if (this.state.hydra.discovery) {
       this.state.hydra.discovery.close().catch(() => {});
       this.state.hydra.discovery = null;
@@ -115,15 +128,21 @@ export class HybridHub {
     if (!this.mesh?.peers) return;
     const entries = Array.from(this.mesh.peers.entries());
     entries.forEach(([pub, info]) => {
+      const loc = info?.meta?.loc;
+      const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
+        ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
+        : null;
       this.state.noclip.peers.set(pub, {
         nknPub: pub,
         addr: info?.addr || pub,
         last: info?.lastTs || 0,
         online: this.mesh._online?.(pub) ?? false,
-        meta: info?.meta || {}
+        meta: info?.meta || {},
+        geo
       });
     });
     this.renderPeers();
+    this._markStateDirty();
   }
 
   async ensureHydraDiscovery() {
@@ -140,9 +159,22 @@ export class HybridHub {
       });
       await discovery.init();
       discovery.on('peer', (peer) => {
-        if (!peer?.nknPub) return;
-        this.state.hydra.peers.set(peer.nknPub, peer);
+        const pub = peer?.nknPub ? peer.nknPub.toLowerCase() : '';
+        if (!pub) return;
+        const loc = peer.meta?.loc;
+        const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
+          ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
+          : null;
+        this.state.hydra.peers.set(pub, {
+          ...peer,
+          nknPub: pub,
+          addr: peer.addr || pub,
+          geo,
+          last: peer.last || nowSecondsFallback(),
+          online: true
+        });
         if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
+        this._flushState();
       });
       discovery.on('dm', ({ from, msg }) => this._handleHydraChat(from, msg));
       discovery.on('status', (status) => {
@@ -151,6 +183,7 @@ export class HybridHub {
       });
       this.state.hydra.discovery = discovery;
       await discovery.start(metaIdentity(this.mesh));
+      await this._flushState();
       return discovery;
     } catch (err) {
       pushToast(`Hydra discovery failed: ${err?.message || err}`);
@@ -190,14 +223,20 @@ export class HybridHub {
   _handleNoclipPeer(peer) {
     if (!peer?.pub) return;
     const pub = peer.pub.toLowerCase();
+    const loc = peer.meta?.loc;
+    const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
+      ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
+      : null;
     this.state.noclip.peers.set(pub, {
       nknPub: pub,
       addr: peer.addr || pub,
       last: peer.lastTs || nowSecondsFallback(),
       online: true,
-      meta: peer.meta || {}
+      meta: peer.meta || {},
+      geo
     });
     if (this.state.network === NETWORKS.NOCLIP) this.renderPeers();
+    this._markStateDirty();
   }
 
   _handleNoclipChat({ from, payload }) {
@@ -207,7 +246,8 @@ export class HybridHub {
     this._appendChat(key, {
       dir: 'in',
       text: payload?.text || '',
-      ts: payload?.ts || nowSecondsFallback()
+      ts: payload?.ts || nowSecondsFallback(),
+      kind: 'chat'
     });
     if (this.state.selectedKey === key) {
       this.renderChat();
@@ -218,19 +258,24 @@ export class HybridHub {
 
   _handleHydraChat(from, msg) {
     const pub = from ? from.toLowerCase() : '';
-    if (!pub) return;
+    if (!pub || !msg || typeof msg !== 'object') return;
+    if (typeof msg.type === 'string' && msg.type.startsWith('hybrid-')) return;
     const key = makeScopedKey(NETWORKS.HYDRA, pub);
     if (msg.type === 'chat-message') {
+      const peerRecord = this.state.hydra.peers.get(pub);
+      if (peerRecord) peerRecord.last = msg.ts || nowSecondsFallback();
       this._appendChat(key, {
         dir: 'in',
         text: msg.text || '',
-        ts: msg.ts || nowSecondsFallback()
+        ts: msg.ts || nowSecondsFallback(),
+        kind: 'chat'
       });
       if (this.state.selectedKey === key) {
         this.renderChat();
       } else {
         pushToast(`Hydra message from ${shortPub(pub)}`);
       }
+      if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
     }
   }
 
@@ -241,7 +286,9 @@ export class HybridHub {
       dir: entry.dir || 'in',
       text: entry.text || '',
       ts: entry.ts || nowSecondsFallback(),
-      id: entry.id || generateBridgeId()
+      id: entry.id || generateBridgeId(),
+      kind: entry.kind || 'chat',
+      meta: entry.meta || null
     });
     this.state.chat.set(scopedKey, list.slice(-200));
   }
@@ -261,7 +308,7 @@ export class HybridHub {
       const target = pub;
       try {
         this.mesh?.discovery?.dm(target, { type: 'chat-message', text, ts, id });
-        this._appendChat(selected, { dir: 'out', text, ts, id });
+        this._appendChat(selected, { dir: 'out', text, ts, id, kind: 'chat' });
         this.renderChat();
       } catch (err) {
         pushToast(`Send failed: ${err?.message || err}`);
@@ -275,7 +322,7 @@ export class HybridHub {
       discovery.dm(pub, { type: 'chat-message', text, ts, id }).catch((err) => {
         pushToast(`Hydra send failed: ${err?.message || err}`);
       });
-      this._appendChat(selected, { dir: 'out', text, ts, id });
+      this._appendChat(selected, { dir: 'out', text, ts, id, kind: 'chat' });
       this.renderChat();
     }
     if (ui.hybridChatInput) ui.hybridChatInput.value = '';
@@ -310,13 +357,357 @@ export class HybridHub {
       label.textContent = displayName(peer);
       const meta = document.createElement('div');
       meta.className = 'hybrid-peer-meta';
-      meta.textContent = `${peer.online ? 'Online' : 'Offline'} • ${formatLast(peer.last)}`;
+      const parts = [peer.online ? 'Online' : 'Offline', `Last ${formatLast(peer.last)}`];
+      if (peer.geo && Number.isFinite(peer.geo.lat) && Number.isFinite(peer.geo.lon)) {
+        if (typeof peer.geo.gh === 'string') parts.push(`gh ${peer.geo.gh.slice(0, 8)}`);
+        else parts.push(`${peer.geo.lat.toFixed(4)}, ${peer.geo.lon.toFixed(4)}`);
+      }
+      meta.textContent = parts.join(' • ');
       row.appendChild(label);
       row.appendChild(meta);
       frag.appendChild(row);
     });
     ui.hybridPeerList.appendChild(frag);
     if (ui.hybridPeerSummary) ui.hybridPeerSummary.textContent = `${peers.length} peer${peers.length === 1 ? '' : 's'} • ${network === NETWORKS.HYDRA ? 'Hydra' : 'NoClip'}`;
+  }
+
+  _handleBridgeEvent(evt) {
+    const from = evt?.from ? evt.from.toLowerCase() : '';
+    const payload = evt?.payload;
+    if (!from || !payload || typeof payload !== 'object') return;
+    const type = payload.type || '';
+    const peerRecord = this.state.hydra.peers.get(from);
+    if (peerRecord) peerRecord.last = payload.ts || nowSecondsFallback();
+    if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
+    if (type === 'hybrid-bridge-resource') {
+      this._handleResource(from, payload);
+      return;
+    }
+    if (type === 'hybrid-bridge-command') {
+      const key = makeScopedKey(NETWORKS.HYDRA, from);
+      this._appendChat(key, {
+        dir: 'in',
+        kind: 'command',
+        text: payload.command?.label || 'Command received',
+        meta: { command: payload.command },
+        ts: payload.ts || nowSecondsFallback()
+      });
+      if (this.state.selectedKey === key) this.renderChat();
+      return;
+    }
+    if (type === 'hybrid-bridge-log') {
+      const key = makeScopedKey(NETWORKS.HYDRA, from);
+      this._appendChat(key, {
+        dir: 'in',
+        kind: 'log',
+        text: payload.message || 'Bridge log entry',
+        meta: { details: payload.details || '' },
+        ts: payload.ts || nowSecondsFallback()
+      });
+      if (this.state.selectedKey === key) this.renderChat();
+      return;
+    }
+  }
+
+  _handleResource(from, payload) {
+    const key = makeScopedKey(NETWORKS.HYDRA, from);
+    const resource = payload.resource || {};
+    const issuer = payload.issuer?.graphId || payload.issuer?.nodeId || shortPub(from);
+    const id = resource.id || payload.id || generateBridgeId();
+    if (resource.remove) {
+      this._removeResource(id, issuer);
+      this._appendChat(key, {
+        dir: 'in',
+        kind: 'log',
+        text: `Resource ${id} removed by ${issuer}`,
+        ts: payload.ts || nowSecondsFallback(),
+        meta: { details: '' }
+      });
+      if (this.state.selectedKey === key) this.renderChat();
+      return;
+    }
+    const applied = this._applyResource(id, resource, issuer);
+    this._appendChat(key, {
+      dir: 'in',
+      kind: 'resource',
+      text: `${resource.label || issuer} deployed ${resource.kind || 'resource'}`,
+      ts: payload.ts || nowSecondsFallback(),
+      meta: { resource, issuer }
+    });
+    if (!this.state.selectedKey && this.state.network === NETWORKS.HYDRA) {
+      this.setActivePeer(key);
+    } else if (this.state.selectedKey === key) {
+      this.renderChat();
+    } else if (applied) {
+      pushToast(`Resource from ${issuer}`);
+    }
+  }
+
+  _ensureResourceLayer() {
+    if (this.resourceLayer || !this.app?.sceneMgr?.scene) return;
+    const layer = new THREE.Group();
+    layer.name = 'hybrid-resource-layer';
+    this.app.sceneMgr.scene.add(layer);
+    this.resourceLayer = layer;
+  }
+
+  _clearResources() {
+    this.resources.forEach((entry) => {
+      if (entry?.group && entry.group.parent) entry.group.parent.remove(entry.group);
+      this._disposeResourceEntry(entry);
+    });
+    this.resources.clear();
+    if (this.resourceLayer && this.resourceLayer.parent) {
+      this.resourceLayer.parent.remove(this.resourceLayer);
+    }
+    this.resourceLayer = null;
+  }
+
+  _disposeResourceEntry(entry) {
+    if (!entry) return;
+    const disposeObject = (obj) => {
+      if (!obj) return;
+      if (obj.geometry) {
+        try { obj.geometry.dispose(); } catch (_) {}
+      }
+      if (obj.material) {
+        const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+        materials.forEach((mat) => {
+          if (mat && typeof mat.dispose === 'function') {
+            try { mat.dispose(); } catch (_) {}
+          }
+        });
+      }
+    };
+    try {
+      entry.group?.traverse((child) => disposeObject(child));
+    } catch (_) {
+      disposeObject(entry.group);
+    }
+  }
+
+  _applyResource(id, resource, issuer) {
+    this._ensureResourceLayer();
+    if (!this.resourceLayer) return false;
+    const world = this._resolveWorldPosition(resource);
+    if (!world) return false;
+
+    let entry = this.resources.get(id);
+    if (!entry) {
+      entry = { group: new THREE.Group(), mesh: null, label: null };
+      entry.group.name = `hybrid-resource-${id}`;
+      this.resources.set(id, entry);
+      this.resourceLayer.add(entry.group);
+    }
+
+    entry.group.position.set(world.x, world.y, world.z);
+    let heading = Number(resource.heading);
+    if (!Number.isFinite(heading) && Number.isFinite(resource.headingDeg)) {
+      heading = (Number(resource.headingDeg) * Math.PI) / 180;
+    }
+    entry.group.rotation.set(0, Number.isFinite(heading) ? heading : 0, 0);
+
+    this._applyResourceMesh(entry, resource);
+    this._ensureResourceLabel(entry, resource.label || issuer);
+    entry.resource = resource;
+    entry.issuer = issuer;
+    return true;
+  }
+
+  _removeResource(id, issuer) {
+    const entry = this.resources.get(id);
+    if (!entry) return;
+    if (entry.group?.parent) entry.group.parent.remove(entry.group);
+    this._disposeResourceEntry(entry);
+    this.resources.delete(id);
+    if (issuer) pushToast(`Resource ${id} removed by ${issuer}`);
+  }
+
+  _applyResourceMesh(entry, resource) {
+    if (!entry) return;
+    if (entry.mesh) {
+      entry.group.remove(entry.mesh);
+      this._disposeResourceEntry({ group: entry.mesh });
+      entry.mesh = null;
+    }
+    const scale = Number(resource.scale) > 0 ? Number(resource.scale) : 1;
+    let mesh = null;
+    const color = resource.color || '#8fd2ff';
+    if ((resource.kind || '').toLowerCase() === 'obelisk') {
+      mesh = this._createObeliskMesh(scale, color);
+    } else {
+      mesh = this._createMarkerMesh(scale, color);
+    }
+    entry.mesh = mesh;
+    entry.group.add(mesh);
+  }
+
+  _ensureResourceLabel(entry, text) {
+    if (!entry) return;
+    if (entry.label) {
+      entry.label.material.map.dispose?.();
+      entry.label.material.dispose?.();
+      entry.group.remove(entry.label);
+      entry.label = null;
+    }
+    const sprite = this._createLabelSprite(text || 'bridge');
+    sprite.position.set(0, 6, 0);
+    entry.group.add(sprite);
+    entry.label = sprite;
+  }
+
+  _resolveWorldPosition(resource = {}) {
+    let x = Number(resource.x);
+    let y = Number(resource.y);
+    let z = Number(resource.z);
+
+    if (Array.isArray(resource.world) && resource.world.length >= 3) {
+      x = Number(resource.world[0]);
+      y = Number(resource.world[1]);
+      z = Number(resource.world[2]);
+    } else if (resource.world && typeof resource.world === 'object') {
+      if (Number.isFinite(resource.world.x)) x = Number(resource.world.x);
+      if (Number.isFinite(resource.world.y)) y = Number(resource.world.y);
+      if (Number.isFinite(resource.world.z)) z = Number(resource.world.z);
+    } else if (Array.isArray(resource.position) && resource.position.length >= 3) {
+      x = Number(resource.position[0]);
+      y = Number(resource.position[1]);
+      z = Number(resource.position[2]);
+    }
+
+    const origin = this.mesh?._originLatLon?.();
+    if ((!Number.isFinite(x) || !Number.isFinite(z)) && origin) {
+      let lat = Number(resource.lat);
+      let lon = Number(resource.lon);
+      const geo = resource.geo;
+      if (geo && typeof geo === 'object') {
+        if (Number.isFinite(geo.lat)) lat = Number(geo.lat);
+        if (Number.isFinite(geo.lon)) lon = Number(geo.lon);
+      }
+      if ((!Number.isFinite(lat) || !Number.isFinite(lon)) && typeof resource.geohash === 'string') {
+        const decoded = decodeGeohash(resource.geohash);
+        if (decoded) {
+          lat = decoded.lat;
+          lon = decoded.lon;
+        }
+      }
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+        if (world) {
+          x = world.x;
+          z = world.z;
+        }
+      }
+    }
+
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+
+    let ground = Number.isFinite(resource.ground) ? Number(resource.ground) : null;
+    const geoGround = resource.geo && Number.isFinite(resource.geo.ground) ? Number(resource.geo.ground) : null;
+    if (!Number.isFinite(ground) && Number.isFinite(geoGround)) ground = geoGround;
+    if (!Number.isFinite(ground) && this.app?.hexGridMgr?.getHeightAt) {
+      const sample = this.app.hexGridMgr.getHeightAt(x, z);
+      if (Number.isFinite(sample)) ground = sample;
+    }
+    if (!Number.isFinite(ground)) ground = 0;
+
+    if (!Number.isFinite(y)) {
+      const alt = Number(resource.altitude);
+      if (Number.isFinite(alt)) y = ground + alt;
+      else if (resource.geo && Number.isFinite(resource.geo.eye)) y = ground + Number(resource.geo.eye);
+      else y = ground;
+    }
+
+    return { x, y, z };
+  }
+
+  _createObeliskMesh(scale, color) {
+    const group = new THREE.Group();
+    const height = 5 * scale;
+    const bodyGeo = new THREE.CylinderGeometry(0.45 * scale, 0.9 * scale, height, 6, 1, false);
+    const material = new THREE.MeshStandardMaterial({ color: new THREE.Color(color), emissive: 0x112233, metalness: 0.2, roughness: 0.4 });
+    const body = new THREE.Mesh(bodyGeo, material);
+    body.castShadow = true;
+    body.receiveShadow = true;
+    body.position.y = height / 2;
+    group.add(body);
+
+    const tipGeo = new THREE.ConeGeometry(0.75 * scale, 1.2 * scale, 6, 1);
+    const tipMat = material.clone();
+    tipMat.emissiveIntensity = 0.4;
+    const tip = new THREE.Mesh(tipGeo, tipMat);
+    tip.castShadow = true;
+    tip.position.y = height + 0.6 * scale;
+    group.add(tip);
+    return group;
+  }
+
+  _createMarkerMesh(scale, color) {
+    const height = 3 * scale;
+    const geo = new THREE.CylinderGeometry(0.6 * scale, 0.6 * scale, height, 12);
+    const material = new THREE.MeshStandardMaterial({ color: new THREE.Color(color), roughness: 0.35, metalness: 0.1 });
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.position.y = height / 2;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
+  }
+
+  _createLabelSprite(text) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(10, 16, 28, 0.85)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = 'rgba(120, 180, 255, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+    ctx.fillStyle = '#e8f6ff';
+    ctx.font = '28px "IBM Plex Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(text || '').slice(0, 24), canvas.width / 2, canvas.height / 2);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(8, 2.2, 1);
+    sprite.center.set(0.5, 0);
+    return sprite;
+  }
+
+  _markStateDirty() {
+    if (this._stateTimer) return;
+    this._stateTimer = setTimeout(() => this._flushState(), 600);
+  }
+
+  async _flushState() {
+    if (this._stateTimer) {
+      clearTimeout(this._stateTimer);
+      this._stateTimer = null;
+    }
+    const discovery = this.state.hydra.discovery;
+    if (!discovery) return;
+    const hydraPeers = Array.from(this.state.hydra.peers.keys());
+    if (!hydraPeers.length) return;
+    const snapshot = Array.from(this.state.noclip.peers.values()).map((peer) => ({
+      nknPub: peer.nknPub,
+      addr: peer.addr,
+      meta: peer.meta || {},
+      geo: peer.geo || null,
+      last: peer.last || nowSecondsFallback()
+    }));
+    if (!snapshot.length) return;
+    const payload = {
+      type: 'hybrid-bridge-state',
+      peers: snapshot,
+      ts: nowSecondsFallback()
+    };
+    await Promise.all(
+      hydraPeers.map((pub) => discovery.dm(pub, payload).catch(() => {}))
+    );
   }
 
   renderChat() {
@@ -340,15 +731,29 @@ export class HybridHub {
     ui.hybridChatLog.innerHTML = '';
     const frag = document.createDocumentFragment();
     history.forEach((entry) => {
+      const kind = entry.kind || 'chat';
       const row = document.createElement('div');
-      row.className = `hybrid-chat-row ${entry.dir === 'out' ? 'out' : 'in'}`;
+      row.className = `hybrid-chat-row ${kind} ${entry.dir === 'out' ? 'out' : 'in'}`;
       const text = document.createElement('div');
       text.className = 'hybrid-chat-text';
-      text.textContent = entry.text;
+      const prefix = kind === 'resource' ? '[Resource]' : kind === 'log' ? '[Log]' : kind === 'command' ? '[Command]' : null;
+      text.textContent = prefix ? `${prefix} ${entry.text}` : entry.text;
+      row.appendChild(text);
+      if (kind === 'resource' && entry.meta?.resource) {
+        const detail = document.createElement('div');
+        detail.className = 'hybrid-chat-detail';
+        detail.textContent = describeResource(entry.meta.resource);
+        row.appendChild(detail);
+      }
+      if (kind === 'log' && entry.meta?.details) {
+        const detail = document.createElement('div');
+        detail.className = 'hybrid-chat-detail';
+        detail.textContent = entry.meta.details;
+        row.appendChild(detail);
+      }
       const time = document.createElement('div');
       time.className = 'hybrid-chat-time';
-      time.textContent = new Date(entry.ts * 1000).toLocaleTimeString();
-      row.appendChild(text);
+      time.textContent = new Date((entry.ts || nowSecondsFallback()) * 1000).toLocaleTimeString();
       row.appendChild(time);
       frag.appendChild(row);
     });
@@ -376,6 +781,49 @@ function shortPub(pub) {
   const text = String(pub);
   if (text.length <= 12) return text;
   return `${text.slice(0, 6)}…${text.slice(-4)}`;
+}
+
+function describeResource(resource = {}) {
+  const parts = [];
+  if (resource.label) parts.push(resource.label);
+  if (resource.kind) parts.push(resource.kind);
+  if (resource.id) parts.push(`#${resource.id}`);
+  if (resource.geo && Number.isFinite(resource.geo.lat) && Number.isFinite(resource.geo.lon)) {
+    parts.push(`${resource.geo.lat.toFixed(4)}, ${resource.geo.lon.toFixed(4)}`);
+  }
+  if (Array.isArray(resource.world) && resource.world.length >= 3) {
+    parts.push(`world (${Number(resource.world[0]).toFixed(2)}, ${Number(resource.world[1]).toFixed(2)}, ${Number(resource.world[2]).toFixed(2)})`);
+  }
+  return parts.join(' • ');
+}
+
+const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+
+function decodeGeohash(hash) {
+  if (typeof hash !== 'string' || !hash) return null;
+  let even = true;
+  let latRange = [-90, 90];
+  let lonRange = [-180, 180];
+  for (const char of hash.toLowerCase()) {
+    const idx = GH32.indexOf(char);
+    if (idx === -1) return null;
+    for (let mask = 16; mask >= 1; mask >>= 1) {
+      if (even) {
+        const mid = (lonRange[0] + lonRange[1]) / 2;
+        if (idx & mask) lonRange[0] = mid;
+        else lonRange[1] = mid;
+      } else {
+        const mid = (latRange[0] + latRange[1]) / 2;
+        if (idx & mask) latRange[0] = mid;
+        else latRange[1] = mid;
+      }
+      even = !even;
+    }
+  }
+  return {
+    lat: (latRange[0] + latRange[1]) / 2,
+    lon: (lonRange[0] + lonRange[1]) / 2
+  };
 }
 
 function sanitizeRoom() {

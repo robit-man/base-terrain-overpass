@@ -991,6 +991,20 @@ export class Mesh {
     if (typeof navigator !== 'undefined' && navigator.userAgent) {
       meta.ua = navigator.userAgent.substring(0, 80);
     }
+    try {
+      const geo = this._currentSelfGeo?.(1500);
+      if (geo && Number.isFinite(geo.lat) && Number.isFinite(geo.lon)) {
+        meta.loc = {
+          lat: +geo.lat.toFixed(7),
+          lon: +geo.lon.toFixed(7)
+        };
+        if (typeof geo.gh === 'string') meta.loc.gh = geo.gh;
+        if (Number.isFinite(geo.prec)) meta.loc.prec = Number(geo.prec);
+        if (Number.isFinite(geo.radius)) meta.loc.radius = Number(geo.radius);
+      }
+    } catch (_) {
+      // ignore geo sampling failure
+    }
     return meta;
   }
 

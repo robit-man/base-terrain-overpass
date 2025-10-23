@@ -2324,6 +2324,18 @@ canvas {
     background: rgba(255, 255, 255, 0.06);
 }
 
+.hybrid-chat-row.resource {
+    background: rgba(108, 198, 255, 0.18);
+}
+
+.hybrid-chat-row.log {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.hybrid-chat-row.command {
+    background: rgba(255, 160, 122, 0.2);
+}
+
 .hybrid-chat-row.out {
     background: rgba(108, 198, 255, 0.22);
     align-self: flex-end;
@@ -2331,6 +2343,11 @@ canvas {
 
 .hybrid-chat-text {
     font-size: 14px;
+}
+
+.hybrid-chat-detail {
+    font-size: 11px;
+    opacity: 0.65;
 }
 
 .hybrid-chat-time {
