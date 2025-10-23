@@ -19,6 +19,11 @@ const BUILD_FRAME_BUDGET_MS = 8; // ms budget to spend per frame on feature buil
 const BUILD_IDLE_BUDGET_MS = 8; // ms budget when we have idle time available
 const RESNAP_INTERVAL = 0.2; // seconds between ground rescan passes
 const RESNAP_FRAME_BUDGET_MS = 10; // ms per frame allotted to resnap tiles
+const RESNAP_HEIGHT_TOLERANCE = 0.15; // meters delta before adjusting height
+const RESNAP_LOCK_TOLERANCE = 0.75; // meters delta allowed before unlocking a locked building
+const RESNAP_LOCK_FRAMES = 6; // consecutive stable frames before locking
+const RESNAP_VERIFY_TOLERANCE = 0.5; // meters delta for routine verify pass
+const RESNAP_VERIFY_LOCK_TOLERANCE = 1.5; // meters delta required to unlock a locked building
 const TARGET_FPS = 60;
 
 /* ---------------- helpers ---------------- */
@@ -282,7 +287,8 @@ export class BuildingManager {
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
     this._resnapVerifyBatch = 12;
-    this._resnapVerifyTolerance = 0.12;
+    this._resnapVerifyTolerance = RESNAP_VERIFY_TOLERANCE;
+    this._resnapVerifyLockTolerance = RESNAP_VERIFY_LOCK_TOLERANCE;
     this._pendingTerrainTiles = new Set();
 
     this._wireframeMode = false;
@@ -1736,13 +1742,14 @@ export class BuildingManager {
         break;
       }
       case 'road': {
-        const road = this._buildRoad(feature.flat, feature.tags, feature.id);
-        if (!road) return;
-        road.userData.tile = tileKey;
-        this.group.add(road);
-        state.extras.push(road);
-        this._refreshRoadVisibility(road);
-        this._enqueueDirtyResnap(tileKey);
+        // Road geometry temporarily disabled during performance pass.
+        // const road = this._buildRoad(feature.flat, feature.tags, feature.id);
+        // if (!road) return;
+        // road.userData.tile = tileKey;
+        // this.group.add(road);
+        // state.extras.push(road);
+        // this._refreshRoadVisibility(road);
+        // this._enqueueDirtyResnap(tileKey);
         break;
       }
       case 'water': {
@@ -1754,11 +1761,12 @@ export class BuildingManager {
         break;
       }
       case 'area': {
-        const area = this._buildArea(feature.flat, feature.tags, feature.id);
-        if (!area) return;
-        area.userData.tile = tileKey;
-        this.group.add(area);
-        state.extras.push(area);
+        // Area geometry temporarily disabled while focusing on building stability.
+        // const area = this._buildArea(feature.flat, feature.tags, feature.id);
+        // if (!area) return;
+        // area.userData.tile = tileKey;
+        // this.group.add(area);
+        // state.extras.push(area);
         break;
       }
       default:
@@ -1966,6 +1974,7 @@ export class BuildingManager {
       tile: null,
       resnapStableFrames: 0,
       resnapFrozen: false,
+      resnapLock: false,
       insideRadius: true,
       isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z)
     };
@@ -2199,10 +2208,24 @@ export class BuildingManager {
     this._resnapDirtyQueue.push(tileKey);
     const state = this._tileStates.get(tileKey);
     if (state && Array.isArray(state.buildings)) {
+      let unlockedFound = false;
       for (const building of state.buildings) {
         if (!building?.info) continue;
-        building.info.resnapFrozen = false;
-        building.info.resnapStableFrames = 0;
+        const info = building.info;
+        if (info.resnapLock) continue;
+        info.resnapFrozen = false;
+        info.resnapStableFrames = 0;
+        unlockedFound = true;
+      }
+      if (!unlockedFound && (!state.extras || !state.extras.length)) {
+        // fully locked tile; skip queuing work
+        this._resnapDirtyTiles.delete(tileKey);
+        const idx = this._resnapDirtyQueue.lastIndexOf(tileKey);
+        if (idx !== -1) {
+          this._resnapDirtyQueue.splice(idx, 1);
+          this._resnapDirtyIndex = Math.min(this._resnapDirtyIndex, this._resnapDirtyQueue.length);
+        }
+        return;
       }
     }
   }
@@ -2331,17 +2354,29 @@ export class BuildingManager {
       groundBase = baseline - this.extraDepth;
     }
     const prev = info.baseHeight;
-    const changed = !Number.isFinite(prev) || Math.abs(prev - groundBase) > 0.02;
-    info.baseHeight = groundBase;
+    const diff = Number.isFinite(prev) ? Math.abs(prev - groundBase) : Infinity;
+    const threshold = info.resnapLock ? RESNAP_LOCK_TOLERANCE : RESNAP_HEIGHT_TOLERANCE;
+    const changed = !Number.isFinite(prev) || diff > threshold;
 
     if (!changed) {
+      if (Number.isFinite(prev)) {
+        info.baseHeight = prev;
+      } else {
+        info.baseHeight = groundBase;
+      }
       info.resnapStableFrames = (info.resnapStableFrames || 0) + 1;
-      if (info.resnapStableFrames >= 2) info.resnapFrozen = true;
+      if (info.resnapStableFrames >= RESNAP_LOCK_FRAMES) {
+        info.resnapFrozen = true;
+        info.resnapLock = true;
+      }
       this._refreshBuildingVisibility(building);
       return false;
     }
 
+    info.baseHeight = groundBase;
     info.resnapStableFrames = 0;
+    info.resnapFrozen = false;
+    if (info.resnapLock && diff > RESNAP_LOCK_TOLERANCE) info.resnapLock = false;
 
     if (building.render) {
       const newGeom = this._makeWireGeometry(info.rawFootprint, info.baseHeight, info.height);
@@ -2591,10 +2626,12 @@ export class BuildingManager {
         }
         const baseline = baseSample + this.extraDepth;
         const current = info.baseHeight + this.extraDepth;
+        const tolerance = info.resnapLock ? this._resnapVerifyLockTolerance : this._resnapVerifyTolerance;
         const diff = Math.abs(baseline - current);
-        if (diff > this._resnapVerifyTolerance) {
+        if (diff > tolerance) {
           info.resnapFrozen = false;
           info.resnapStableFrames = 0;
+          if (info.resnapLock) info.resnapLock = false;
           this._refreshBuildingVisibility(building);
           needsResnap = true;
         }

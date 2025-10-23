@@ -1,7 +1,21 @@
-@import url('../hydra/docs/style.css');
-
 :root {
-    /* HUD palette derived from Hydra theme variables */
+    color-scheme: dark;
+    --bg: #000000;
+    --bg-tp: #00000033;
+    --panel: #000000aa;
+    --panel2: rgba(255, 255, 255, .05);
+    --border: rgba(255, 255, 255, .12);
+    --accent: #5ee3a6;
+    --accent2: #a8ff60;
+    --text: #e8f1f8;
+    --muted: #a9b6c3;
+    --ok: #7dffb0;
+    --warn: #f9c846;
+    --err: #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --r: 16px;
+    --shadow: 0 18px 34px rgba(8, 16, 26, 0.45);
+
     --hud-bg: rgba(6, 12, 18, 0.78);
     --hud-border: rgba(255, 255, 255, 0.14);
     --hud-text-primary: var(--text);
@@ -33,6 +47,35 @@ body.modal-open {
     overflow: hidden;
 }
 
+body.theme-night {
+    color-scheme: dark;
+}
+
+body.theme-day {
+    color-scheme: light;
+    --bg: #f6f8ff;
+    --bg-tp: rgba(242, 245, 255, 0.6);
+    --panel: rgba(248, 250, 255, 0.9);
+    --panel2: rgba(0, 0, 0, 0.05);
+    --border: rgba(0, 0, 0, 0.14);
+    --text: rgba(28, 36, 56, 0.95);
+    --muted: rgba(58, 66, 86, 0.68);
+    --hud-bg: rgba(248, 250, 255, 0.92);
+    --hud-border: rgba(30, 38, 62, 0.16);
+    --hud-text-primary: rgba(28, 36, 56, 0.95);
+    --hud-text-muted: rgba(68, 74, 98, 0.7);
+    --hud-chip-bg: rgba(0, 0, 0, 0.06);
+    --hud-accent: #1b66d1;
+    --hud-status-ok: #208f68;
+    --hud-status-warn: #cf7f24;
+    --hud-status-error: #c95454;
+    --hud-shadow: 0 18px 34px rgba(96, 118, 168, 0.22);
+    --hud-button-bg: rgba(0, 0, 0, 0.06);
+    --hud-button-border: rgba(0, 0, 0, 0.18);
+    --hud-button-text: rgba(24, 32, 48, 0.9);
+    --hud-glass: saturate(120%) blur(18px);
+}
+
 body:not(.debug-mode) .debug-only {
     display: none !important;
 }
@@ -47,6 +90,47 @@ body>canvas {
     position: fixed;
     z-index: 0;
     left: 0px;
+}
+
+button {
+    appearance: none;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 0.2s ease, border 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+
+button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.28);
+}
+
+button.secondary {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(0, 0, 0, 0.08);
+    color: #181818;
+}
+
+button.secondary:hover {
+    background: rgba(255, 255, 255, 0.98);
+    border-color: rgba(0, 0, 0, 0.12);
+}
+
+button.ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+
+button.ghost:hover {
+    background: rgba(255, 255, 255, 0.06);
 }
 
 * {
@@ -190,7 +274,7 @@ body>canvas {
 }
 
 .mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace
+    font-family: var(--mono);
 }
 
 .dot {
@@ -229,19 +313,20 @@ input[type=text] {
     position: relative;
     gap: 10px;
     align-items: flex-start;
-    border: 1px solid #222;
-    background: #0a0a0a;
-    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.45);
+    border-radius: 12px;
     padding: 8px
 }
 
 .peer .name {
-    font-family: ui-monospace, Menlo, Consolas, monospace
+    font-family: var(--mono);
+    color: var(--text);
 }
 
 .peer .meta {
     font-size: 12px;
-    color: #9aa0a6
+    color: var(--muted);
 }
 
 .peer .pose {
@@ -1020,6 +1105,11 @@ input[type=text] {
     justify-content: center;
     border-radius: 50%;
     transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+#closeButton:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.28);
 }
 
 #closeButton:hover {

@@ -1068,13 +1068,16 @@ _stitchInteractiveToVisualEdges(tile, {
     return THREE.MathUtils.radToDeg(Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
   }
   _ensureTileOverlay(tile) {
-    if (!this._overlayEnabled || !tile || tile.type !== 'interactive') return;
-    if (!this.origin) return;
+    if (!this._overlayEnabled || !tile || !this.origin) return;
+    const eligibleTypes = ['interactive', 'visual', 'farfield'];
+    if (!eligibleTypes.includes(tile.type)) return;
     if (tile._overlay && (tile._overlay.status === 'loading' || tile._overlay.status === 'ready')) return;
 
     const center = this._tileCenterLatLon(tile);
     if (!center) return;
-    const zoom = this._overlayZoom;
+    let zoom = this._overlayZoom;
+    if (tile.type === 'visual') zoom = Math.max(3, zoom - 1);
+    else if (tile.type === 'farfield') zoom = Math.max(3, zoom - 2);
     const slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
     const key = `${zoom}/${slippy.x}/${slippy.y}`;
 
@@ -1173,7 +1176,8 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!bounds) return;
     this._ensureTileUv(tile, bounds);
     this._installOverlayMesh(tile, entry.texture);
-    if (this._treeEnabled) this._applyTreeSeeds(tile, entry);
+    const allowTrees = tile.type === 'interactive';
+    if (allowTrees && this._treeEnabled) this._applyTreeSeeds(tile, entry);
     else this._clearTileTrees(tile);
     tile._overlay = { status: 'ready', cacheKey: `${entry.zoom}/${entry.x}/${entry.y}` };
   }
@@ -1205,26 +1209,34 @@ _stitchInteractiveToVisualEdges(tile, {
   }
   _installOverlayMesh(tile, texture) {
     if (!tile || !texture) return;
+    const blend = tile.type === 'farfield' ? 0.28 : tile.type === 'visual' ? 0.45 : 0.7;
     let mesh = tile._overlayMesh;
     if (!mesh) {
-      const mat = new THREE.MeshBasicMaterial({
+      const mat = new THREE.MeshStandardMaterial({
         map: texture,
+        vertexColors: true,
         transparent: true,
-        opacity: 0.8,
+        opacity: blend,
         depthWrite: false,
         side: THREE.BackSide,
-        toneMapped: false,
+        metalness: 0.02,
+        roughness: 0.9,
+        toneMapped: true,
+        color: new THREE.Color(0.94, 0.97, 1.0)
       });
       mat.polygonOffset = true;
       mat.polygonOffsetFactor = -0.5;
       mat.polygonOffsetUnits = -0.5;
       mesh = new THREE.Mesh(tile.grid.geometry, mat);
-      mesh.renderOrder = 0.2;
+      mesh.renderOrder = 0.15;
       mesh.frustumCulled = false;
+      mesh.receiveShadow = true;
+      mesh.castShadow = false;
       tile.grid.group.add(mesh);
       tile._overlayMesh = mesh;
     } else {
       mesh.material.map = texture;
+      mesh.material.opacity = blend;
       mesh.material.needsUpdate = true;
       mesh.visible = true;
     }
@@ -2464,7 +2476,9 @@ _stitchInteractiveToVisualEdges(tile, {
 
     const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide });
     const mesh = new THREE.Mesh(geom, this._getTerrainMaterial());
-    mesh.frustumCulled = false; mesh.receiveShadow = false; mesh.castShadow = false;
+    mesh.frustumCulled = false;
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
 
     const group = new THREE.Group(); group.add(mesh);
     return { group, mesh, geometry: geom, mat };
@@ -2597,6 +2611,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this.tiles.set(id, tile);
     this._ensureRoadMask(tile, { reset: true });
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
+    this._ensureTileOverlay(tile);
     for (const [dq, dr] of HEX_DIRS) {
       const n = this._getTile(q + dq, r + dr);
       if (n && n.type === 'farfield') this._markFarfieldAdapterDirty(n);
@@ -2665,6 +2680,7 @@ _stitchInteractiveToVisualEdges(tile, {
 
     this._initColorsNearBlack(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
+    this._ensureTileOverlay(tile);
     this._invalidateHeightCache();
     this._ensureFarfieldAdapter(tile);
     for (const [dq, dr] of HEX_DIRS) {
