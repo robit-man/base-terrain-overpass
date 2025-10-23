@@ -447,10 +447,16 @@
                 <input id="envFarfieldBatch" type="range" min="8" max="128" step="4" value="48" />
               </div>
               <div class="slider-row">
-                <label for="envTileRadius">Tile Radius <span class="mono" id="envTileRadiusValue">100 m</span> <span
-                    class="tiny env-current" id="envTileRadiusCurrent">(engine: 100 m)</span></label>
-                <input id="envTileRadius" type="range" min="60" max="180" step="5" value="100" />
+                <label for="envTileSize">Tile Size <span class="mono" id="envTileSizeValue">1000 m</span> <span
+                    class="tiny env-current" id="envTileSizeCurrent">(engine: 1000 m)</span></label>
+                <input id="envTileSize" type="range" min="200" max="4000" step="100" value="1000" />
               </div>
+              <div class="slider-row">
+                <label for="envTileSamples">Samples Per Side <span class="mono" id="envTileSamplesValue">65</span> <span
+                    class="tiny env-current" id="envTileSamplesCurrent">(engine: 65)</span></label>
+                <input id="envTileSamples" type="range" min="9" max="129" step="2" value="65" />
+              </div>
+              <div class="kv tiny">Grid spacing: <span class="mono" id="envTileSpacingValue">15.6 m</span></div>
               <div class="button-row">
                 <button id="envTerrainApply" type="button">Update Terrain</button>
                 <button id="envTerrainAuto" type="button" data-state="on">Auto (On)</button>

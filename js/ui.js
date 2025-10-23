@@ -93,6 +93,10 @@ const terrainRelayInput = document.getElementById('terrainRelayInput');
 const terrainDatasetInput = document.getElementById('terrainDatasetInput');
 const terrainModeGeohash = document.getElementById('terrainModeGeohash');
 const terrainModeLatLng = document.getElementById('terrainModeLatLng');
+if (terrainRelayStatus) {
+  terrainRelayStatus.setAttribute('aria-live', 'polite');
+  terrainRelayStatus.setAttribute('aria-atomic', 'true');
+}
 const teleportToastHost = document.getElementById('teleportToastHost');
 const hudUsersToggle = document.getElementById('hudUsersToggle');
 const hudUserPanel = document.getElementById('hudUserPanel');
@@ -128,9 +132,13 @@ const envFarfieldBudgetCurrent = document.getElementById('envFarfieldBudgetCurre
 const envFarfieldBatch = document.getElementById('envFarfieldBatch');
 const envFarfieldBatchValue = document.getElementById('envFarfieldBatchValue');
 const envFarfieldBatchCurrent = document.getElementById('envFarfieldBatchCurrent');
-const envTileRadius = document.getElementById('envTileRadius');
-const envTileRadiusValue = document.getElementById('envTileRadiusValue');
-const envTileRadiusCurrent = document.getElementById('envTileRadiusCurrent');
+const envTileSize = document.getElementById('envTileSize');
+const envTileSizeValue = document.getElementById('envTileSizeValue');
+const envTileSizeCurrent = document.getElementById('envTileSizeCurrent');
+const envTileSamples = document.getElementById('envTileSamples');
+const envTileSamplesValue = document.getElementById('envTileSamplesValue');
+const envTileSamplesCurrent = document.getElementById('envTileSamplesCurrent');
+const envTileSpacingValue = document.getElementById('envTileSpacingValue');
 const envTerrainApply = document.getElementById('envTerrainApply');
 const envTerrainAuto = document.getElementById('envTerrainAuto');
 const envTerrainTargetFps = document.getElementById('envTerrainTargetFps');
@@ -322,7 +330,9 @@ export const ui = {
   envFarfieldNearPad, envFarfieldNearPadValue, envFarfieldNearPadCurrent,
   envFarfieldBudget, envFarfieldBudgetValue, envFarfieldBudgetCurrent,
   envFarfieldBatch, envFarfieldBatchValue, envFarfieldBatchCurrent,
-  envTileRadius, envTileRadiusValue, envTileRadiusCurrent,
+  envTileSize, envTileSizeValue, envTileSizeCurrent,
+  envTileSamples, envTileSamplesValue, envTileSamplesCurrent,
+  envTileSpacingValue,
   envTerrainApply, envTerrainAuto,
   envTerrainTargetFps, envTerrainTargetFpsValue,
   envBuildingRadius, envBuildingRadiusValue, envBuildingRadiusCurrent,

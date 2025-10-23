@@ -157,7 +157,9 @@ export class BuildingManager {
     this._baseRadius = initialRadius;
     this._defaultRadius = initialRadius;
     this._currentPerfQuality = 1;
-    this.tileSize = tileSize || (tileManager?.tileRadius ? tileManager.tileRadius * 1.75 : 160);
+    const managerTileSize = tileManager?.tileSize
+      || (tileManager?.tileRadius ? tileManager.tileRadius * 2 : null);
+    this.tileSize = tileSize || managerTileSize || 1000;
     this._tileDiagHalf = this.tileSize * Math.SQRT2 * 0.5;
     const spanBase = Math.ceil((this.radius + this.tileSize) / Math.max(1, this.tileSize));
     this._tileSpanCap = Math.max(6, spanBase + 2);
@@ -1380,58 +1382,52 @@ export class BuildingManager {
 
   _terrainTileReady(tileKey) {
     const tm = this.tileManager;
-    if (!tm || !tm.tiles || typeof tm._worldToAxialFloat !== 'function' || typeof tm._axialRound !== 'function') {
-      return false;
-    }
+    if (!tm || !tm.tiles) return false;
 
-    const parts = tileKey.split(',');
-    if (parts.length !== 2) return false;
-    const tx = Number(parts[0]);
-    const tz = Number(parts[1]);
-    if (!Number.isFinite(tx) || !Number.isFinite(tz)) return false;
+    const isReady = (key) => {
+      if (!key) return false;
+      const tile = tm.tiles.get(key);
+      if (!tile) return false;
+      if (this._isTerrainTileReady(tile, true)) return true;
+      return this._isTerrainTileReady(tile, false);
+    };
 
-    const size = this.tileSize;
-    const centerX = (tx + 0.5) * size;
-    const centerZ = (tz + 0.5) * size;
+    if (isReady(tileKey)) return true;
 
-    const axialFloat = tm._worldToAxialFloat.call(tm, centerX, centerZ);
-    const axial = axialFloat ? tm._axialRound.call(tm, axialFloat.q, axialFloat.r) : null;
-    if (!axial || !Number.isFinite(axial.q) || !Number.isFinite(axial.r)) return false;
-
-    if (typeof tm.hasInteractiveTerrainAt === 'function') {
+    const bounds = tm.worldBoundsForKey?.(tileKey);
+    if (bounds && typeof tm.hasInteractiveTerrainAt === 'function') {
+      const centerX = (bounds.minX + bounds.maxX) * 0.5;
+      const centerZ = (bounds.minZ + bounds.maxZ) * 0.5;
       if (tm.hasInteractiveTerrainAt(centerX, centerZ)) return true;
     }
 
-    const centerKey = `${axial.q},${axial.r}`;
-    const centerTile = tm.tiles.get(centerKey);
-    if (this._isTerrainTileReady(centerTile, true)) return true;
-    if (this._isTerrainTileReady(centerTile, false)) return true;
-
-    // Fallback: check immediate neighbors for a ready interactive/visual tile
-    const offsets = [
-      [1, 0], [1, -1], [0, -1],
-      [-1, 0], [-1, 1], [0, 1]
-    ];
-    for (const [dq, dr] of offsets) {
-      const neighbor = tm.tiles.get(`${axial.q + dq},${axial.r + dr}`);
-      if (this._isTerrainTileReady(neighbor, true)) return true;
-      if (this._isTerrainTileReady(neighbor, false)) return true;
+    const neighbors = tm.neighborKeysForKey?.(tileKey) ?? this._squareNeighborKeys(tileKey);
+    for (const neighborKey of neighbors) {
+      if (isReady(neighborKey)) return true;
     }
     return false;
+  }
+
+  _squareNeighborKeys(tileKey) {
+    if (!tileKey) return [];
+    const parts = tileKey.split(',');
+    if (parts.length !== 2) return [];
+    const tx = Number(parts[0]);
+    const tz = Number(parts[1]);
+    if (!Number.isFinite(tx) || !Number.isFinite(tz)) return [];
+    return [
+      `${tx + 1},${tz}`,
+      `${tx - 1},${tz}`,
+      `${tx},${tz + 1}`,
+      `${tx},${tz - 1}`,
+    ];
   }
 
   _isTerrainTileReady(tile, requireInteractive) {
     if (!tile) return false;
     if (requireInteractive && tile.type !== 'interactive') return false;
-    if (tile.type === 'interactive') {
-      if (!tile._phase?.seedDone) return false;
-      if (Number.isFinite(tile.unreadyCount)) {
-        const total = Number.isFinite(tile.pos?.count) ? tile.pos.count : Infinity;
-        if (tile.unreadyCount >= total) return false;
-      }
-    } else if (!tile._phase?.fullDone) {
-      return false;
-    }
+    if (tile.ready === false) return false;
+    if (Number.isFinite(tile.unreadyCount) && tile.unreadyCount > 0) return false;
     return true;
   }
 
@@ -3093,8 +3089,13 @@ export class BuildingManager {
   /* ---------------- tiles & cache utils ---------------- */
 
   _tileKeyForWorld(x, z) {
-    const tx = Math.floor(x / this.tileSize);
-    const tz = Math.floor(z / this.tileSize);
+    if (this.tileManager?.tileKeyForWorld) {
+      return this.tileManager.tileKeyForWorld(x, z);
+    }
+    const size = this.tileSize || 1;
+    const offset = this.tileManager?.gridOffset || { x: 0, z: 0 };
+    const tx = Math.floor((x + (offset.x || 0)) / size);
+    const tz = Math.floor((z + (offset.z || 0)) / size);
     return `${tx},${tz}`;
   }
 
@@ -3107,16 +3108,31 @@ export class BuildingManager {
   }
 
   _bboxForTile(tileKey) {
+    const tm = this.tileManager;
+    const precise = tm?.latLonBoundsForKey?.(tileKey);
+    if (precise) {
+      const { minLat, minLon, maxLat, maxLon } = precise;
+      return [minLat, minLon, maxLat, maxLon];
+    }
+
+    const originLat = tm?.origin?.lat ?? this.lat0;
+    const originLon = tm?.origin?.lon ?? this.lon0;
+    const offset = tm?.gridOffset || { x: 0, z: 0 };
+    const size = this.tileSize || 1;
     const [tx, tz] = tileKey.split(',').map(Number);
-    const minX = tx * this.tileSize;
-    const maxX = (tx + 1) * this.tileSize;
-    const minZ = tz * this.tileSize;
-    const maxZ = (tz + 1) * this.tileSize;
-    const { dLat, dLon } = metresPerDegree(this.lat0);
-    const lonA = this.lon0 + minX / dLon;
-    const lonB = this.lon0 + maxX / dLon;
-    const latA = this.lat0 - minZ / dLat;
-    const latB = this.lat0 - maxZ / dLat;
+    const minX = tx * size - (offset.x || 0);
+    const maxX = (tx + 1) * size - (offset.x || 0);
+    const minZ = tz * size - (offset.z || 0);
+    const maxZ = (tz + 1) * size - (offset.z || 0);
+
+    if (!Number.isFinite(originLat) || !Number.isFinite(originLon)) {
+      return [0, 0, 0, 0];
+    }
+    const { dLat, dLon } = metresPerDegree(originLat);
+    const lonA = originLon + minX / dLon;
+    const lonB = originLon + maxX / dLon;
+    const latA = originLat - minZ / dLat;
+    const latB = originLat - maxZ / dLat;
     const minLat = Math.min(latA, latB);
     const maxLat = Math.max(latA, latB);
     const minLon = Math.min(lonA, lonB);

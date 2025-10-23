@@ -4,7 +4,7 @@ import { SceneManager } from './scene.js';
 import { Sensors, GeoButton } from './sensors.js';
 import { Input } from './input.js';
 import { AudioEngine } from './audio.js';
-import { TileManager } from './tiles.js';
+import { TileManager, DEFAULT_TERRAIN_DATASET as BASE_TERRAIN_DATASET } from './tiles.js';
 import { ipLocate, latLonToWorld, worldToLatLon, metresPerDegree } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { Locomotion } from './locomotion.js';
@@ -155,7 +155,10 @@ const COMPASS_YAW_KEY = 'xr.useCompassYaw.v1';
 const PLAYER_POSE_KEY = 'xr.playerPose.v1';
 const DEBUG_STATE_KEY = 'xr.debugMode.v1';
 const PROCESS_METRICS_KEY = 'xr.processMetrics.v2';
-const DEFAULT_TERRAIN_DATASET = 'mapzen';
+const DEFAULT_TERRAIN_DATASET = BASE_TERRAIN_DATASET;
+const TERRAIN_RELAY_KEY = 'xr.terrain.relay.v1';
+const TERRAIN_DATASET_KEY = 'xr.terrain.dataset.v1';
+const TERRAIN_MODE_KEY = 'xr.terrain.mode.v1';
 
 class App {
   constructor() {
@@ -244,6 +247,8 @@ class App {
     const terrainClientProvider = () => this._getMeshClient();
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
+      renderer: this.sceneMgr.renderer,
+      deferWarm: true,
     });
     this.sceneMgr.setTileRadiusSource(() => {
       const tm = this.hexGridMgr;
@@ -251,6 +256,7 @@ class App {
       const ring = Math.max(1, tm.FARFIELD_RING ?? tm.VISUAL_RING ?? 1);
       return Math.max(200, tm.tileRadius * ring);
     });
+    this._initTerrainPreferences();
 
     const visualRing = Math.max(0, this.hexGridMgr?.VISUAL_RING ?? 0);
     const tileRadius = Math.max(1, this.hexGridMgr?.tileRadius ?? 120);
@@ -618,12 +624,14 @@ class App {
     relayInput?.addEventListener('change', () => {
       const addr = relayInput.value.trim();
       this.hexGridMgr.setRelayAddress(addr);
+      this._storeTerrainPref(TERRAIN_RELAY_KEY, addr);
       this.hexGridMgr.refreshTiles();
     });
 
     datasetInput?.addEventListener('change', () => {
       const dataset = datasetInput.value.trim() || DEFAULT_TERRAIN_DATASET;
       this.hexGridMgr.setRelayDataset(dataset);
+      this._storeTerrainPref(TERRAIN_DATASET_KEY, dataset);
       this.hexGridMgr.refreshTiles();
     });
 
@@ -641,12 +649,14 @@ class App {
     modeGeohash?.addEventListener('change', () => {
       if (!modeGeohash.checked) return;
       this.hexGridMgr.setRelayMode('geohash');
+      this._storeTerrainPref(TERRAIN_MODE_KEY, 'geohash');
       this.hexGridMgr.refreshTiles();
     });
 
     modeLatLng?.addEventListener('change', () => {
       if (!modeLatLng.checked) return;
       this.hexGridMgr.setRelayMode('latlng');
+      this._storeTerrainPref(TERRAIN_MODE_KEY, 'latlng');
       this.hexGridMgr.refreshTiles();
     });
 
@@ -1142,6 +1152,40 @@ class App {
     return null;
   }
 
+  _loadTerrainPref(key) {
+    if (!key) return null;
+    try {
+      const raw = localStorage.getItem(key);
+      return typeof raw === 'string' ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _storeTerrainPref(key, value) {
+    if (!key) return;
+    try {
+      if (value == null || value === '') localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    } catch { /* ignore quota */ }
+  }
+
+  _initTerrainPreferences() {
+    if (!this.hexGridMgr) return;
+    const relayPref = this._loadTerrainPref(TERRAIN_RELAY_KEY);
+    if (relayPref && relayPref !== this.hexGridMgr.relayAddress) {
+      this.hexGridMgr.setRelayAddress(relayPref);
+    }
+    const datasetPref = this._loadTerrainPref(TERRAIN_DATASET_KEY);
+    if (datasetPref && datasetPref !== this.hexGridMgr.relayDataset) {
+      this.hexGridMgr.setRelayDataset(datasetPref);
+    }
+    const modePref = this._loadTerrainPref(TERRAIN_MODE_KEY);
+    if (modePref === 'latlng' || modePref === 'geohash') {
+      this.hexGridMgr.setRelayMode(modePref);
+    }
+  }
+
   _storeGpsLockPref(enabled) {
     try {
       localStorage.setItem(GPS_LOCK_KEY, enabled ? '1' : '0');
@@ -1199,8 +1243,13 @@ class App {
       envFarfieldBudgetValue,
       envFarfieldBatch,
       envFarfieldBatchValue,
-      envTileRadius,
-      envTileRadiusValue,
+      envTileSize,
+      envTileSizeValue,
+      envTileSizeCurrent,
+      envTileSamples,
+      envTileSamplesValue,
+      envTileSamplesCurrent,
+      envTileSpacingValue,
       envTerrainApply,
       envTerrainAuto,
       envTerrainTargetFps,
@@ -1235,9 +1284,21 @@ class App {
       setCurrent(envFarfieldNearPadCurrent, settings.farfieldNearPad);
       setCurrent(envFarfieldBudgetCurrent, settings.farfieldCreateBudget);
       setCurrent(envFarfieldBatchCurrent, settings.farfieldBatchSize);
-      setCurrent(envTileRadiusCurrent, settings.tileRadius, ' m');
+      setCurrent(envTileSizeCurrent, settings.tileSize, ' m');
+      setCurrent(envTileSamplesCurrent, settings.samplesPerSide);
+      updateGridSpacingText(
+        settings.tileSize ?? this.hexGridMgr?.tileSize ?? 1000,
+        settings.samplesPerSide ?? this.hexGridMgr?.samplesPerSide ?? this.hexGridMgr?.vertexCountPerSide ?? 65
+      );
     };
     this._updateTerrainCurrentDisplay = updateTerrainCurrent;
+
+    const updateGridSpacingText = (tileSizeMeters, samplesPerSide) => {
+      if (!envTileSpacingValue) return;
+      const samples = Math.max(2, samplesPerSide || 0);
+      const spacing = samples > 1 ? tileSizeMeters / (samples - 1) : tileSizeMeters;
+      envTileSpacingValue.textContent = `${spacing.toFixed(1)} m`;
+    };
 
     const syncTerrainControls = () => {
       const settings = this.hexGridMgr?.getTerrainSettings?.();
@@ -1261,10 +1322,15 @@ class App {
       const batch = Math.max(1, Math.round(settings.farfieldBatchSize ?? this.hexGridMgr?.FARFIELD_BATCH_SIZE ?? 48));
       envFarfieldBatch.value = batch;
       setText(envFarfieldBatchValue, batch);
-      if (envTileRadius) {
-        const radius = Math.round(settings.tileRadius ?? this.hexGridMgr?.tileRadius ?? 100);
-        envTileRadius.value = radius;
-        setText(envTileRadiusValue, `${radius} m`);
+      if (envTileSize) {
+        const tileSizeMeters = Math.round(settings.tileSize ?? this.hexGridMgr?.tileSize ?? 1000);
+        envTileSize.value = tileSizeMeters;
+        setText(envTileSizeValue, `${tileSizeMeters} m`);
+      }
+      if (envTileSamples) {
+        const samples = Math.max(3, Math.round(settings.samplesPerSide ?? this.hexGridMgr?.samplesPerSide ?? this.hexGridMgr?.vertexCountPerSide ?? 65));
+        envTileSamples.value = samples;
+        setText(envTileSamplesValue, samples);
       }
       updateTerrainCurrent(settings);
     };
@@ -1333,8 +1399,21 @@ class App {
       this._disableTerrainAuto();
       this._scheduleTerrainUpdate();
     });
-    envTileRadius?.addEventListener('input', () => {
-      setText(envTileRadiusValue, `${envTileRadius.value} m`);
+    envTileSize?.addEventListener('input', () => {
+      const size = Number(envTileSize.value);
+      setText(envTileSizeValue, `${size} m`);
+      const samples = Number(envTileSamples?.value ?? this.hexGridMgr?.samplesPerSide ?? this.hexGridMgr?.vertexCountPerSide ?? 65);
+      updateGridSpacingText(size, samples);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envTileSamples?.addEventListener('input', () => {
+      const raw = Number(envTileSamples.value);
+      const samples = Math.max(3, raw);
+      envTileSamples.value = samples;
+      setText(envTileSamplesValue, samples);
+      const size = Number(envTileSize?.value ?? this.hexGridMgr?.tileSize ?? 1000);
+      updateGridSpacingText(size, samples);
       this._disableTerrainAuto();
       this._scheduleTerrainUpdate();
     });
@@ -1561,15 +1640,20 @@ class App {
     const nearPad = Math.max(0, Number(ui.envFarfieldNearPad?.value ?? this.hexGridMgr?.FARFIELD_NEAR_PAD ?? 6));
     const budget = Math.max(1, Number(ui.envFarfieldBudget?.value ?? this.hexGridMgr?.FARFIELD_CREATE_BUDGET ?? 60));
     const batch = Math.max(1, Number(ui.envFarfieldBatch?.value ?? this.hexGridMgr?.FARFIELD_BATCH_SIZE ?? 48));
-    const tileRadius = Math.max(10, Number(ui.envTileRadius?.value ?? this.hexGridMgr?.tileRadius ?? 100));
+    const tileSize = Math.max(50, Number(ui.envTileSize?.value ?? this.hexGridMgr?.tileSize ?? 1000));
+    let samples = Math.max(3, Number(ui.envTileSamples?.value ?? this.hexGridMgr?.samplesPerSide ?? this.hexGridMgr?.vertexCountPerSide ?? 65));
+    if (samples % 2 === 0) samples += 1;
     return {
       interactiveRing: interactive,
       visualRing: visual,
+      farfieldRing: visual + farExtra,
       farfieldExtra: farExtra,
       farfieldNearPad: nearPad,
       farfieldCreateBudget: budget,
       farfieldBatchSize: batch,
-      tileRadius,
+      tileSize,
+      samplesPerSide: samples,
+      tileRadius: tileSize * 0.5,
     };
   }
 
@@ -3728,13 +3812,41 @@ class App {
         const hbDur = Number.isFinite(metrics?.lastHeartbeatMs) ? `${metrics.lastHeartbeatMs.toFixed(0)}ms` : 'n/a';
         relayTooltip += `\nheartbeat · ${ageLabel} · ${hbDur}`;
       }
+      const meshConnected = !!this.mesh?.client?.addr;
+      const displayLevel = (relayStatus.level === 'ok' && !meshConnected)
+        ? 'warn'
+        : (relayStatus.level || 'info');
+
       if (this._terrainStatusEl) {
-        this._terrainStatusEl.textContent = relayStatus.text || 'idle';
-        this._terrainStatusEl.dataset.state = relayStatus.level || 'info';
+        const pipelineInfo = relayStatus.pipeline || null;
+        const queueCount = pipelineInfo?.queue ?? 0;
+        const inflightCount = pipelineInfo?.inflight ?? 0;
+        const phaseLabel = pipelineInfo?.phase || 'idle';
+        let statusText = relayStatus.text || 'idle';
+        if (queueCount > 0) {
+          statusText += ` · ${phaseLabel} q${queueCount}`;
+        } else if (inflightCount > 0) {
+          statusText += ` · ${phaseLabel} ${inflightCount}`;
+        }
+
+        this._terrainStatusEl.textContent = statusText;
+        this._terrainStatusEl.dataset.state = displayLevel;
         this._terrainStatusEl.dataset.connected = relayStatus.connected ? 'true' : 'false';
+        this._terrainStatusEl.dataset.address = relayStatus.address || '';
+        this._terrainStatusEl.dataset.dataset = relayStatus.dataset || this.hexGridMgr.relayDataset || DEFAULT_TERRAIN_DATASET;
+        this._terrainStatusEl.dataset.mode = relayStatus.mode || this.hexGridMgr.relayMode || 'geohash';
+        if (pipelineInfo) {
+          this._terrainStatusEl.dataset.queue = String(queueCount);
+          this._terrainStatusEl.dataset.phase = phaseLabel;
+          this._terrainStatusEl.dataset.inflight = String(inflightCount);
+        } else {
+          delete this._terrainStatusEl.dataset.queue;
+          delete this._terrainStatusEl.dataset.phase;
+          delete this._terrainStatusEl.dataset.inflight;
+        }
         this._terrainStatusEl.title = relayTooltip;
       }
-      if (this._hudTerrainDot) applyHudStatusDot(this._hudTerrainDot, relayStatus.level || '');
+      if (this._hudTerrainDot) applyHudStatusDot(this._hudTerrainDot, displayLevel);
       if (this._hudTerrainLabel) this._hudTerrainLabel.title = relayTooltip;
     }
 

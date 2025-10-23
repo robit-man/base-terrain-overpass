@@ -1,4 +1,5 @@
 const LS_SEED_KEY = 'terrain.nkn.seed.v1';
+const DEFAULT_DATASET = 'mapzen';
 
 function makeSeed() {
   const buf = new Uint8Array(32);
@@ -15,9 +16,9 @@ function ensureJson(obj) {
 }
 
 export class TerrainRelay {
-  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null } = {}) {
+  constructor({ defaultRelay = '', dataset = DEFAULT_DATASET, mode = 'geohash', onStatus = null, clientProvider = null } = {}) {
     this.relayAddress = defaultRelay.trim();
-    this.dataset = dataset.trim() || 'mapzen';
+    this.dataset = dataset.trim() || DEFAULT_DATASET;
     this.mode = mode === 'latlng' ? 'latlng' : 'geohash';
     this._onStatus = typeof onStatus === 'function' ? onStatus : null;
 
@@ -62,7 +63,7 @@ export class TerrainRelay {
   }
 
   setDataset(dataset) {
-    this.dataset = (dataset || '').trim() || 'mapzen';
+    this.dataset = (dataset || '').trim() || DEFAULT_DATASET;
   }
 
   setMode(mode) {
@@ -414,6 +415,7 @@ export class TerrainRelay {
       connected: this.connected,
       address: this.relayAddress || null,
       dataset: this.dataset,
+      mode: this.mode,
       clientAddr: this.selfAddr || null,
       status: { text: this._statusText, level: this._statusLevel },
       metrics,

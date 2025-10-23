@@ -107,9 +107,12 @@ export class PhysicsEngine {
       if (!tile || tile.type !== 'interactive') continue;
       const id = TILE_ID(tile);
       if (this.tileColliderMap.has(id)) continue;
-      if (typeof tile.unreadyCount === 'number' && tile.unreadyCount > 0) continue;
+      const notReady = (typeof tile.unreadyCount === 'number')
+        ? tile.unreadyCount > 0
+        : (tile.ready === false);
+      if (notReady) continue;
 
-      const mesh = tile.grid?.mesh;
+      const mesh = tile.mesh || tile.grid?.mesh;
       if (!mesh) continue;
 
       this.registerStaticMesh(mesh);
