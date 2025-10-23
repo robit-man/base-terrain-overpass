@@ -36,6 +36,7 @@ function isAddr(s) { return typeof s === 'string' && /\.[0-9a-f]{64}$/i.test(s);
 export class Mesh {
   constructor(app) {
     this.app = app;
+    this._listeners = new Map();
     this.client = null; this.selfPub = null; this.selfAddr = null;
     this.signallerHex = ''; this.DEFAULT_SIG = '8ad525942fc13bdf468a640a18716cbd91ba75d3bcb0ca198f73e9cd0cf34a88';
 
@@ -1043,6 +1044,7 @@ export class Mesh {
       this.discovery.on('handshake', (peer) => this._handleDiscoveryPeer(peer, 'handshake'));
       this.discovery.on('handshake_ack', (peer) => this._handleDiscoveryPeer(peer, 'ack'));
       this.discovery.on('status', (ev) => this._handleDiscoveryStatus(ev));
+      this.discovery.on('dm', (evt) => this._handleDiscoveryDm(evt));
 
       for (const peer of this.discovery.peers) this._handleDiscoveryPeer(peer, 'persisted');
 
@@ -1074,6 +1076,29 @@ export class Mesh {
       this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
     }
     this._updateDiscoveryUi();
+  }
+
+  on(evt, handler) {
+    if (!evt || typeof handler !== 'function') return () => {};
+    if (!this._listeners.has(evt)) this._listeners.set(evt, new Set());
+    this._listeners.get(evt).add(handler);
+    return () => this.off(evt, handler);
+  }
+
+  off(evt, handler) {
+    this._listeners.get(evt)?.delete(handler);
+  }
+
+  _emit(evt, payload) {
+    const list = this._listeners.get(evt);
+    if (!list) return;
+    list.forEach((fn) => {
+      try {
+        fn(payload);
+      } catch (err) {
+        // ignore listener failures
+      }
+    });
   }
 
   _handleDiscoveryPeer(peer, via = 'presence') {
@@ -1114,6 +1139,30 @@ export class Mesh {
         this._fireDiscoveryHello(pub);
         this._sendPoseSnapshotTo(pub).catch(() => { });
       }
+    }
+
+    this._emit('noclip-peer', {
+      peer: {
+        pub,
+        addr: ent.addr || peer.addr || pub,
+        lastTs: ent.lastTs || now(),
+        meta: peer.meta || {},
+        online: ent && this._online(pub)
+      }
+    });
+  }
+
+  _handleDiscoveryDm(evt) {
+    if (!evt) return;
+    const from = (evt.from || '').toLowerCase();
+    if (!from) return;
+    const payload = evt.msg || {};
+    const type = String(payload.type || '');
+    if (type.startsWith('chat-')) {
+      this._emit('noclip-chat', { from, payload });
+    }
+    if (type.startsWith('hybrid-')) {
+      this._emit('noclip-bridge', { from, payload });
     }
   }
 

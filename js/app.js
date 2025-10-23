@@ -18,6 +18,7 @@ import { BuildingManager } from './buildings.js';
 import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
 import { AdaptiveQualityManager } from './adaptiveQuality.js';
+import { HybridHub } from './hybrid.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -417,6 +418,8 @@ class App {
       this.avatarFactoryPromise
     );
     this.mesh = new Mesh(this);
+    this.hybrid = new HybridHub({ mesh: this.mesh });
+    this.hybrid.init();
 
     // Local avatar shell
     this.localAvatar = null;

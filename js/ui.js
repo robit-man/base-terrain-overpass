@@ -24,6 +24,14 @@ const lpSpd = document.getElementById('lpSpd');
 
 const peerSummary = document.getElementById('peerSummary');
 const peerList = document.getElementById('peerList');
+const hybridPeerSummary = document.getElementById('hybridPeerSummary');
+const hybridPeerList = document.getElementById('hybridPeerList');
+const hybridNetworkButtons = document.querySelectorAll('[data-hybrid-network]');
+const hybridChatPeer = document.getElementById('hybridChatPeer');
+const hybridChatStatus = document.getElementById('hybridChatStatus');
+const hybridChatLog = document.getElementById('hybridChatLog');
+const hybridChatInput = document.getElementById('hybridChatInput');
+const hybridChatSend = document.getElementById('hybridChatSend');
 const processLeaderboardSection = document.getElementById('processLeaderboardSection');
 const processLeaderboard = document.getElementById('processLeaderboard');
 const processCards = document.getElementById('processCards');
@@ -295,6 +303,8 @@ export const ui = {
   poseHzEl, poseSentEl, poseDropEl, poseRateEl,
   lpPos, lpEul, lpSpd,
   peerSummary, peerList,
+  hybridPeerSummary, hybridPeerList, hybridNetworkButtons,
+  hybridChatPeer, hybridChatStatus, hybridChatLog, hybridChatInput, hybridChatSend,
   controlTabsRoot,
   processLeaderboardSection, processLeaderboard, processCards, processGraph, processEmptyState, processReset,
   diagPidTargetFps, diagPidSmoothedFps, diagPidError, diagPidIntegral, diagPidDerivative, diagPidQuality,

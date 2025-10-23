@@ -247,6 +247,8 @@
             data-tab="navigation">Navigation</button>
           <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-networking"
             data-tab="networking">Networking</button>
+          <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-hybrid"
+            data-tab="hybrid">Hybrid</button>
           <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-character"
             data-tab="character">Character</button>
           <button class="control-tab" role="tab" aria-selected="false" aria-controls="tab-environment"
@@ -356,6 +358,34 @@
               <h3 class="section-title">Peers</h3>
               <div class="tiny" id="peerSummary">—</div>
               <div id="peerList" class="peer-list"></div>
+            </section>
+          </div>
+
+          <div class="tab-panel" id="tab-hybrid" role="tabpanel" data-tab-panel="hybrid" hidden>
+            <section class="modal-section">
+              <h3 class="section-title">Hybrid Peers</h3>
+              <div class="hybrid-toggle-row" role="group" aria-label="Peer network">
+                <button type="button" class="ghost is-active" data-hybrid-network="noclip">NoClip</button>
+                <button type="button" class="ghost" data-hybrid-network="hydra">Hydra</button>
+              </div>
+              <div class="tiny" id="hybridPeerSummary">—</div>
+              <div class="hybrid-peer-list" id="hybridPeerList"></div>
+            </section>
+
+            <section class="modal-section">
+              <h3 class="section-title">Bridge Chat</h3>
+              <div class="hybrid-chat-shell">
+                <div class="hybrid-chat-heading">
+                  <div class="hybrid-chat-peer" id="hybridChatPeer">Select a peer…</div>
+                  <div class="tiny" id="hybridChatStatus">Bridge idle</div>
+                </div>
+                <div class="hybrid-chat-log" id="hybridChatLog"></div>
+                <div class="hybrid-chat-controls">
+                  <input id="hybridChatInput" type="text" placeholder="Message" autocomplete="off"
+                    spellcheck="false">
+                  <button id="hybridChatSend" type="button">Send</button>
+                </div>
+              </div>
             </section>
           </div>
 
