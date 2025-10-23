@@ -975,7 +975,7 @@ class App {
     const renderer = this.sceneMgr?.renderer;
     if (renderer?.xr?.isPresenting) return;
 
-    const yaw = this._wrapAngle(headingRad);
+    const yaw = this._wrapAngle(headingRad + Math.PI);
     if (Number.isFinite(this._lastGpsHeading)) {
       const delta = Math.abs(this._wrapAngle(yaw - this._lastGpsHeading));
       if (delta < THREE.MathUtils.degToRad(0.35)) return;
