@@ -447,19 +447,31 @@ export class SceneManager {
     const L = eclipticLongitude(M);
     const dec = declination(L);
     const ra = rightAscension(L);
-    const H = siderealTime(d, lw) - ra;
+    const HRaw = siderealTime(d, lw) - ra;
+    const H = THREE.MathUtils.euclideanModulo(HRaw + Math.PI, Math.PI * 2) - Math.PI;
 
-    const altitude = Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(H));
-    const azimuthSouth = Math.PI + Math.atan2(Math.sin(H), Math.cos(H) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi));
-    const azimuth = (azimuthSouth + Math.PI) % (Math.PI * 2);
+    const sinPhi = Math.sin(phi);
+    const cosPhi = Math.cos(phi);
+    const sinDec = Math.sin(dec);
+    const cosDec = Math.cos(dec);
+
+    const altitude = Math.asin(
+      sinPhi * sinDec + cosPhi * cosDec * Math.cos(H)
+    );
+    const azRaw = Math.atan2(
+      Math.sin(H),
+      Math.cos(H) * sinPhi - Math.tan(dec) * cosPhi
+    );
 
     const cosAlt = Math.cos(altitude);
-    const x = Math.sin(azimuth) * cosAlt;
-    const y = Math.sin(altitude);
-    const z = Math.cos(azimuth) * cosAlt;
+    const direction = new THREE.Vector3(
+      -Math.sin(azRaw) * cosAlt,
+      Math.sin(altitude),
+      Math.cos(azRaw) * cosAlt
+    ).normalize();
 
     return {
-      direction: new THREE.Vector3(x, y, z).normalize(),
+      direction,
       altitude,
     };
   }
