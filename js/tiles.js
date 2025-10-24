@@ -96,8 +96,9 @@ export class TileManager {
     this._overlayCanvas = null;
     this._overlayCtx = null;
     this._treeEnabled = true;
-    this._treeAssets = null;
-    this.TREE_LOD_DISTANCES = { medium: 55, low: 140, cull: 240 };
+    this._treeLib = (typeof window !== 'undefined') ? window['@dgreenheck/ez-tree'] || null : null;
+    this._treeLibPromise = null;
+    this._treeLibWarned = false;
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -1340,455 +1341,157 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     this._spawnTreesForTile(tile, worldPositions);
   }
-  _ensureTreeAssets() {
-    if (this._treeAssets) return this._treeAssets;
-    const barkTex = null;
-    const trunkMat = new THREE.MeshStandardMaterial({
-      color: 0x5c3b1f,
-      roughness: 0.85,
-      metalness: 0.02,
-      map: barkTex,
-    });
-    const foliageMatBroad = new THREE.MeshStandardMaterial({
-      color: 0x295f3a,
-      roughness: 0.6,
-      metalness: 0.05,
-      emissive: 0x072810,
-      emissiveIntensity: 0.08,
-    });
-    const foliageMatConifer = new THREE.MeshStandardMaterial({
-      color: 0x184d2d,
-      roughness: 0.55,
-      metalness: 0.04,
-      emissive: 0x052015,
-      emissiveIntensity: 0.06,
-    });
-    const branchMat = new THREE.MeshStandardMaterial({
-      color: 0x6d4523,
-      roughness: 0.8,
-      metalness: 0.05,
-    });
-    const trunkMatSimple = new THREE.MeshStandardMaterial({
-      color: 0x4f341c,
-      roughness: 0.9,
-      metalness: 0.02,
-    });
-    const foliageMatSimple = new THREE.MeshStandardMaterial({
-      color: 0x2a5c36,
-      roughness: 0.7,
-      metalness: 0.03,
-      emissive: 0x062512,
-      emissiveIntensity: 0.04,
-    });
-    const foliageBillboardMat = new THREE.MeshBasicMaterial({
-      color: 0x2f6b3c,
-      transparent: true,
-      opacity: 0.78,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    foliageBillboardMat.toneMapped = false;
-    this._treeAssets = {
-      trunkMat,
-      trunkMatSimple,
-      foliageMatBroad,
-      foliageMatConifer,
-      foliageMatSimple,
-      foliageBillboardMat,
-      branchMat,
-    };
-    return this._treeAssets;
-  }
-  _createTreeDetailedMesh(type, assets) {
-    const tree = new THREE.Group();
-    tree.name = 'tree';
 
-    const addCylinder = (radiusTop, radiusBottom, height, radialSegments = 7) => {
-      return new THREE.CylinderGeometry(radiusTop, radiusBottom, height, radialSegments, 1, false);
-    };
+  _ensureTreeLibrary() {
+    if (this._treeLib) return Promise.resolve(this._treeLib);
+    if (this._treeLibPromise) return this._treeLibPromise;
+    if (typeof window === 'undefined') return Promise.resolve(null);
 
-    const addSphere = (radius, segments = 6) => new THREE.IcosahedronGeometry(radius, segments);
-
-    const buildBranch = (config) => {
-      const {
-        origin,
-        length,
-        radiusBase,
-        depth,
-        parent,
-        density = 2,
-        upBias = 0.25,
-        twist = Math.PI / 3,
-        spread = Math.PI / 4,
-      } = config;
-      if (depth <= 0 || length <= 0.25) return;
-
-      const radiusTop = radiusBase * THREE.MathUtils.randFloat(0.46, 0.63);
-      const geom = addCylinder(radiusTop, radiusBase, length, 6);
-      const mesh = new THREE.Mesh(geom, assets.branchMat);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      mesh.position.copy(origin);
-      const tilt = THREE.MathUtils.randFloat(-spread, spread);
-      const yaw = THREE.MathUtils.randFloatSpread(twist * 2);
-      const tipPitch = THREE.MathUtils.randFloat(upBias * 0.4, upBias * 1.2);
-      mesh.rotation.set(tilt, yaw, tipPitch);
-      mesh.translateY(length * 0.5);
-      parent.add(mesh);
-
-      const childOrigin = new THREE.Vector3().copy(mesh.position);
-      childOrigin.y += length * THREE.MathUtils.randFloat(0.5, 0.85);
-      const nextLength = length * THREE.MathUtils.randFloat(0.55, 0.82);
-      const childRadius = radiusTop * THREE.MathUtils.randFloat(0.4, 0.7);
-      const branchCount = THREE.MathUtils.randInt(1, density + 1);
-
-      for (let i = 0; i < branchCount; i++) {
-        buildBranch({
-          origin: childOrigin,
-          length: nextLength * THREE.MathUtils.randFloat(0.75, 1.15),
-          radiusBase: childRadius,
-          depth: depth - 1,
-          parent,
-          density: THREE.MathUtils.clamp(density - 1, 1, 3),
-          upBias: THREE.MathUtils.randFloat(upBias * 0.8, upBias * 1.2),
-          twist: twist * THREE.MathUtils.randFloat(0.65, 0.9),
-          spread: spread * THREE.MathUtils.randFloat(0.65, 0.95),
-        });
-      }
-      return mesh;
-    };
-
-    const buildDeciduous = () => {
-      const trunkHeight = THREE.MathUtils.randFloat(6, 9.5);
-      const trunkRadius = THREE.MathUtils.randFloat(0.18, 0.28);
-      const trunkGeom = addCylinder(trunkRadius * 0.58, trunkRadius, trunkHeight, 8);
-      const trunk = new THREE.Mesh(trunkGeom, assets.trunkMat.clone());
-      trunk.castShadow = true;
-      trunk.receiveShadow = true;
-      const buryDepth = THREE.MathUtils.randFloat(0.28, 0.48);
-      trunk.position.y = trunkHeight / 2 - buryDepth;
-      trunk.rotation.z = THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(2.2));
-      trunk.material.color.offsetHSL(THREE.MathUtils.randFloatSpread(0.02), THREE.MathUtils.randFloat(-0.04, 0.04), THREE.MathUtils.randFloat(-0.06, 0.08));
-      tree.add(trunk);
-
-      const canopyHeight = THREE.MathUtils.randFloat(3.2, 3.9);
-      const canopyRadius = THREE.MathUtils.randFloat(2.6, 3.6);
-      const canopy = new THREE.Group();
-      canopy.position.y = trunkHeight * THREE.MathUtils.randFloat(0.68, 0.78);
-      const pointCount = 480;
-      const positionArray = new Float32Array(pointCount * 3);
-      const colorArray = new Float32Array(pointCount * 3);
-      for (let i = 0; i < pointCount; i++) {
-        const r = canopyRadius * Math.sqrt(Math.random());
-        const theta = Math.random() * Math.PI * 2;
-        const u = this._randGaussian(0, 0.35);
-        const x = r * Math.cos(theta) + THREE.MathUtils.randFloatSpread(0.4);
-        const z = r * Math.sin(theta) + THREE.MathUtils.randFloatSpread(0.4);
-        const y = this._randGaussian(canopyHeight * 0.4, canopyHeight * 0.28) + Math.abs(u) * canopyHeight * 0.5;
-        positionArray[i * 3] = x;
-        positionArray[i * 3 + 1] = y;
-        positionArray[i * 3 + 2] = z;
-        const baseColor = new THREE.Color(0x295f3d);
-        baseColor.offsetHSL(
-          THREE.MathUtils.randFloatSpread(0.08),
-          THREE.MathUtils.randFloat(-0.08, 0.12),
-          THREE.MathUtils.randFloat(-0.12, 0.08)
-        );
-        colorArray[i * 3] = baseColor.r;
-        colorArray[i * 3 + 1] = baseColor.g;
-        colorArray[i * 3 + 2] = baseColor.b;
-      }
-      const canopyGeom = new THREE.BufferGeometry();
-      canopyGeom.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
-      canopyGeom.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
-      const canopyMat = new THREE.PointsMaterial({
-        size: THREE.MathUtils.randFloat(0.28, 0.42),
-        sizeAttenuation: true,
-        vertexColors: true,
-        transparent: true,
-        opacity: 0.96,
-        depthWrite: false,
-      });
-      const canopyPoints = new THREE.Points(canopyGeom, canopyMat);
-      canopy.add(canopyPoints);
-      tree.add(canopy);
-
-      const branchBase = new THREE.Vector3(0, trunkHeight * 0.64, 0);
-      const primaryBranches = THREE.MathUtils.randInt(4, 6);
-      const branchNodes = [];
-      for (let i = 0; i < primaryBranches; i++) {
-        const base = branchBase.clone();
-        base.x += this._randGaussian(0, trunkRadius * 0.8);
-        base.z += this._randGaussian(0, trunkRadius * 0.8);
-        const length = THREE.MathUtils.randFloat(2.6, 3.8);
-        const radius = trunkRadius * THREE.MathUtils.randFloat(0.32, 0.58);
-        const branch = buildBranch({
-          origin: base,
-          length,
-          radiusBase: radius,
-          depth: 4,
-          parent: tree,
-          density: 3,
-          upBias: THREE.MathUtils.randFloat(0.22, 0.35),
-          twist: Math.PI / 2,
-          spread: Math.PI / 3,
-        });
-        if (branch) {
-          branchNodes.push({
-            origin: branch.position.clone(),
-            direction: new THREE.Vector3(0, 1, 0).applyEuler(branch.rotation),
-            radius: radius * 0.65,
-            depth: 3,
-            level: 1,
-          });
-        }
-      }
-
-      const subBranchCount = THREE.MathUtils.randInt(5, 9);
-      for (let i = 0; i < subBranchCount && branchNodes.length; i++) {
-        const node = branchNodes[THREE.MathUtils.randInt(0, branchNodes.length - 1)];
-        const offset = node.direction.clone().multiplyScalar(THREE.MathUtils.randFloat(0.6, 1.1));
-        const origin = node.origin.clone().add(offset);
-        const subLength = THREE.MathUtils.randFloat(1.4, 2.1);
-        const subRadius = node.radius * THREE.MathUtils.randFloat(0.45, 0.7);
-        const child = buildBranch({
-          origin,
-          length: subLength,
-          radiusBase: subRadius,
-          depth: node.depth - 1,
-          parent: tree,
-          density: 2,
-          upBias: THREE.MathUtils.randFloat(0.28, 0.4),
-          twist: Math.PI / 2,
-          spread: Math.PI / 3.4,
-        });
-        if (child) {
-          branchNodes.push({
-            origin: child.position.clone(),
-            direction: new THREE.Vector3(0, 1, 0).applyEuler(child.rotation),
-            radius: subRadius * 0.55,
-            depth: Math.max(1, (node.depth - 1)),
-            level: (node.level || 1) + 1,
-          });
-        }
-      }
-    };
-
-    const buildConifer = () => {
-      const trunkHeight = THREE.MathUtils.randFloat(8, 11.5);
-      const trunkRadius = THREE.MathUtils.randFloat(0.18, 0.24);
-      const trunkGeom = addCylinder(trunkRadius * 0.55, trunkRadius, trunkHeight, 9);
-      const trunk = new THREE.Mesh(trunkGeom, assets.trunkMat.clone());
-      trunk.castShadow = true;
-      trunk.receiveShadow = true;
-      const buryDepth = THREE.MathUtils.randFloat(0.3, 0.48);
-      trunk.position.y = trunkHeight / 2 - buryDepth;
-      tree.add(trunk);
-
-      const branchLevels = THREE.MathUtils.randInt(6, 8);
-      const radiusFalloff = THREE.MathUtils.randFloat(0.78, 0.88);
-      let currentRadius = THREE.MathUtils.randFloat(2.1, 2.8);
-      const branchNodes = [];
-      for (let i = 0; i < branchLevels; i++) {
-        const heightRatio = i / (branchLevels - 1);
-        const ringY = trunkHeight * (0.15 + heightRatio * 0.78);
-        const branches = THREE.MathUtils.randInt(5, 7);
-        for (let j = 0; j < branches; j++) {
-          const yaw = (j / branches) * Math.PI * 2 + THREE.MathUtils.randFloatSpread(Math.PI / branches);
-          const pitch = THREE.MathUtils.randFloat(0.28, 0.55);
-          const length = currentRadius * THREE.MathUtils.randFloat(0.6, 1.05);
-          const origin = new THREE.Vector3(0, ringY, 0);
-          const branch = buildBranch({
-            origin,
-            length,
-            radiusBase: trunkRadius * THREE.MathUtils.randFloat(0.3, 0.45),
-            depth: 2,
-            parent: tree,
-            density: 2,
-            upBias: THREE.MathUtils.randFloat(0.05, 0.12),
-            twist: Math.PI / 3,
-            spreadFan: Math.PI / 6,
-            yaw,
-            pitch,
-          });
-          if (branch) {
-            branchNodes.push({
-              origin: branch.position.clone(),
-              direction: new THREE.Vector3(0, 1, 0).applyEuler(branch.rotation),
-              radius: trunkRadius * THREE.MathUtils.randFloat(0.18, 0.25),
-              depth: 2,
-            });
-          }
-        }
-        currentRadius *= radiusFalloff;
-      }
-
-      const needleCount = 520;
-      const needlePositions = new Float32Array(needleCount * 3);
-      const needleColors = new Float32Array(needleCount * 3);
-      for (let i = 0; i < needleCount; i++) {
-        const node = branchNodes[THREE.MathUtils.randInt(0, branchNodes.length - 1)];
-        if (!node) continue;
-        const offsetDist = THREE.MathUtils.randFloat(0.25, 1.4);
-        const offsetVec = node.direction.clone().multiplyScalar(offsetDist);
-        const swirl = THREE.MathUtils.randFloatSpread(Math.PI / 2.5);
-        const tilt = THREE.MathUtils.randFloat(0.3, 1.1);
-        const rot = new THREE.Quaternion().setFromEuler(new THREE.Euler(tilt, swirl, THREE.MathUtils.randFloat(-0.2, 0.2)));
-        offsetVec.applyQuaternion(rot);
-        const base = node.origin.clone().add(offsetVec);
-        base.y += THREE.MathUtils.randFloat(-0.25, 0.35);
-        needlePositions[i * 3] = base.x - trunk.position.x;
-        needlePositions[i * 3 + 1] = base.y;
-        needlePositions[i * 3 + 2] = base.z - trunk.position.z;
-        const baseColor = new THREE.Color(0x193a22);
-        baseColor.offsetHSL(
-          THREE.MathUtils.randFloatSpread(0.03),
-          THREE.MathUtils.randFloat(-0.02, 0.05),
-          THREE.MathUtils.randFloat(-0.03, 0.02)
-        );
-        needleColors[i * 3] = baseColor.r;
-        needleColors[i * 3 + 1] = baseColor.g;
-        needleColors[i * 3 + 2] = baseColor.b;
-      }
-      const needlesGeom = new THREE.BufferGeometry();
-      needlesGeom.setAttribute('position', new THREE.BufferAttribute(needlePositions, 3));
-      needlesGeom.setAttribute('color', new THREE.BufferAttribute(needleColors, 3));
-      const needlesMat = new THREE.PointsMaterial({
-        size: THREE.MathUtils.randFloat(0.11, 0.16),
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.85,
-        vertexColors: true,
-        depthWrite: false,
-      });
-      const needleCloud = new THREE.Points(needlesGeom, needlesMat);
-      needleCloud.position.y = trunkHeight * 0.08;
-      tree.add(needleCloud);
-
-      const tipNeedles = new THREE.BufferGeometry();
-      const tips = new Float32Array(branchNodes.length * 3);
-      for (let i = 0; i < branchNodes.length; i++) {
-        const tip = branchNodes[i].origin.clone().add(branchNodes[i].direction.clone().multiplyScalar(0.6));
-        tips[i * 3] = tip.x - trunk.position.x;
-        tips[i * 3 + 1] = tip.y;
-        tips[i * 3 + 2] = tip.z - trunk.position.z;
-      }
-      tipNeedles.setAttribute('position', new THREE.BufferAttribute(tips, 3));
-      const tipMat = new THREE.PointsMaterial({
-        size: THREE.MathUtils.randFloat(0.16, 0.24),
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.92,
-        color: 0x1e4625,
-        depthWrite: false,
-      });
-      const tipCloud = new THREE.Points(tipNeedles, tipMat);
-      tipCloud.position.y = trunkHeight * 0.06;
-      tree.add(tipCloud);
-    };
-
-    if (type === 'conifer') buildConifer();
-    else buildDeciduous();
-
-    return tree;
-  }
-
-  _createTreeSimplifiedMesh(type, assets) {
-    const group = new THREE.Group();
-    group.name = 'tree-medium';
-
-    const trunkHeight = type === 'conifer'
-      ? THREE.MathUtils.randFloat(5.8, 7.4)
-      : THREE.MathUtils.randFloat(4.6, 6.2);
-    const trunkRadius = type === 'conifer'
-      ? THREE.MathUtils.randFloat(0.14, 0.18)
-      : THREE.MathUtils.randFloat(0.16, 0.22);
-    const trunkGeom = new THREE.CylinderGeometry(trunkRadius * 0.6, trunkRadius, trunkHeight, 5, 1);
-    const trunk = new THREE.Mesh(trunkGeom, assets.trunkMatSimple);
-    trunk.castShadow = true;
-    trunk.receiveShadow = true;
-    trunk.position.y = trunkHeight / 2;
-    group.add(trunk);
-
-    if (type === 'conifer') {
-      const coneGeom = new THREE.ConeGeometry(trunkHeight * 0.45, trunkHeight * 0.95, 6, 1, true);
-      const canopy = new THREE.Mesh(coneGeom, assets.foliageMatSimple);
-      canopy.castShadow = true;
-      canopy.receiveShadow = true;
-      canopy.position.y = trunkHeight * 0.62;
-      canopy.rotation.x = THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(1.5));
-      group.add(canopy);
-    } else {
-      const sphereGeom = new THREE.IcosahedronGeometry(trunkHeight * 0.36, 1);
-      const canopy = new THREE.Mesh(sphereGeom, assets.foliageMatSimple);
-      canopy.castShadow = true;
-      canopy.receiveShadow = true;
-      canopy.position.y = trunkHeight * 0.78;
-      canopy.scale.set(THREE.MathUtils.randFloat(0.95, 1.1), THREE.MathUtils.randFloat(1, 1.15), THREE.MathUtils.randFloat(0.95, 1.1));
-      group.add(canopy);
+    if (window['@dgreenheck/ez-tree']) {
+      this._treeLib = window['@dgreenheck/ez-tree'];
+      return Promise.resolve(this._treeLib);
     }
 
-    return group;
+    const src = 'https://cdn.jsdelivr.net/npm/ez-tree-fork@1.0.3/build/ez-tree.es.js';
+    this._treeLibPromise = import(src)
+      .then((mod) => {
+        this._treeLib = mod;
+        return this._treeLib;
+      })
+      .catch((err) => {
+        if (!this._treeLibWarned) {
+          console.warn('[tiles] EZ-Tree library failed to load', err);
+          this._treeLibWarned = true;
+        }
+        this._treeLibPromise = null;
+        return null;
+      });
+    return this._treeLibPromise;
   }
 
-  _createTreeBillboard(type, assets) {
-    const group = new THREE.Group();
-    group.name = 'tree-low';
+  _hashTreeSeed(x, z) {
+    const xi = Math.floor(x);
+    const zi = Math.floor(z);
+    let seed = (xi * 374761393) ^ (zi * 668265263);
+    seed = (seed ^ (seed >> 13)) >>> 0;
+    return seed || 1;
+  }
 
-    const trunkHeight = type === 'conifer'
-      ? THREE.MathUtils.randFloat(4.5, 5.6)
-      : THREE.MathUtils.randFloat(3.6, 4.5);
-    const trunkRadius = THREE.MathUtils.randFloat(0.12, 0.16);
-    const trunkGeom = new THREE.CylinderGeometry(trunkRadius * 0.55, trunkRadius, trunkHeight, 4, 1);
-    const trunk = new THREE.Mesh(trunkGeom, assets.trunkMatSimple);
-    trunk.castShadow = false;
-    trunk.receiveShadow = false;
-    trunk.position.y = trunkHeight / 2;
-    group.add(trunk);
+  _seededRandom(seed, offset = 0) {
+    const value = Math.sin(seed + offset * 374761393) * 43758.5453123;
+    return value - Math.floor(value);
+  }
 
-    const canopyHeight = type === 'conifer' ? trunkHeight * 1.55 : trunkHeight * 1.25;
-    const canopyWidth = type === 'conifer' ? canopyHeight * 0.42 : canopyHeight * 0.66;
-    const planeGeom = new THREE.PlaneGeometry(canopyWidth, canopyHeight);
-    const planes = [0, Math.PI / 2];
-    for (const ang of planes) {
-      const plane = new THREE.Mesh(planeGeom, assets.foliageBillboardMat);
-      plane.position.y = trunkHeight * 0.65;
-      plane.rotation.y = ang;
-      plane.renderOrder = 2;
-      group.add(plane);
+  _pickTreeProfile(lat) {
+    const absLat = Math.abs(lat || 0);
+    if (absLat >= 60) return 'boreal';
+    if (absLat >= 38) return 'temperate';
+    if (absLat >= 18) return 'subtropical';
+    return 'tropical';
+  }
+
+  _configureTreeForRegion(tree, latLon, seed, lib = this._treeLib) {
+    if (!lib) return;
+
+    const { TreeType, BarkType, LeafType, Billboard } = lib;
+    const opts = tree.options || tree._options || {};
+
+    if (opts.seed !== undefined) opts.seed = seed;
+
+    const lat = latLon?.lat ?? 0;
+    const profile = this._pickTreeProfile(lat);
+    const seedNoise = (offset, min, max) => min + this._seededRandom(seed, offset) * (max - min);
+
+    if (opts.branch?.levels != null) {
+      opts.branch.levels = Math.round(seedNoise(1, 2.2, 3.8));
     }
 
-    return group;
+    if (opts.branch?.twist) {
+      Object.keys(opts.branch.twist).forEach((level, idx) => {
+        opts.branch.twist[level] = seedNoise(20 + idx, -0.2, 0.4);
+      });
+    }
+
+    switch (profile) {
+      case 'boreal':
+        if (opts.type != null && TreeType?.Evergreen) opts.type = TreeType.Evergreen;
+        if (opts.bark?.type != null && BarkType?.Pine) opts.bark.type = BarkType.Pine;
+        if (opts.leaves?.type != null && LeafType?.Pine) opts.leaves.type = LeafType.Pine;
+        if (opts.leaves?.billboard != null && Billboard?.Single) opts.leaves.billboard = Billboard.Single;
+        if (opts.branch?.angle) {
+          Object.keys(opts.branch.angle).forEach((level) => {
+            opts.branch.angle[level] = seedNoise(30 + Number(level), 32, 48);
+          });
+        }
+        break;
+      case 'temperate':
+        if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
+        if (opts.bark?.type != null && BarkType?.Oak) opts.bark.type = BarkType.Oak;
+        if (opts.leaves?.type != null && LeafType?.Oak) opts.leaves.type = LeafType.Oak;
+        if (opts.leaves?.billboard != null && Billboard?.Double) opts.leaves.billboard = Billboard.Double;
+        if (opts.branch?.angle) {
+          Object.keys(opts.branch.angle).forEach((level) => {
+            opts.branch.angle[level] = seedNoise(40 + Number(level), 45, 68);
+          });
+        }
+        break;
+      case 'subtropical':
+        if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
+        if (opts.bark?.type != null && BarkType?.Willow) opts.bark.type = BarkType.Willow;
+        if (opts.leaves?.type != null && LeafType?.Ash) opts.leaves.type = LeafType.Ash;
+        if (opts.branch?.angle) {
+          Object.keys(opts.branch.angle).forEach((level) => {
+            opts.branch.angle[level] = seedNoise(50 + Number(level), 55, 75);
+          });
+        }
+        break;
+      default:
+        if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
+        if (opts.bark?.type != null && BarkType?.Birch) opts.bark.type = BarkType.Birch;
+        if (opts.leaves?.type != null && LeafType?.Aspen) opts.leaves.type = LeafType.Aspen;
+        if (opts.branch?.angle) {
+          Object.keys(opts.branch.angle).forEach((level) => {
+            opts.branch.angle[level] = seedNoise(60 + Number(level), 40, 70);
+          });
+        }
+        break;
+    }
+
+    if (opts.branch?.length) {
+      const base = seedNoise(5, 16, 28);
+      opts.branch.length[0] = base;
+      if (opts.branch.length[1] != null) opts.branch.length[1] = base * seedNoise(6, 0.45, 0.68);
+      if (opts.branch.length[2] != null) opts.branch.length[2] = base * seedNoise(7, 0.25, 0.45);
+    }
+
+    if (opts.branch?.children) {
+      Object.keys(opts.branch.children).forEach((level, idx) => {
+        const baseChildren = profile === 'boreal' ? 4 : profile === 'temperate' ? 6 : 5;
+        opts.branch.children[level] = Math.max(2, Math.round(baseChildren * seedNoise(10 + idx, 0.75, 1.25)));
+      });
+    }
+
+    if (opts.leaves?.count != null) {
+      const base = profile === 'boreal' ? 4 : profile === 'temperate' ? 12 : 16;
+      opts.leaves.count = Math.round(base * seedNoise(12, 0.8, 1.4));
+    }
+
+    if (opts.leaves?.size != null) {
+      opts.leaves.size = seedNoise(13, 1.8, 3.5);
+    }
+
+    if (opts.leaves?.sizeVariance != null) {
+      opts.leaves.sizeVariance = seedNoise(14, 0.4, 0.8);
+    }
   }
 
-  _buildTreeLod(type, assets, scale = 1) {
-    const lod = new THREE.LOD();
-    const detailed = this._createTreeDetailedMesh(type, assets);
-    const medium = this._createTreeSimplifiedMesh(type, assets);
-    const low = this._createTreeBillboard(type, assets);
-
-    detailed.scale.setScalar(scale);
-    medium.scale.setScalar(scale);
-    low.scale.setScalar(scale);
-
-    lod.addLevel(detailed, 0);
-    lod.addLevel(medium, this.TREE_LOD_DISTANCES.medium);
-    lod.addLevel(low, this.TREE_LOD_DISTANCES.low);
-    const culled = new THREE.Object3D();
-    culled.visible = false;
-    lod.addLevel(culled, this.TREE_LOD_DISTANCES.cull);
-
-    lod.userData.species = type;
-    lod.userData.lodChildren = { detailed, medium, low };
-
-    return lod;
-  }
-
-  _spawnTreesForTile(tile, worldPositions = []) {
+  async _spawnTreesForTile(tile, worldPositions = []) {
     this._clearTileTrees(tile);
     if (!this._treeEnabled || !worldPositions.length) return;
 
-    const assets = this._ensureTreeAssets();
+    const treeLib = await this._ensureTreeLibrary();
+    if (!treeLib || !treeLib.Tree) return;
+
     const basePos = tile.grid.group.position;
     const group = new THREE.Group();
     group.name = 'tile-trees';
@@ -1797,13 +1500,8 @@ _stitchInteractiveToVisualEdges(tile, {
     tile._treeSamples = [];
 
     for (const pos of worldPositions) {
-      const species = Math.random() < 0.55 ? 'deciduous' : 'conifer';
-      const scale = species === 'conifer'
-        ? THREE.MathUtils.randFloat(0.8, 1.2)
-        : THREE.MathUtils.randFloat(0.75, 1.35);
-
-      const jitterX = THREE.MathUtils.randFloatSpread(1.6);
-      const jitterZ = THREE.MathUtils.randFloatSpread(1.6);
+      const jitterX = THREE.MathUtils.randFloatSpread(1.4);
+      const jitterZ = THREE.MathUtils.randFloatSpread(1.4);
       const localX = pos.x - basePos.x + jitterX;
       const localZ = pos.z - basePos.z + jitterZ;
       const worldX = basePos.x + localX;
@@ -1811,10 +1509,30 @@ _stitchInteractiveToVisualEdges(tile, {
       const groundY = this.getHeightAt(worldX, worldZ);
       if (!Number.isFinite(groundY)) continue;
 
-      const tree = this._buildTreeLod(species, assets, scale);
+      const seed = this._hashTreeSeed(worldX, worldZ);
+      const latLon = this.origin ? worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon) : null;
+      const tree = new treeLib.Tree();
+
+      this._configureTreeForRegion(tree, latLon, seed, treeLib);
+      try {
+        tree.generate();
+      } catch (err) {
+        console.warn('[tiles] ez-tree generation failed', err);
+        continue;
+      }
+
+      const scale = THREE.MathUtils.lerp(0.55, 1.1, this._seededRandom(seed, 90));
+      tree.scale.setScalar(scale);
       tree.position.set(localX, groundY, localZ);
-      tree.rotation.y = Math.random() * Math.PI * 2;
-      tree.userData.anchor = { worldX, worldZ };
+      tree.rotation.y = this._seededRandom(seed, 3) * Math.PI * 2;
+      tree.userData.anchor = { worldX, worldZ, seed };
+
+      tree.traverse((child) => {
+        if (child.isMesh || child.isPoints) {
+          child.castShadow = true;
+          child.receiveShadow = !child.isPoints;
+        }
+      });
 
       group.add(tree);
       tile._treeInstances.push({ object: tree, worldX, worldZ });
@@ -1859,6 +1577,19 @@ _stitchInteractiveToVisualEdges(tile, {
     });
   }
 
+  _disposeTreeObject(obj) {
+    if (!obj) return;
+    obj.traverse((child) => {
+      if (child.isMesh || child.isPoints || child.isLine) {
+        if (child.geometry) child.geometry.dispose?.();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach((mat) => mat?.dispose?.());
+          else child.material.dispose?.();
+        }
+      }
+    });
+  }
+
   _clearTileTrees(tile) {
     if (!tile) return;
     if (tile._treeGroup) {
@@ -1866,7 +1597,12 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     tile._treeGroup = null;
     tile._treeSnapScheduled = false;
-    if (tile._treeInstances) tile._treeInstances.length = 0;
+    if (Array.isArray(tile._treeInstances)) {
+      for (const inst of tile._treeInstances) {
+        this._disposeTreeObject(inst?.object);
+      }
+      tile._treeInstances.length = 0;
+    }
     tile._treeInstances = null;
     if (tile._treeSamples) tile._treeSamples.length = 0;
   }
