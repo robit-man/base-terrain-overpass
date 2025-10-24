@@ -493,10 +493,12 @@ _stitchInteractiveToVisualEdges(tile, {
   _getFarfieldMaterial() {
     if (!this._farfieldMat) {
       this._farfieldMat = this._getTerrainMaterial().clone();
+      this._farfieldMat.side = THREE.DoubleSide;
       this._farfieldMat.polygonOffset = true;
       this._farfieldMat.polygonOffsetFactor = 1;
       this._farfieldMat.polygonOffsetUnits = 2;
       this._farfieldMat.name = 'TileFarfieldMaterial';
+      this._farfieldMat.needsUpdate = true;
     }
     return this._farfieldMat;
   }
@@ -1169,44 +1171,71 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!outer || !inner) return false;
     const lonSpan = Math.max(1e-9, outer.lonMax - outer.lonMin);
     const latSpan = Math.max(1e-9, outer.latMax - outer.latMin);
-    const lonMargin = Math.max(1e-7, lonSpan * 0.015);
-    const latMargin = Math.max(1e-7, latSpan * 0.015);
+    const lonMargin = Math.max(1e-6, lonSpan * 0.02);
+    const latMargin = Math.max(1e-6, latSpan * 0.02);
     return (
-      inner.lonMin >= outer.lonMin + lonMargin &&
-      inner.lonMax <= outer.lonMax - lonMargin &&
-      inner.latMin >= outer.latMin + latMargin &&
-      inner.latMax <= outer.latMax - latMargin
+      inner.lonMin >= outer.lonMin - lonMargin &&
+      inner.lonMax <= outer.lonMax + lonMargin &&
+      inner.latMin >= outer.latMin - latMargin &&
+      inner.latMax <= outer.latMax + latMargin
     );
   }
   _estimateTileCoverageLatLon(tile) {
     if (!tile || !this.origin) return null;
     const group = tile.grid?.group;
     if (!group) return null;
-    const radius = tile._radiusOverride ?? this.tileRadius;
-    if (!Number.isFinite(radius) || radius <= 0) return null;
-    const samples = [{ x: 0, z: 0 }];
-    const outer = this._hexCorners(radius);
-    const mid = this._hexCorners(radius * 0.55);
-    for (const pt of outer) samples.push(pt);
-    for (const pt of mid) samples.push(pt);
     let latMin = Infinity;
     let latMax = -Infinity;
     let lonMin = Infinity;
     let lonMax = -Infinity;
-    for (const pt of samples) {
-      const wx = group.position.x + pt.x;
-      const wz = group.position.z + pt.z;
-      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
-      if (!ll) continue;
-      if (ll.lat < latMin) latMin = ll.lat;
-      if (ll.lat > latMax) latMax = ll.lat;
-      if (ll.lon < lonMin) lonMin = ll.lon;
-      if (ll.lon > lonMax) lonMax = ll.lon;
+    const pos = tile.pos;
+    if (pos?.count) {
+      const stride = Math.max(1, Math.floor(pos.count / 2000));
+      for (let i = 0; i < pos.count; i += stride) {
+        const wx = group.position.x + pos.getX(i);
+        const wz = group.position.z + pos.getZ(i);
+        const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+        if (!ll) continue;
+        if (ll.lat < latMin) latMin = ll.lat;
+        if (ll.lat > latMax) latMax = ll.lat;
+        if (ll.lon < lonMin) lonMin = ll.lon;
+        if (ll.lon > lonMax) lonMax = ll.lon;
+      }
+      // ensure last vertex included
+      const lastIdx = pos.count - 1;
+      if (lastIdx >= 0) {
+        const wx = group.position.x + pos.getX(lastIdx);
+        const wz = group.position.z + pos.getZ(lastIdx);
+        const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+        if (ll) {
+          if (ll.lat < latMin) latMin = ll.lat;
+          if (ll.lat > latMax) latMax = ll.lat;
+          if (ll.lon < lonMin) lonMin = ll.lon;
+          if (ll.lon > lonMax) lonMax = ll.lon;
+        }
+      }
+    } else {
+      const radius = tile._radiusOverride ?? this.tileRadius;
+      if (!Number.isFinite(radius) || radius <= 0) return null;
+      const samples = [{ x: 0, z: 0 }, ...this._hexCorners(radius), ...this._hexCorners(radius * 0.55)];
+      for (const pt of samples) {
+        const wx = group.position.x + pt.x;
+        const wz = group.position.z + pt.z;
+        const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+        if (!ll) continue;
+        if (ll.lat < latMin) latMin = ll.lat;
+        if (ll.lat > latMax) latMax = ll.lat;
+        if (ll.lon < lonMin) lonMin = ll.lon;
+        if (ll.lon > lonMax) lonMax = ll.lon;
+      }
     }
     if (!Number.isFinite(latMin) || !Number.isFinite(latMax) || !Number.isFinite(lonMin) || !Number.isFinite(lonMax)) {
       return null;
     }
-    return { latMin, latMax, lonMin, lonMax };
+    // add tiny padding to account for numeric jitter
+    const epsilonLat = Math.max(1e-7, (latMax - latMin) * 0.005);
+    const epsilonLon = Math.max(1e-7, (lonMax - lonMin) * 0.005);
+    return { latMin: latMin - epsilonLat, latMax: latMax + epsilonLat, lonMin: lonMin - epsilonLon, lonMax: lonMax + epsilonLon };
   }
   _primeWaybackVersions() {
     if (typeof window === 'undefined') return;
@@ -1484,6 +1513,14 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!tile || !texture) return;
     const mesh = tile.grid?.mesh;
     if (!mesh) return;
+    if (tile.type === 'farfield') {
+      tile.grid?.group?.layers?.set?.(0);
+      mesh.layers?.set?.(0);
+    }
+    if (tile.type === 'farfield') {
+      tile.grid?.group?.layers?.set?.(0);
+      mesh.layers?.set?.(0);
+    }
     if (!mesh.userData) mesh.userData = {};
     let backup = mesh.userData._overlayBackup;
     if (!backup) {
@@ -1524,7 +1561,7 @@ _stitchInteractiveToVisualEdges(tile, {
     mat.opacity = 1;
     mat.alphaTest = 0;
     mat.depthWrite = true;
-    mat.side = THREE.BackSide;
+    mat.side = tile.type === 'farfield' ? THREE.DoubleSide : THREE.BackSide;
     mat.metalness = mat.metalness ?? 0.05;
     mat.roughness = mat.roughness ?? 0.75;
     mat.needsUpdate = true;
