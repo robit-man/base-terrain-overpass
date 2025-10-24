@@ -1210,14 +1210,33 @@ _stitchInteractiveToVisualEdges(tile, {
   }
   _teardownOverlayForTile(tile) {
     if (!tile) return;
-    if (tile._overlayMesh?.material) {
-      const mat = tile._overlayMesh.material;
+    const mesh = tile.grid?.mesh;
+    if (mesh?.material) {
+      const mat = mesh.material;
       if (mat.map) {
         mat.map = null;
+        mat.needsUpdate = true;
+      }
+      const backup = mesh.userData?._overlayBackup;
+      if (backup) {
+        mat.vertexColors = backup.vertexColors;
+        mat.transparent = backup.transparent;
+        mat.opacity = backup.opacity;
+        mat.depthWrite = backup.depthWrite;
+        mat.alphaTest = backup.alphaTest;
+        mat.side = backup.side;
+        if (backup.color && mat.color?.isColor) mat.color.copy(backup.color);
+        if (backup.shared && backup.clone && mat === backup.clone) {
+          try { mat.dispose?.(); } catch { /* noop */ }
+          mesh.material = backup.original;
+          backup.clone = null;
+        }
+      } else {
+        mat.vertexColors = true;
       }
       mat.needsUpdate = true;
+      mesh.receiveShadow = true;
     }
-    if (tile._overlayMesh) tile._overlayMesh.visible = false;
     if (tile._overlay?.status) tile._overlay = null;
     this._clearTileTrees(tile);
   }
@@ -1352,7 +1371,7 @@ _stitchInteractiveToVisualEdges(tile, {
     const bounds = entry.bounds;
     if (!bounds) return;
     this._ensureTileUv(tile, bounds);
-    this._installOverlayMesh(tile, entry.texture);
+    this._applyOverlayTexture(tile, entry.texture);
     const allowTrees = tile.type === 'interactive';
     if (allowTrees && this._treeEnabled) this._applyTreeSeeds(tile, entry);
     else this._clearTileTrees(tile);
@@ -1387,40 +1406,56 @@ _stitchInteractiveToVisualEdges(tile, {
     }
     uv.needsUpdate = true;
   }
-  _installOverlayMesh(tile, texture) {
+  _applyOverlayTexture(tile, texture) {
     if (!tile || !texture) return;
-    const blend = tile.type === 'farfield' ? 0.28 : tile.type === 'visual' ? 0.45 : 0.7;
-    let mesh = tile._overlayMesh;
-    if (!mesh) {
-      const mat = new THREE.MeshStandardMaterial({
-        map: texture,
-        vertexColors: true,
-        transparent: true,
-        opacity: blend,
-        depthWrite: false,
-        side: THREE.BackSide,
-        metalness: 0.02,
-        roughness: 0.9,
-        toneMapped: true,
-        color: new THREE.Color(1, 1, 1)
-      });
-      mat.polygonOffset = true;
-      mat.polygonOffsetFactor = -0.5;
-      mat.polygonOffsetUnits = -0.5;
-      mesh = new THREE.Mesh(tile.grid.geometry, mat);
-      mesh.renderOrder = 0.15;
-      mesh.frustumCulled = false;
-      mesh.receiveShadow = true;
-      mesh.castShadow = false;
-      tile.grid.group.add(mesh);
-      tile._overlayMesh = mesh;
-    } else {
-      mesh.material.map = texture;
-      mesh.material.opacity = blend;
-      mesh.material.color.set(1, 1, 1);
-      mesh.material.needsUpdate = true;
-      mesh.visible = true;
+    const mesh = tile.grid?.mesh;
+    if (!mesh) return;
+    if (!mesh.userData) mesh.userData = {};
+    let backup = mesh.userData._overlayBackup;
+    if (!backup) {
+      const original = mesh.material;
+      const shared = original === this._terrainMat || original === this._farfieldMat;
+      let material = original;
+      if (shared) {
+        material = original.clone();
+        mesh.material = material;
+      }
+      backup = {
+        original,
+        shared,
+        clone: shared ? mesh.material : null,
+        vertexColors: original?.vertexColors ?? false,
+        transparent: original?.transparent ?? false,
+        opacity: original?.opacity ?? 1,
+        depthWrite: original?.depthWrite ?? true,
+        alphaTest: original?.alphaTest ?? 0,
+        side: original?.side ?? THREE.BackSide,
+        color: original?.color?.isColor ? original.color.clone() : null,
+      };
+      mesh.userData._overlayBackup = backup;
+    } else if (backup.shared && (!backup.clone || mesh.material === backup.original)) {
+      const clone = backup.original.clone();
+      mesh.material = clone;
+      backup.clone = clone;
     }
+    const mat = mesh.material;
+    if (!mat) return;
+    if (mat.map && mat.map !== texture) {
+      mat.map = null;
+    }
+    mat.vertexColors = false;
+    if (mat.color?.isColor) mat.color.set(0xffffff);
+    mat.map = texture;
+    mat.transparent = false;
+    mat.opacity = 1;
+    mat.alphaTest = 0;
+    mat.depthWrite = true;
+    mat.side = THREE.BackSide;
+    mat.metalness = mat.metalness ?? 0.05;
+    mat.roughness = mat.roughness ?? 0.75;
+    mat.needsUpdate = true;
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
   }
   _processOverlayImage(image, bounds) {
     if (typeof document === 'undefined') {
@@ -4894,16 +4929,7 @@ update(playerPos) {
       const entry = this._overlayCache.get(t._overlay.cacheKey);
       entry?.waiters?.delete?.(t);
     }
-    if (t._overlayMesh) {
-      try {
-        t.grid.group.remove(t._overlayMesh);
-        if (t._overlayMesh.material) {
-          t._overlayMesh.material.map = null;
-          t._overlayMesh.material.dispose?.();
-        }
-      } catch { }
-      t._overlayMesh = null;
-    }
+    this._teardownOverlayForTile(t);
     if (t._overlay) t._overlay = null;
     if (t.type === 'farfield') {
       const key = this._farfieldAdapterKey(t);
@@ -4917,6 +4943,14 @@ update(playerPos) {
       }
       t.grid.geometry?.dispose?.();
       t.grid.mat?.dispose?.();
+      const mesh = t.grid?.mesh;
+      if (mesh?.material) {
+        const mat = mesh.material;
+        if (mat !== this._terrainMat && mat !== this._farfieldMat) {
+          try { mat.map = null; } catch { /* noop */ }
+          mat.dispose?.();
+        }
+      }
       t.wire?.material?.dispose?.();
     } catch { }
     t._adapter = null;
