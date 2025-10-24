@@ -770,6 +770,19 @@ _stitchInteractiveToVisualEdges(tile, {
 
     const geometries = [];
     const farTiles = [];
+    const attributeMeta = new Map();
+
+    const recordAttribute = (name, attribute) => {
+      if (!attribute) return;
+      if (!attributeMeta.has(name)) {
+        attributeMeta.set(name, {
+          itemSize: attribute.itemSize || 1,
+          normalized: attribute.normalized || false,
+          arrayType: attribute.array?.constructor || Float32Array
+        });
+      }
+    };
+
     for (const tile of this.tiles.values()) {
       if (!tile || tile.type !== 'farfield') continue;
       const geom = tile.grid?.geometry;
@@ -778,6 +791,15 @@ _stitchInteractiveToVisualEdges(tile, {
       group.updateMatrixWorld(true);
       const clone = geom.clone();
       clone.applyMatrix4(group.matrixWorld);
+
+      const attributes = clone.attributes || clone.getAttributes?.() || {};
+      for (const name in attributes) {
+        recordAttribute(name, attributes[name]);
+      }
+      recordAttribute('normal', attributes.normal);
+      recordAttribute('color', attributes.color);
+      recordAttribute('uv', attributes.uv);
+
       geometries.push(clone);
       farTiles.push(tile);
     }
@@ -789,10 +811,53 @@ _stitchInteractiveToVisualEdges(tile, {
       return;
     }
 
-    const merged = mergeGeometries(geometries, false);
-    merged.computeVertexNormals();
+    const attributeNames = Array.from(attributeMeta.keys()).filter((name) => name !== 'position');
+    for (const clone of geometries) {
+      const position = clone.getAttribute('position');
+      const count = position ? position.count : 0;
+      for (const name of attributeNames) {
+        if (clone.getAttribute(name)) continue;
+        const meta = attributeMeta.get(name);
+        if (!meta || !count) continue;
+        const ArrayType = meta.arrayType || Float32Array;
+        const array = new ArrayType(count * meta.itemSize);
+        if (name === 'color') {
+          for (let i = 0; i < count; i++) {
+            const idx = i * meta.itemSize;
+            array[idx] = 1;
+            if (meta.itemSize > 1) array[idx + 1] = 1;
+            if (meta.itemSize > 2) array[idx + 2] = 1;
+          }
+        } else if (name === 'normal') {
+          for (let i = 0; i < count; i++) {
+            const idx = i * meta.itemSize;
+            array[idx] = 0;
+            if (meta.itemSize > 1) array[idx + 1] = 1;
+            if (meta.itemSize > 2) array[idx + 2] = 0;
+          }
+        }
+        const attr = new THREE.BufferAttribute(array, meta.itemSize, meta.normalized);
+        clone.setAttribute(name, attr);
+      }
+    }
+
+    let merged = null;
+    try {
+      merged = mergeGeometries(geometries, false);
+      if (merged) merged.computeVertexNormals();
+    } catch (err) {
+      console.warn('[tiles] farfield merge failed, falling back to individual tiles', err);
+      merged = null;
+    }
     for (const g of geometries) {
       g.dispose?.();
+    }
+
+    if (!merged) {
+      this._disposeFarfieldMergedMesh();
+      state.dirty = false;
+      state.lastBuildTime = tNow;
+      return;
     }
 
     const material = this._getFarfieldMaterial();
