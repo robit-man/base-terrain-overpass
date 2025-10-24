@@ -112,6 +112,7 @@ export class TileManager {
     this._treePerfSampleTime = 0;
     this._treePerfEvalTimer = 0;
     this._treeRegenQueue = null;
+    this._treeRegenSet = new Set();
     this._primeWaybackVersions();
 
     if (!scene.userData._tmLightsAdded) {
