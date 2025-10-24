@@ -1516,6 +1516,8 @@ _stitchInteractiveToVisualEdges(tile, {
     if (tile.type === 'farfield') {
       tile.grid?.group?.layers?.set?.(0);
       mesh.layers?.set?.(0);
+      if (tile._adapter?.mesh) tile._adapter.mesh.layers?.set?.(0);
+      this._markFarfieldAdapterDirty(tile);
     }
     if (tile.type === 'farfield') {
       tile.grid?.group?.layers?.set?.(0);
