@@ -2,6 +2,16 @@ import * as THREE from 'three';
 import { VRButton } from 'VRButton';
 import { Sky } from 'Sky';
 
+const TWILIGHT_ALTITUDE = THREE.MathUtils.degToRad(-0.5);
+const NIGHT_ALTITUDE = THREE.MathUtils.degToRad(-12);
+const DAY_EXPOSURE = 1.15;
+const NIGHT_EXPOSURE = 0.18;
+const NIGHT_FOG_COLOR = new THREE.Color(0x05070d);
+const NIGHT_AMBIENT_COLOR = new THREE.Color(0x05060a);
+const DAY_AMBIENT_COLOR = new THREE.Color(0x1e212b);
+const DUSK_SUN_COLOR = new THREE.Color(0xffa864);
+const DAY_SUN_COLOR = new THREE.Color(0xffffff);
+
 export class SceneManager {
   constructor() {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true  });
@@ -9,7 +19,7 @@ export class SceneManager {
     this.renderer.setPixelRatio(devicePixelRatio);
     this.renderer.outputEncoding = THREE.sRGBEncoding;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.toneMappingExposure = DAY_EXPOSURE;
     this.renderer.physicallyCorrectLights = true;
     this.renderer.xr.enabled = true;
     try {
@@ -63,8 +73,10 @@ export class SceneManager {
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
-    this.ambient = new THREE.AmbientLight(0x1e212b, 0.18);
+    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.18);
     this.scene.add(this.ambient);
+    this._ambientDayColor = DAY_AMBIENT_COLOR.clone();
+    this._ambientNightColor = NIGHT_AMBIENT_COLOR.clone();
 
     // Where remote avatars live
     this.remoteLayer = new THREE.Group();
@@ -72,6 +84,7 @@ export class SceneManager {
     this.scene.add(this.remoteLayer);
 
     this._skyEnvTarget = null;
+    this.currentNightMix = 0;
 
     // ---- Tile radius sampling (used for fog near/far) ----
     // You can override with setTileRadiusSource(number | () => number)
@@ -284,9 +297,18 @@ export class SceneManager {
   // Start close for atmospheric perspective; scale far with tile radius; tighten at night/haze
   _computeFogDistances(tileRadius, altitude, turbidity) {
     const R = Math.max(50, tileRadius);
+    const nightMix = this.currentNightMix ?? 0;
+    const dayFactor = 1 - nightMix;
 
-    const far = Math.min(R, this.camera.far - 50);
+    let far = Math.min(R, this.camera.far - 50);
+    if (nightMix > 0) {
+      far = THREE.MathUtils.lerp(far * 0.35, far, Math.pow(dayFactor, 0.65));
+    }
     let near = Math.max(this.camera.near + 10, Math.min(far - 20, R * 0.06));
+    if (nightMix > 0) {
+      const nightNear = Math.min(far - 15, near + 35 * nightMix);
+      near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
+    }
     if (near >= far - 5) near = Math.max(this.camera.near + 5, far - 5);
 
     return { near, far };
@@ -297,6 +319,11 @@ export class SceneManager {
 
     // 🔍 Sample the true color just BELOW the horizon from the Sky shader
     const fogColor = this._sampleSkyHorizonColor();
+    const nightMix = this.currentNightMix ?? 0;
+    if (nightMix > 0) {
+      const blend = THREE.MathUtils.smoothstep(0.2, 1.0, nightMix);
+      if (blend > 0) fogColor.lerp(NIGHT_FOG_COLOR, blend);
+    }
 
     // Distances based on tile radius + atmosphere
     const tileRadius = this._sampleTileRadius();
@@ -336,19 +363,49 @@ export class SceneManager {
     this.sunLight.target.updateMatrixWorld();
 
     const sunStrength = Math.max(0, Math.sin(altitude));
-    this.sunLight.intensity = THREE.MathUtils.lerp(0.05, 6.5, THREE.MathUtils.clamp(sunStrength + 0.2, 0, 1));
-    this.sunLight.visible = altitude > -0.35;
-    this.ambient.intensity = THREE.MathUtils.lerp(0.05, 0.22, THREE.MathUtils.clamp(sunStrength + 0.3, 0, 1));
+    let nightMix = 0;
+    if (altitude < TWILIGHT_ALTITUDE) {
+      nightMix = THREE.MathUtils.clamp(
+        (TWILIGHT_ALTITUDE - altitude) / (TWILIGHT_ALTITUDE - NIGHT_ALTITUDE),
+        0,
+        1
+      );
+    }
+    const dayFactor = Math.max(0, 1 - nightMix);
+    const daylight = THREE.MathUtils.clamp(sunStrength + 0.2, 0, 1);
+
+    const sunIntensityBase = THREE.MathUtils.lerp(0.05, 6.5, daylight);
+    const sunIntensity = sunIntensityBase * Math.pow(dayFactor, 1.8);
+    this.sunLight.intensity = sunIntensity;
+    this.sunLight.visible = sunIntensity > 0.02;
+
+    const ambientDay = THREE.MathUtils.lerp(0.06, 0.22, daylight);
+    const ambientIntensity = THREE.MathUtils.lerp(0.008, ambientDay, Math.pow(dayFactor, 1.1));
+    this.ambient.intensity = ambientIntensity;
+    this.ambient.color.copy(this._ambientNightColor).lerp(this._ambientDayColor, Math.pow(dayFactor, 1.3));
+
+    this.sunLight.color.copy(DUSK_SUN_COLOR).lerp(DAY_SUN_COLOR, Math.pow(dayFactor, 1.6));
 
     const uniforms = this.sky.material.uniforms;
-    uniforms['turbidity'].value = turbidity;
-    uniforms['rayleigh'].value = rayleigh;
-    uniforms['mieCoefficient'].value = mieCoefficient;
-    uniforms['mieDirectionalG'].value = mieDirectionalG;
+    const turbidityNight = THREE.MathUtils.lerp(turbidity, 0.25, nightMix);
+    const rayleighNight = THREE.MathUtils.lerp(rayleigh, 0.08, nightMix);
+    const mieNight = THREE.MathUtils.lerp(mieCoefficient, 0.00005, nightMix);
+    const mieDirectionalNight = THREE.MathUtils.lerp(mieDirectionalG, 0.92, nightMix);
+    uniforms['turbidity'].value = turbidityNight;
+    uniforms['rayleigh'].value = rayleighNight;
+    uniforms['mieCoefficient'].value = mieNight;
+    uniforms['mieDirectionalG'].value = mieDirectionalNight;
+    if (uniforms['luminance']) {
+      uniforms['luminance'].value = THREE.MathUtils.lerp(1, 0.06, nightMix);
+    }
     uniforms['sunPosition'].value.copy(direction.clone().multiplyScalar(45000));
 
     this.currentSunAltitude = altitude;
     this.currentSunStrength = sunStrength;
+    this.currentNightMix = nightMix;
+
+    const targetExposure = THREE.MathUtils.lerp(NIGHT_EXPOSURE, DAY_EXPOSURE, Math.pow(dayFactor, 1.1));
+    this.renderer.toneMappingExposure = targetExposure;
 
     if (this._skyEnvTarget) this._skyEnvTarget.dispose();
     this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
