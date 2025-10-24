@@ -25,6 +25,9 @@ export class Sensors {
     this._yawOff = 0;
     this._pitchOff = 0;
 
+    // One-time compass alignment flag (align yaw to heading once we have both)
+    this._compassAligned = false;
+
     // Screen orientation (rad)
     this._screenOri = 0;
 
@@ -33,40 +36,49 @@ export class Sensors {
     this._q0 = new THREE.Quaternion();
     this._q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -PI/2 around X
     this._eulerIn = new THREE.Euler();   // for beta/alpha/gamma → quaternion
-    this._eulerOut = new THREE.Euler();  // to read yaw/pitch (YXZ)
+    this._eulerOut = new THREE.Euler();  // to read pitch if desired (YXZ)
     this._orientationQuat = new THREE.Quaternion();
-    this._accelRaw = new THREE.Vector3();
-    this._accelWorld = new THREE.Vector3();
+
+    // Vectors used for heading/yaw extraction
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
+    this._fwdTmp = new THREE.Vector3();
 
+    // Motion/accel
+    this._accelRaw = new THREE.Vector3();
+    this._accelWorld = new THREE.Vector3();
     this.motion = { ax: 0, ay: 0, az: 0, ready: false, timestamp: 0 };
     this._motionListening = false;
 
+    // Magnetometer
     this._magSensor = null;
     this._magStartAttempted = false;
     this._magVec = new THREE.Vector3();
     this._magTemp = new THREE.Vector3();
-    this._webHeadingDeg = null;
-    this._webHeadingReady = false;
     this._magWorld = new THREE.Vector3();
     this._magReady = false;
 
+    // Web-reported heading (e.g., webkitCompassHeading)
+    this._webHeadingDeg = null;
+    this._webHeadingReady = false;
+
+    // Gravity (for tilt compensation fallback)
     this._gravityVec = new THREE.Vector3();
     this._gravityTemp = new THREE.Vector3();
     this._gravityReady = false;
 
+    // Enabling flow
     this._enabling = false;
     this._autoGestureAttached = false;
     this._autoGestureHandler = null;
 
+    // Public heading fields
     this.headingDeg = null;
-    this.headingRad = null;
+    this.headingRad = null;       // 0..2π, 0 = North(-Z), positive clockwise
     this.headingSource = 'unknown';
     this.headingConfidence = 0;
-    this.headingConfidence = 0;
 
-    // Bind handler once
+    // Bind handlers
     this._onDO = this._onDO.bind(this);
     this._onDM = this._onDM.bind(this);
 
@@ -160,6 +172,37 @@ export class Sensors {
     return { yaw: this.yaw, pitch: this.pitch, ready: (this.ready && this.enabled) };
   }
 
+  // --- Helpers ----------------------------------------------------
+
+  /** Vector-based yaw from a quaternion: 0 = North(-Z), +90° = East(+X), positive clockwise. */
+  _yawFromQuat(q) {
+    // Forward vector in world space
+    this._fwdTmp.set(0, 0, -1).applyQuaternion(q);
+    // IMPORTANT: use -x, -z so result is θ (not -θ), matching compass (CW positive)
+    return Math.atan2(-this._fwdTmp.x, -this._fwdTmp.z);
+  }
+
+  _normalizeAngle(rad) {
+    const twoPi = Math.PI * 2;
+    let out = rad % twoPi;
+    if (out < 0) out += twoPi;
+    return out;
+  }
+
+  _wrapPi(rad) {
+    if (!Number.isFinite(rad)) return 0;
+    return Math.atan2(Math.sin(rad), Math.cos(rad));
+  }
+
+  /** Heading from current orientation quaternion (no magnetometer), normalized to 0..2π */
+  _orientationHeading() {
+    if (!this._orientationQuat) return null;
+    const yaw = this._yawFromQuat(this._orientationQuat);
+    return Number.isFinite(yaw) ? this._normalizeAngle(yaw) : null;
+  }
+
+  // --- Event handlers --------------------------------------------
+
   // DeviceOrientation handler
   _onDO(e) {
     const a = e.alpha, b = e.beta, g = e.gamma;
@@ -185,28 +228,36 @@ export class Sensors {
       .multiply(this._q1) // -PI/2 X
       .multiply(this._q0.setFromAxisAngle(this._zee, -this._screenOri)); // compensate screen orientation
 
-    // Extract yaw (around Y) and pitch (around X) without rolling the camera
+    // Extract pitch from Euler if you like, but get yaw from vector-based method (no sign bug)
     this._eulerOut.setFromQuaternion(q, 'YXZ');
     this._measPitch = this._eulerOut.x;
-    this._measYaw   = this._eulerOut.y;
+    this._measYaw   = this._yawFromQuat(q); // << FIXED: use vector-based yaw
 
     // Apply calibration offsets to produce final camera-facing angles
     this.yaw   = this._measYaw   + this._yawOff;
     this.pitch = this._measPitch + this._pitchOff;
     this._orientationQuat.copy(q);
 
+    // Prefer platform heading if provided (iOS)
     if (typeof e.webkitCompassHeading === 'number' && Number.isFinite(e.webkitCompassHeading)) {
       this._webHeadingDeg = (e.webkitCompassHeading % 360 + 360) % 360;
       this._webHeadingReady = true;
       this._setHeading(THREE.MathUtils.degToRad(this._webHeadingDeg), 'webkit');
+      this._tryInitialCompassAlign();
       return;
     }
 
-    if (this._updateTiltCompensatedHeading()) return;
+    // Try magnetometer (tilt-compensated)
+    if (this._updateTiltCompensatedHeading()) {
+      this._tryInitialCompassAlign();
+      return;
+    }
 
+    // Fallback: derive heading from orientation only (gyro-fused)
     const orientationHeading = this._orientationHeading();
     if (Number.isFinite(orientationHeading)) {
       this._setHeading(orientationHeading, 'orientation');
+      this._tryInitialCompassAlign();
     } else if (!Number.isFinite(this.headingRad)) {
       this.headingDeg = null;
       this.headingRad = null;
@@ -229,7 +280,9 @@ export class Sensors {
       } else {
         this._gravityVec.lerp(this._gravityTemp, 0.18);
       }
-      this._updateTiltCompensatedHeading();
+      if (this._updateTiltCompensatedHeading()) {
+        this._tryInitialCompassAlign();
+      }
     }
 
     let ax = 0;
@@ -258,6 +311,8 @@ export class Sensors {
     this.motion.timestamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
   }
 
+  // --- Magnetometer / Heading ------------------------------------
+
   _startMagnetometer() {
     if (this._magStartAttempted) return;
     this._magStartAttempted = true;
@@ -275,7 +330,9 @@ export class Sensors {
           this._magVec.lerp(this._magTemp, 0.25);
         }
         this._magReady = true;
-        this._updateTiltCompensatedHeading();
+        if (this._updateTiltCompensatedHeading()) {
+          this._tryInitialCompassAlign();
+        }
       });
       sensor.addEventListener('error', () => {
         try { sensor.stop(); } catch { /* noop */ }
@@ -291,16 +348,23 @@ export class Sensors {
     }
   }
 
+  /**
+   * Use magnetometer + orientation to compute a tilt-compensated heading.
+   * Returns true if heading was updated.
+   */
   _updateTiltCompensatedHeading() {
     if (!this._magReady) return false;
 
     const magNorm = this._magVec.length();
     if (magNorm < 1e-6) return false;
 
+    // If we have a reliable orientation quaternion, rotate mag to world and read yaw
     if (this.orient?.ready) {
       const world = this._magWorld.copy(this._magVec).applyQuaternion(this._orientationQuat);
-      const headingRaw = this._normalizeAngle(Math.atan2(world.x, -world.z));
+      // FIXED SIGN: use -x, -z to match yaw convention (0=N, CW+)
+      const headingRaw = this._normalizeAngle(Math.atan2(-world.x, -world.z));
 
+      // Compare against orientation-only heading to resolve possible 180° ambiguity
       const orientHeading = this._orientationHeading();
       let finalHeading = headingRaw;
       if (Number.isFinite(orientHeading)) {
@@ -311,6 +375,7 @@ export class Sensors {
       return this._setHeading(finalHeading, 'magnetometer');
     }
 
+    // Fallback: use gravity vector to build a tilt frame and compensate mag manually
     if (!this._gravityReady) return false;
 
     const ax = -this._gravityVec.x;
@@ -339,6 +404,7 @@ export class Sensors {
     const mxComp = mx * cosPitch + mz * sinPitch;
     const myComp = mx * sinRoll * sinPitch + my * cosRoll - mz * sinRoll * cosPitch;
 
+    // This formula already matches 0=N, CW+: keep as-is
     let headingRad = Math.atan2(-myComp, mxComp);
     if (!Number.isFinite(headingRad)) return false;
 
@@ -350,9 +416,10 @@ export class Sensors {
     if (!Number.isFinite(headingRad)) return false;
     let target = this._normalizeAngle(headingRad);
 
+    // Smoothly approach target to reduce jitter
     if (Number.isFinite(this.headingRad)) {
       const delta = this._wrapPi(target - this.headingRad);
-      target = this.headingRad + delta * 0.22;
+      target = this.headingRad + delta * 0.22; // EMA-ish
       target = this._normalizeAngle(target);
     }
 
@@ -366,28 +433,19 @@ export class Sensors {
     return true;
   }
 
-  _normalizeAngle(rad) {
-    const twoPi = Math.PI * 2;
-    let out = rad % twoPi;
-    if (out < 0) out += twoPi;
-    return out;
+  // One-time alignment: when we have a compass heading and an orientation, align yaw to heading.
+  _tryInitialCompassAlign() {
+    if (this._compassAligned) return;
+    if (!Number.isFinite(this.headingRad)) return;
+    if (!this.orient?.ready) return;
+
+    const gyYaw = this._yawFromQuat(this._orientationQuat);
+    const err = this._wrapPi(this.headingRad - gyYaw);
+    this._yawOff += err;        // apply as calibration offset (do not touch pitch)
+    this._compassAligned = true;
   }
 
-  _wrapPi(rad) {
-    if (!Number.isFinite(rad)) return 0;
-    return Math.atan2(Math.sin(rad), Math.cos(rad));
-  }
-
-  _orientationHeading() {
-    if (!this._orientationQuat) return null;
-    const forward = this._headingWorld.copy(this._headingBasis).applyQuaternion(this._orientationQuat);
-    const x = forward.x;
-    const z = forward.z;
-    const horiz = x * x + z * z;
-    if (horiz < 1e-8) return null;
-    const heading = Math.atan2(x, -z);
-    return Number.isFinite(heading) ? this._normalizeAngle(heading) : null;
-  }
+  // --- Misc / UI --------------------------------------------------
 
   _setupAutoEnable() {
     this.enable()
