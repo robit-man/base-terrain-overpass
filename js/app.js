@@ -3690,6 +3690,12 @@ class App {
 
     if (doPerf) this._perfNextMs = now + (urgent ? 120 : this._perfCadenceMs);
 
+    if (this.hexGridMgr?.updateTreePerformanceSample) {
+      const fpsForTrees = Number.isFinite(perfState?.smoothedFps)
+        ? perfState.smoothedFps
+        : fpsEstimate;
+      this.hexGridMgr.updateTreePerformanceSample(fpsForTrees, dt);
+    }
 
     if (perfState.qualityChanged || perfState.hudReady) {
       const tileSummary = perfState.subsystems?.terrain ?? null;

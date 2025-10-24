@@ -109,6 +109,12 @@ export class TileManager {
     this._treeLib = (typeof window !== 'undefined') ? window['@dgreenheck/ez-tree'] || null : null;
     this._treeLibPromise = null;
     this._treeLibWarned = false;
+    this._treeComplexity = 0.35;
+    this._treeTargetComplexity = 0.35;
+    this._treePerfSamples = [];
+    this._treePerfSampleTime = 0;
+    this._treePerfEvalTimer = 0;
+    this._treeRegenQueue = null;
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -1380,7 +1386,9 @@ _stitchInteractiveToVisualEdges(tile, {
   }
   _extractGreenSamples(data, width, height) {
     const step = Math.max(2, Math.floor(Math.min(width, height) / 64));
-    const maxSamples = 180;
+    const complexity = THREE.MathUtils.clamp(this._treeComplexity ?? 0.35, 0.2, 1);
+    const maxSamples = Math.round(120 + complexity * 120);
+    const spawnBias = THREE.MathUtils.lerp(0.22, 0.48, complexity);
     const out = [];
     for (let y = 0; y < height; y += step) {
       for (let x = 0; x < width; x += step) {
@@ -1394,7 +1402,7 @@ _stitchInteractiveToVisualEdges(tile, {
         if (brightness < 45) continue;
         if (g < 90) continue;
         if (g < r * 1.15 || g < b * 1.25) continue;
-        if (Math.random() > 0.35) continue;
+        if (Math.random() > spawnBias) continue;
         out.push({ u: x / width, v: y / height });
         if (out.length >= maxSamples) return out;
       }
@@ -1418,7 +1426,9 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!bounds || !this.origin) return;
     const samples = entry.samples;
     const worldPositions = [];
-    const maxCount = 40;
+    const complexity = THREE.MathUtils.clamp(this._treeComplexity ?? 0.35, 0.2, 1);
+    const maxCount = Math.max(3, Math.round(4 + complexity * 40));
+    const densityScalar = THREE.MathUtils.lerp(0.18, 0.9, complexity);
     const center = tile.grid.group.position;
     const radius = tile._radiusOverride ?? this.tileRadius;
     const lonSpan = bounds.lonMax - bounds.lonMin || 1;
@@ -1428,7 +1438,8 @@ _stitchInteractiveToVisualEdges(tile, {
       const s = samples[i];
       const distCenter = Math.hypot(s.u - 0.5, s.v - 0.5);
       const densityWeight = Math.max(0, 1 - distCenter);
-      if (Math.random() > densityWeight) continue;
+      const spawnChance = Math.min(1, densityWeight * densityScalar);
+      if (Math.random() > spawnChance) continue;
 
       const lon = bounds.lonMin + lonSpan * s.u;
       const lat = bounds.latMax - latSpan * s.v;
@@ -1497,6 +1508,50 @@ _stitchInteractiveToVisualEdges(tile, {
     return 'tropical';
   }
 
+  updateTreePerformanceSample(fps, dt = 0) {
+    if (!this._treeEnabled) return;
+    if (!Number.isFinite(fps) || !Number.isFinite(dt) || dt <= 0) return;
+    if (!Array.isArray(this._treePerfSamples)) {
+      this._treePerfSamples = [];
+      this._treePerfSampleTime = 0;
+      this._treePerfEvalTimer = 0;
+    }
+    this._treePerfSamples.push({ fps, dt });
+    this._treePerfSampleTime += dt;
+    while (this._treePerfSamples.length > 0 && this._treePerfSampleTime > 6) {
+      const oldest = this._treePerfSamples.shift();
+      this._treePerfSampleTime -= oldest.dt;
+    }
+
+    this._treePerfEvalTimer += dt;
+    if (this._treePerfEvalTimer >= 5 && this._treePerfSampleTime >= 2.5) {
+      let totalFps = 0;
+      let totalDt = 0;
+      for (const sample of this._treePerfSamples) {
+        totalFps += sample.fps * sample.dt;
+        totalDt += sample.dt;
+      }
+      const avgFps = totalDt > 1e-6 ? totalFps / totalDt : fps;
+      const prevTarget = this._treeTargetComplexity;
+      if (avgFps >= 54) {
+        this._treeTargetComplexity = Math.min(1, this._treeTargetComplexity + 0.12);
+      } else if (avgFps <= 44) {
+        this._treeTargetComplexity = Math.max(0.25, this._treeTargetComplexity - 0.15);
+      }
+      if (Math.abs(this._treeTargetComplexity - prevTarget) < 0.01) {
+        this._treeTargetComplexity = THREE.MathUtils.clamp(this._treeTargetComplexity, 0.25, 1);
+      }
+      if (Math.abs(this._treeTargetComplexity - prevTarget) > 0.1) {
+        this._scheduleTreeRefresh();
+      }
+      this._treePerfEvalTimer = 0;
+    }
+
+    const lerpRate = THREE.MathUtils.clamp(dt * 0.35, 0, 0.35);
+    this._treeComplexity = THREE.MathUtils.lerp(this._treeComplexity, this._treeTargetComplexity, lerpRate);
+    this._treeComplexity = THREE.MathUtils.clamp(this._treeComplexity, 0.25, 1);
+  }
+
   _configureTreeForRegion(tree, latLon, seed, lib = this._treeLib) {
     if (!lib) return;
 
@@ -1507,15 +1562,27 @@ _stitchInteractiveToVisualEdges(tile, {
 
     const lat = latLon?.lat ?? 0;
     const profile = this._pickTreeProfile(lat);
+    const complexity = THREE.MathUtils.clamp(this._treeComplexity ?? 0.35, 0.2, 1);
     const seedNoise = (offset, min, max) => min + this._seededRandom(seed, offset) * (max - min);
+    const angleScale = THREE.MathUtils.lerp(0.85, 1.1, complexity);
+    const applyAngleRange = (baseMin, baseMax) => {
+      if (!opts.branch?.angle) return;
+      Object.keys(opts.branch.angle).forEach((level) => {
+        opts.branch.angle[level] = seedNoise(40 + Number(level), baseMin * angleScale, baseMax * angleScale);
+      });
+    };
 
+    const levelMin = THREE.MathUtils.lerp(1, 2.1, complexity);
+    const levelMax = THREE.MathUtils.lerp(1.5, 4.0, complexity);
     if (opts.branch?.levels != null) {
-      opts.branch.levels = Math.round(seedNoise(1, 2.2, 3.8));
+      const rawLevels = seedNoise(1, levelMin, levelMax);
+      opts.branch.levels = Math.max(1, Math.round(rawLevels));
     }
 
+    const twistScale = THREE.MathUtils.lerp(0.4, 1, complexity);
     if (opts.branch?.twist) {
       Object.keys(opts.branch.twist).forEach((level, idx) => {
-        opts.branch.twist[level] = seedNoise(20 + idx, -0.2, 0.4);
+        opts.branch.twist[level] = seedNoise(20 + idx, -0.2, 0.4) * twistScale;
       });
     }
 
@@ -1525,72 +1592,140 @@ _stitchInteractiveToVisualEdges(tile, {
         if (opts.bark?.type != null && BarkType?.Pine) opts.bark.type = BarkType.Pine;
         if (opts.leaves?.type != null && LeafType?.Pine) opts.leaves.type = LeafType.Pine;
         if (opts.leaves?.billboard != null && Billboard?.Single) opts.leaves.billboard = Billboard.Single;
-        if (opts.branch?.angle) {
-          Object.keys(opts.branch.angle).forEach((level) => {
-            opts.branch.angle[level] = seedNoise(30 + Number(level), 32, 48);
-          });
-        }
+        applyAngleRange(32, 48);
         break;
       case 'temperate':
         if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
         if (opts.bark?.type != null && BarkType?.Oak) opts.bark.type = BarkType.Oak;
         if (opts.leaves?.type != null && LeafType?.Oak) opts.leaves.type = LeafType.Oak;
         if (opts.leaves?.billboard != null && Billboard?.Double) opts.leaves.billboard = Billboard.Double;
-        if (opts.branch?.angle) {
-          Object.keys(opts.branch.angle).forEach((level) => {
-            opts.branch.angle[level] = seedNoise(40 + Number(level), 45, 68);
-          });
-        }
+        applyAngleRange(45, 68);
         break;
       case 'subtropical':
         if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
         if (opts.bark?.type != null && BarkType?.Willow) opts.bark.type = BarkType.Willow;
         if (opts.leaves?.type != null && LeafType?.Ash) opts.leaves.type = LeafType.Ash;
-        if (opts.branch?.angle) {
-          Object.keys(opts.branch.angle).forEach((level) => {
-            opts.branch.angle[level] = seedNoise(50 + Number(level), 55, 75);
-          });
-        }
+        applyAngleRange(55, 75);
         break;
       default:
         if (opts.type != null && TreeType?.Deciduous) opts.type = TreeType.Deciduous;
         if (opts.bark?.type != null && BarkType?.Birch) opts.bark.type = BarkType.Birch;
         if (opts.leaves?.type != null && LeafType?.Aspen) opts.leaves.type = LeafType.Aspen;
-        if (opts.branch?.angle) {
-          Object.keys(opts.branch.angle).forEach((level) => {
-            opts.branch.angle[level] = seedNoise(60 + Number(level), 40, 70);
-          });
-        }
+        applyAngleRange(40, 70);
         break;
     }
 
+    const lengthScale = THREE.MathUtils.lerp(0.6, 1.05, complexity);
     if (opts.branch?.length) {
-      const base = seedNoise(5, 16, 28);
+      const base = seedNoise(5, 16, 28) * lengthScale;
       opts.branch.length[0] = base;
-      if (opts.branch.length[1] != null) opts.branch.length[1] = base * seedNoise(6, 0.45, 0.68);
-      if (opts.branch.length[2] != null) opts.branch.length[2] = base * seedNoise(7, 0.25, 0.45);
+      if (opts.branch.length[1] != null) opts.branch.length[1] = base * seedNoise(6, 0.45, 0.68) * lengthScale;
+      if (opts.branch.length[2] != null) opts.branch.length[2] = base * seedNoise(7, 0.25, 0.45) * lengthScale;
     }
 
+    const childScale = THREE.MathUtils.lerp(0.45, 1.05, complexity);
     if (opts.branch?.children) {
       Object.keys(opts.branch.children).forEach((level, idx) => {
         const baseChildren = profile === 'boreal' ? 4 : profile === 'temperate' ? 6 : 5;
-        opts.branch.children[level] = Math.max(2, Math.round(baseChildren * seedNoise(10 + idx, 0.75, 1.25)));
+        const raw = baseChildren * seedNoise(10 + idx, 0.75, 1.25) * childScale;
+        opts.branch.children[level] = Math.max(1, Math.round(raw));
       });
+    }
+
+    const radiusScale = THREE.MathUtils.lerp(0.55, 1.0, complexity);
+    if (opts.branch?.radius) {
+      Object.keys(opts.branch.radius).forEach((level) => {
+        opts.branch.radius[level] = (opts.branch.radius[level] || 0.7) * radiusScale;
+      });
+    }
+
+    const sectionScale = THREE.MathUtils.lerp(0.6, 1.0, complexity);
+    if (opts.branch?.sections) {
+      Object.keys(opts.branch.sections).forEach((level) => {
+        const base = opts.branch.sections[level] || 6;
+        opts.branch.sections[level] = Math.max(3, Math.round(base * sectionScale));
+      });
+    }
+
+    const segmentScale = THREE.MathUtils.lerp(0.6, 1.0, complexity);
+    if (opts.branch?.segments) {
+      Object.keys(opts.branch.segments).forEach((level) => {
+        const base = opts.branch.segments[level] || 4;
+        opts.branch.segments[level] = Math.max(3, Math.round(base * segmentScale));
+      });
+    }
+
+    if (opts.branch?.gnarliness) {
+      const gnarlScale = THREE.MathUtils.lerp(0.5, 1.0, complexity);
+      Object.keys(opts.branch.gnarliness).forEach((level) => {
+        opts.branch.gnarliness[level] = (opts.branch.gnarliness[level] || 0.1) * gnarlScale;
+      });
+    }
+
+    if (opts.branch?.force?.strength != null) {
+      opts.branch.force.strength *= THREE.MathUtils.lerp(0.6, 1.0, complexity);
     }
 
     if (opts.leaves?.count != null) {
       const base = profile === 'boreal' ? 4 : profile === 'temperate' ? 12 : 16;
-      opts.leaves.count = Math.round(base * seedNoise(12, 0.8, 1.4));
+      const countScale = THREE.MathUtils.lerp(0.4, 1.25, complexity);
+      opts.leaves.count = Math.max(2, Math.round(base * seedNoise(12, 0.8, 1.4) * countScale));
     }
 
     if (opts.leaves?.size != null) {
-      opts.leaves.size = seedNoise(13, 1.8, 3.5);
+      const sizeScale = THREE.MathUtils.lerp(0.8, 1.15, complexity);
+      opts.leaves.size = seedNoise(13, 1.6, 3.5) * sizeScale;
     }
 
     if (opts.leaves?.sizeVariance != null) {
-      opts.leaves.sizeVariance = seedNoise(14, 0.4, 0.8);
+      const varianceScale = THREE.MathUtils.lerp(0.6, 1.05, complexity);
+      opts.leaves.sizeVariance = seedNoise(14, 0.35, 0.8) * varianceScale;
+    }
+
+    if (opts.leaves?.billboard != null && Billboard) {
+      opts.leaves.billboard = complexity < 0.5
+        ? (Billboard.Single ?? opts.leaves.billboard)
+        : (Billboard.Double ?? opts.leaves.billboard);
     }
   }
+  _scheduleTreeRefresh() {
+    if (!this.tiles?.size) return;
+    if (Array.isArray(this._treeRegenQueue) && this._treeRegenQueue.length) return;
+    const tiles = Array.from(this.tiles.values()).filter((tile) => tile && tile.type === 'interactive');
+    if (!tiles.length) return;
+    this._treeRegenQueue = tiles;
+  }
+
+  _serviceTreeRefresh(maxTilesPerFrame = 1) {
+    if (!Array.isArray(this._treeRegenQueue) || !this._treeRegenQueue.length) return;
+    const start = performance?.now ? performance.now() : Date.now();
+    const budgetMs = 1.2;
+    let processed = 0;
+    while (this._treeRegenQueue.length && processed < maxTilesPerFrame) {
+      if (performance?.now && performance.now() - start > budgetMs) break;
+      const tile = this._treeRegenQueue.shift();
+      if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
+      if (tile._overlay?.status !== 'ready') {
+        this._treeRegenQueue.push(tile);
+        processed += 1;
+        continue;
+      }
+      const entryKey = tile._overlay?.cacheKey;
+      const entry = entryKey ? this._overlayCache.get(entryKey) : null;
+      if (!entry || !Array.isArray(entry.samples) || !entry.samples.length) {
+        this._treeRegenQueue.push(tile);
+        processed += 1;
+        continue;
+      }
+      this._applyTreeSeeds(tile, entry);
+      processed += 1;
+    }
+    if (!this._treeRegenQueue.length) {
+      this._treeRegenQueue = null;
+    }
+  }
+
+
 
   async _spawnTreesForTile(tile, worldPositions = []) {
     try {
@@ -1600,6 +1735,8 @@ _stitchInteractiveToVisualEdges(tile, {
       const treeLib = await this._ensureTreeLibrary();
       if (!treeLib || !treeLib.Tree) return;
 
+      const complexity = THREE.MathUtils.clamp(this._treeComplexity ?? 0.35, 0.2, 1);
+      const jitterRange = THREE.MathUtils.lerp(0.6, 1.6, complexity);
       const basePos = tile.grid.group.position;
       const group = new THREE.Group();
       group.name = 'tile-trees';
@@ -1608,8 +1745,8 @@ _stitchInteractiveToVisualEdges(tile, {
       tile._treeSamples = [];
 
       for (const pos of worldPositions) {
-        const jitterX = THREE.MathUtils.randFloatSpread(1.4);
-        const jitterZ = THREE.MathUtils.randFloatSpread(1.4);
+        const jitterX = THREE.MathUtils.randFloatSpread(jitterRange);
+        const jitterZ = THREE.MathUtils.randFloatSpread(jitterRange);
         const localX = pos.x - basePos.x + jitterX;
         const localZ = pos.z - basePos.z + jitterZ;
         const worldX = basePos.x + localX;
@@ -1629,7 +1766,10 @@ _stitchInteractiveToVisualEdges(tile, {
           continue;
         }
 
-        const scale = THREE.MathUtils.lerp(0.55, 1.1, this._seededRandom(seed, 90));
+        const scaleBase = THREE.MathUtils.lerp(0.5, 0.98, complexity);
+        const scaleVariance = THREE.MathUtils.lerp(0.2, 0.45, complexity);
+        const scaleNoise = this._seededRandom(seed, 80) - 0.5;
+        const scale = THREE.MathUtils.clamp(scaleBase + scaleNoise * scaleVariance, 0.32, 1.3);
         tree.scale.setScalar(scale);
         tree.position.set(localX, groundY, localZ);
         tree.rotation.y = this._seededRandom(seed, 3) * Math.PI * 2;
@@ -3959,6 +4099,8 @@ update(playerPos) {
       }
     }
     this._updateFarfieldMergedMesh();
+    const treeRefreshPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 3, this._treeComplexity ?? 0.35)));
+    this._serviceTreeRefresh(treeRefreshPerFrame);
   };
 
   // Decide whether to do heavy work this frame
