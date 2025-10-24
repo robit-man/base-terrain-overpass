@@ -303,6 +303,10 @@ export class SceneManager {
     let far = Math.min(R, this.camera.far - 50);
     if (nightMix > 0) {
       far = THREE.MathUtils.lerp(far * 0.35, far, Math.pow(dayFactor, 0.65));
+      if (nightMix > 0.65) {
+        const clampFar = THREE.MathUtils.lerp(R * 0.18, R * 0.35, Math.pow(dayFactor, 0.8));
+        far = Math.min(far, clampFar);
+      }
     }
     let near = Math.max(this.camera.near + 10, Math.min(far - 20, R * 0.06));
     if (nightMix > 0) {
@@ -321,7 +325,8 @@ export class SceneManager {
     const fogColor = this._sampleSkyHorizonColor();
     const nightMix = this.currentNightMix ?? 0;
     if (nightMix > 0) {
-      const blend = THREE.MathUtils.smoothstep(0.2, 1.0, nightMix);
+      const t = THREE.MathUtils.clamp((nightMix - 0.08) / 0.92, 0, 1);
+      const blend = Math.pow(t, 1.25);
       if (blend > 0) fogColor.lerp(NIGHT_FOG_COLOR, blend);
     }
 
