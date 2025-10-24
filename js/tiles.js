@@ -761,6 +761,12 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!this._farfieldMerge) return;
     const state = this._farfieldMerge;
     const tNow = (typeof now === 'function') ? now() : Date.now();
+    if (this._overlayEnabled) {
+      if (state.mesh) this._disposeFarfieldMergedMesh();
+      state.dirty = false;
+      state.lastBuildTime = tNow;
+      return;
+    }
     if (!force) {
       if (!state.dirty) return;
       if (tNow < (state.nextBuild || 0)) return;
@@ -1151,6 +1157,57 @@ _stitchInteractiveToVisualEdges(tile, {
     const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, zoom);
     return THREE.MathUtils.radToDeg(Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
   }
+  _slippyTileBounds(x, y, zoom) {
+    return {
+      lonMin: this._slippyTileToLon(x, zoom),
+      lonMax: this._slippyTileToLon(x + 1, zoom),
+      latMax: this._slippyTileToLat(y, zoom),
+      latMin: this._slippyTileToLat(y + 1, zoom),
+    };
+  }
+  _boundsContain(outer, inner) {
+    if (!outer || !inner) return false;
+    const lonSpan = Math.max(1e-9, outer.lonMax - outer.lonMin);
+    const latSpan = Math.max(1e-9, outer.latMax - outer.latMin);
+    const lonMargin = Math.max(1e-7, lonSpan * 0.015);
+    const latMargin = Math.max(1e-7, latSpan * 0.015);
+    return (
+      inner.lonMin >= outer.lonMin + lonMargin &&
+      inner.lonMax <= outer.lonMax - lonMargin &&
+      inner.latMin >= outer.latMin + latMargin &&
+      inner.latMax <= outer.latMax - latMargin
+    );
+  }
+  _estimateTileCoverageLatLon(tile) {
+    if (!tile || !this.origin) return null;
+    const group = tile.grid?.group;
+    if (!group) return null;
+    const radius = tile._radiusOverride ?? this.tileRadius;
+    if (!Number.isFinite(radius) || radius <= 0) return null;
+    const samples = [{ x: 0, z: 0 }];
+    const outer = this._hexCorners(radius);
+    const mid = this._hexCorners(radius * 0.55);
+    for (const pt of outer) samples.push(pt);
+    for (const pt of mid) samples.push(pt);
+    let latMin = Infinity;
+    let latMax = -Infinity;
+    let lonMin = Infinity;
+    let lonMax = -Infinity;
+    for (const pt of samples) {
+      const wx = group.position.x + pt.x;
+      const wz = group.position.z + pt.z;
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      if (!ll) continue;
+      if (ll.lat < latMin) latMin = ll.lat;
+      if (ll.lat > latMax) latMax = ll.lat;
+      if (ll.lon < lonMin) lonMin = ll.lon;
+      if (ll.lon > lonMax) lonMax = ll.lon;
+    }
+    if (!Number.isFinite(latMin) || !Number.isFinite(latMax) || !Number.isFinite(lonMin) || !Number.isFinite(lonMax)) {
+      return null;
+    }
+    return { latMin, latMax, lonMin, lonMax };
+  }
   _primeWaybackVersions() {
     if (typeof window === 'undefined') return;
     if (typeof fetch !== 'function' || typeof DOMParser === 'undefined') return;
@@ -1255,10 +1312,21 @@ _stitchInteractiveToVisualEdges(tile, {
 
     const center = this._tileCenterLatLon(tile);
     if (!center) return;
+    const coverage = this._estimateTileCoverageLatLon(tile);
     let zoom = this._overlayZoom;
     if (tile.type === 'visual') zoom = Math.max(3, zoom - 1);
     else if (tile.type === 'farfield') zoom = Math.max(3, zoom - 2);
-    const slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
+    let slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
+    let bounds = this._slippyTileBounds(slippy.x, slippy.y, zoom);
+    if (coverage) {
+      let attempts = 0;
+      while (zoom > 0 && !this._boundsContain(bounds, coverage) && attempts < 16) {
+        zoom -= 1;
+        slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
+        bounds = this._slippyTileBounds(slippy.x, slippy.y, zoom);
+        attempts++;
+      }
+    }
     const key = `${version}/${zoom}/${slippy.x}/${slippy.y}`;
 
     let entry = this._overlayCache.get(key);
@@ -1274,9 +1342,13 @@ _stitchInteractiveToVisualEdges(tile, {
         x: slippy.x,
         y: slippy.y,
         version,
+        bounds,
+        coverage,
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);
+    } else if (!entry.bounds && bounds) {
+      entry.bounds = bounds;
     }
     entry.waiters.add(tile);
     tile._overlay = { status: 'loading', cacheKey: key };
@@ -1287,10 +1359,11 @@ _stitchInteractiveToVisualEdges(tile, {
       entry.status = 'error';
       return;
     }
-    const lonMin = this._slippyTileToLon(x, zoom);
-    const lonMax = this._slippyTileToLon(x + 1, zoom);
-    const latMax = this._slippyTileToLat(y, zoom);
-    const latMin = this._slippyTileToLat(y + 1, zoom);
+    let bounds = entry.bounds;
+    if (!bounds) {
+      bounds = this._slippyTileBounds(x, y, zoom);
+    }
+    const { lonMin, lonMax, latMin, latMax } = bounds;
     const url = this._buildWaybackTileUrl(version, zoom, x, y);
     if (!url) {
       entry.status = 'error';
@@ -1399,10 +1472,11 @@ _stitchInteractiveToVisualEdges(tile, {
       const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
       const lon = Number.isFinite(ll?.lon) ? ll.lon : bounds.lonMin;
       const lat = Number.isFinite(ll?.lat) ? ll.lat : bounds.latMin;
-      const u = THREE.MathUtils.clamp((lon - bounds.lonMin) / lonSpan, 0, 1);
-      const v = THREE.MathUtils.clamp((bounds.latMax - lat) / latSpan, 0, 1);
-      data[i * 2] = u;
-      data[i * 2 + 1] = v;
+      const u = (lon - bounds.lonMin) / lonSpan;
+      const v = (bounds.latMax - lat) / latSpan;
+      const eps = 1e-5;
+      data[i * 2] = THREE.MathUtils.clamp(u, eps, 1 - eps);
+      data[i * 2 + 1] = THREE.MathUtils.clamp(v, eps, 1 - eps);
     }
     uv.needsUpdate = true;
   }
