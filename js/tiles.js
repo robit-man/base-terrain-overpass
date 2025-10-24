@@ -12,6 +12,16 @@ const DEFAULT_TERRAIN_DATASET = 'mapzen';
 const DM_BUDGET_BYTES = 9600;
 const MAX_LOCATIONS_PER_BATCH = 1800;
 const TERRAIN_FETCH_BOOST = 2;
+const PAINTERLY_KERNEL_SIZE = 5;
+const PAINTERLY_KERNEL_RADIUS = 2;
+const PAINTERLY_KERNEL = [
+  1, 4, 7, 4, 1,
+  4, 16, 26, 16, 4,
+  7, 26, 41, 26, 7,
+  4, 16, 26, 16, 4,
+  1, 4, 7, 4, 1
+];
+const PAINTERLY_KERNEL_WEIGHT = PAINTERLY_KERNEL.reduce((sum, w) => sum + w, 0);
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
 
@@ -1127,22 +1137,29 @@ _stitchInteractiveToVisualEdges(tile, {
     const image = new Image();
     image.crossOrigin = 'anonymous';
     image.onload = () => {
-      const texture = new THREE.Texture(image);
-      texture.needsUpdate = true;
-      texture.flipY = false;
-      texture.anisotropy = 4;
-      texture.wrapS = THREE.ClampToEdgeWrapping;
-      texture.wrapT = THREE.ClampToEdgeWrapping;
       const overlayData = this._processOverlayImage(image, {
         lonMin,
         lonMax,
         latMin,
         latMax,
       });
+      let texture;
+      if (overlayData.canvas) {
+        texture = new THREE.CanvasTexture(overlayData.canvas);
+      } else {
+        texture = new THREE.Texture(image);
+      }
+      texture.needsUpdate = true;
+      texture.flipY = false;
+      texture.anisotropy = 4;
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      if ('colorSpace' in texture && THREE.SRGBColorSpace) texture.colorSpace = THREE.SRGBColorSpace;
+      else if ('encoding' in texture && THREE.sRGBEncoding != null) texture.encoding = THREE.sRGBEncoding;
       entry.status = 'ready';
       entry.texture = texture;
       entry.bounds = { lonMin, lonMax, latMin, latMax };
-      entry.samples = overlayData.samples;
+      entry.samples = overlayData.samples || [];
       entry.imageSize = overlayData.imageSize;
       const waiters = entry.waiters ? Array.from(entry.waiters) : [];
       entry.waiters?.clear?.();
@@ -1246,11 +1263,81 @@ _stitchInteractiveToVisualEdges(tile, {
       mesh.visible = true;
     }
   }
+  _applyPainterlyFilter(imageData, width, height) {
+    if (!imageData || !imageData.data) return imageData;
+    const src = imageData.data;
+    let filtered;
+    if (typeof ImageData === 'function') {
+      filtered = new ImageData(width, height);
+    } else if (this._overlayCtx?.createImageData) {
+      filtered = this._overlayCtx.createImageData(width, height);
+    } else {
+      return imageData;
+    }
+    const dest = filtered.data;
+    const kernel = PAINTERLY_KERNEL;
+    const size = PAINTERLY_KERNEL_SIZE;
+    const radius = PAINTERLY_KERNEL_RADIUS;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let a = 0;
+        let weightTotal = 0;
+        for (let ky = -radius; ky <= radius; ky++) {
+          const sy = Math.min(height - 1, Math.max(0, y + ky));
+          const wy = ky + radius;
+          for (let kx = -radius; kx <= radius; kx++) {
+            const sx = Math.min(width - 1, Math.max(0, x + kx));
+            const wx = kx + radius;
+            const weight = kernel[wy * size + wx];
+            const idx = (sy * width + sx) * 4;
+            r += src[idx] * weight;
+            g += src[idx + 1] * weight;
+            b += src[idx + 2] * weight;
+            a += src[idx + 3] * weight;
+            weightTotal += weight;
+          }
+        }
+        const effectiveWeight = weightTotal > 0 ? weightTotal : PAINTERLY_KERNEL_WEIGHT;
+        const invWeight = effectiveWeight > 0 ? 1 / effectiveWeight : 0;
+        r *= invWeight;
+        g *= invWeight;
+        b *= invWeight;
+        a *= invWeight;
+
+        const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const saturation = 1.12;
+        let rr = luminance + (r - luminance) * saturation;
+        let gg = luminance + (g - luminance) * saturation;
+        let bb = luminance + (b - luminance) * saturation;
+
+        rr = rr * 1.05 + 6;
+        gg = gg * 1.0 + 4;
+        bb = bb * 0.95 + 6;
+
+        const hash = Math.sin((x * 12.9898 + y * 78.233) * 43758.5453);
+        const noise = (hash - Math.floor(hash)) - 0.5;
+        const noiseScale = 6;
+        rr += noise * noiseScale;
+        gg += noise * noiseScale * 0.8;
+        bb += noise * noiseScale * 0.6;
+
+        const idxOut = (y * width + x) * 4;
+        dest[idxOut] = THREE.MathUtils.clamp(rr, 0, 255);
+        dest[idxOut + 1] = THREE.MathUtils.clamp(gg, 0, 255);
+        dest[idxOut + 2] = THREE.MathUtils.clamp(bb, 0, 255);
+        dest[idxOut + 3] = THREE.MathUtils.clamp(a, 0, 255);
+      }
+    }
+    return filtered;
+  }
   _processOverlayImage(image, bounds) {
     if (typeof document === 'undefined') {
       const w = image.naturalWidth || image.width || 256;
       const h = image.naturalHeight || image.height || 256;
-      return { samples: [], imageSize: { width: w, height: h }, bounds };
+      return { samples: [], imageSize: { width: w, height: h }, bounds, canvas: null };
     }
     const canvas = this._overlayCanvas || document.createElement('canvas');
     const ctx = this._overlayCtx || canvas.getContext('2d', { willReadFrequently: true });
@@ -1263,13 +1350,33 @@ _stitchInteractiveToVisualEdges(tile, {
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(image, 0, 0, w, h);
     let samples = [];
+    let filteredData = null;
     try {
-      const imgData = ctx.getImageData(0, 0, w, h).data;
-      samples = this._extractGreenSamples(imgData, w, h);
-    } catch {
-      samples = [];
+      const originalData = ctx.getImageData(0, 0, w, h);
+      filteredData = this._applyPainterlyFilter(originalData, w, h);
+      if (filteredData) ctx.putImageData(filteredData, 0, 0);
+      const sampleSource = filteredData ? filteredData.data : originalData.data;
+      samples = this._extractGreenSamples(sampleSource, w, h);
+    } catch (err) {
+      try {
+        const fallback = ctx.getImageData(0, 0, w, h).data;
+        samples = this._extractGreenSamples(fallback, w, h);
+      } catch {
+        samples = [];
+      }
     }
-    return { samples, imageSize: { width: w, height: h }, bounds };
+    let textureCanvas = null;
+    try {
+      textureCanvas = document.createElement('canvas');
+      textureCanvas.width = w;
+      textureCanvas.height = h;
+      const tctx = textureCanvas.getContext('2d');
+      if (filteredData) tctx.putImageData(filteredData, 0, 0);
+      else tctx.drawImage(canvas, 0, 0, w, h);
+    } catch {
+      textureCanvas = null;
+    }
+    return { samples, imageSize: { width: w, height: h }, bounds, canvas: textureCanvas };
   }
   _extractGreenSamples(data, width, height) {
     const step = Math.max(2, Math.floor(Math.min(width, height) / 64));
@@ -1486,68 +1593,72 @@ _stitchInteractiveToVisualEdges(tile, {
   }
 
   async _spawnTreesForTile(tile, worldPositions = []) {
-    this._clearTileTrees(tile);
-    if (!this._treeEnabled || !worldPositions.length) return;
+    try {
+      this._clearTileTrees(tile);
+      if (!this._treeEnabled || !worldPositions.length) return;
 
-    const treeLib = await this._ensureTreeLibrary();
-    if (!treeLib || !treeLib.Tree) return;
+      const treeLib = await this._ensureTreeLibrary();
+      if (!treeLib || !treeLib.Tree) return;
 
-    const basePos = tile.grid.group.position;
-    const group = new THREE.Group();
-    group.name = 'tile-trees';
+      const basePos = tile.grid.group.position;
+      const group = new THREE.Group();
+      group.name = 'tile-trees';
 
-    tile._treeInstances = [];
-    tile._treeSamples = [];
+      tile._treeInstances = [];
+      tile._treeSamples = [];
 
-    for (const pos of worldPositions) {
-      const jitterX = THREE.MathUtils.randFloatSpread(1.4);
-      const jitterZ = THREE.MathUtils.randFloatSpread(1.4);
-      const localX = pos.x - basePos.x + jitterX;
-      const localZ = pos.z - basePos.z + jitterZ;
-      const worldX = basePos.x + localX;
-      const worldZ = basePos.z + localZ;
-      const groundY = this.getHeightAt(worldX, worldZ);
-      if (!Number.isFinite(groundY)) continue;
+      for (const pos of worldPositions) {
+        const jitterX = THREE.MathUtils.randFloatSpread(1.4);
+        const jitterZ = THREE.MathUtils.randFloatSpread(1.4);
+        const localX = pos.x - basePos.x + jitterX;
+        const localZ = pos.z - basePos.z + jitterZ;
+        const worldX = basePos.x + localX;
+        const worldZ = basePos.z + localZ;
+        const groundY = this.getHeightAt(worldX, worldZ);
+        if (!Number.isFinite(groundY)) continue;
 
-      const seed = this._hashTreeSeed(worldX, worldZ);
-      const latLon = this.origin ? worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon) : null;
-      const tree = new treeLib.Tree();
+        const seed = this._hashTreeSeed(worldX, worldZ);
+        const latLon = this.origin ? worldToLatLon(worldX, worldZ, this.origin.lat, this.origin.lon) : null;
+        const tree = new treeLib.Tree();
 
-      this._configureTreeForRegion(tree, latLon, seed, treeLib);
-      try {
-        tree.generate();
-      } catch (err) {
-        console.warn('[tiles] ez-tree generation failed', err);
-        continue;
+        this._configureTreeForRegion(tree, latLon, seed, treeLib);
+        try {
+          tree.generate();
+        } catch (err) {
+          console.warn('[tiles] ez-tree generation failed', err);
+          continue;
+        }
+
+        const scale = THREE.MathUtils.lerp(0.55, 1.1, this._seededRandom(seed, 90));
+        tree.scale.setScalar(scale);
+        tree.position.set(localX, groundY, localZ);
+        tree.rotation.y = this._seededRandom(seed, 3) * Math.PI * 2;
+        tree.userData.anchor = { worldX, worldZ, seed };
+
+        tree.traverse((child) => {
+          if (child.isMesh || child.isPoints) {
+            child.castShadow = true;
+            child.receiveShadow = !child.isPoints;
+          }
+        });
+
+        group.add(tree);
+        tile._treeInstances.push({ object: tree, worldX, worldZ });
+        tile._treeSamples.push({ x: worldX, z: worldZ });
       }
 
-      const scale = THREE.MathUtils.lerp(0.55, 1.1, this._seededRandom(seed, 90));
-      tree.scale.setScalar(scale);
-      tree.position.set(localX, groundY, localZ);
-      tree.rotation.y = this._seededRandom(seed, 3) * Math.PI * 2;
-      tree.userData.anchor = { worldX, worldZ, seed };
+      if (!tile._treeInstances.length) {
+        tile._treeInstances = null;
+        tile._treeSamples = null;
+        return;
+      }
 
-      tree.traverse((child) => {
-        if (child.isMesh || child.isPoints) {
-          child.castShadow = true;
-          child.receiveShadow = !child.isPoints;
-        }
-      });
-
-      group.add(tree);
-      tile._treeInstances.push({ object: tree, worldX, worldZ });
-      tile._treeSamples.push({ x: worldX, z: worldZ });
+      tile.grid.group.add(group);
+      tile._treeGroup = group;
+      this._resnapTreesForTile(tile);
+    } catch (err) {
+      console.warn('[tiles] tree generation aborted', err);
     }
-
-    if (!tile._treeInstances.length) {
-      tile._treeInstances = null;
-      tile._treeSamples = null;
-      return;
-    }
-
-    tile.grid.group.add(group);
-    tile._treeGroup = group;
-    this._resnapTreesForTile(tile);
   }
 
   _resnapTreesForTile(tile) {
