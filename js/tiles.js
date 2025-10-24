@@ -12,18 +12,11 @@ const DEFAULT_TERRAIN_DATASET = 'mapzen';
 const DM_BUDGET_BYTES = 9600;
 const MAX_LOCATIONS_PER_BATCH = 1800;
 const TERRAIN_FETCH_BOOST = 2;
-const PAINTERLY_KERNEL_SIZE = 5;
-const PAINTERLY_KERNEL_RADIUS = 2;
-const PAINTERLY_KERNEL = [
-  1, 4, 7, 4, 1,
-  4, 16, 26, 16, 4,
-  7, 26, 41, 26, 7,
-  4, 16, 26, 16, 4,
-  1, 4, 7, 4, 1
-];
-const PAINTERLY_KERNEL_WEIGHT = PAINTERLY_KERNEL.reduce((sum, w) => sum + w, 0);
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
+const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
+const WAYBACK_WMTS_CAPABILITIES = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml';
+const DEFAULT_WAYBACK_VERSION = '49849';
 
 // phased acquisition for interactive tiles
 const PHASE_SEED = 0; // center + 6 tips
@@ -105,6 +98,10 @@ export class TileManager {
     this._overlayCache = new Map();
     this._overlayCanvas = null;
     this._overlayCtx = null;
+    this._overlayVersion = DEFAULT_WAYBACK_VERSION;
+    this._overlayVersions = [];
+    this._overlayVersionPromise = null;
+    this._overlayVersionLastFetch = 0;
     this._treeEnabled = true;
     this._treeLib = (typeof window !== 'undefined') ? window['@dgreenheck/ez-tree'] || null : null;
     this._treeLibPromise = null;
@@ -115,6 +112,7 @@ export class TileManager {
     this._treePerfSampleTime = 0;
     this._treePerfEvalTimer = 0;
     this._treeRegenQueue = null;
+    this._primeWaybackVersions();
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -1153,11 +1151,88 @@ _stitchInteractiveToVisualEdges(tile, {
     const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, zoom);
     return THREE.MathUtils.radToDeg(Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
   }
+  _primeWaybackVersions() {
+    if (typeof window === 'undefined') return;
+    if (typeof fetch !== 'function' || typeof DOMParser === 'undefined') return;
+    if (this._overlayVersionPromise) return;
+    this._overlayVersionPromise = (async () => {
+      try {
+        const res = await fetch(WAYBACK_WMTS_CAPABILITIES, { mode: 'cors' });
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching Wayback capabilities`);
+        const text = await res.text();
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(text, 'application/xml');
+        const layers = Array.from(xml.querySelectorAll('Contents > Layer'));
+        const versions = [];
+        for (const layer of layers) {
+          const id = (layer.querySelector('ows\\:Identifier') || layer.querySelector('Identifier'))?.textContent?.trim() || '';
+          const title = (layer.querySelector('ows\\:Title') || layer.querySelector('Title'))?.textContent?.trim() || id;
+          const resURL = layer.querySelector('ResourceURL[resourceType="tile"]')?.getAttribute('template') || '';
+          const versionMatch = resURL.match(/\/tile\/(\d+)\/\{?TileMatrix/i);
+          const version = versionMatch ? versionMatch[1] : '';
+          if (!version) continue;
+          let sortKey = version;
+          let label = title || version;
+          const dateMatch = title.match(/(\d{4}-\d{2}-\d{2})/);
+          if (dateMatch) {
+            sortKey = dateMatch[1];
+            label = `${dateMatch[1]}  (v${version})`;
+          } else {
+            label = `${label}  (v${version})`;
+          }
+          versions.push({ id: version, label, sortKey });
+        }
+        versions.sort((a, b) => (a.sortKey < b.sortKey ? 1 : (a.sortKey > b.sortKey ? -1 : 0)));
+        if (versions.length) {
+          this._overlayVersions = versions;
+          const latest = versions[0]?.id;
+          if (latest) this._applyOverlayVersion(latest);
+        }
+      } catch (err) {
+        console.warn('[TileManager] Wayback capabilities fetch failed', err);
+      } finally {
+        this._overlayVersionPromise = null;
+      }
+    })();
+  }
+  _applyOverlayVersion(version) {
+    if (!version || this._overlayVersion === version) return;
+    this._overlayVersion = version;
+    const tiles = Array.from(this.tiles.values());
+    for (const tile of tiles) this._teardownOverlayForTile(tile);
+    for (const entry of this._overlayCache.values()) {
+      try {
+        entry.texture?.dispose?.();
+      } catch { /* noop */ }
+    }
+    this._overlayCache.clear();
+    for (const tile of tiles) this._ensureTileOverlay(tile);
+  }
+  _teardownOverlayForTile(tile) {
+    if (!tile) return;
+    if (tile._overlayMesh?.material) {
+      const mat = tile._overlayMesh.material;
+      if (mat.map) {
+        mat.map = null;
+      }
+      mat.needsUpdate = true;
+    }
+    if (tile._overlayMesh) tile._overlayMesh.visible = false;
+    if (tile._overlay?.status) tile._overlay = null;
+    this._clearTileTrees(tile);
+  }
+  _buildWaybackTileUrl(version, zoom, x, y) {
+    if (!version) return null;
+    return `${WAYBACK_WMTS_ROOT}/tile/${version}/${zoom}/${y}/${x}`;
+  }
   _ensureTileOverlay(tile) {
     if (!this._overlayEnabled || !tile || !this.origin) return;
     const eligibleTypes = ['interactive', 'visual', 'farfield'];
     if (!eligibleTypes.includes(tile.type)) return;
     if (tile._overlay && (tile._overlay.status === 'loading' || tile._overlay.status === 'ready')) return;
+    this._primeWaybackVersions();
+    const version = this._overlayVersion || DEFAULT_WAYBACK_VERSION;
+    if (!version) return;
 
     const center = this._tileCenterLatLon(tile);
     if (!center) return;
@@ -1165,7 +1240,7 @@ _stitchInteractiveToVisualEdges(tile, {
     if (tile.type === 'visual') zoom = Math.max(3, zoom - 1);
     else if (tile.type === 'farfield') zoom = Math.max(3, zoom - 2);
     const slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
-    const key = `${zoom}/${slippy.x}/${slippy.y}`;
+    const key = `${version}/${zoom}/${slippy.x}/${slippy.y}`;
 
     let entry = this._overlayCache.get(key);
     if (entry && entry.status === 'ready') {
@@ -1179,6 +1254,7 @@ _stitchInteractiveToVisualEdges(tile, {
         zoom,
         x: slippy.x,
         y: slippy.y,
+        version,
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);
@@ -1187,12 +1263,20 @@ _stitchInteractiveToVisualEdges(tile, {
     tile._overlay = { status: 'loading', cacheKey: key };
   }
   _fetchOverlayTile(cacheKey, entry) {
-    const { zoom, x, y } = entry;
+    const { zoom, x, y, version } = entry;
+    if (!version) {
+      entry.status = 'error';
+      return;
+    }
     const lonMin = this._slippyTileToLon(x, zoom);
     const lonMax = this._slippyTileToLon(x + 1, zoom);
     const latMax = this._slippyTileToLat(y, zoom);
     const latMin = this._slippyTileToLat(y + 1, zoom);
-    const url = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+    const url = this._buildWaybackTileUrl(version, zoom, x, y);
+    if (!url) {
+      entry.status = 'error';
+      return;
+    }
     if (typeof Image === 'undefined') {
       entry.status = 'error';
       if (entry.waiters) {
@@ -1272,7 +1356,10 @@ _stitchInteractiveToVisualEdges(tile, {
     const allowTrees = tile.type === 'interactive';
     if (allowTrees && this._treeEnabled) this._applyTreeSeeds(tile, entry);
     else this._clearTileTrees(tile);
-    tile._overlay = { status: 'ready', cacheKey: `${entry.zoom}/${entry.x}/${entry.y}` };
+    tile._overlay = {
+      status: 'ready',
+      cacheKey: `${entry.version}/${entry.zoom}/${entry.x}/${entry.y}`,
+    };
   }
   _ensureTileUv(tile, bounds) {
     if (!tile || !bounds || !this.origin) return;
@@ -1315,7 +1402,7 @@ _stitchInteractiveToVisualEdges(tile, {
         metalness: 0.02,
         roughness: 0.9,
         toneMapped: true,
-        color: new THREE.Color(0.94, 0.97, 1.0)
+        color: new THREE.Color(1, 1, 1)
       });
       mat.polygonOffset = true;
       mat.polygonOffsetFactor = -0.5;
@@ -1330,79 +1417,10 @@ _stitchInteractiveToVisualEdges(tile, {
     } else {
       mesh.material.map = texture;
       mesh.material.opacity = blend;
+      mesh.material.color.set(1, 1, 1);
       mesh.material.needsUpdate = true;
       mesh.visible = true;
     }
-  }
-  _applyPainterlyFilter(imageData, width, height) {
-    if (!imageData || !imageData.data) return imageData;
-    const src = imageData.data;
-    let filtered;
-    if (typeof ImageData === 'function') {
-      filtered = new ImageData(width, height);
-    } else if (this._overlayCtx?.createImageData) {
-      filtered = this._overlayCtx.createImageData(width, height);
-    } else {
-      return imageData;
-    }
-    const dest = filtered.data;
-    const kernel = PAINTERLY_KERNEL;
-    const size = PAINTERLY_KERNEL_SIZE;
-    const radius = PAINTERLY_KERNEL_RADIUS;
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let r = 0;
-        let g = 0;
-        let b = 0;
-        let a = 0;
-        let weightTotal = 0;
-        for (let ky = -radius; ky <= radius; ky++) {
-          const sy = Math.min(height - 1, Math.max(0, y + ky));
-          const wy = ky + radius;
-          for (let kx = -radius; kx <= radius; kx++) {
-            const sx = Math.min(width - 1, Math.max(0, x + kx));
-            const wx = kx + radius;
-            const weight = kernel[wy * size + wx];
-            const idx = (sy * width + sx) * 4;
-            r += src[idx] * weight;
-            g += src[idx + 1] * weight;
-            b += src[idx + 2] * weight;
-            a += src[idx + 3] * weight;
-            weightTotal += weight;
-          }
-        }
-        const effectiveWeight = weightTotal > 0 ? weightTotal : PAINTERLY_KERNEL_WEIGHT;
-        const invWeight = effectiveWeight > 0 ? 1 / effectiveWeight : 0;
-        r *= invWeight;
-        g *= invWeight;
-        b *= invWeight;
-        a *= invWeight;
-
-        const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        const saturation = 1.12;
-        let rr = luminance + (r - luminance) * saturation;
-        let gg = luminance + (g - luminance) * saturation;
-        let bb = luminance + (b - luminance) * saturation;
-
-        rr = rr * 1.05 + 6;
-        gg = gg * 1.0 + 4;
-        bb = bb * 0.95 + 6;
-
-        const hash = Math.sin((x * 12.9898 + y * 78.233) * 43758.5453);
-        const noise = (hash - Math.floor(hash)) - 0.5;
-        const noiseScale = 6;
-        rr += noise * noiseScale;
-        gg += noise * noiseScale * 0.8;
-        bb += noise * noiseScale * 0.6;
-
-        const idxOut = (y * width + x) * 4;
-        dest[idxOut] = THREE.MathUtils.clamp(rr, 0, 255);
-        dest[idxOut + 1] = THREE.MathUtils.clamp(gg, 0, 255);
-        dest[idxOut + 2] = THREE.MathUtils.clamp(bb, 0, 255);
-        dest[idxOut + 3] = THREE.MathUtils.clamp(a, 0, 255);
-      }
-    }
-    return filtered;
   }
   _processOverlayImage(image, bounds) {
     if (typeof document === 'undefined') {
@@ -1421,13 +1439,9 @@ _stitchInteractiveToVisualEdges(tile, {
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(image, 0, 0, w, h);
     let samples = [];
-    let filteredData = null;
     try {
-      const originalData = ctx.getImageData(0, 0, w, h);
-      filteredData = this._applyPainterlyFilter(originalData, w, h);
-      if (filteredData) ctx.putImageData(filteredData, 0, 0);
-      const sampleSource = filteredData ? filteredData.data : originalData.data;
-      samples = this._extractGreenSamples(sampleSource, w, h);
+      const imageData = ctx.getImageData(0, 0, w, h);
+      samples = this._extractGreenSamples(imageData.data, w, h);
     } catch (err) {
       try {
         const fallback = ctx.getImageData(0, 0, w, h).data;
@@ -1442,8 +1456,7 @@ _stitchInteractiveToVisualEdges(tile, {
       textureCanvas.width = w;
       textureCanvas.height = h;
       const tctx = textureCanvas.getContext('2d');
-      if (filteredData) tctx.putImageData(filteredData, 0, 0);
-      else tctx.drawImage(canvas, 0, 0, w, h);
+      tctx.drawImage(canvas, 0, 0, w, h);
     } catch {
       textureCanvas = null;
     }
