@@ -58,22 +58,28 @@ export class SceneManager {
     skyUniforms['mieCoefficient'].value = 0.004;
     skyUniforms['mieDirectionalG'].value = 0.95;
 
-    this.sunLight = new THREE.DirectionalLight(0xffffff, 4);
+    // OPTIMIZED: Enhanced directional sun light with realistic intensity
+    this.sunLight = new THREE.DirectionalLight(0xffffff, 3.5);  // Slightly reduced for more realistic contrast
     this.sunLight.position.set(1000, 500, -800);
     this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.set(1024, 1024);
-    this.renderer.shadowMap.autoUpdate = false;   // add this
+
+    // OPTIMIZED: Higher quality shadow maps for buildings/trees
+    this.sunLight.shadow.mapSize.set(2048, 2048);  // Increased from 1024 for sharper shadows
     this.sunLight.shadow.camera.near = 10;
-    this.sunLight.shadow.camera.far = 1800;
-    this.sunLight.shadow.camera.left = -600;
-    this.sunLight.shadow.camera.right = 600;
-    this.sunLight.shadow.camera.top = 600;
-    this.sunLight.shadow.camera.bottom = -600;
-    this.sunLight.shadow.bias = -0.00015;
+    this.sunLight.shadow.camera.far = 2000;        // Extended to cover more area
+    this.sunLight.shadow.camera.left = -800;       // Wider coverage
+    this.sunLight.shadow.camera.right = 800;
+    this.sunLight.shadow.camera.top = 800;
+    this.sunLight.shadow.camera.bottom = -800;
+    this.sunLight.shadow.bias = -0.0001;           // Reduced bias for cleaner shadows
+    this.sunLight.shadow.normalBias = 0.02;        // Added normal bias to reduce artifacts
+    this.sunLight.shadow.radius = 1.5;             // Soft shadow edges (PCFSoftShadowMap only)
+
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
-    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.18);
+    // OPTIMIZED: Enhanced ambient lighting for better shadow visibility
+    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.25);  // Increased from 0.18 to fill shadows
     this.scene.add(this.ambient);
     this._ambientDayColor = DAY_AMBIENT_COLOR.clone();
     this._ambientNightColor = NIGHT_AMBIENT_COLOR.clone();

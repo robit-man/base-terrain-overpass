@@ -1430,6 +1430,56 @@ class App {
       this._handleTargetFpsChange(val);
     });
 
+    // Imagery vintage controls
+    const { envImageryVintage, envImageryTimeline, envImageryTimelineLabel } = ui;
+    if (envImageryVintage && envImageryTimeline) {
+      // Populate versions when available from tile manager
+      const populateImageryVersions = () => {
+        const versions = this.hexGridMgr?._overlayVersions || [];
+        if (versions.length === 0) {
+          setTimeout(populateImageryVersions, 1000);
+          return;
+        }
+        envImageryVintage.innerHTML = '';
+        versions.forEach((v, i) => {
+          const opt = document.createElement('option');
+          opt.value = v.id;
+          opt.textContent = v.label;
+          envImageryVintage.appendChild(opt);
+        });
+        envImageryTimeline.max = String(versions.length - 1);
+        envImageryTimeline.value = '0';
+        const currentVersion = this.hexGridMgr?._overlayVersion || versions[0]?.id;
+        envImageryVintage.value = currentVersion;
+        const currentIdx = versions.findIndex(v => v.id === currentVersion);
+        if (currentIdx >= 0) envImageryTimeline.value = String(currentIdx);
+        if (envImageryTimelineLabel) envImageryTimelineLabel.textContent = versions[currentIdx >= 0 ? currentIdx : 0]?.label || '—';
+      };
+      setTimeout(populateImageryVersions, 500);
+
+      envImageryTimeline.addEventListener('input', () => {
+        const versions = this.hexGridMgr?._overlayVersions || [];
+        const idx = parseInt(envImageryTimeline.value, 10);
+        const v = versions[idx];
+        if (!v) return;
+        if (envImageryTimelineLabel) envImageryTimelineLabel.textContent = v.label;
+        envImageryVintage.value = v.id;
+        this.hexGridMgr?._applyOverlayVersion?.(v.id);
+      });
+
+      envImageryVintage.addEventListener('change', () => {
+        const version = envImageryVintage.value;
+        if (!version) return;
+        this.hexGridMgr?._applyOverlayVersion?.(version);
+        const versions = this.hexGridMgr?._overlayVersions || [];
+        const idx = versions.findIndex(v => v.id === version);
+        if (idx >= 0) {
+          envImageryTimeline.value = String(idx);
+          if (envImageryTimelineLabel) envImageryTimelineLabel.textContent = versions[idx].label;
+        }
+      });
+    }
+
     syncTerrainControls();
     syncBuildingControls();
     syncTargets();

@@ -36,7 +36,7 @@ export class UniformHexGrid {
       color: 0xffffff,
       metalness: 0.05,
       roughness: 0.7,
-      side: THREE.BackSide,
+      side: THREE.DoubleSide,  // CHANGED: DoubleSide to receive shadows properly
       vertexColors: true,
       flatShading: false,
     });
@@ -44,6 +44,9 @@ export class UniformHexGrid {
     mesh.frustumCulled = false;
     mesh.receiveShadow = true;
     mesh.castShadow = false;
+
+    // CRITICAL: Ensure mesh is on correct layer for shadows
+    mesh.layers.enable(0);  // Default layer for shadow casting
 
     const wireMat = new THREE.MeshBasicMaterial({
       color: 0x222222,

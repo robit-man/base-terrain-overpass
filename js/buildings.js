@@ -688,6 +688,9 @@ export class BuildingManager {
     // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
+    // ANIMATION: Update all animating buildings each frame
+    this._updateBuildingAnimations();
+
     // CSS3D panel: render only when visible, and throttle (big perf win)
     if (this._cssEnabled && this._cssRenderer && this._cssScene) {
       const anyVisible = (this._cssPanelVisible === true) || this._hoverGroup?.visible === true;
@@ -1976,7 +1979,12 @@ export class BuildingManager {
       resnapFrozen: false,
       resnapLock: false,
       insideRadius: true,
-      isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z)
+      isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z),
+      // Animation state
+      animating: false,
+      animationProgress: 0,
+      animationStartTime: 0,
+      animationDuration: 0.8  // seconds for rise animation
     };
 
     edges.userData.buildingInfo = info;
@@ -2430,11 +2438,48 @@ export class BuildingManager {
     const inside = info.insideRadius !== false;
     const snapped = !!info.resnapFrozen;
     const shouldShow = inside && snapped;
-    const wireMode = !!this._wireframeMode;
 
-    if (building.render) building.render.visible = shouldShow && wireMode;
-    if (building.solid) building.solid.visible = shouldShow && !wireMode;
-    if (building.pick) building.pick.visible = shouldShow;
+    // ANIMATION: Start animation when building first becomes snapped
+    if (shouldShow && !info.animating && info.animationProgress === 0) {
+      info.animating = true;
+      info.animationProgress = 0;
+      info.animationStartTime = performance.now() / 1000;
+    }
+
+    // Buildings are ALWAYS solid (no wireframe mode)
+    if (building.render) building.render.visible = false;  // Never show wireframe
+    if (building.solid) {
+      building.solid.visible = shouldShow;
+      // Apply animation scale if animating
+      if (info.animating && building.solid) {
+        const elapsed = (performance.now() / 1000) - info.animationStartTime;
+        info.animationProgress = Math.min(1, elapsed / info.animationDuration);
+
+        // Ease out cubic for smooth deceleration
+        const eased = 1 - Math.pow(1 - info.animationProgress, 3);
+
+        // Scale Y from 0 to 1
+        building.solid.scale.y = eased;
+
+        // Complete animation
+        if (info.animationProgress >= 1) {
+          info.animating = false;
+          building.solid.scale.y = 1;
+        }
+      } else if (!info.animating && info.animationProgress > 0) {
+        // Ensure scale is reset to 1 after animation completes
+        building.solid.scale.y = 1;
+      }
+    }
+    if (building.pick) {
+      building.pick.visible = shouldShow;
+      // Sync picker scale with solid mesh
+      if (info.animating && building.pick) {
+        building.pick.scale.y = building.solid?.scale.y || 1;
+      } else if (!info.animating && info.animationProgress > 0) {
+        building.pick.scale.y = 1;
+      }
+    }
     this._updateMergedGroupVisibility(info.tile);
   }
 
@@ -2448,6 +2493,25 @@ export class BuildingManager {
 
     road.visible = shouldShow && !wireMode;
     if (data.wireframeLines) data.wireframeLines.visible = shouldShow && wireMode;
+  }
+
+  _updateBuildingAnimations() {
+    if (!this._tileStates || !this._tileStates.size) return;
+
+    // Iterate through all tiles and update animating buildings
+    for (const state of this._tileStates.values()) {
+      if (!state.buildings || !state.buildings.length) continue;
+
+      for (const building of state.buildings) {
+        if (!building || !building.info) continue;
+        const info = building.info;
+
+        // Only update if actively animating
+        if (info.animating) {
+          this._refreshBuildingVisibility(building);
+        }
+      }
+    }
   }
 
   _updateMergedGroupVisibility(tileKey) {
@@ -2575,27 +2639,9 @@ export class BuildingManager {
   }
 
   setWireframe(enabled) {
-    const next = !!enabled;
-    if (this._wireframeMode === next) return;
-    this._wireframeMode = next;
-    if (this._roadMaterial) { this._roadMaterial.wireframe = next; this._roadMaterial.needsUpdate = true; }
-    if (this._waterMaterialShared) { this._waterMaterialShared.wireframe = next; this._waterMaterialShared.needsUpdate = true; }
-    if (this._areaMaterial) { this._areaMaterial.wireframe = next; this._areaMaterial.needsUpdate = true; }
-    if (this._buildingMaterial) this._buildingMaterial.wireframe = false;
-
-    for (const state of this._tileStates.values()) {
-      if (!state) continue;
-      for (const building of state.buildings) this._refreshBuildingVisibility(building);
-      for (const extra of state.extras) {
-        if (extra?.userData?.type === 'road') {
-          this._refreshRoadVisibility(extra);
-        }
-        if (extra?.material) {
-          extra.material.wireframe = next;
-          extra.material.needsUpdate = true;
-        }
-      }
-    }
+    // DISABLED: Buildings are now always solid (no wireframe mode)
+    // Keeping this method for backward compatibility but making it a no-op
+    return;
   }
 
   _verifyFloatingBuildings() {

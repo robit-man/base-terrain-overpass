@@ -150,6 +150,9 @@ const envBuildingApply = document.getElementById('envBuildingApply');
 const envBuildingAuto = document.getElementById('envBuildingAuto');
 const envBuildingTargetFps = document.getElementById('envBuildingTargetFps');
 const envBuildingTargetFpsValue = document.getElementById('envBuildingTargetFpsValue');
+const envImageryVintage = document.getElementById('envImageryVintage');
+const envImageryTimeline = document.getElementById('envImageryTimeline');
+const envImageryTimelineLabel = document.getElementById('envImageryTimelineLabel');
 if (hudQos) hudQos.addEventListener('animationend', () => hudQos.classList.remove('flash'));
 const displayNameInput = document.getElementById('displayNameInput');
 const displayNameSave = document.getElementById('displayNameSave');
@@ -338,6 +341,7 @@ export const ui = {
   envBuildingRadius, envBuildingRadiusValue, envBuildingRadiusCurrent,
   envBuildingApply, envBuildingAuto,
   envBuildingTargetFps, envBuildingTargetFpsValue,
+  envImageryVintage, envImageryTimeline, envImageryTimelineLabel,
   displayNameInput, displayNameSave, toastHost,
   applyHudStatusDot,
   openMenu, closeMenu,

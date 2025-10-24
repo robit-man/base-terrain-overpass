@@ -442,6 +442,21 @@
 
           <div class="tab-panel" id="tab-environment" role="tabpanel" data-tab-panel="environment" hidden>
             <section class="modal-section">
+              <h3 class="section-title">Satellite Imagery</h3>
+              <div class="slider-row">
+                <label for="envImageryVintage">Vintage</label>
+                <select id="envImageryVintage" class="mono">
+                  <option value="">Loading versions...</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <label for="envImageryTimeline">Timeline <span class="mono" id="envImageryTimelineLabel">—</span></label>
+                <input id="envImageryTimeline" type="range" min="0" max="0" step="1" value="0" />
+              </div>
+              <p class="tiny">Select historical ARCGIS Wayback imagery. Newer versions are higher quality.</p>
+            </section>
+
+            <section class="modal-section">
               <h3 class="section-title">Terrain LOD</h3>
               <div class="slider-row">
                 <label for="envInteractiveRing">Interactive Ring <span class="mono"
