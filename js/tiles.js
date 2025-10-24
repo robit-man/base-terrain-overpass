@@ -80,6 +80,16 @@ export class TileManager {
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._lastHeight = 0;
 
+    // ---- Movement prediction for tile preloading ----
+    this._lastPlayerPos = null;
+    this._playerVelocity = new THREE.Vector3();
+    this._velocityHistory = [];
+    this._velocityHistorySize = 5;
+    this.PREDICT_TILES_THRESHOLD = 2.0;  // m/s minimum velocity to trigger prediction
+    this.PREDICT_LOOKAHEAD_TIME = 2.0;   // seconds to look ahead
+    this.TILE_REMOVAL_HYSTERESIS = 2;    // extra rings to keep before removing tiles
+    this.TILE_DOWNGRADE_HYSTERESIS = 1;  // extra rings before downgrading visual->farfield
+
     this._relaxKeys = [];
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
@@ -459,6 +469,100 @@ _stitchInteractiveToVisualEdges(tile, {
     if (d > Math.PI) d = 2 * Math.PI - d;
     return d;
   }
+
+  /* ---------------- Movement prediction for tile preloading ---------------- */
+
+  _updateVelocity(currentPos, deltaTime) {
+    if (!this._lastPlayerPos) {
+      this._lastPlayerPos = currentPos.clone();
+      return;
+    }
+
+    // Calculate instantaneous velocity
+    const displacement = new THREE.Vector3().subVectors(currentPos, this._lastPlayerPos);
+    const speed = displacement.length();
+
+    // Only track significant movement (> 0.1 m/frame to filter noise)
+    if (speed > 0.1 && deltaTime > 0) {
+      const velocity = displacement.divideScalar(deltaTime);
+
+      // Add to history
+      this._velocityHistory.push(velocity.clone());
+      if (this._velocityHistory.length > this._velocityHistorySize) {
+        this._velocityHistory.shift();
+      }
+
+      // Calculate smoothed velocity (average of recent history)
+      if (this._velocityHistory.length > 0) {
+        this._playerVelocity.set(0, 0, 0);
+        for (const v of this._velocityHistory) {
+          this._playerVelocity.add(v);
+        }
+        this._playerVelocity.divideScalar(this._velocityHistory.length);
+      }
+    }
+
+    this._lastPlayerPos.copy(currentPos);
+  }
+
+  _predictivePreloadTiles(currentPos, q0, r0) {
+    const speed = this._playerVelocity.length();
+
+    // Only predict if moving faster than threshold
+    if (speed < this.PREDICT_TILES_THRESHOLD) return;
+
+    // Predict future position
+    const futurePos = new THREE.Vector3()
+      .copy(currentPos)
+      .add(
+        this._playerVelocity.clone().multiplyScalar(this.PREDICT_LOOKAHEAD_TIME)
+      );
+
+    // Convert future position to hex coordinates
+    const a = this.tileRadius;
+    const qf = (2 / 3 * futurePos.x) / a;
+    const rf = ((-1 / 3 * futurePos.x) + (Math.sqrt(3) / 3 * futurePos.z)) / a;
+    const futureQ = Math.round(qf);
+    const futureR = Math.round(rf);
+
+    // Calculate direction vector in hex space
+    const dq = futureQ - q0;
+    const dr = futureR - r0;
+    const hexDist = Math.abs(dq) + Math.abs(dr) + Math.abs(-dq - dr);
+
+    // Only preload if we're predicting movement to a different tile
+    if (hexDist === 0) return;
+
+    // Preload tiles in the direction of movement (visual ring only for efficiency)
+    const preloadRadius = Math.min(2, this.VISUAL_RING);
+    let preloaded = 0;
+    const maxPreload = 6; // Limit to 6 tiles to avoid overwhelming the system
+
+    for (let d = 1; d <= preloadRadius; d++) {
+      for (let s = 0; s < 6; s++) {
+        if (preloaded >= maxPreload) break;
+
+        // Calculate tile position in direction of movement
+        const q = futureQ + Math.round(dq * d / Math.max(1, hexDist));
+        const r = futureR + Math.round(dr * d / Math.max(1, hexDist));
+
+        const id = `${q},${r}`;
+        const tile = this.tiles.get(id);
+
+        // Preload if tile doesn't exist or needs population
+        if (!tile) {
+          const dist = this._hexDist(q, r, q0, r0);
+          if (dist <= this.VISUAL_RING && dist > this.INTERACTIVE_RING) {
+            this._addVisualTile(q, r);
+            preloaded++;
+          }
+        } else if (tile.type === 'visual' || tile.type === 'interactive') {
+          this._queuePopulateIfNeeded?.(tile, false);
+        }
+      }
+    }
+  }
+
   _getTerrainMaterial() {
     if (!this._terrainMat) {
       this._terrainMat = new THREE.MeshStandardMaterial({
@@ -659,8 +763,9 @@ _stitchInteractiveToVisualEdges(tile, {
   }
 
   _farfieldTierForDist(dist) {
-    const nearPad = Math.max(2, Number.isFinite(this.FARFIELD_NEAR_PAD) ? this.FARFIELD_NEAR_PAD : 6);
-    if (dist <= this.VISUAL_RING + nearPad) return { stride: 1, scale: 1, samples: 'all', minPrec: 6 };
+    // OPTIMIZED: Removed padding rings (was +6 rings at full res)
+    // Now use edge subdivision for seamless transition
+    if (dist <= this.VISUAL_RING + 1) return { stride: 1, scale: 2, samples: 'all', minPrec: 6, subdivideEdges: true };
     if (dist <= this.VISUAL_RING + 24) return { stride: 2, scale: 2, samples: 'tips', minPrec: 5 };
     if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 4, samples: 'tips', minPrec: 4 };
     if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 8, samples: 'tips', minPrec: 3 };
@@ -690,6 +795,110 @@ _stitchInteractiveToVisualEdges(tile, {
     pos.needsUpdate = true;
     this._markFarfieldAdapterDirty(tile);
     try { tile.grid.geometry.computeVertexNormals(); } catch { }
+  }
+
+  /* ---------------- Edge subdivision for seamless farfield transitions ---------------- */
+
+  _subdivideInterfaceEdges(tile) {
+    if (!tile || tile.type !== 'farfield') return;
+    if (!tile._subdivideEdges) return; // Only for tiles flagged for subdivision
+
+    const dist = this._hexDist(tile.q, tile.r, 0, 0);
+    if (dist !== this.VISUAL_RING + 1) return; // Only first farfield ring
+
+    // Find which sides interface with visual tiles
+    const interfaceSides = [];
+    for (let s = 0; s < 6; s++) {
+      const nq = tile.q + HEX_DIRS[s][0];
+      const nr = tile.r + HEX_DIRS[s][1];
+      const nTile = this._getTile(nq, nr);
+      if (nTile && (nTile.type === 'visual' || nTile.type === 'interactive')) {
+        interfaceSides.push({ side: s, neighbor: nTile });
+      }
+    }
+
+    if (!interfaceSides.length) return;
+
+    // For each interface side, refine the edge band
+    for (const { side, neighbor } of interfaceSides) {
+      this._refineEdgeBand(tile, side, neighbor, {
+        bandRatio: 0.25           // Refine outer 25% of tile radius
+      });
+    }
+  }
+
+  _refineEdgeBand(tile, side, neighbor, { bandRatio = 0.25 }) {
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const aR = this.tileRadius;
+    const innerBand = aR * (1 - bandRatio);
+    const nMesh = this._getMeshForTile(neighbor);
+
+    if (!nMesh) return;
+
+    // Get the two corner vertices for this side
+    const cornerA = side + 1;
+    const cornerB = ((side + 1) % 6) + 1;
+
+    const Ax = pos.getX(cornerA), Az = pos.getZ(cornerA);
+    const Bx = pos.getX(cornerB), Bz = pos.getZ(cornerB);
+
+    // Sample heights from neighbor at corners
+    let Ay = this._robustSampleHeightFromMesh(nMesh, base.x + Ax, base.z + Az);
+    let By = this._robustSampleHeightFromMesh(nMesh, base.x + Bx, base.z + Bz);
+
+    if (!Number.isFinite(Ay)) Ay = pos.getY(cornerA);
+    if (!Number.isFinite(By)) By = pos.getY(cornerB);
+
+    // Update corner heights to match neighbor
+    pos.setY(cornerA, Ay);
+    pos.setY(cornerB, By);
+
+    // Find all vertices in the edge band for this side and blend their heights
+    const sideAngle = (side + 0.5) * (Math.PI / 3);
+    const sideArc = Math.PI / 10;
+
+    for (let i = 0; i < pos.count; i++) {
+      if (i === 0 || i === cornerA || i === cornerB) continue; // Skip center and corners
+
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+
+      if (r < innerBand) continue; // Only process edge band
+
+      // Check if this vertex is on this side
+      const angle = this._angleOf(x, z);
+      const angleDiff = this._angDiff(angle, sideAngle);
+      if (angleDiff > sideArc) continue;
+
+      // Sample height from neighbor at this position
+      const wx = base.x + x;
+      const wz = base.z + z;
+      let neighborHeight = this._robustSampleHeightFromMesh(nMesh, wx, wz);
+
+      if (Number.isFinite(neighborHeight)) {
+        // Blend between tile's original height and neighbor's height
+        const blendWeight = (r - innerBand) / (aR - innerBand);
+        const smoothWeight = blendWeight * blendWeight * (3 - 2 * blendWeight); // Smoothstep
+        const originalHeight = pos.getY(i);
+        const blendedHeight = originalHeight + (neighborHeight - originalHeight) * smoothWeight;
+        pos.setY(i, blendedHeight);
+      }
+    }
+
+    pos.needsUpdate = true;
+    try { tile.grid.geometry.computeVertexNormals(); } catch {}
+  }
+
+  _robustSampleHeightFromMesh(mesh, wx, wz) {
+    if (!mesh) return null;
+    this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+    const hits = this.ray.intersectObject(mesh, true);
+    if (hits && hits.length > 0) {
+      return hits[0].point.y;
+    }
+    return null;
   }
 
   // JS % is weird for negatives; normalize
@@ -1344,8 +1553,11 @@ _stitchInteractiveToVisualEdges(tile, {
     if (!center) return;
     const coverage = this._estimateTileCoverageLatLon(tile);
     let zoom = this._overlayZoom;
+
+    // OPTIMIZED: Progressive loading - different resolution tiers
     if (tile.type === 'visual') zoom = Math.max(3, zoom - 1);
     else if (tile.type === 'farfield') zoom = Math.max(3, zoom - 2);
+
     let slippy = this._slippyLonLatToTile(center.lon, center.lat, zoom);
     let bounds = this._slippyTileBounds(slippy.x, slippy.y, zoom);
     if (coverage) {
@@ -1357,8 +1569,57 @@ _stitchInteractiveToVisualEdges(tile, {
         attempts++;
       }
     }
-    const key = `${version}/${zoom}/${slippy.x}/${slippy.y}`;
 
+    // OPTIMIZED: Try loading a lower-res placeholder first for interactive tiles
+    const isInteractive = tile.type === 'interactive';
+    const hasPlaceholder = tile._overlay && tile._overlay.status === 'placeholder';
+
+    if (isInteractive && !hasPlaceholder) {
+      const placeholderZoom = Math.max(3, zoom - 3);
+      const placeholderSlippy = this._slippyLonLatToTile(center.lon, center.lat, placeholderZoom);
+      const placeholderKey = `${version}/${placeholderZoom}/${placeholderSlippy.x}/${placeholderSlippy.y}`;
+      const placeholderEntry = this._overlayCache.get(placeholderKey);
+
+      if (placeholderEntry && placeholderEntry.status === 'ready') {
+        // Apply placeholder immediately
+        this._applyOverlayEntryToTile(tile, placeholderEntry);
+        tile._overlay = { status: 'placeholder', cacheKey: placeholderKey, targetZoom: zoom };
+        // Queue upgrade to full resolution
+        if (typeof requestIdleCallback !== 'undefined') {
+          requestIdleCallback(() => {
+            if (this.tiles.get(`${tile.q},${tile.r}`) === tile) {
+              this._upgradeOverlayResolution(tile, version, zoom, slippy, bounds, coverage);
+            }
+          }, { timeout: 2000 });
+        } else {
+          setTimeout(() => {
+            if (this.tiles.get(`${tile.q},${tile.r}`) === tile) {
+              this._upgradeOverlayResolution(tile, version, zoom, slippy, bounds, coverage);
+            }
+          }, 500);
+        }
+        return;
+      } else if (!placeholderEntry) {
+        // Load placeholder in background
+        const placeholderBounds = this._slippyTileBounds(placeholderSlippy.x, placeholderSlippy.y, placeholderZoom);
+        const pEntry = {
+          status: 'loading',
+          waiters: new Set(),
+          zoom: placeholderZoom,
+          x: placeholderSlippy.x,
+          y: placeholderSlippy.y,
+          version,
+          bounds: placeholderBounds,
+          coverage,
+        };
+        this._overlayCache.set(placeholderKey, pEntry);
+        this._fetchOverlayTile(placeholderKey, pEntry);
+        pEntry.waiters.add(tile);
+      }
+    }
+
+    // Load full resolution texture
+    const key = `${version}/${zoom}/${slippy.x}/${slippy.y}`;
     let entry = this._overlayCache.get(key);
     if (entry && entry.status === 'ready') {
       this._applyOverlayEntryToTile(tile, entry);
@@ -1383,6 +1644,37 @@ _stitchInteractiveToVisualEdges(tile, {
     entry.waiters.add(tile);
     tile._overlay = { status: 'loading', cacheKey: key };
   }
+  _upgradeOverlayResolution(tile, version, zoom, slippy, bounds, coverage) {
+    if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) return;
+
+    const key = `${version}/${zoom}/${slippy.x}/${slippy.y}`;
+    let entry = this._overlayCache.get(key);
+
+    if (entry && entry.status === 'ready') {
+      this._applyOverlayEntryToTile(tile, entry);
+      tile._overlay = { status: 'ready', cacheKey: key };
+      return;
+    }
+
+    if (!entry) {
+      entry = {
+        status: 'loading',
+        waiters: new Set(),
+        zoom,
+        x: slippy.x,
+        y: slippy.y,
+        version,
+        bounds,
+        coverage,
+      };
+      this._overlayCache.set(key, entry);
+      this._fetchOverlayTile(key, entry);
+    }
+
+    entry.waiters.add(tile);
+    tile._overlay = { status: 'upgrading', cacheKey: key };
+  }
+
   _fetchOverlayTile(cacheKey, entry) {
     const { zoom, x, y, version } = entry;
     if (!version) {
@@ -1504,7 +1796,8 @@ _stitchInteractiveToVisualEdges(tile, {
       const lat = Number.isFinite(ll?.lat) ? ll.lat : bounds.latMin;
       const u = (lon - bounds.lonMin) / lonSpan;
       const v = (bounds.latMax - lat) / latSpan;
-      const eps = 1e-5;
+      // OPTIMIZED: Slightly larger inset (0.1%) to prevent texture bleeding at seams
+      const eps = 0.001;
       data[i * 2] = THREE.MathUtils.clamp(u, eps, 1 - eps);
       data[i * 2 + 1] = THREE.MathUtils.clamp(v, eps, 1 - eps);
     }
@@ -4297,6 +4590,11 @@ update(playerPos) {
   const nowMs = () => (performance?.now ? performance.now() : Date.now());
   const HARD_BUDGET_MS = (this.UPDATE_BUDGET_MS ?? 4.5);
 
+  // Update velocity tracking for predictive preloading
+  const deltaTime = this._lastUpdateTime ? (startMs - this._lastUpdateTime) / 1000 : 0.016;
+  this._lastUpdateTime = startMs;
+  this._updateVelocity(playerPos, deltaTime);
+
   this._refillRateTokens(startMs);
   if (this._populateDrainPending || (this._populateQueue.length && this._populateInflight < this.MAX_CONCURRENT_POPULATES)) {
     this._drainPopulateQueue({ budgetMs: 3.6, maxBatch: 4 });
@@ -4313,6 +4611,9 @@ update(playerPos) {
     this._lastQR = { q: q0, r: r0 };
     this._pendingHeavySweep = true; // 🔁 ensure we continue filling ring next frames
   }
+
+  // Predictive preloading based on movement direction
+  this._predictivePreloadTiles(playerPos, q0, r0);
 
   const maintenance = () => {
     this._ensureRelaxList?.();
@@ -4432,7 +4733,7 @@ update(playerPos) {
         if (dist <= this.VISUAL_RING) continue;
 
         const tier = this._farfieldTierForDist?.(dist) || { stride: 3, scale: 2, samples: 'sparse', minPrec: 6 };
-        const { stride, scale, samples, minPrec } = tier;
+        const { stride, scale, samples, minPrec, subdivideEdges } = tier;
         if (!this._divisible?.(q - q0, stride) || !this._divisible?.(r - r0, stride)) continue;
 
         const id = `${q},${r}`;
@@ -4440,32 +4741,49 @@ update(playerPos) {
 
         if (!existing) {
           const t = this._addFarfieldTile(q, r, scale, samples);
-          t._farMinPrec = minPrec; workDone++;
+          t._farMinPrec = minPrec;
+          t._subdivideEdges = subdivideEdges || false;
+          if (subdivideEdges) this._subdivideInterfaceEdges(t);
+          workDone++;
           if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
         } else if (existing.type !== 'farfield' ||
                    (existing.scale || 1) !== scale ||
                    (existing._farSampleMode || 'all') !== samples) {
           this._discardTile(id);
           const t = this._addFarfieldTile(q, r, scale, samples);
-          t._farMinPrec = minPrec; workDone++;
+          t._farMinPrec = minPrec;
+          t._subdivideEdges = subdivideEdges || false;
+          if (subdivideEdges) this._subdivideInterfaceEdges(t);
+          workDone++;
           if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
         } else {
           existing._farMinPrec = minPrec;
+          existing._subdivideEdges = subdivideEdges || false;
+          if (subdivideEdges) this._subdivideInterfaceEdges(existing);
           this._queuePopulateIfNeeded?.(existing, false);
         }
       }
     }
   }
 
-  // 4) prune/downgrade (respect budget)
+  // 4) prune/downgrade (respect budget, with hysteresis to prevent thrashing)
   if (!budgetHit) {
     const toRemove = [];
     const toFarfield = [];
+    const removalThreshold = this.FARFIELD_RING + this.TILE_REMOVAL_HYSTERESIS;
+    const downgradeThreshold = this.VISUAL_RING + this.TILE_DOWNGRADE_HYSTERESIS;
+
     for (const [id, t] of this.tiles) {
       if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
       const dist = this._hexDist(t.q, t.r, q0, r0);
-      if (dist > this.FARFIELD_RING) { toRemove.push(id); continue; }
-      if (dist > this.VISUAL_RING) { if (t.type !== 'farfield') toFarfield.push({ q: t.q, r: t.r }); }
+
+      // Only remove tiles beyond farfield ring + hysteresis buffer
+      if (dist > removalThreshold) { toRemove.push(id); continue; }
+
+      // Only downgrade visual->farfield beyond visual ring + hysteresis buffer
+      if (dist > downgradeThreshold) {
+        if (t.type !== 'farfield') toFarfield.push({ q: t.q, r: t.r });
+      }
     }
     for (const id of toRemove) {
       if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
@@ -4526,13 +4844,36 @@ update(playerPos) {
 
     if (changed) {
       this._resetAllTiles();
-      this._ensureType(0, 0, 'interactive');
+
+      // FIX: Create full interactive ring immediately, not just center tile
+      // This ensures all nearby tiles are visible on teleport
+      for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
+        const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
+        const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
+        for (let dr = rMin; dr <= rMax; dr++) {
+          this._ensureType(dq, dr, 'interactive');
+        }
+      }
+
       this._prewarmVisualRing(0, 0);
       this._prewarmFarfieldRing(0, 0);
+
+      // FIX: Force heavy sweep to continue populating tiles
+      this._pendingHeavySweep = true;
+      this._lastQR = { q: 0, r: 0 };
     } else if (immediate && !this.tiles.size) {
-      this._ensureType(0, 0, 'interactive');
+      // FIX: Same logic for immediate spawn with no tiles
+      for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
+        const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
+        const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
+        for (let dr = rMin; dr <= rMax; dr++) {
+          this._ensureType(dq, dr, 'interactive');
+        }
+      }
       this._prewarmVisualRing(0, 0);
       this._prewarmFarfieldRing(0, 0);
+      this._pendingHeavySweep = true;
+      this._lastQR = { q: 0, r: 0 };
     }
 
     if (immediate && this.origin) {
