@@ -2082,9 +2082,9 @@ canvas {
 
 #buildingHoverToast {
     position: fixed;
-    bottom: calc(50% - 20px);
-    left: 1.5rem;
-    max-width: 360px;
+    left: calc(50% - 180px);
+    bottom: 1.5rem;
+    width: 360px;
     color: var(--hud-text-primary);
     font-size: 13px;
     line-height: 1.35;
