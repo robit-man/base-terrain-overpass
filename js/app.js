@@ -3855,21 +3855,40 @@ class App {
     if (!xrOn) {
       measure('orientation', () => {
         if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-          const deviceQuat = this._deviceQuatForFPV(this.sensors.orient);
+          // Use screen-compensated device quaternion from Sensors (no re-mapping here)
+          const { q: deviceQuat } =
+            (this.sensors.getQuaternion && this.sensors.getQuaternion()) ||
+            { q: this._deviceQuatForFPV(this.sensors.orient) };
+
           const compassOffset = this._getCompassYawOffset() || 0;
           const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
           const totalOffset = this._wrapAngle(compassOffset + manualOffset);
-          const deviceEuler = this._tmpEuler.setFromQuaternion(deviceQuat, 'YXZ');
-          let yaw = this._wrapAngle(deviceEuler.y + totalOffset);
-          const pitch = THREE.MathUtils.clamp(deviceEuler.x, this._pitchMin, this._pitchMax);
-          const roll = THREE.MathUtils.clamp(deviceEuler.z, -Math.PI / 2, Math.PI / 2);
-          const bodyQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ'));
-          dolly.quaternion.copy(bodyQuat);
-          dolly.rotation.set(0, yaw, 0);
-          const camEuler = new THREE.Euler(pitch, 0, roll, 'YXZ');
-          camera.quaternion.setFromEuler(camEuler);
+
+          // yaw: 0 = North (-Z), clockwise +
+          this._tmpVec3.set(0, 0, -1).applyQuaternion(deviceQuat);
+          const yawDev = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
+          const yaw = this._wrapAngle(yawDev + totalOffset);
+
+          // remove raw yaw from the device quaternion → yaw-free tilt
+          this._tmpQuat.setFromEuler(new THREE.Euler(0, -yawDev, 0, 'YXZ'));
+          const qNoYaw = this._tmpQuat2.copy(deviceQuat).premultiply(this._tmpQuat);
+
+          // pitch/roll from yaw-free frame (decoupled → no 2×)
+          const tiltEuler = this._tmpEuler.setFromQuaternion(qNoYaw, 'YXZ');
+          const pitch = THREE.MathUtils.clamp(tiltEuler.x, this._pitchMin, this._pitchMax);
+          const roll = THREE.MathUtils.clamp(tiltEuler.z, -Math.PI / 2, Math.PI / 2);
+
+          // prevent additive legacy rotates (otherwise tilt feels doubled)
+          dolly.rotation.set(0, 0, 0);
+          camera.rotation.set(0, 0, 0);
+
+          // apply: yaw on dolly; pitch/roll on camera
+          dolly.quaternion.setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ'));
+          camera.quaternion.setFromEuler(new THREE.Euler(pitch, 0, roll, 'YXZ'));
           camera.up.set(0, 1, 0);
+
           this._pitch = pitch;
+
         } else {
           const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
           const yawAbs = e.y;
