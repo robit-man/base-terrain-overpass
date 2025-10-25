@@ -4643,6 +4643,7 @@ class App {
       // Create modal UI
       this.sceneMgr.smartModal = new SmartObjectModal({
         smartObjects: this.sceneMgr.smartObjects,
+        mesh: this.mesh,
         onClose: () => {
           // Optional: Do something when modal closes
         }

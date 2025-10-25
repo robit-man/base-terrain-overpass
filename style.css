@@ -3054,3 +3054,137 @@ canvas {
 .smart-modal-content::-webkit-scrollbar-thumb:hover {
   background: rgba(94, 227, 166, 0.5);
 }
+
+/* QR Code and Scanner Styles */
+.smart-invite-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.smart-invite-controls select {
+  flex: 1;
+}
+
+.smart-btn-invite,
+.smart-btn-scan {
+  background: linear-gradient(135deg, #5ee3a6, #a8ff60);
+  color: #000;
+  padding: 10px 16px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.smart-btn-invite:hover,
+.smart-btn-scan:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(94, 227, 166, 0.4);
+}
+
+.smart-qr-display {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(94, 227, 166, 0.3);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  margin-top: 12px;
+}
+
+.smart-qr-display canvas {
+  display: block;
+  margin: 0 auto 12px;
+  border-radius: 4px;
+}
+
+.smart-qr-url {
+  font-family: monospace;
+  font-size: 12px;
+  color: #a8ff60;
+  word-break: break-all;
+  margin: 8px 0;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+}
+
+.smart-qr-hint {
+  font-size: 12px;
+  color: #a9b6c3;
+  margin: 8px 0 0;
+}
+
+.smart-scanner {
+  position: relative;
+  background: #000;
+  border: 2px solid #5ee3a6;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-top: 12px;
+  max-width: 400px;
+}
+
+.smart-scanner video {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.smart-scanner-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.smart-scanner-frame {
+  width: 200px;
+  height: 200px;
+  border: 3px solid #5ee3a6;
+  border-radius: 12px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+}
+
+.smart-scanner-overlay p {
+  color: #fff;
+  font-size: 14px;
+  margin-top: 220px;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.smart-btn-cancel-scan {
+  background: rgba(255, 107, 107, 0.2);
+  color: #ff6b6b;
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  margin: 12px;
+  pointer-events: auto;
+}
+
+.smart-scan-result {
+  background: rgba(94, 227, 166, 0.1);
+  border: 1px solid rgba(94, 227, 166, 0.3);
+  border-radius: 6px;
+  padding: 12px;
+  margin-top: 12px;
+}
+
+.result-success {
+  color: #5ee3a6;
+  font-size: 14px;
+  margin: 0;
+}
+
+.result-success span {
+  font-weight: 600;
+  color: #a8ff60;
+}
+
+.scan-icon {
+  margin-right: 6px;
+}
