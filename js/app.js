@@ -172,6 +172,7 @@ class App {
 
     // Core systems
     this.sceneMgr = new SceneManager();
+    this.sceneMgr.app = this;
 
     // === NEW: cap pixel ratio to avoid overdraw on HiDPI ===
     const devicePixelRatioSafe = window.devicePixelRatio || 1;
@@ -275,6 +276,7 @@ class App {
       const ring = Math.max(1, tm.FARFIELD_RING ?? tm.VISUAL_RING ?? 1);
       return Math.max(200, tm.tileRadius * ring);
     });
+    this.sceneMgr.setTerrainTargetProvider(() => this._collectTerrainRaycastTargets());
 
     const visualRing = Math.max(0, this.hexGridMgr?.VISUAL_RING ?? 0);
     const tileRadius = Math.max(1, this.hexGridMgr?.tileRadius ?? 120);
@@ -486,6 +488,7 @@ class App {
     this._mobileFPVOn = false;
 
     this._pointerNdc = { x: 0, y: 0, has: false };
+    this._placeBtnState = null;
     const dom = this.sceneMgr.renderer.domElement;
     window.addEventListener('pointermove', (e) => this._onPointerMove(e, dom), { passive: true });
     window.addEventListener('pointerleave', () => {
@@ -713,6 +716,11 @@ class App {
       this._syncTeleportButtonState();
     }
     this._setupTeleportPointerHandler();
+
+    if (ui.hudPlaceToggle) {
+      ui.hudPlaceToggle.addEventListener('click', () => this._toggleSmartPlacementMode());
+      this._syncPlaceButtonState(true);
+    }
 
     if (this._locationState) {
       this.miniMap.notifyLocationChange({
@@ -4582,7 +4590,9 @@ class App {
     });
 
     // Update Smart Objects
+    this._updateSmartObjectPlacementPreview();
     this.sceneMgr.updateSmartObjects();
+    this._syncPlaceButtonState();
 
     logger?.frameEnd?.();
     this._updateProcessLeaderboard();
@@ -4602,7 +4612,8 @@ class App {
         camera: this.sceneMgr.camera,
         hybrid: this.hybrid,
         mesh: this.mesh,
-        spatialAudio: this.sceneMgr.spatialAudio
+        spatialAudio: this.sceneMgr.spatialAudio,
+        onPlacementModeChange: (active) => this._syncPlaceButtonState(true, active)
       });
 
       // Create modal UI
@@ -4626,9 +4637,94 @@ class App {
       }
 
       console.log('[App] Smart Objects initialized');
+      this._syncPlaceButtonState(true);
     } catch (err) {
       console.error('[App] Failed to initialize Smart Objects:', err);
+      this._syncPlaceButtonState(true, false);
     }
+  }
+
+  _updateSmartObjectPlacementPreview() {
+    const smartObjects = this.sceneMgr?.smartObjects;
+    if (!smartObjects || !smartObjects.placementMode) return;
+    if (!this._pointerNdc?.has) {
+      smartObjects.setPlacementTarget(null);
+      return;
+    }
+    const camera = this.sceneMgr?.camera;
+    if (!camera || !this._raycaster) {
+      smartObjects.setPlacementTarget(null);
+      return;
+    }
+    const targets = this._collectTerrainRaycastTargets();
+    if (!targets.length) {
+      smartObjects.setPlacementTarget(null);
+      return;
+    }
+    this._raycaster.setFromCamera(this._pointerNdc, camera);
+    const hits = this._raycaster.intersectObjects(targets, true);
+    const point = hits && hits.length ? hits[0].point : null;
+    smartObjects.setPlacementTarget(point || null);
+  }
+
+  _prepareCursorForPlacement() {
+    if (this.input?.controls?.isLocked) {
+      this.input.controls.unlock?.();
+    } else if (typeof document !== 'undefined' && document.pointerLockElement) {
+      try {
+        document.exitPointerLock?.();
+      } catch { }
+    }
+    if (!this._pointerNdc) {
+      this._pointerNdc = { x: 0, y: 0, has: true };
+      return;
+    }
+    if (!this._pointerNdc.has) {
+      this._pointerNdc.x = 0;
+      this._pointerNdc.y = 0;
+      this._pointerNdc.has = true;
+    }
+  }
+
+  _toggleSmartPlacementMode(forceValue = null) {
+    const smartObjects = this.sceneMgr?.smartObjects;
+    if (!smartObjects) return;
+    const next = forceValue == null ? !smartObjects.placementMode : !!forceValue;
+    this._setSmartPlacementMode(next);
+  }
+
+  _setSmartPlacementMode(enabled) {
+    const smartObjects = this.sceneMgr?.smartObjects;
+    if (!smartObjects) return;
+    const next = !!enabled;
+    if (next === smartObjects.placementMode) {
+      this._syncPlaceButtonState();
+      return;
+    }
+    if (next) {
+      this._prepareCursorForPlacement();
+      smartObjects.enterPlacementMode();
+      pushToast('Click a terrain tile to place a Smart Object', { duration: 2800 });
+    } else {
+      smartObjects.cancelPlacementMode();
+    }
+    this._syncPlaceButtonState(true);
+  }
+
+  _syncPlaceButtonState(force = false, activeOverride = null) {
+    const btn = ui.hudPlaceToggle;
+    if (!btn) return;
+    const smartObjects = this.sceneMgr?.smartObjects;
+    let active = !!(smartObjects && smartObjects.placementMode);
+    if (typeof activeOverride === 'boolean') active = activeOverride;
+    if (!force && this._placeBtnState === active) return;
+    this._placeBtnState = active;
+    btn.classList.toggle('on', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.textContent = active ? 'Place (On)' : 'Place';
+    btn.title = active
+      ? 'Click a terrain tile to place a Smart Object'
+      : 'Toggle smart object placement mode';
   }
 
   _maybeUpdateSun(origin) {

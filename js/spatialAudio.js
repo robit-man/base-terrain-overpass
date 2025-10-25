@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+
 /**
  * SpatialAudioManager
  * Manages 3D spatial audio playback for Smart Objects

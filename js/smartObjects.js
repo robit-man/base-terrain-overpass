@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+
 /**
  * SmartObjectManager
  * Manages Smart Objects in the NoClip 3D scene
@@ -8,12 +10,15 @@
  */
 
 class SmartObjectManager {
-  constructor({ scene, camera, hybrid, mesh, spatialAudio }) {
+  constructor({ scene, camera, hybrid, mesh, spatialAudio, onPlacementModeChange }) {
     this.scene = scene;
     this.camera = camera;
     this.hybrid = hybrid;
     this.mesh = mesh;
     this.spatialAudio = spatialAudio;
+    this.onPlacementModeChange = (typeof onPlacementModeChange === 'function')
+      ? onPlacementModeChange
+      : null;
 
     // Object storage
     this.objects = new Map(); // uuid -> SmartObject
@@ -22,6 +27,8 @@ class SmartObjectManager {
     // Placement mode
     this.placementMode = false;
     this.placementPreview = null;
+    this._pendingPlacementPoint = null;
+    this._hasPendingPlacementTarget = false;
 
     // Local storage key
     this.STORAGE_KEY = 'noclip_smart_objects_v1';
@@ -32,6 +39,16 @@ class SmartObjectManager {
   _init() {
     this._loadFromStorage();
     this._createPlacementPreview();
+    this._notifyPlacementModeChange();
+  }
+
+  _notifyPlacementModeChange() {
+    if (!this.onPlacementModeChange) return;
+    try {
+      this.onPlacementModeChange(!!this.placementMode);
+    } catch (err) {
+      console.warn('[SmartObjects] placement mode callback error', err);
+    }
   }
 
   /**
@@ -58,18 +75,51 @@ class SmartObjectManager {
 
     this.placementMode = true;
     this.placementPreview.visible = true;
+    this.setPlacementTarget(null);
+    this._notifyPlacementModeChange();
 
-    console.log('[SmartObjects] Placement mode activated - move camera and press G again to place');
+    console.log('[SmartObjects] Placement mode activated - click terrain to place');
+  }
+
+  /**
+   * Cancel placement mode without creating an object
+   */
+  cancelPlacementMode() {
+    if (!this.placementMode) return;
+    this.placementMode = false;
+    this.placementPreview.visible = false;
+    this.setPlacementTarget(null);
+    this._notifyPlacementModeChange();
   }
 
   /**
    * Exit placement mode and create object at current preview position
    */
-  exitPlacementModeAndPlace() {
+  exitPlacementModeAndPlace(positionOverride = null) {
     if (!this.placementMode) return;
 
-    // Get position from preview
-    const position = this.placementPreview.position.clone();
+    // Determine placement position
+    let position = null;
+    if (positionOverride) {
+      if (typeof positionOverride.x === 'number') {
+        position = new THREE.Vector3(
+          positionOverride.x,
+          positionOverride.y ?? 0,
+          positionOverride.z ?? 0
+        );
+      } else if (typeof positionOverride.clone === 'function') {
+        position = positionOverride.clone();
+      }
+    } else if (this._hasPendingPlacementTarget && this._pendingPlacementPoint) {
+      position = this._pendingPlacementPoint.clone();
+    } else if (this.placementPreview) {
+      position = this.placementPreview.position.clone();
+    }
+
+    if (!position) {
+      console.warn('[SmartObjects] No placement target available');
+      return;
+    }
 
     // Create smart object at this position
     const uuid = this._generateUUID();
@@ -123,8 +173,25 @@ class SmartObjectManager {
 
     this.placementMode = false;
     this.placementPreview.visible = false;
+    this.setPlacementTarget(null);
+    this._notifyPlacementModeChange();
 
     console.log(`[SmartObjects] Created object ${uuid} at`, position);
+  }
+
+  /**
+   * Update placement target from pointer intersections
+   */
+  setPlacementTarget(point) {
+    if (!point) {
+      this._hasPendingPlacementTarget = false;
+      return;
+    }
+    if (!this._pendingPlacementPoint) {
+      this._pendingPlacementPoint = new THREE.Vector3();
+    }
+    this._pendingPlacementPoint.copy(point);
+    this._hasPendingPlacementTarget = true;
   }
 
   /**
@@ -133,14 +200,22 @@ class SmartObjectManager {
   updatePlacementPreview() {
     if (!this.placementMode || !this.placementPreview.visible) return;
 
-    // Position preview 5 units in front of camera
-    const direction = new THREE.Vector3();
-    this.camera.getWorldDirection(direction);
+    let target = null;
 
-    const cameraPos = this.camera.position.clone();
-    const previewPos = cameraPos.add(direction.multiplyScalar(5));
+    if (this._hasPendingPlacementTarget && this._pendingPlacementPoint) {
+      target = this._pendingPlacementPoint;
+    }
 
-    this.placementPreview.position.copy(previewPos);
+    if (!target) {
+      // Position preview 5 units in front of camera as a fallback
+      const direction = new THREE.Vector3();
+      this.camera.getWorldDirection(direction);
+
+      const cameraPos = this.camera.position.clone();
+      target = cameraPos.add(direction.multiplyScalar(5));
+    }
+
+    this.placementPreview.position.copy(target);
   }
 
   /**

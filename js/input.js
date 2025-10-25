@@ -14,6 +14,7 @@ export class Input {
     const shouldLock = (e) => {
       if (isMobile) return false;
       if (sceneMgr.renderer.xr.isPresenting) return false;
+      if (sceneMgr.smartObjects?.placementMode) return false;
       if (ui.menuPane && ui.menuPane.style.display === 'block') return false;
       const path = e.composedPath?.() || [];
       return path.includes(canvas) || e.target === canvas;
@@ -142,12 +143,17 @@ export class Input {
       case 'ControlLeft': case 'ControlRight': this.m.crouch = d; break;
       case 'Space': if (d) this.m.jump = true; break;
       case 'KeyG':
-        // Smart Object placement toggle
-        if (d && this.sceneMgr.smartObjects) {
-          if (this.sceneMgr.smartObjects.placementMode) {
-            this.sceneMgr.smartObjects.exitPlacementModeAndPlace();
-          } else {
-            this.sceneMgr.smartObjects.enterPlacementMode();
+        if (d) {
+          const app = this.sceneMgr?.app;
+          if (app && typeof app._toggleSmartPlacementMode === 'function') {
+            app._toggleSmartPlacementMode();
+          } else if (this.sceneMgr.smartObjects) {
+            // Fallback to direct toggle if app hook missing
+            if (this.sceneMgr.smartObjects.placementMode) {
+              this.sceneMgr.smartObjects.cancelPlacementMode();
+            } else {
+              this.sceneMgr.smartObjects.enterPlacementMode();
+            }
           }
         }
         break;

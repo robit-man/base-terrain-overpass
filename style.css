@@ -1628,6 +1628,12 @@ canvas {
     transition: background 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
 
+#buttonStack .hud-button.on {
+    background: var(--hud-button-border);
+    color: var(--hud-text-primary);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+}
+
 #perfHud .hud-button:hover:not(:disabled) {
     background: var(--hud-button-border);
     color: var(--hud-text-primary);

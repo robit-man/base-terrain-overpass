@@ -115,9 +115,19 @@ export class SceneManager {
     // Raycaster for click detection
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
+    this._terrainTargetProvider = null;
 
     // Click handler for Smart Objects
     this.renderer.domElement.addEventListener('click', (e) => this._handleClick(e));
+  }
+
+  setTerrainTargetProvider(fn) {
+    this._terrainTargetProvider = typeof fn === 'function' ? fn : null;
+  }
+
+  _getTerrainRaycastTargets() {
+    if (typeof this._terrainTargetProvider !== 'function') return [];
+    return this._terrainTargetProvider() || [];
   }
 
   // Public API to supply tile radius (number) or a function that returns a number each call.
@@ -500,15 +510,25 @@ export class SceneManager {
   _handleClick(event) {
     if (!this.smartObjects || !this.smartModal) return;
 
-    // Check if menu is open or we're in placement mode
-    if (this.smartObjects.placementMode) return;
-
     // Calculate mouse position in normalized device coordinates
     this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
     this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
     // Update raycaster
     this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    // Placement mode: try to place on terrain tiles
+    if (this.smartObjects.placementMode) {
+      const targets = this._getTerrainRaycastTargets();
+      if (targets.length) {
+        const intersections = this.raycaster.intersectObjects(targets, true);
+        if (intersections.length > 0) {
+          const point = intersections[0].point.clone();
+          this.smartObjects.exitPlacementModeAndPlace(point);
+        }
+      }
+      return;
+    }
 
     // Check for Smart Object intersection
     const clickedObject = this.smartObjects.getObjectAtPosition(this.raycaster);

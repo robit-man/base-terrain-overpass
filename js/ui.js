@@ -70,6 +70,7 @@ const hudDebugToggle = document.getElementById('hudDebugToggle');
 const hudWireframeToggle = document.getElementById('hudWireframeToggle');
 const hudReset = document.getElementById('hudReset');
 const hudTeleportToggle = document.getElementById('hudTeleportToggle');
+const hudPlaceToggle = document.getElementById('hudPlaceToggle');
 const hudRadioToggle = document.getElementById('hudRadioToggle');
 const hudRadioPanel = document.getElementById('hudRadioPanel');
 const hudRadioStatus = document.getElementById('hudRadioStatus');
@@ -334,6 +335,7 @@ export const ui = {
   hudWeather, hudWeatherIcon, hudWeatherTemp, hudWeatherDesc,
   hudWeatherHumidity, hudWeatherWind, hudWeatherRain, hudWeatherForecast,
   hudWireframeToggle,
+  hudPlaceToggle,
   hudRadioToggle, hudRadioPanel, hudRadioStatus, hudRadioDial, hudRadioList,
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,
