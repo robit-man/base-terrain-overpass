@@ -2388,6 +2388,7 @@ canvas {
     color: inherit;
     cursor: pointer;
     text-align: left;
+    position: relative;
 }
 
 .hybrid-peer:hover {
@@ -2407,6 +2408,39 @@ canvas {
 .hybrid-peer-meta {
     font-size: 12px;
     opacity: 0.65;
+}
+
+.hybrid-peer-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    font-size: 18px;
+    line-height: 1;
+    opacity: 0.9;
+}
+
+.hybrid-peer-badge[data-bridge-status="connected"] {
+    opacity: 1;
+    animation: pulse 2s ease-in-out infinite;
+}
+
+.hybrid-peer-badge[data-bridge-status="handshaking"] {
+    animation: spin 1.5s linear infinite;
+}
+
+.hybrid-peer-badge[data-bridge-status="error"],
+.hybrid-peer-badge[data-bridge-status="timeout"] {
+    opacity: 0.6;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
 }
 
 .hybrid-empty {

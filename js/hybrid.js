@@ -197,13 +197,19 @@ export class HybridHub {
         const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
           ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
           : null;
+
+        // Detect bridge capability
+        const hasBridge = this._detectBridgeCapability(peer.meta);
+
         this.state.hydra.peers.set(pub, {
           ...peer,
           nknPub: pub,
           addr: peer.addr || pub,
           geo,
           last: peer.last || nowSecondsFallback(),
-          online: true
+          online: true,
+          hasBridge,
+          bridgeStatus: hasBridge ? 'detected' : null
         });
         if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
         this._flushState();
@@ -245,11 +251,133 @@ export class HybridHub {
     this.renderChat();
   }
 
-  setActivePeer(scopedKey) {
+  async setActivePeer(scopedKey) {
     if (!scopedKey) return;
     this.state.selectedKey = scopedKey;
+
+    // Auto-initiate handshake for Hydra peers with bridge
+    const [network, pub] = scopedKey.split(':');
+    if (network === NETWORKS.HYDRA) {
+      const peer = this.state.hydra.peers.get(pub);
+      if (peer?.hasBridge && peer.bridgeStatus === 'detected') {
+        await this._initiateHandshake(pub);
+      }
+    }
+
     this.renderPeers();
     this.renderChat();
+  }
+
+  _detectBridgeCapability(meta) {
+    if (!meta || typeof meta !== 'object') return false;
+
+    // Check for Hydra graph with bridge node indicators
+    const ids = meta.ids;
+    if (Array.isArray(ids)) {
+      // Look for 'bridge' or 'noclip-bridge' in ids array
+      if (ids.includes('bridge') || ids.includes('noclip-bridge')) {
+        return true;
+      }
+      // Hydra peers with 'graph' capability might have bridge nodes
+      if (ids.includes('hydra') && ids.includes('graph')) {
+        return true; // Assume graph peers may have bridge capability
+      }
+    }
+
+    // Check for explicit bridge flag
+    if (meta.hasBridge === true || meta.bridge === true) {
+      return true;
+    }
+
+    // Check kind field
+    if (meta.kind === 'hydra' || meta.kind === 'bridge') {
+      return true;
+    }
+
+    return false;
+  }
+
+  async _initiateHandshake(pub) {
+    const peer = this.state.hydra.peers.get(pub);
+    if (!peer) return;
+
+    const discovery = this.state.hydra.discovery;
+    if (!discovery) {
+      pushToast('Hydra discovery not ready');
+      return;
+    }
+
+    try {
+      // Update status to connecting
+      peer.bridgeStatus = 'handshaking';
+      this.renderPeers();
+
+      // Send handshake request
+      await discovery.dm(pub, {
+        type: 'hybrid-bridge-handshake',
+        clientType: 'noclip',
+        capabilities: ['pose', 'geo', 'resources', 'scene-updates'],
+        graphId: this.mesh?.selfPub || '',
+        ts: nowSecondsFallback()
+      });
+
+      pushToast(`Handshake sent to ${shortPub(pub)}`);
+
+      // Set timeout for handshake response
+      setTimeout(() => {
+        const currentPeer = this.state.hydra.peers.get(pub);
+        if (currentPeer && currentPeer.bridgeStatus === 'handshaking') {
+          currentPeer.bridgeStatus = 'timeout';
+          this.renderPeers();
+        }
+      }, 10000); // 10 second timeout
+
+    } catch (err) {
+      peer.bridgeStatus = 'error';
+      pushToast(`Handshake failed: ${err?.message || err}`);
+      this.renderPeers();
+    }
+  }
+
+  _handleHandshakeResponse(pub, msg) {
+    const peer = this.state.hydra.peers.get(pub);
+    if (!peer) return;
+
+    const isAck = msg.type === 'hybrid-bridge-handshake-ack';
+
+    // Update peer capabilities
+    if (msg.capabilities && Array.isArray(msg.capabilities)) {
+      peer.capabilities = msg.capabilities;
+    }
+
+    if (msg.graphId) {
+      peer.graphId = msg.graphId;
+    }
+
+    // Update bridge status
+    peer.bridgeStatus = isAck ? 'connected' : 'handshake-received';
+    peer.last = msg.ts || nowSecondsFallback();
+
+    // Log to chat
+    const key = makeScopedKey(NETWORKS.HYDRA, pub);
+    this._appendChat(key, {
+      dir: 'in',
+      kind: 'log',
+      text: isAck
+        ? `Bridge connected • Capabilities: ${(msg.capabilities || []).join(', ')}`
+        : `Handshake request from ${shortPub(pub)}`,
+      ts: msg.ts || nowSecondsFallback(),
+      meta: { handshake: msg }
+    });
+
+    this.renderPeers();
+    if (this.state.selectedKey === key) {
+      this.renderChat();
+    }
+
+    if (isAck) {
+      pushToast(`Bridge connected to ${shortPub(pub)}`);
+    }
   }
 
   _handleNoclipPeer(peer) {
@@ -323,6 +451,12 @@ export class HybridHub {
 
     // Log raw message
     this._logRawMessage(from, msg, NETWORKS.HYDRA);
+
+    // Handle handshake responses
+    if (msg.type === 'hybrid-bridge-handshake' || msg.type === 'hybrid-bridge-handshake-ack') {
+      this._handleHandshakeResponse(pub, msg);
+      return;
+    }
 
     if (typeof msg.type === 'string' && msg.type.startsWith('hybrid-')) return;
     const key = makeScopedKey(NETWORKS.HYDRA, pub);
@@ -417,12 +551,29 @@ export class HybridHub {
       row.className = 'hybrid-peer';
       row.dataset.peerKey = key;
       row.classList.toggle('active', this.state.selectedKey === key);
+
+      // Add bridge indicator for Hydra peers
+      if (network === NETWORKS.HYDRA && peer.hasBridge) {
+        const badge = document.createElement('span');
+        badge.className = 'hybrid-peer-badge';
+        badge.dataset.bridgeStatus = peer.bridgeStatus || 'detected';
+        badge.textContent = getBridgeStatusIcon(peer.bridgeStatus);
+        badge.title = getBridgeStatusText(peer.bridgeStatus);
+        row.appendChild(badge);
+      }
+
       const label = document.createElement('div');
       label.className = 'hybrid-peer-name';
       label.textContent = displayName(peer);
       const meta = document.createElement('div');
       meta.className = 'hybrid-peer-meta';
       const parts = [peer.online ? 'Online' : 'Offline', `Last ${formatLast(peer.last)}`];
+
+      // Show bridge status
+      if (network === NETWORKS.HYDRA && peer.hasBridge && peer.bridgeStatus) {
+        parts.push(`Bridge: ${peer.bridgeStatus}`);
+      }
+
       if (peer.geo && Number.isFinite(peer.geo.lat) && Number.isFinite(peer.geo.lon)) {
         if (typeof peer.geo.gh === 'string') parts.push(`gh ${peer.geo.gh.slice(0, 8)}`);
         else parts.push(`${peer.geo.lat.toFixed(4)}, ${peer.geo.lon.toFixed(4)}`);
@@ -987,6 +1138,30 @@ function formatLast(last) {
   if (delta < 60) return `${delta}s ago`;
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
   return `${Math.floor(delta / 3600)}h ago`;
+}
+
+function getBridgeStatusIcon(status) {
+  switch (status) {
+    case 'connected': return '🔗';
+    case 'handshaking': return '⏳';
+    case 'detected': return '🌉';
+    case 'timeout': return '⏱️';
+    case 'error': return '❌';
+    case 'handshake-received': return '🤝';
+    default: return '❓';
+  }
+}
+
+function getBridgeStatusText(status) {
+  switch (status) {
+    case 'connected': return 'Bridge Connected';
+    case 'handshaking': return 'Handshaking...';
+    case 'detected': return 'Bridge Detected (Click to connect)';
+    case 'timeout': return 'Handshake Timeout';
+    case 'error': return 'Connection Error';
+    case 'handshake-received': return 'Handshake Received';
+    default: return 'Unknown Status';
+  }
 }
 
 function metaIdentity(mesh) {
