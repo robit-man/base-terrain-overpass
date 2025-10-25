@@ -361,6 +361,10 @@ class App {
     this._gpsHeadingMinMeters = 0.25;
     this._gpsHeadingVelocityMin = 0.12;
 
+    // Compass-first alignment (like orient.html)
+    this._compassAligned = false;
+    this._compassYawOffset = 0;
+
     if (ui.yawOffsetRange) {
       ui.yawOffsetRange.addEventListener('input', () => {
         this._manualYawOffset = THREE.MathUtils.degToRad(Number(ui.yawOffsetRange.value) || 0);
@@ -556,6 +560,7 @@ class App {
         this._compassYawOffset = 0;
         this._compassYawConfidence = 0;
         this._compassLastUpdate = 0;
+        this._compassAligned = false; // Reset compass-first alignment
         updateYawText();
       });
     }
@@ -963,7 +968,13 @@ class App {
   _applyMotionHeadingFromVector(dx, dz, { minDistance = null } = {}) {
     if (!this._gpsLockEnabled) return;
     if (!Number.isFinite(dx) || !Number.isFinite(dz)) return;
-    const threshold = Number.isFinite(minDistance) ? Math.max(0, minDistance) : Math.max(0, this._gpsHeadingMinMeters || 0);
+
+    // When compass/orientation is available, GPS should NOT control heading
+    // When compass is NOT available, require 10m+ movement before orienting to GPS vector
+    const hasCompass = this._mobileFPVOn && this.sensors?.orient?.ready;
+    const defaultThreshold = hasCompass ? Infinity : 10.0; // 10 meters when no compass
+    const threshold = Number.isFinite(minDistance) ? Math.max(0, minDistance) : defaultThreshold;
+
     const magnitudeSq = dx * dx + dz * dz;
     if (threshold > 0 && magnitudeSq < threshold * threshold) return;
     if (magnitudeSq < 1e-6) return;
@@ -975,6 +986,12 @@ class App {
     if (!Number.isFinite(headingRad)) return;
     const renderer = this.sceneMgr?.renderer;
     if (renderer?.xr?.isPresenting) return;
+
+    // PRIORITY: If we have compass/orientation controls active, don't let GPS override yaw
+    if (this._mobileFPVOn && this.sensors?.orient?.ready) {
+      // Compass/gyro is ground truth, GPS should not change orientation
+      return;
+    }
 
     const yaw = this._wrapAngle(headingRad + Math.PI);
     if (Number.isFinite(this._lastGpsHeading)) {
@@ -2856,15 +2873,23 @@ class App {
   }
 
   // Old, proven mapping: (beta, alpha, -gamma) YXZ then align device frame by Rx(-90°).
+  // Optimized: reuse temp objects to avoid GC pressure
   _deviceQuatForFPV(orient) {
     const a = orient?.a || 0; // alpha (Z)
     const b = orient?.b || 0; // beta  (X)
     const g = orient?.g || 0; // gamma (Y)
-    const euler = new THREE.Euler(RAD(b), RAD(a), RAD(-g), 'YXZ');
-    const q = new THREE.Quaternion().setFromEuler(euler);
-    const rxMinus90 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
-    q.multiply(rxMinus90);
-    return q;
+
+    // Reuse existing temp euler and quaternion objects
+    if (!this._deviceQuatFPVTempEuler) {
+      this._deviceQuatFPVTempEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+      this._deviceQuatFPVTempQuat = new THREE.Quaternion();
+      this._deviceQuatFPVRxMinus90 = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2); // -PI/2 about X
+    }
+
+    this._deviceQuatFPVTempEuler.set(RAD(b), RAD(a), RAD(-g), 'YXZ');
+    this._deviceQuatFPVTempQuat.setFromEuler(this._deviceQuatFPVTempEuler);
+    this._deviceQuatFPVTempQuat.multiply(this._deviceQuatFPVRxMinus90);
+    return this._deviceQuatFPVTempQuat;
   }
 
   _enterMobileFPV() {
@@ -3859,9 +3884,25 @@ class App {
           // Get screen-compensated device quaternion from Sensors
           const { q: deviceQuat } = this.sensors.getQuaternion?.() || { q: this._deviceQuatForFPV(this.sensors.orient) };
 
-          const compassOffset = this._getCompassYawOffset() || 0;
+          // COMPASS-FIRST ALIGNMENT (like orient.html)
+          // On first compass lock, align gyro yaw to compass heading ONCE
+          if (!this._compassAligned) {
+            const heading = this.sensors.getHeading?.();
+            if (heading?.rad != null && Number.isFinite(heading.rad)) {
+              // Extract gyro yaw from device quaternion
+              this._tmpVec3.set(0, 0, -1).applyQuaternion(deviceQuat);
+              const gyroYaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
+
+              // Calculate error: how much to rotate gyro to match compass
+              const err = this._wrapAngle(heading.rad - gyroYaw);
+              this._compassYawOffset = err;
+              this._compassAligned = true;
+            }
+          }
+
+          // Apply offsets: compass alignment + manual offset
           const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
-          const totalOffset = this._wrapAngle(compassOffset + manualOffset);
+          const totalOffset = this._wrapAngle(this._compassYawOffset + manualOffset);
 
           // Apply yaw offset as quaternion (like orient.html)
           this._tmpQuat.setFromAxisAngle(this._yAxis, totalOffset);
@@ -3871,8 +3912,7 @@ class App {
           this._tmpVec3.set(0, 0, -1).applyQuaternion(qFinal);
           const yaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
 
-          // CRITICAL FIX: Only set dolly yaw, do NOT set quaternion
-          // Setting both rotation and quaternion causes double application
+          // Set dolly yaw only (not quaternion - would cause double application)
           dolly.rotation.set(0, yaw, 0);
 
           // Camera gets ONLY pitch/roll (yaw is on dolly)
