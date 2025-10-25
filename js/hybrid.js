@@ -289,6 +289,14 @@ export class HybridHub {
       discovery.on('peer', (peer) => {
         const pub = peer?.nknPub ? peer.nknPub.toLowerCase() : '';
         if (!pub) return;
+
+        // Filter out self
+        const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
+        if (pub === selfPub) return;
+
+        // Filter out NoClip peers (they should be in noclip.peers, not hydra.peers)
+        if (peer.meta?.network === 'noclip') return;
+
         const loc = peer.meta?.loc;
         const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
           ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
