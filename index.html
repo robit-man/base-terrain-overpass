@@ -411,8 +411,13 @@
             </section>
 
             <section class="modal-section">
-              <h3 class="section-title">Bridge Chat</h3>
-              <div class="hybrid-chat-shell">
+              <h3 class="section-title">Bridge Communication</h3>
+              <div class="hybrid-view-toggle" role="group" aria-label="Message view">
+                <button type="button" class="ghost is-active" data-hybrid-view="chat">Chat</button>
+                <button type="button" class="ghost" data-hybrid-view="raw">Raw DM</button>
+              </div>
+
+              <div class="hybrid-chat-shell" id="hybridChatShell">
                 <div class="hybrid-chat-heading">
                   <div class="hybrid-chat-peer" id="hybridChatPeer">Select a peer…</div>
                   <div class="tiny" id="hybridChatStatus">Bridge idle</div>
@@ -422,6 +427,21 @@
                   <input id="hybridChatInput" type="text" placeholder="Message" autocomplete="off" spellcheck="false">
                   <button id="hybridChatSend" class="secondary" type="button">Send</button>
                 </div>
+              </div>
+
+              <div class="hybrid-raw-shell" id="hybridRawShell" hidden>
+                <div class="hybrid-raw-controls">
+                  <select id="hybridRawFilter" class="ghost">
+                    <option value="">All Types</option>
+                    <option value="hybrid-bridge-state">Bridge State</option>
+                    <option value="hybrid-bridge-resource">Resources</option>
+                    <option value="hybrid-bridge-command">Commands</option>
+                    <option value="chat-message">Chat</option>
+                    <option value="presence">Presence</option>
+                  </select>
+                  <button id="hybridRawClear" type="button" class="ghost">Clear</button>
+                </div>
+                <div class="hybrid-raw-log" id="hybridRawLog"></div>
               </div>
             </section>
           </div>

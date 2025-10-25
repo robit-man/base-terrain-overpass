@@ -2493,6 +2493,126 @@ canvas {
     flex: 1;
 }
 
+/* Hybrid View Toggle */
+.hybrid-view-toggle {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    padding-bottom: 0.5rem;
+}
+
+.hybrid-view-toggle button {
+    padding: 0.4rem 1rem;
+    font-size: 13px;
+}
+
+/* Raw DM View */
+.hybrid-raw-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.hybrid-raw-controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.hybrid-raw-controls select {
+    flex: 1;
+    padding: 0.4rem 0.6rem;
+    font-size: 12px;
+    background: rgba(10, 16, 28, 0.6);
+    border: 1px solid rgba(120, 180, 255, 0.3);
+    border-radius: 4px;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+.hybrid-raw-controls button {
+    padding: 0.4rem 0.8rem;
+    font-size: 12px;
+}
+
+.hybrid-raw-log {
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: 'IBM Plex Mono', 'Courier New', monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(120, 180, 255, 0.2);
+    border-radius: 4px;
+    padding: 0.5rem;
+}
+
+.hybrid-raw-entry {
+    padding: 0.75rem;
+    background: rgba(10, 16, 28, 0.5);
+    border: 1px solid rgba(120, 180, 255, 0.2);
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+}
+
+.hybrid-raw-entry:last-child {
+    margin-bottom: 0;
+}
+
+.hybrid-raw-meta {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.7rem;
+    color: rgba(255, 255, 255, 0.6);
+    flex-wrap: wrap;
+}
+
+.hybrid-raw-meta span {
+    white-space: nowrap;
+}
+
+.hybrid-raw-meta strong {
+    color: rgba(143, 210, 255, 0.9);
+}
+
+.hybrid-raw-payload {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 0.5rem;
+    border-radius: 3px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.7rem;
+}
+
+.hybrid-raw-payload .json-key {
+    color: #8fd2ff;
+}
+
+.hybrid-raw-payload .json-string {
+    color: #98c379;
+}
+
+.hybrid-raw-payload .json-number {
+    color: #d19a66;
+}
+
+.hybrid-raw-payload .json-boolean {
+    color: #e5c07b;
+}
+
+.hybrid-raw-payload .json-null {
+    color: #888;
+}
+
+.hybrid-empty {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 0.9rem;
+}
+
 /* Weather Widget */
 .hud-weather {
     border-radius: 8px;

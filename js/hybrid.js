@@ -42,6 +42,9 @@ export class HybridHub {
     this.state = {
       network: NETWORKS.NOCLIP,
       selectedKey: null,
+      rawMessageView: false,
+      rawMessages: [],
+      rawFilter: '',
       hydra: {
         discovery: null,
         peers: new Map(),
@@ -89,6 +92,35 @@ export class HybridHub {
         if (!target) return;
         const key = target.dataset.peerKey;
         this.setActivePeer(key);
+      });
+    }
+
+    // View toggle buttons
+    const viewButtons = document.querySelectorAll('[data-hybrid-view]');
+    viewButtons.forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const view = btn.dataset.hybridView;
+        this.setMessageView(view);
+      });
+    });
+
+    // Raw message filter
+    const rawFilter = document.getElementById('hybridRawFilter');
+    if (rawFilter) {
+      rawFilter.addEventListener('change', (e) => {
+        this.state.rawFilter = e.target.value;
+        this.renderRawMessages();
+      });
+    }
+
+    // Clear raw messages
+    const rawClear = document.getElementById('hybridRawClear');
+    if (rawClear) {
+      rawClear.addEventListener('click', (e) => {
+        e.preventDefault();
+        this.state.rawMessages = [];
+        this.renderRawMessages();
       });
     }
 
@@ -239,9 +271,38 @@ export class HybridHub {
     this._markStateDirty();
   }
 
+  _logRawMessage(from, msg, network) {
+    if (!msg || typeof msg !== 'object') return;
+
+    const entry = {
+      id: generateBridgeId(),
+      from: from ? from.toLowerCase() : 'unknown',
+      network: network || NETWORKS.HYDRA,
+      type: msg.type || 'unknown',
+      timestamp: Date.now(),
+      payload: msg,
+      size: JSON.stringify(msg).length
+    };
+
+    this.state.rawMessages.push(entry);
+
+    // Keep only last 100 messages
+    if (this.state.rawMessages.length > 100) {
+      this.state.rawMessages = this.state.rawMessages.slice(-100);
+    }
+
+    if (this.state.rawMessageView) {
+      this.renderRawMessages();
+    }
+  }
+
   _handleNoclipChat({ from, payload }) {
     const pub = from ? from.toLowerCase() : '';
     if (!pub) return;
+
+    // Log raw message
+    this._logRawMessage(from, payload, NETWORKS.NOCLIP);
+
     const key = makeScopedKey(NETWORKS.NOCLIP, pub);
     this._appendChat(key, {
       dir: 'in',
@@ -259,6 +320,10 @@ export class HybridHub {
   _handleHydraChat(from, msg) {
     const pub = from ? from.toLowerCase() : '';
     if (!pub || !msg || typeof msg !== 'object') return;
+
+    // Log raw message
+    this._logRawMessage(from, msg, NETWORKS.HYDRA);
+
     if (typeof msg.type === 'string' && msg.type.startsWith('hybrid-')) return;
     const key = makeScopedKey(NETWORKS.HYDRA, pub);
     if (msg.type === 'chat-message') {
@@ -375,6 +440,10 @@ export class HybridHub {
     const from = evt?.from ? evt.from.toLowerCase() : '';
     const payload = evt?.payload;
     if (!from || !payload || typeof payload !== 'object') return;
+
+    // Log raw message
+    this._logRawMessage(from, payload, NETWORKS.HYDRA);
+
     const type = payload.type || '';
     const peerRecord = this.state.hydra.peers.get(from);
     if (peerRecord) peerRecord.last = payload.ts || nowSecondsFallback();
@@ -761,6 +830,87 @@ export class HybridHub {
     ui.hybridChatLog.scrollTop = ui.hybridChatLog.scrollHeight;
     if (ui.hybridChatInput) ui.hybridChatInput.disabled = false;
     if (ui.hybridChatSend) ui.hybridChatSend.disabled = false;
+  }
+
+  setMessageView(view) {
+    this.state.rawMessageView = view === 'raw';
+
+    // Update button states
+    document.querySelectorAll('[data-hybrid-view]').forEach((btn) => {
+      btn.classList.toggle('is-active', btn.dataset.hybridView === view);
+    });
+
+    // Toggle visibility
+    const chatShell = document.getElementById('hybridChatShell');
+    const rawShell = document.getElementById('hybridRawShell');
+
+    if (chatShell) chatShell.hidden = view === 'raw';
+    if (rawShell) rawShell.hidden = view !== 'raw';
+
+    if (view === 'raw') {
+      this.renderRawMessages();
+    } else {
+      this.renderChat();
+    }
+  }
+
+  renderRawMessages() {
+    const container = document.getElementById('hybridRawLog');
+    if (!container) return;
+
+    const filter = this.state.rawFilter;
+    const messages = filter
+      ? this.state.rawMessages.filter((m) => m.type === filter)
+      : this.state.rawMessages;
+
+    container.innerHTML = '';
+
+    if (!messages.length) {
+      const empty = document.createElement('div');
+      empty.className = 'hybrid-empty';
+      empty.textContent = filter ? `No messages of type "${filter}"` : 'No raw messages yet';
+      container.appendChild(empty);
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+
+    // Show newest first
+    messages.slice().reverse().forEach((entry) => {
+      const row = document.createElement('div');
+      row.className = 'hybrid-raw-entry';
+
+      const meta = document.createElement('div');
+      meta.className = 'hybrid-raw-meta';
+      meta.innerHTML = `
+        <span><strong>From:</strong> ${shortPub(entry.from)}</span>
+        <span><strong>Type:</strong> ${entry.type}</span>
+        <span><strong>Size:</strong> ${entry.size}B</span>
+        <span><strong>Time:</strong> ${new Date(entry.timestamp).toLocaleTimeString()}</span>
+        <span><strong>Network:</strong> ${entry.network}</span>
+      `;
+
+      const payload = document.createElement('div');
+      payload.className = 'hybrid-raw-payload';
+      payload.innerHTML = this._highlightJson(entry.payload);
+
+      row.appendChild(meta);
+      row.appendChild(payload);
+      frag.appendChild(row);
+    });
+
+    container.appendChild(frag);
+    container.scrollTop = 0; // Scroll to top (newest)
+  }
+
+  _highlightJson(obj) {
+    const json = JSON.stringify(obj, null, 2);
+    return json
+      .replace(/"([^"]+)":/g, '<span class="json-key">"$1"</span>:')
+      .replace(/:\s*"([^"]*)"/g, ': <span class="json-string">"$1"</span>')
+      .replace(/:\s*(\d+\.?\d*)/g, ': <span class="json-number">$1</span>')
+      .replace(/:\s*(true|false)/g, ': <span class="json-boolean">$1</span>')
+      .replace(/:\s*null/g, ': <span class="json-null">null</span>');
   }
 }
 
