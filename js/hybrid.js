@@ -860,6 +860,54 @@ export class HybridHub {
       if (this.state.selectedKey === key) this.renderChat();
       return;
     }
+    if (type === 'smart-object-audio-output') {
+      // Audio from Hydra TTS to NoClip Smart Object
+      this._handleSmartObjectAudio(from, payload);
+      return;
+    }
+    if (type === 'smart-object-text-update') {
+      // Text update from Hydra LLM to NoClip Smart Object
+      this._handleSmartObjectText(from, payload);
+      return;
+    }
+  }
+
+  /**
+   * Handle incoming audio packet from Hydra for Smart Objects
+   */
+  _handleSmartObjectAudio(from, payload) {
+    // Check if scene manager has smart objects initialized
+    if (!this.sceneMgr || !this.sceneMgr.smartObjects) return;
+
+    const audioPacket = payload.audioPacket;
+    const objectId = payload.objectId || payload.nodeId;
+
+    if (!audioPacket || !objectId) {
+      console.warn('[Hybrid] Invalid smart object audio packet');
+      return;
+    }
+
+    // Route to Smart Object
+    this.sceneMgr.smartObjects.handleAudioPacket(objectId, audioPacket);
+  }
+
+  /**
+   * Handle incoming text update from Hydra for Smart Objects
+   */
+  _handleSmartObjectText(from, payload) {
+    // Check if scene manager has smart objects initialized
+    if (!this.sceneMgr || !this.sceneMgr.smartObjects) return;
+
+    const textData = payload.textData;
+    const objectId = payload.objectId || payload.nodeId;
+
+    if (!textData || !objectId) {
+      console.warn('[Hybrid] Invalid smart object text update');
+      return;
+    }
+
+    // Route to Smart Object
+    this.sceneMgr.smartObjects.handleTextUpdate(objectId, textData);
   }
 
   _handleResource(from, payload) {

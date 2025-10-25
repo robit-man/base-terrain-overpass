@@ -141,6 +141,16 @@ export class Input {
       case 'ShiftLeft': case 'ShiftRight': this.m.run = d; break;
       case 'ControlLeft': case 'ControlRight': this.m.crouch = d; break;
       case 'Space': if (d) this.m.jump = true; break;
+      case 'KeyG':
+        // Smart Object placement toggle
+        if (d && this.sceneMgr.smartObjects) {
+          if (this.sceneMgr.smartObjects.placementMode) {
+            this.sceneMgr.smartObjects.exitPlacementModeAndPlace();
+          } else {
+            this.sceneMgr.smartObjects.enterPlacementMode();
+          }
+        }
+        break;
     }
   }
   consumeJump(){ const j = this.m.jump; this.m.jump = false; return j; }

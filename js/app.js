@@ -21,6 +21,9 @@ import { AdaptiveQualityManager } from './adaptiveQuality.js';
 import { HybridHub } from './hybrid.js';
 import { WeatherManager } from './weather.js';
 import { RadioManager } from './radio.js';
+import { SmartObjectManager } from './smartObjects.js';
+import { SpatialAudioManager } from './spatialAudio.js';
+import { SmartObjectModal } from './smartModal.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -450,6 +453,9 @@ class App {
     this.mesh = new Mesh(this);
     this.hybrid = new HybridHub({ mesh: this.mesh });
     this.hybrid.init();
+
+    // Initialize Smart Objects system
+    this._initSmartObjects();
 
     // Local avatar shell
     this.localAvatar = null;
@@ -4575,8 +4581,54 @@ class App {
       }
     });
 
+    // Update Smart Objects
+    this.sceneMgr.updateSmartObjects();
+
     logger?.frameEnd?.();
     this._updateProcessLeaderboard();
+  }
+
+  _initSmartObjects() {
+    try {
+      // Create spatial audio manager
+      this.sceneMgr.spatialAudio = new SpatialAudioManager({
+        camera: this.sceneMgr.camera,
+        listener: this.sceneMgr.camera
+      });
+
+      // Create smart objects manager
+      this.sceneMgr.smartObjects = new SmartObjectManager({
+        scene: this.sceneMgr.scene,
+        camera: this.sceneMgr.camera,
+        hybrid: this.hybrid,
+        mesh: this.mesh,
+        spatialAudio: this.sceneMgr.spatialAudio
+      });
+
+      // Create modal UI
+      this.sceneMgr.smartModal = new SmartObjectModal({
+        smartObjects: this.sceneMgr.smartObjects,
+        onClose: () => {
+          // Optional: Do something when modal closes
+        }
+      });
+
+      // Link hybrid to scene manager for audio routing
+      this.hybrid.sceneMgr = this.sceneMgr;
+
+      // Handle peer sync messages for smart objects
+      if (this.mesh) {
+        this.mesh.on('message', (msg) => {
+          if (this.sceneMgr.smartObjects) {
+            this.sceneMgr.smartObjects.handlePeerSync(msg);
+          }
+        });
+      }
+
+      console.log('[App] Smart Objects initialized');
+    } catch (err) {
+      console.error('[App] Failed to initialize Smart Objects:', err);
+    }
   }
 
   _maybeUpdateSun(origin) {

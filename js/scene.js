@@ -106,6 +106,18 @@ export class SceneManager {
     });
 
     this.updateSun({ lat: 0, lon: 0, date: new Date() });
+
+    // Smart Objects - will be initialized later by app.js
+    this.smartObjects = null;
+    this.smartModal = null;
+    this.spatialAudio = null;
+
+    // Raycaster for click detection
+    this.raycaster = new THREE.Raycaster();
+    this.mouse = new THREE.Vector2();
+
+    // Click handler for Smart Objects
+    this.renderer.domElement.addEventListener('click', (e) => this._handleClick(e));
   }
 
   // Public API to supply tile radius (number) or a function that returns a number each call.
@@ -480,5 +492,45 @@ export class SceneManager {
       direction,
       altitude,
     };
+  }
+
+  /**
+   * Handle click for Smart Object interaction
+   */
+  _handleClick(event) {
+    if (!this.smartObjects || !this.smartModal) return;
+
+    // Check if menu is open or we're in placement mode
+    if (this.smartObjects.placementMode) return;
+
+    // Calculate mouse position in normalized device coordinates
+    this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    // Update raycaster
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    // Check for Smart Object intersection
+    const clickedObject = this.smartObjects.getObjectAtPosition(this.raycaster);
+
+    if (clickedObject) {
+      // Open modal for this object
+      this.smartModal.show(clickedObject);
+    }
+  }
+
+  /**
+   * Update Smart Objects (call this in animation loop)
+   */
+  updateSmartObjects() {
+    if (!this.smartObjects) return;
+
+    // Update placement preview position
+    this.smartObjects.updatePlacementPreview();
+
+    // Update spatial audio listener position
+    if (this.spatialAudio) {
+      this.spatialAudio.updateListenerPosition();
+    }
   }
 }
