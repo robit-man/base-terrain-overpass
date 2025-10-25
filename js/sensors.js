@@ -456,8 +456,9 @@ export class Sensors {
     if (!this.orient?.ready) return false;
 
     const gyYaw = this._yawFromQuat(this._orientationQuat);
-    const err = this._wrapPi(this.headingRad - gyYaw);
-    this._yawOff += err;           // re-align to current compass
+    // Negate heading because app.js applies it negated to dolly
+    // Set offset to make gyro yaw match negated compass heading
+    this._yawOff = -this.headingRad - gyYaw;
     this._composeFinalQuat();
     return true;
   }

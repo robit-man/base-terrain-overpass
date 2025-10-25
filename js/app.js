@@ -1037,7 +1037,8 @@ class App {
     if (!dolly) return false;
 
     // Instantly rotate dolly to compass heading
-    dolly.rotation.set(0, heading, 0);
+    // Negate: compass and dolly use opposite rotation directions
+    dolly.rotation.set(0, -heading, 0);
 
     // Force sensors to re-align so gyro continues from this heading
     this.sensors?.forceCompassAlign?.();
@@ -3895,12 +3896,14 @@ class App {
 
           // Extract yaw from cameraQuat (compass-aligned gyro)
           this._tmpVec3.set(0, 0, -1).applyQuaternion(cameraQuat);
-          const yaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
-          dolly.rotation.set(0, yaw, 0);
+          const yawFromCamera = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
+
+          // Set dolly yaw directly (no negation)
+          dolly.rotation.set(0, yawFromCamera, 0);
 
           // Camera (child of dolly) gets ONLY pitch/roll from cameraQuat
-          // Remove yaw from cameraQuat to get pitch/roll only
-          this._tmpQuat.setFromAxisAngle(this._yAxis, -yaw);
+          // Remove yaw from cameraQuat
+          this._tmpQuat.setFromAxisAngle(this._yAxis, -yawFromCamera);
           camera.quaternion.copy(cameraQuat).premultiply(this._tmpQuat);
           camera.up.set(0, 1, 0);
 
