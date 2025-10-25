@@ -161,18 +161,26 @@ export class HybridHub {
 
   _primeNoclipPeers() {
     if (!this.mesh?.peers) return;
+    const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
     const entries = Array.from(this.mesh.peers.entries());
     entries.forEach(([pub, info]) => {
+      // Filter out self
+      if (pub.toLowerCase() === selfPub) return;
+
       const loc = info?.meta?.loc;
       const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
         ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
         : null;
+
+      // Add network prefix to identify as NoClip peer
+      const addrWithPrefix = `noclip.${pub}`;
+
       this.state.noclip.peers.set(pub, {
         nknPub: pub,
-        addr: info?.addr || pub,
+        addr: addrWithPrefix,
         last: info?.lastTs || 0,
         online: this.mesh._online?.(pub) ?? false,
-        meta: info?.meta || {},
+        meta: { ...info?.meta, network: 'noclip' } || { network: 'noclip' },
         geo
       });
     });
@@ -183,8 +191,60 @@ export class HybridHub {
   _consumePeerParam() {
     try {
       const url = new URL(window.location.href);
-      const peerParam = url.searchParams.get('peer');
 
+      // Check for ?noclip= param (new format: noclip.<hex>)
+      let noclipValue = url.searchParams.get('noclip');
+      if (noclipValue) {
+        const parts = noclipValue.split('.');
+        const hex = parts.length === 2 && parts[0] === 'noclip' ? parts[1] : noclipValue;
+        const hexLower = hex.toLowerCase();
+
+        if (/^[0-9a-f]{64}$/i.test(hexLower)) {
+          url.searchParams.delete('noclip');
+          const newUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+          try {
+            window.history.replaceState({}, document.title, newUrl);
+          } catch (err) {
+            console.warn('[hybrid] Failed to update URL:', err);
+          }
+
+          return {
+            type: 'noclip',
+            prefix: 'noclip',
+            pub: hexLower,
+            addr: `noclip.${hexLower}`
+          };
+        }
+      }
+
+      // Check for ?hydra= param (new format: hydra.<hex>)
+      let hydraValue = url.searchParams.get('hydra');
+      if (hydraValue) {
+        const parts = hydraValue.split('.');
+        const hex = parts.length === 2 && parts[0] === 'hydra' ? parts[1] : hydraValue;
+        const hexLower = hex.toLowerCase();
+
+        if (/^[0-9a-f]{64}$/i.test(hexLower)) {
+          url.searchParams.delete('hydra');
+          const newUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+          try {
+            window.history.replaceState({}, document.title, newUrl);
+          } catch (err) {
+            console.warn('[hybrid] Failed to update URL:', err);
+          }
+
+          return {
+            type: 'hydra',
+            prefix: 'hydra',
+            pub: hexLower,
+            addr: `hydra.${hexLower}`,
+            requiresConfirmation: true // Hydra connections need user approval
+          };
+        }
+      }
+
+      // Fallback: Legacy ?peer= param for backwards compatibility
+      const peerParam = url.searchParams.get('peer');
       if (!peerParam) return null;
 
       // Format: <prefix>.<hex64> or just <hex64>
@@ -225,6 +285,7 @@ export class HybridHub {
       }
 
       return {
+        type: 'legacy',
         prefix: safePrefix || 'peer',
         pub: hexLower,
         addr: safePrefix ? `${safePrefix}.${hexLower}` : hexLower
@@ -236,36 +297,91 @@ export class HybridHub {
     }
   }
 
+  async _confirmHydraConnection(peer) {
+    return new Promise((resolve) => {
+      // Create a simple confirmation using browser's built-in confirm for now
+      // TODO: Replace with a proper modal UI similar to Hydra's workspace sync modal
+      const message = `A Hydra graph instance wants to connect:\n\n` +
+        `Address: ${peer.addr}\n` +
+        `Pub Key: ${peer.pub.slice(0, 16)}...\n\n` +
+        `This will allow the Hydra instance to:\n` +
+        `• Receive your position and scene state\n` +
+        `• Send resources and commands to your scene\n` +
+        `• Exchange data bi-directionally\n\n` +
+        `Accept this connection?`;
+
+      const confirmed = confirm(message);
+      resolve(confirmed);
+    });
+  }
+
   async _connectToPeerFromUrl() {
     const peer = this._consumePeerParam();
     if (!peer) return;
 
-    console.log('[hybrid] Connecting to peer from URL:', peer.prefix);
+    console.log('[hybrid] Connecting to peer from URL:', peer.type, peer.prefix);
 
     try {
-      // Add to hydra peers immediately
-      this.state.hydra.peers.set(peer.pub, {
-        nknPub: peer.pub,
-        addr: peer.addr,
-        meta: { username: peer.prefix },
-        last: nowSecondsFallback(),
-        online: false,
-        fromUrl: true,
-        hasBridge: true, // Assume bridge capability
-        bridgeStatus: 'detected'
-      });
+      if (peer.type === 'hydra') {
+        // Hydra peer detected - show confirmation modal
+        const confirmed = await this._confirmHydraConnection(peer);
+        if (!confirmed) {
+          pushToast('Connection cancelled');
+          return;
+        }
 
-      // Switch to Hydra network
-      this.setNetwork(NETWORKS.HYDRA);
+        // Add to hydra peers
+        this.state.hydra.peers.set(peer.pub, {
+          nknPub: peer.pub,
+          addr: peer.addr,
+          meta: { username: peer.prefix, network: 'hydra' },
+          last: nowSecondsFallback(),
+          online: false,
+          fromUrl: true,
+          hasBridge: true,
+          bridgeStatus: 'detected',
+          trusted: true // Mark as trusted after user confirmation
+        });
 
-      // Ensure discovery is running
-      await this.ensureHydraDiscovery();
+        // Switch to Hydra network
+        this.setNetwork(NETWORKS.HYDRA);
 
-      // Auto-select the peer (this will trigger handshake)
-      const key = makeScopedKey(NETWORKS.HYDRA, peer.pub);
-      await this.setActivePeer(key);
+        // Ensure discovery is running
+        await this.ensureHydraDiscovery();
 
-      pushToast(`Connecting to ${peer.prefix}...`);
+        // Auto-select the peer (this will trigger handshake)
+        const key = makeScopedKey(NETWORKS.HYDRA, peer.pub);
+        await this.setActivePeer(key);
+
+        pushToast(`Connecting to Hydra peer ${peer.pub.slice(0, 8)}...`);
+
+      } else if (peer.type === 'noclip') {
+        // NoClip peer - direct connection to another NoClip instance
+        // (Current behavior - auto-connect)
+        pushToast(`NoClip peer detected: ${peer.pub.slice(0, 8)}...`);
+        // NoClip-to-NoClip connections handled by mesh peer discovery
+
+      } else {
+        // Legacy peer param - treat as Hydra for backwards compatibility
+        this.state.hydra.peers.set(peer.pub, {
+          nknPub: peer.pub,
+          addr: peer.addr,
+          meta: { username: peer.prefix },
+          last: nowSecondsFallback(),
+          online: false,
+          fromUrl: true,
+          hasBridge: true,
+          bridgeStatus: 'detected'
+        });
+
+        this.setNetwork(NETWORKS.HYDRA);
+        await this.ensureHydraDiscovery();
+
+        const key = makeScopedKey(NETWORKS.HYDRA, peer.pub);
+        await this.setActivePeer(key);
+
+        pushToast(`Connecting to ${peer.prefix}...`);
+      }
 
     } catch (err) {
       console.error('[hybrid] Failed to connect to peer from URL:', err);
@@ -305,13 +421,17 @@ export class HybridHub {
         // Detect bridge capability
         const hasBridge = this._detectBridgeCapability(peer.meta);
 
+        // Add network prefix to identify as Hydra peer
+        const addrWithPrefix = `hydra.${pub}`;
+
         this.state.hydra.peers.set(pub, {
           ...peer,
           nknPub: pub,
-          addr: peer.addr || pub,
+          addr: addrWithPrefix,
           geo,
           last: peer.last || nowSecondsFallback(),
           online: true,
+          meta: { ...peer.meta, network: 'hydra' },
           hasBridge,
           bridgeStatus: hasBridge ? 'detected' : null
         });
@@ -487,16 +607,25 @@ export class HybridHub {
   _handleNoclipPeer(peer) {
     if (!peer?.pub) return;
     const pub = peer.pub.toLowerCase();
+
+    // Filter out self from NoClip peers
+    const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
+    if (pub === selfPub) return;
+
     const loc = peer.meta?.loc;
     const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
       ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
       : null;
+
+    // Add network prefix to identify as NoClip peer
+    const addrWithPrefix = `noclip.${pub}`;
+
     this.state.noclip.peers.set(pub, {
       nknPub: pub,
-      addr: peer.addr || pub,
+      addr: addrWithPrefix,
       last: peer.lastTs || nowSecondsFallback(),
       online: true,
-      meta: peer.meta || {},
+      meta: { ...peer.meta, network: 'noclip' },
       geo
     });
     if (this.state.network === NETWORKS.NOCLIP) this.renderPeers();
@@ -1168,20 +1297,40 @@ export class HybridHub {
       .replace(/:\s*null/g, ': <span class="json-null">null</span>');
   }
 
-  generatePeerLink(pub) {
+  generatePeerLink(pub, options = {}) {
     if (!pub) return null;
 
     try {
-      // Get peer info for prefix
+      // Determine if this is self (for sharing own NoClip address)
+      const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
+      const isSelf = pub.toLowerCase() === selfPub;
+
+      // Get peer info
       const peer = this.state.hydra.peers.get(pub) || this.state.noclip.peers.get(pub);
-      const prefix = peer?.meta?.username || this.mesh?.displayName || 'noclip';
 
-      // Sanitize prefix
-      const safePrefix = String(prefix).replace(/[^a-z0-9_-]/gi, '').slice(0, 32) || 'peer';
+      // Determine network type
+      let network = options.network || peer?.meta?.network || (isSelf ? 'noclip' : null);
 
-      // Build URL
+      // If no network determined, try to infer from which map has the peer
+      if (!network) {
+        if (this.state.noclip.peers.has(pub)) network = 'noclip';
+        else if (this.state.hydra.peers.has(pub)) network = 'hydra';
+        else network = 'noclip'; // Default to noclip for unknown peers
+      }
+
+      // Build URL with appropriate parameter
       const url = new URL(window.location.href);
-      url.searchParams.set('peer', `${safePrefix}.${pub}`);
+
+      if (network === 'noclip' || isSelf) {
+        // Use ?noclip=noclip.<hex> format
+        url.searchParams.set('noclip', `noclip.${pub}`);
+      } else if (network === 'hydra') {
+        // Use ?hydra=hydra.<hex> format
+        url.searchParams.set('hydra', `hydra.${pub}`);
+      } else {
+        // Fallback to noclip
+        url.searchParams.set('noclip', `noclip.${pub}`);
+      }
 
       return url.toString();
 

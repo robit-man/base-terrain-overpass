@@ -14,7 +14,7 @@ import { now, fmtAgo, isHex64, shortHex, rad, deg } from './utils.js';
  *   peers: [{
  *     pub: "hex64",
  *     lastTs: Number,
- *     ids: ["peer","web","phone","client", ...],
+ *     ids: ["peer","noclip","phone","client", ...],
  *     addrs: [{ addr, lastAck, lastProbe, rttMs }]
  *   }]
  * }
@@ -459,7 +459,7 @@ export class Mesh {
       const pub = (p.pub || '').toLowerCase();
       if (!isHex64(pub) || pub === this.selfPub) continue;
 
-      const ids = new Set(['peer', 'web', 'phone', 'client', ...(p.ids || [])]);
+      const ids = new Set(['peer', 'noclip', 'phone', 'client', ...(p.ids || [])]);
       const targets = new Set([...ids].map(id => addrFrom(id, pub)));
       (p.addrs || []).forEach(a => { if (isAddr(a.addr)) targets.add(a.addr); });
 
@@ -1034,7 +1034,7 @@ export class Mesh {
 
     if (this.discovery) {
       const meta = { ...(this.discovery.me?.meta || {}), ...this._discoveryMeta() };
-      this.discovery.me = { ...(this.discovery.me || {}), nknPub: this.selfPub, addr: this.selfAddr || this.discovery.me?.addr || addrFrom('web', this.selfPub), meta };
+      this.discovery.me = { ...(this.discovery.me || {}), nknPub: this.selfPub, addr: this.selfAddr || this.discovery.me?.addr || addrFrom('noclip', this.selfPub), meta };
       this.discoveryStatus.state = 'ready';
       this.discoveryStatus.detail = `peers ${this.discovery.peers.length}`;
       this._updateDiscoveryUi();
@@ -1051,7 +1051,7 @@ export class Mesh {
       const meta = this._discoveryMeta();
       this.discovery = await createDiscovery({
         room: this.discoveryRoom,
-        me: { nknPub: this.selfPub, addr: this.selfAddr || addrFrom('web', this.selfPub), meta }
+        me: { nknPub: this.selfPub, addr: this.selfAddr || addrFrom('noclip', this.selfPub), meta }
       });
 
       this.discovery.on('peer', (peer) => this._handleDiscoveryPeer(peer, 'presence'));
@@ -1201,7 +1201,7 @@ export class Mesh {
 
   _idSet(pub) {
     let s = this.knownIds.get(pub);
-    if (!s) { s = new Set(['peer', 'web', 'phone', 'client']); this.knownIds.set(pub, s); }
+    if (!s) { s = new Set(['peer', 'noclip', 'phone', 'client']); this.knownIds.set(pub, s); }
     return s;
   }
 
@@ -1231,7 +1231,8 @@ export class Mesh {
       let hex = localStorage.getItem('NKN_SEED_HEX_V1');
       const makeSeed = () => { const u = new Uint8Array(32); crypto.getRandomValues(u); return Array.from(u).map(b => b.toString(16).padStart(2, '0')).join(''); };
       if (!isHex64(hex)) { hex = makeSeed(); localStorage.setItem('NKN_SEED_HEX_V1', hex); }
-      this.client = new window.nkn.MultiClient({ seed: hex, identifier: 'web', numSubClients: 8, originalClient: true });
+      // Use noclip. prefix for NoClip peers (changed from web.)
+      this.client = new window.nkn.MultiClient({ seed: hex, identifier: 'noclip', numSubClients: 8, originalClient: true });
 
       // Session support (ncp-js)
       try {
@@ -1708,7 +1709,7 @@ export class Mesh {
     for (const a of this.addrPool.keys()) set.add(a);
     for (const [pub] of this.peers.entries()) {
       this._idSet(pub).forEach(id => set.add(addrFrom(id, pub)));
-      set.add(addrFrom('peer', pub)); set.add(addrFrom('web', pub)); set.add(addrFrom('phone', pub));
+      set.add(addrFrom('peer', pub)); set.add(addrFrom('noclip', pub)); set.add(addrFrom('phone', pub));
     }
     return [...set].filter(a => a !== this.selfAddr && !a.endsWith(`.${this.selfPub}`));
   }
