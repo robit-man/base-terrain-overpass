@@ -1634,6 +1634,22 @@ canvas {
     box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
 }
 
+#buttonStack .hud-button.arming {
+    background: rgba(94, 227, 166, 0.25);
+    color: var(--hud-text-primary);
+    box-shadow: 0 0 12px rgba(94, 227, 166, 0.45);
+}
+
+.scene-canvas {
+    filter: brightness(1) contrast(1);
+    transition: filter 0.25s ease;
+}
+
+.scene-canvas.pointer-lock-arming {
+    transition: filter 1s linear;
+    filter: brightness(2) contrast(2);
+}
+
 #perfHud .hud-button:hover:not(:disabled) {
     background: var(--hud-button-border);
     color: var(--hud-text-primary);

@@ -229,6 +229,12 @@ class App {
       ui,
       getLocation: () => this._locationState
     });
+    this._pointerLockArmed = false;
+    this._pointerLockActive = false;
+    this._pointerLockHoldTimer = null;
+    this._pointerLockHoldPointerId = null;
+    this._pointerLockHoldActive = false;
+    this._pointerLockButtonState = 'idle';
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -495,6 +501,12 @@ class App {
       this._pointerNdc.has = false;
       this.buildings?.clearHover();
     });
+    if (dom) {
+      dom.addEventListener('pointerdown', (e) => this._onCanvasPointerDown(e), { passive: true });
+      dom.addEventListener('pointerup', (e) => this._onCanvasPointerUp(e), { passive: true });
+      dom.addEventListener('pointerleave', (e) => this._onCanvasPointerLeave(e), { passive: true });
+      dom.addEventListener('pointercancel', (e) => this._onCanvasPointerLeave(e), { passive: true });
+    }
     document.addEventListener('pointerlockchange', () => {
       if (document.pointerLockElement) {
         this._pointerNdc.x = 0;
@@ -503,6 +515,7 @@ class App {
       } else {
         this._pointerNdc.has = false;
       }
+      this._handlePointerLockChange(!!document.pointerLockElement);
     });
     this._raycaster = new THREE.Raycaster();
     this._tmpVec = new THREE.Vector3();
@@ -716,6 +729,11 @@ class App {
       this._syncTeleportButtonState();
     }
     this._setupTeleportPointerHandler();
+
+    if (ui.hudPointerLock) {
+      ui.hudPointerLock.addEventListener('click', () => this._handlePointerLockButton());
+      this._syncPointerLockButton(true);
+    }
 
     if (ui.hudPlaceToggle) {
       ui.hudPlaceToggle.addEventListener('click', () => this._toggleSmartPlacementMode());
@@ -4683,6 +4701,122 @@ class App {
       this._pointerNdc.x = 0;
       this._pointerNdc.y = 0;
       this._pointerNdc.has = true;
+    }
+  }
+
+  _handlePointerLockButton() {
+    if (this._pointerLockActive) {
+      this._setPointerLockArmed(false, { silent: true });
+      this.input?.unlockPointer();
+      return;
+    }
+    if (this._pointerLockArmed) {
+      this._setPointerLockArmed(false, { silent: true });
+      return;
+    }
+    this._setPointerLockArmed(true);
+  }
+
+  _setPointerLockArmed(enabled, { silent = false } = {}) {
+    const next = !!enabled;
+    if (next === this._pointerLockArmed) return;
+    this._pointerLockArmed = next;
+    if (!next) {
+      this._cancelPointerHold();
+    } else if (!silent) {
+      pushToast('Click and hold the scene for 1s to lock the pointer', { duration: 2800 });
+    }
+    this._syncPointerLockButton(true);
+  }
+
+  _onCanvasPointerDown(e) {
+    if (!this._pointerLockArmed || this._pointerLockActive) return;
+    if (e.button !== 0) return;
+    if (e.pointerType && e.pointerType !== 'mouse') return;
+    if (this._pointerLockHoldActive) return;
+    this._pointerLockHoldActive = true;
+    this._pointerLockHoldPointerId = e.pointerId;
+    this._setCanvasHoldVisual(true);
+    this._clearPointerHoldTimer();
+    this._pointerLockHoldTimer = setTimeout(() => this._commitPointerLock(), 1000);
+  }
+
+  _onCanvasPointerUp(e) {
+    if (!this._pointerLockHoldActive) return;
+    if (e.pointerId != null && e.pointerId !== this._pointerLockHoldPointerId) return;
+    this._cancelPointerHold();
+  }
+
+  _onCanvasPointerLeave(e) {
+    if (!this._pointerLockHoldActive) return;
+    if (e.pointerId != null && e.pointerId !== this._pointerLockHoldPointerId) return;
+    this._cancelPointerHold();
+  }
+
+  _clearPointerHoldTimer() {
+    if (this._pointerLockHoldTimer) {
+      clearTimeout(this._pointerLockHoldTimer);
+      this._pointerLockHoldTimer = null;
+    }
+  }
+
+  _cancelPointerHold() {
+    this._pointerLockHoldActive = false;
+    this._pointerLockHoldPointerId = null;
+    this._clearPointerHoldTimer();
+    this._setCanvasHoldVisual(false);
+  }
+
+  _setCanvasHoldVisual(active) {
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (!canvas) return;
+    if (active) {
+      canvas.classList.add('pointer-lock-arming');
+    } else {
+      canvas.classList.remove('pointer-lock-arming');
+    }
+  }
+
+  _commitPointerLock() {
+    if (!this._pointerLockArmed || this._pointerLockActive) return;
+    if (!this._pointerLockHoldActive) return;
+    this._pointerLockHoldActive = false;
+    this._clearPointerHoldTimer();
+    this._setCanvasHoldVisual(false);
+    this._pointerLockHoldPointerId = null;
+    this._setPointerLockArmed(false, { silent: true });
+    this.input?.lockPointer();
+  }
+
+  _handlePointerLockChange(isLocked) {
+    this._pointerLockActive = !!isLocked;
+    if (!isLocked) {
+      this._pointerLockArmed = false;
+    }
+    this._cancelPointerHold();
+    this._syncPointerLockButton(true);
+  }
+
+  _syncPointerLockButton(force = false) {
+    const btn = ui.hudPointerLock;
+    if (!btn) return;
+    const locked = this._pointerLockActive;
+    const arming = this._pointerLockArmed && !locked;
+    const state = locked ? 'locked' : (arming ? 'arming' : 'idle');
+    if (!force && this._pointerLockButtonState === state) return;
+    this._pointerLockButtonState = state;
+    btn.classList.toggle('on', locked);
+    btn.classList.toggle('arming', arming);
+    btn.setAttribute('aria-pressed', locked ? 'true' : 'false');
+    if (locked) {
+      btn.textContent = 'Unlock Pointer';
+      btn.title = 'Pointer locked · click to release';
+    } else if (arming) {
+      btn.textContent = 'Lock Pointer…';
+      btn.title = 'Click and hold the scene for 1s to lock';
+    } else {
+      btn.textContent = 'Lock Pointer';
+      btn.title = 'Click to arm pointer lock';
     }
   }
 

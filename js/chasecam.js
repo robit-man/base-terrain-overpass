@@ -55,6 +55,7 @@ export class ChaseCam {
 
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
+      if (!this._shouldHandleWheel(e)) return;
       this.targetBoom = THREE.MathUtils.clamp(
         this.targetBoom + e.deltaY * 0.1,
         this.minBoom,
@@ -145,6 +146,16 @@ export class ChaseCam {
   }
 
   isFirstPerson() { return this.targetBoom <= this.FIRST_THRESHOLD; }
+
+  _shouldHandleWheel(event) {
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (!canvas) return false;
+    if (event.target === canvas) return true;
+    if (canvas.contains?.(event.target)) return true;
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : null;
+    if (Array.isArray(path) && path.includes(canvas)) return true;
+    return false;
+  }
 
   _updateMobilePitch(dt) {
     if (!this.isMobile || !this.orient || !this.orient.ready) return;

@@ -10,19 +10,6 @@ export class Input {
     this.controls = new PointerLockControls(sceneMgr.dolly, document.body);
     this.m = { f:false,b:false,l:false,r:false, run:false, crouch:false, jump:false };
 
-    // Only lock on canvas clicks (desktop)
-    const shouldLock = (e) => {
-      if (isMobile) return false;
-      if (sceneMgr.renderer.xr.isPresenting) return false;
-      if (sceneMgr.smartObjects?.placementMode) return false;
-      if (ui.menuPane && ui.menuPane.style.display === 'block') return false;
-      const path = e.composedPath?.() || [];
-      return path.includes(canvas) || e.target === canvas;
-    };
-    document.body.addEventListener('click', (e) => {
-      if (shouldLock(e)) this.controls.lock();
-    });
-
     addEventListener('keydown', e => this._k(e, true));
     addEventListener('keyup',   e => this._k(e, false));
 
@@ -160,4 +147,20 @@ export class Input {
     }
   }
   consumeJump(){ const j = this.m.jump; this.m.jump = false; return j; }
+
+  lockPointer() {
+    if (this.controls && !this.controls.isLocked) {
+      this.controls.lock();
+    }
+  }
+
+  unlockPointer() {
+    if (this.controls && this.controls.isLocked) {
+      this.controls.unlock();
+    }
+  }
+
+  isPointerLocked() {
+    return !!(this.controls && this.controls.isLocked);
+  }
 }
