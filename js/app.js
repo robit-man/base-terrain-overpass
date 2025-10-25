@@ -235,6 +235,11 @@ class App {
     this._pointerLockHoldPointerId = null;
     this._pointerLockHoldActive = false;
     this._pointerLockButtonState = 'idle';
+    this._orbitDragActive = false;
+    this._orbitDragPointerId = null;
+    this._orbitDragLastX = 0;
+    this._orbitDragLastY = 0;
+    this._orbitDragSensitivity = 0.0022;
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -506,6 +511,7 @@ class App {
       dom.addEventListener('pointerup', (e) => this._onCanvasPointerUp(e), { passive: true });
       dom.addEventListener('pointerleave', (e) => this._onCanvasPointerLeave(e), { passive: true });
       dom.addEventListener('pointercancel', (e) => this._onCanvasPointerLeave(e), { passive: true });
+      dom.addEventListener('pointermove', (e) => this._onCanvasPointerMove(e), { passive: false });
     }
     document.addEventListener('pointerlockchange', () => {
       if (document.pointerLockElement) {
@@ -4730,27 +4736,40 @@ class App {
   }
 
   _onCanvasPointerDown(e) {
-    if (!this._pointerLockArmed || this._pointerLockActive) return;
-    if (e.button !== 0) return;
-    if (e.pointerType && e.pointerType !== 'mouse') return;
-    if (this._pointerLockHoldActive) return;
-    this._pointerLockHoldActive = true;
-    this._pointerLockHoldPointerId = e.pointerId;
-    this._setCanvasHoldVisual(true);
-    this._clearPointerHoldTimer();
-    this._pointerLockHoldTimer = setTimeout(() => this._commitPointerLock(), 1000);
+    const isMouse = !e.pointerType || e.pointerType === 'mouse';
+    if (this._pointerLockArmed && !this._pointerLockActive && isMouse && e.button === 0) {
+      if (this._pointerLockHoldActive) return;
+      this._pointerLockHoldActive = true;
+      this._pointerLockHoldPointerId = e.pointerId;
+      this._setCanvasHoldVisual(true);
+      this._clearPointerHoldTimer();
+      this._pointerLockHoldTimer = setTimeout(() => this._commitPointerLock(), 1000);
+      return;
+    }
+    if (!this._pointerLockArmed && !this._pointerLockActive && isMouse && e.button === 0) {
+      this._beginOrbitDrag(e);
+    }
   }
 
   _onCanvasPointerUp(e) {
-    if (!this._pointerLockHoldActive) return;
-    if (e.pointerId != null && e.pointerId !== this._pointerLockHoldPointerId) return;
-    this._cancelPointerHold();
+    if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
+      this._cancelPointerHold();
+    }
+    this._endOrbitDrag(e);
   }
 
   _onCanvasPointerLeave(e) {
-    if (!this._pointerLockHoldActive) return;
-    if (e.pointerId != null && e.pointerId !== this._pointerLockHoldPointerId) return;
-    this._cancelPointerHold();
+    if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
+      this._cancelPointerHold();
+    }
+    this._endOrbitDrag(e);
+  }
+
+  _onCanvasPointerMove(e) {
+    if (this._orbitDragActive && e.pointerId === this._orbitDragPointerId) {
+      e.preventDefault();
+      this._handleOrbitDrag(e);
+    }
   }
 
   _clearPointerHoldTimer() {
@@ -4788,12 +4807,59 @@ class App {
     this.input?.lockPointer();
   }
 
+  _beginOrbitDrag(e) {
+    if (this._orbitDragActive) return;
+    this._orbitDragActive = true;
+    this._orbitDragPointerId = e.pointerId;
+    this._orbitDragLastX = e.clientX;
+    this._orbitDragLastY = e.clientY;
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (canvas) canvas.style.cursor = 'grabbing';
+  }
+
+  _handleOrbitDrag(e) {
+    if (!this._orbitDragActive || e.pointerId !== this._orbitDragPointerId) return;
+    const dx = e.clientX - this._orbitDragLastX;
+    const dy = e.clientY - this._orbitDragLastY;
+    if (dx === 0 && dy === 0) return;
+    this._orbitDragLastX = e.clientX;
+    this._orbitDragLastY = e.clientY;
+    this._applyDesktopOrbitDelta(dx, dy);
+  }
+
+  _endOrbitDrag(e = null) {
+    if (!this._orbitDragActive) return;
+    if (e && e.pointerId != null && e.pointerId !== this._orbitDragPointerId) return;
+    this._orbitDragActive = false;
+    this._orbitDragPointerId = null;
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (canvas) canvas.style.cursor = '';
+  }
+
+  _applyDesktopOrbitDelta(dx, dy) {
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return;
+    const sensitivity = this._orbitDragSensitivity || 0.0022;
+    const yawDelta = -dx * sensitivity;
+    let pitchDelta = -dy * sensitivity;
+    const currentPitch = this._pitch ?? 0;
+    const maxUp = this._pitchMax - currentPitch;
+    const maxDown = this._pitchMin - currentPitch;
+    pitchDelta = THREE.MathUtils.clamp(pitchDelta, maxDown, maxUp);
+    const euler = this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
+    euler.y += yawDelta;
+    euler.x = pitchDelta;
+    dolly.quaternion.setFromEuler(euler);
+  }
+
   _handlePointerLockChange(isLocked) {
     this._pointerLockActive = !!isLocked;
     if (!isLocked) {
       this._pointerLockArmed = false;
     }
     this._cancelPointerHold();
+    this._endOrbitDrag();
+    this._togglePointerLockHint(this._pointerLockActive);
     this._syncPointerLockButton(true);
   }
 
@@ -4817,6 +4883,22 @@ class App {
     } else {
       btn.textContent = 'Lock Pointer';
       btn.title = 'Click to arm pointer lock';
+    }
+  }
+
+  _togglePointerLockHint(show) {
+    const hint = ui.pointerLockHint;
+    if (!hint) return;
+    if (show) {
+      hint.hidden = false;
+      requestAnimationFrame(() => hint.classList.add('show'));
+    } else {
+      hint.classList.remove('show');
+      setTimeout(() => {
+        if (!hint.classList.contains('show')) {
+          hint.hidden = true;
+        }
+      }, 320);
     }
   }
 

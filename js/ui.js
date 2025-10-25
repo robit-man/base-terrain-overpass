@@ -117,6 +117,7 @@ const terrainRelayInput = document.getElementById('terrainRelayInput');
 const terrainDatasetInput = document.getElementById('terrainDatasetInput');
 const terrainModeGeohash = document.getElementById('terrainModeGeohash');
 const terrainModeLatLng = document.getElementById('terrainModeLatLng');
+const pointerLockHint = document.getElementById('pointerLockHint');
 const teleportToastHost = document.getElementById('teleportToastHost');
 const hudUsersToggle = document.getElementById('hudUsersToggle');
 const hudUserPanel = document.getElementById('hudUserPanel');
@@ -344,6 +345,7 @@ export const ui = {
   miniMapMove, miniMapSnap,
   terrainRelayStatus, terrainRelayInput, terrainDatasetInput,
   terrainModeGeohash, terrainModeLatLng,
+  pointerLockHint,
   teleportToastHost,
   hudUsersToggle, hudUserPanel, hudUserList,
   overviewBrowser, overviewPlatform, overviewResolution, overviewUserAgent,
