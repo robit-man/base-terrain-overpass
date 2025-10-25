@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orientation Debug</title>
+    <style>
+        body { margin: 0; padding: 20px; font-family: monospace; font-size: 12px; }
+        #log { white-space: pre; }
+        .highlight { background: yellow; }
+    </style>
+</head>
+<body>
+    <h2>Orientation Debug Logger</h2>
+    <button id="enable">Enable Sensors</button>
+    <button id="clear">Clear Log</button>
+    <div id="log"></div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+        const logDiv = document.getElementById('log');
+        const enableBtn = document.getElementById('enable');
+        const clearBtn = document.getElementById('clear');
+
+        function log(msg) {
+            logDiv.textContent += msg + '\n';
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function fmt(n) {
+            return n != null ? n.toFixed(4) : 'null';
+        }
+
+        clearBtn.addEventListener('click', () => { logDiv.textContent = ''; });
+
+        // orient.html approach
+        const zee = new THREE.Vector3(0, 0, 1);
+        const q0 = new THREE.Quaternion();
+        const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -PI/2 about X
+        const eulerYXZ = new THREE.Euler(0, 0, 0, 'YXZ');
+        const qDevice = new THREE.Quaternion();
+
+        function getScreenAngleRad() {
+            const angle = (screen.orientation && typeof screen.orientation.angle === 'number')
+                ? screen.orientation.angle
+                : (window.orientation || 0);
+            return angle * Math.PI / 180;
+        }
+
+        function setFromDeviceEuler(outQ, alpha, beta, gamma, screenOrientRad) {
+            eulerYXZ.set(beta, alpha, -gamma, 'YXZ');
+            outQ.setFromEuler(eulerYXZ);
+            outQ.multiply(q1);
+            q0.setFromAxisAngle(zee, -screenOrientRad);
+            outQ.multiply(q0);
+            return outQ;
+        }
+
+        // sensors.js approach
+        const _qTilt = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2);
+        const _eulerIn = new THREE.Euler();
+        const _orientationQuat = new THREE.Quaternion();
+        const _q0 = new THREE.Quaternion();
+        const _zee = new THREE.Vector3(0, 0, 1);
+
+        function sensorsJsApproach(alpha, beta, gamma, screenOri) {
+            _orientationQuat
+                .setFromEuler(_eulerIn.set(beta, alpha, -gamma, 'YXZ'))
+                .multiply(_qTilt)
+                .multiply(_q0.setFromAxisAngle(_zee, -screenOri));
+            return _orientationQuat;
+        }
+
+        async function startSensors() {
+            if (typeof DeviceOrientationEvent?.requestPermission === 'function') {
+                try {
+                    const perm = await DeviceOrientationEvent.requestPermission();
+                    if (perm !== 'granted') {
+                        log('Permission denied');
+                        return;
+                    }
+                } catch (err) {
+                    log('Error requesting permission: ' + err);
+                    return;
+                }
+            }
+
+            log('=== Sensor enabled ===\n');
+
+            const type = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
+
+            window.addEventListener(type, (e) => {
+                const alpha = (e.alpha ?? 0);
+                const beta = (e.beta ?? 0);
+                const gamma = (e.gamma ?? 0);
+
+                const alphaRad = THREE.MathUtils.degToRad(alpha);
+                const betaRad = THREE.MathUtils.degToRad(beta);
+                const gammaRad = THREE.MathUtils.degToRad(gamma);
+                const screenOri = getScreenAngleRad();
+
+                log(`\n--- RAW DeviceOrientation (deg) ---`);
+                log(`alpha: ${fmt(alpha)}, beta: ${fmt(beta)}, gamma: ${fmt(gamma)}`);
+
+                // orient.html approach
+                setFromDeviceEuler(qDevice, alphaRad, betaRad, gammaRad, screenOri);
+                const euler1 = new THREE.Euler().setFromQuaternion(qDevice, 'YXZ');
+
+                log(`\n--- orient.html quaternion ---`);
+                log(`q: (${fmt(qDevice.x)}, ${fmt(qDevice.y)}, ${fmt(qDevice.z)}, ${fmt(qDevice.w)})`);
+                log(`Euler YXZ: yaw=${fmt(THREE.MathUtils.radToDeg(euler1.y))}, pitch=${fmt(THREE.MathUtils.radToDeg(euler1.x))}, roll=${fmt(THREE.MathUtils.radToDeg(euler1.z))}`);
+
+                // sensors.js approach
+                const qSensors = sensorsJsApproach(betaRad, alphaRad, gammaRad, screenOri);
+                const euler2 = new THREE.Euler().setFromQuaternion(qSensors, 'YXZ');
+
+                log(`\n--- sensors.js quaternion ---`);
+                log(`q: (${fmt(qSensors.x)}, ${fmt(qSensors.y)}, ${fmt(qSensors.z)}, ${fmt(qSensors.w)})`);
+                log(`Euler YXZ: yaw=${fmt(THREE.MathUtils.radToDeg(euler2.y))}, pitch=${fmt(THREE.MathUtils.radToDeg(euler2.x))}, roll=${fmt(THREE.MathUtils.radToDeg(euler2.z))}`);
+
+                // Check if they match
+                const diff = Math.abs(qDevice.x - qSensors.x) +
+                             Math.abs(qDevice.y - qSensors.y) +
+                             Math.abs(qDevice.z - qSensors.z) +
+                             Math.abs(qDevice.w - qSensors.w);
+
+                if (diff > 0.001) {
+                    log(`\n>>> MISMATCH! Diff = ${fmt(diff)} <<<`);
+                } else {
+                    log(`\n✓ Quaternions match`);
+                }
+
+                log(`\n${'='.repeat(50)}`);
+            }, false);
+        }
+
+        enableBtn.addEventListener('click', () => {
+            enableBtn.disabled = true;
+            startSensors();
+        });
+    </script>
+</body>
+</html>

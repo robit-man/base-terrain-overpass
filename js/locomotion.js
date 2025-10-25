@@ -151,16 +151,18 @@ export class Locomotion {
     }
 
     // Device orientation (mobile, non-XR)
-    if (isMobileDevice && this.orientationRef.ready && !xrPresenting) {
-      const { a, b, g } = this.orientationRef;
-      const euler = new THREE.Euler(rad(b || 0), rad(a || 0), rad(-(g || 0)), 'YXZ');
-      const q = new THREE.Quaternion().setFromEuler(euler)
-        .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
-      dol.quaternion.copy(q);
-      this._lastAppliedTouchYaw = 0;
-      this._touchYawFiltered = 0;
-      baseYaw = this._currentYaw();
-    }
+    // DISABLED: This was causing 2× orientation application when app.js also handles orientation
+    // The orientation is now handled in app.js tick() for mobile FPV mode
+    // if (isMobileDevice && this.orientationRef.ready && !xrPresenting) {
+    //   const { a, b, g } = this.orientationRef;
+    //   const euler = new THREE.Euler(rad(b || 0), rad(a || 0), rad(-(g || 0)), 'YXZ');
+    //   const q = new THREE.Quaternion().setFromEuler(euler)
+    //     .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2));
+    //   dol.quaternion.copy(q);
+    //   this._lastAppliedTouchYaw = 0;
+    //   this._touchYawFiltered = 0;
+    //   baseYaw = this._currentYaw();
+    // }
 
     if (isMobileDevice && !xrPresenting && this._snapYawTarget != null) {
       baseYaw = this._currentYaw();

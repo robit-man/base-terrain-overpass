@@ -492,6 +492,7 @@ class App {
     this._headingBasis = new THREE.Vector3(0, 0, -1);
     this._headingWorld = new THREE.Vector3();
     this._upUnit = new THREE.Vector3(0, 1, 0);
+    this._yAxis = new THREE.Vector3(0, 1, 0);  // for orientation offset quaternion
     this._hudScaleVisible = false;
 
     const compassDial = this._createCompassDial();
@@ -3855,39 +3856,33 @@ class App {
     if (!xrOn) {
       measure('orientation', () => {
         if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-          // Use screen-compensated device quaternion from Sensors (no re-mapping here)
-          const { q: deviceQuat } =
-            (this.sensors.getQuaternion && this.sensors.getQuaternion()) ||
-            { q: this._deviceQuatForFPV(this.sensors.orient) };
+          // Get screen-compensated device quaternion from Sensors
+          const { q: deviceQuat } = this.sensors.getQuaternion?.() || { q: this._deviceQuatForFPV(this.sensors.orient) };
 
           const compassOffset = this._getCompassYawOffset() || 0;
           const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
           const totalOffset = this._wrapAngle(compassOffset + manualOffset);
 
-          // yaw: 0 = North (-Z), clockwise +
-          this._tmpVec3.set(0, 0, -1).applyQuaternion(deviceQuat);
-          const yawDev = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
-          const yaw = this._wrapAngle(yawDev + totalOffset);
+          // Apply yaw offset as quaternion (like orient.html)
+          this._tmpQuat.setFromAxisAngle(this._yAxis, totalOffset);
+          const qFinal = this._tmpQuat2.copy(deviceQuat).premultiply(this._tmpQuat);
 
-          // remove raw yaw from the device quaternion → yaw-free tilt
-          this._tmpQuat.setFromEuler(new THREE.Euler(0, -yawDev, 0, 'YXZ'));
-          const qNoYaw = this._tmpQuat2.copy(deviceQuat).premultiply(this._tmpQuat);
+          // Extract yaw for dolly (locomotion needs this for movement direction)
+          this._tmpVec3.set(0, 0, -1).applyQuaternion(qFinal);
+          const yaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
 
-          // pitch/roll from yaw-free frame (decoupled → no 2×)
-          const tiltEuler = this._tmpEuler.setFromQuaternion(qNoYaw, 'YXZ');
-          const pitch = THREE.MathUtils.clamp(tiltEuler.x, this._pitchMin, this._pitchMax);
-          const roll = THREE.MathUtils.clamp(tiltEuler.z, -Math.PI / 2, Math.PI / 2);
+          // CRITICAL FIX: Only set dolly yaw, do NOT set quaternion
+          // Setting both rotation and quaternion causes double application
+          dolly.rotation.set(0, yaw, 0);
 
-          // prevent additive legacy rotates (otherwise tilt feels doubled)
-          dolly.rotation.set(0, 0, 0);
-          camera.rotation.set(0, 0, 0);
-
-          // apply: yaw on dolly; pitch/roll on camera
-          dolly.quaternion.setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ'));
-          camera.quaternion.setFromEuler(new THREE.Euler(pitch, 0, roll, 'YXZ'));
+          // Camera gets ONLY pitch/roll (yaw is on dolly)
+          // Remove yaw from qFinal to get pure tilt
+          this._tmpQuat.setFromAxisAngle(this._yAxis, -yaw);
+          camera.quaternion.copy(qFinal).premultiply(this._tmpQuat);
           camera.up.set(0, 1, 0);
 
-          this._pitch = pitch;
+          // Legacy pitch tracking
+          this._pitch = this._tmpEuler.setFromQuaternion(qFinal, 'YXZ').x;
 
         } else {
           const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
