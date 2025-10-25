@@ -1120,50 +1120,76 @@ export class Mesh {
     const pub = (peer.nknPub || '').toLowerCase();
     if (!isHex64(pub) || pub === this.selfPub) return;
 
-    const ts = now();
-    this._touchPeer(pub, ts);
+    // Determine peer network based on addr prefix
+    const addr = peer.addr || peer.nknPub || '';
+    const isHydraPeer = addr.toLowerCase().startsWith('hydra.') || addr.toLowerCase().startsWith('graph.');
+    const isNoclipPeer = addr.toLowerCase().startsWith('noclip.');
 
-    let ent = this.peers.get(pub);
-    if (!ent) {
-      ent = { addr: null, lastTs: ts, isVestigial: false };
-      this.peers.set(pub, ent);
+    // If no recognizable prefix, default to noclip for backward compatibility
+    const shouldAddToNoclip = isNoclipPeer || (!isHydraPeer && !isNoclipPeer);
+
+    if (isHydraPeer) {
+      // Route hydra peers to hybrid hub
+      this._emit('hybrid-peer', {
+        peer: {
+          pub,
+          addr: peer.addr || peer.nknPub || pub,
+          last: (typeof peer.last === 'number' ? peer.last : (Date.now() / 1000)) || 0,
+          meta: { ...(peer.meta || {}), network: 'hydra' },
+          online: true,
+          type: 'hydra'
+        }
+      });
+      return; // Don't add to noclip peers
     }
-    if (peer.addr && isAddr(peer.addr) && !ent.addr) ent.addr = peer.addr;
-    if (peer.addr && isAddr(peer.addr)) {
-      const pool = this.addrPool.get(peer.addr) || {};
-      if (!pool.lastProbe) pool.lastProbe = ts;
-      this.addrPool.set(peer.addr, pool);
-    }
 
-    if (Array.isArray(peer.meta?.ids)) {
-      for (const id of peer.meta.ids) this._idSet(pub).add(id);
-    }
+    // Handle noclip peers (original logic)
+    if (shouldAddToNoclip) {
+      const ts = now();
+      this._touchPeer(pub, ts);
 
-    this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
-    this._updateDiscoveryUi();
-
-    const firstSight = !this._discoveryHello.has(pub);
-    if (firstSight) {
-      this._discoveryHello.add(pub);
-      if (via === 'presence' || via === 'persisted') {
-        this.discovery?.handshake(pub, this._discoveryMeta(), { wantAck: true }).catch(() => { });
-        this._fireDiscoveryHello(pub);
-        this._sendPoseSnapshotTo(pub).catch(() => { });
-      } else if (via === 'handshake') {
-        this._fireDiscoveryHello(pub);
-        this._sendPoseSnapshotTo(pub).catch(() => { });
+      let ent = this.peers.get(pub);
+      if (!ent) {
+        ent = { addr: null, lastTs: ts, isVestigial: false };
+        this.peers.set(pub, ent);
       }
-    }
-
-    this._emit('noclip-peer', {
-      peer: {
-        pub,
-        addr: ent.addr || peer.addr || pub,
-        lastTs: ent.lastTs || now(),
-        meta: peer.meta || {},
-        online: ent && this._online(pub)
+      if (peer.addr && isAddr(peer.addr) && !ent.addr) ent.addr = peer.addr;
+      if (peer.addr && isAddr(peer.addr)) {
+        const pool = this.addrPool.get(peer.addr) || {};
+        if (!pool.lastProbe) pool.lastProbe = ts;
+        this.addrPool.set(peer.addr, pool);
       }
-    });
+
+      if (Array.isArray(peer.meta?.ids)) {
+        for (const id of peer.meta.ids) this._idSet(pub).add(id);
+      }
+
+      this.discoveryStatus.detail = `peers ${this.discovery?.peers?.length ?? this.peers.size}`;
+      this._updateDiscoveryUi();
+
+      const firstSight = !this._discoveryHello.has(pub);
+      if (firstSight) {
+        this._discoveryHello.add(pub);
+        if (via === 'presence' || via === 'persisted') {
+          this.discovery?.handshake(pub, this._discoveryMeta(), { wantAck: true }).catch(() => { });
+          this._fireDiscoveryHello(pub);
+          this._sendPoseSnapshotTo(pub).catch(() => { });
+        } else if (via === 'handshake') {
+          this._fireDiscoveryHello(pub);
+          this._sendPoseSnapshotTo(pub).catch(() => { });
+        }
+      }
+
+      this._emit('noclip-peer', {
+        peer: {
+          pub,
+          addr: ent.addr || peer.addr || pub,
+          lastTs: ent.lastTs || now(),
+          meta: peer.meta || {},
+          online: ent && this._online(pub)
+        }
+      });
+    }
   }
 
   _handleDiscoveryDm(evt) {

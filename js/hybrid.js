@@ -128,6 +128,7 @@ export class HybridHub {
       this._disposers.push(this.mesh.on('noclip-peer', (data) => this._handleNoclipPeer(data?.peer)));
       this._disposers.push(this.mesh.on('noclip-chat', (data) => this._handleNoclipChat(data)));
       this._disposers.push(this.mesh.on('noclip-bridge', (data) => this._handleBridgeEvent(data)));
+      this._disposers.push(this.mesh.on('hybrid-peer', (data) => this._handleHydraPeer(data?.peer)));
     }
 
     // seed with current peers
