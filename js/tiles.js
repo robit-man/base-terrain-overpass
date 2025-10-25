@@ -76,6 +76,9 @@ export class TileManager {
     this._originCacheKey = 'na';
     this._fetchPhase = 'interactive';
 
+    // Clean up old cache versions on initialization
+    this._cleanupOldCacheVersions();
+
     this.ray = new THREE.Raycaster();
     this.ray.layers.enable(1);
     this.DOWN = new THREE.Vector3(0, -1, 0);
@@ -972,6 +975,7 @@ _stitchInteractiveToVisualEdges(tile, {
     this._farfieldMerge.dirty = false;
     this._farfieldMerge.nextBuild = 0;
     this._farfieldMerge.lastBuildCount = 0;
+    this._restoreFarfieldTileVisibility();
   }
 
   _updateFarfieldMergedMesh({ force = false } = {}) {
@@ -1104,11 +1108,21 @@ _stitchInteractiveToVisualEdges(tile, {
 
     for (const tile of farTiles) {
       tile._mergedDirty = false;
+      // Hide individual farfield tiles when merged mesh is active to prevent z-fighting
+      if (tile.grid?.group) tile.grid.group.visible = false;
     }
 
     state.dirty = false;
     state.lastBuildTime = tNow;
     state.lastBuildCount = farTiles.length;
+  }
+  _restoreFarfieldTileVisibility() {
+    // Restore visibility of individual farfield tiles when merged mesh is removed
+    for (const tile of this.tiles.values()) {
+      if (tile && tile.type === 'farfield' && tile.grid?.group) {
+        tile.grid.group.visible = true;
+      }
+    }
   }
   _resetFarfieldTileState(tile) {
     if (!tile || tile.type !== 'farfield') return;
@@ -3084,9 +3098,21 @@ _stitchInteractiveToVisualEdges(tile, {
       const y = new Array(pos.count);
       for (let i = 0; i < pos.count; i++) y[i] = +pos.getY(i).toFixed(2);
       const payload = {
-        v: this.CACHE_VER, type: tile.type, spacing: this.spacing, tileRadius: this.tileRadius,
-        q: tile.q, r: tile.r, y
+        v: this.CACHE_VER,
+        type: tile.type,
+        spacing: this.spacing,
+        tileRadius: this.tileRadius,
+        q: tile.q,
+        r: tile.r,
+        y
       };
+
+      // Include farfield-specific metadata for proper restoration
+      if (tile.type === 'farfield') {
+        payload.scale = tile.scale || 1;
+        payload.sampleMode = tile._farSampleMode || 'all';
+      }
+
       localStorage.setItem(this._cacheKey(tile), JSON.stringify(payload));
       if (tile.type === 'interactive') {
         try { localStorage.removeItem(this._seedCacheKey(tile)); } catch { /* ignore */ }
@@ -3189,6 +3215,87 @@ _stitchInteractiveToVisualEdges(tile, {
     }
   }
 
+  /* ---------------- Restore tiles from cache on reload ---------------- */
+
+  _restoreTilesFromCache() {
+    if (!this.origin || !this._originCacheKey || this._originCacheKey === 'na') {
+      return 0;
+    }
+
+    const tilePrefix = `tile:${this.CACHE_VER}:${this._originCacheKey}:`;
+    let restoredCount = 0;
+
+    try {
+      // Scan localStorage for cached tiles matching current origin
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith(tilePrefix)) continue;
+
+        try {
+          const raw = localStorage.getItem(key);
+          if (!raw) continue;
+
+          const data = JSON.parse(raw);
+          if (!data || !Array.isArray(data.y)) continue;
+          if (data.spacing !== this.spacing) continue;
+
+          // Extract tile coordinates from the cache key
+          const parts = key.split(':');
+          if (parts.length < 10) continue;
+
+          const coordStr = parts[parts.length - 1]; // Last part is "q,r"
+          const coords = coordStr.split(',');
+          if (coords.length !== 2) continue;
+
+          const q = parseInt(coords[0], 10);
+          const r = parseInt(coords[1], 10);
+          if (!Number.isFinite(q) || !Number.isFinite(r)) continue;
+
+          const id = `${q},${r}`;
+          if (this.tiles.has(id)) continue; // Skip if tile already exists
+
+          // Determine tile type from cache data
+          const tileType = data.type || 'interactive';
+
+          // Create the tile based on its type
+          let tile = null;
+          if (tileType === 'interactive') {
+            tile = this._addInteractiveTile(q, r);
+          } else if (tileType === 'visual') {
+            tile = this._addVisualTile(q, r);
+          } else if (tileType === 'farfield') {
+            const scale = data.scale || 1;
+            const sampleMode = data.sampleMode || 'all';
+            tile = this._addFarfieldTile(q, r, scale, sampleMode);
+          }
+
+          if (!tile) continue;
+
+          // The tile creation already tried to load from cache, so if it succeeded
+          // it's already loaded. We just count it.
+          if (tile.unreadyCount === 0 || tile._phase?.fullDone) {
+            restoredCount++;
+          }
+
+        } catch (err) {
+          // Skip invalid cache entries
+          console.warn('[tiles] Failed to restore cached tile:', err);
+          continue;
+        }
+      }
+
+      if (restoredCount > 0) {
+        console.log(`[tiles] Restored ${restoredCount} tiles from cache`);
+        this._invalidateHeightCache();
+      }
+
+    } catch (err) {
+      console.warn('[tiles] Error during cache restoration:', err);
+    }
+
+    return restoredCount;
+  }
+
   /* ---------------- creation: interactive tile ---------------- */
 
   _addInteractiveTile(q, r) {
@@ -3200,6 +3307,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const wp = this._axialWorld(q, r);
     grid.group.position.set(wp.x, 0, wp.z);
     this.scene.add(grid.group);
+    // Set renderOrder to ensure proper layering: farfield < visual < interactive
+    if (grid.mesh) grid.mesh.renderOrder = 0;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -3386,6 +3495,8 @@ _stitchInteractiveToVisualEdges(tile, {
     const wp = this._axialWorld(q, r);
     low.group.position.set(wp.x, 0, wp.z);
     this.scene.add(low.group);
+    // Set renderOrder to ensure proper layering: farfield < visual < interactive
+    if (low.mesh) low.mesh.renderOrder = -1;
 
     const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
@@ -3522,6 +3633,8 @@ _stitchInteractiveToVisualEdges(tile, {
     grid.group.name = `tile-${id}`;
     grid.group.position.copy(v.grid.group.position);
     this.scene.add(grid.group);
+    // Set renderOrder to ensure proper layering: farfield < visual < interactive
+    if (grid.mesh) grid.mesh.renderOrder = 0;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -4975,33 +5088,45 @@ update(playerPos) {
     if (changed) {
       this._resetAllTiles();
 
-      // FIX: Create full interactive ring immediately, not just center tile
-      // This ensures all nearby tiles are visible on teleport
-      for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
-        const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
-        const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
-        for (let dr = rMin; dr <= rMax; dr++) {
-          this._ensureType(dq, dr, 'interactive');
-        }
-      }
+      // Try to restore tiles from cache first
+      const restoredCount = this._restoreTilesFromCache();
 
-      this._prewarmVisualRing(0, 0);
-      this._prewarmFarfieldRing(0, 0);
+      // If no tiles were restored from cache, create the default ring
+      if (restoredCount === 0) {
+        // FIX: Create full interactive ring immediately, not just center tile
+        // This ensures all nearby tiles are visible on teleport
+        for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
+          const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
+          const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
+          for (let dr = rMin; dr <= rMax; dr++) {
+            this._ensureType(dq, dr, 'interactive');
+          }
+        }
+
+        this._prewarmVisualRing(0, 0);
+        this._prewarmFarfieldRing(0, 0);
+      }
 
       // FIX: Force heavy sweep to continue populating tiles
       this._pendingHeavySweep = true;
       this._lastQR = { q: 0, r: 0 };
     } else if (immediate && !this.tiles.size) {
-      // FIX: Same logic for immediate spawn with no tiles
-      for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
-        const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
-        const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
-        for (let dr = rMin; dr <= rMax; dr++) {
-          this._ensureType(dq, dr, 'interactive');
+      // Try to restore tiles from cache first
+      const restoredCount = this._restoreTilesFromCache();
+
+      // If no tiles were restored from cache, create the default ring
+      if (restoredCount === 0) {
+        // FIX: Same logic for immediate spawn with no tiles
+        for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
+          const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
+          const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
+          for (let dr = rMin; dr <= rMax; dr++) {
+            this._ensureType(dq, dr, 'interactive');
+          }
         }
+        this._prewarmVisualRing(0, 0);
+        this._prewarmFarfieldRing(0, 0);
       }
-      this._prewarmVisualRing(0, 0);
-      this._prewarmFarfieldRing(0, 0);
       this._pendingHeavySweep = true;
       this._lastQR = { q: 0, r: 0 };
     }
@@ -5563,6 +5688,79 @@ update(playerPos) {
     this._deferredInteractive.clear();
     this._interactiveSecondPass = false;
     this._farfieldAdapterDirty.clear();
+  }
+
+  /* ---------------- Public cache management API ---------------- */
+
+  /**
+   * Manually restore all cached tiles for the current origin.
+   * Useful for reloading terrain data after a page refresh.
+   * @returns {number} Number of tiles restored from cache
+   */
+  restoreCachedTiles() {
+    return this._restoreTilesFromCache();
+  }
+
+  /**
+   * Clear all cached tile data from localStorage.
+   * @param {Object} options - Cleanup options
+   * @param {boolean} options.currentOriginOnly - Only clear tiles for current origin
+   * @param {boolean} options.oldVersionsOnly - Only clear tiles from old cache versions
+   */
+  clearTileCache({ currentOriginOnly = false, oldVersionsOnly = false } = {}) {
+    try {
+      const keysToRemove = [];
+
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+
+        // Match tile cache keys and seed cache keys
+        if (key.startsWith('tile:') || key.startsWith('tileSeed:')) {
+          if (oldVersionsOnly) {
+            // Only remove if not current version
+            if (!key.startsWith(`tile:${this.CACHE_VER}:`) && !key.startsWith(`tileSeed:${this.CACHE_VER}:`)) {
+              keysToRemove.push(key);
+            }
+          } else if (currentOriginOnly) {
+            // Only remove if matches current origin
+            const prefix1 = `tile:${this.CACHE_VER}:${this._originCacheKey}:`;
+            const prefix2 = `tileSeed:${this.CACHE_VER}:${this._originCacheKey}:`;
+            if (key.startsWith(prefix1) || key.startsWith(prefix2)) {
+              keysToRemove.push(key);
+            }
+          } else {
+            // Remove all tile cache entries
+            keysToRemove.push(key);
+          }
+        }
+      }
+
+      for (const key of keysToRemove) {
+        localStorage.removeItem(key);
+      }
+
+      console.log(`[tiles] Cleared ${keysToRemove.length} cached tiles`);
+      return keysToRemove.length;
+
+    } catch (err) {
+      console.warn('[tiles] Error clearing cache:', err);
+      return 0;
+    }
+  }
+
+  /**
+   * Private: Clean up old cache versions on initialization
+   */
+  _cleanupOldCacheVersions() {
+    try {
+      const removed = this.clearTileCache({ oldVersionsOnly: true });
+      if (removed > 0) {
+        console.log(`[tiles] Cleaned up ${removed} old cache entries on initialization`);
+      }
+    } catch (err) {
+      console.warn('[tiles] Error cleaning up old cache:', err);
+    }
   }
 
   dispose() {

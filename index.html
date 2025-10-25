@@ -167,6 +167,13 @@
 
 
     <div class="hud-actions">
+      <div class="hud-radio-panel" id="hudRadioPanel" hidden>
+        <div class="hud-radio-status" id="hudRadioStatus">Radio off</div>
+        <input id="hudRadioDial" class="hud-radio-dial" type="range" min="0" max="100" step="1" value="0">
+        <ul class="hud-radio-list" id="hudRadioList"></ul>
+      </div>
+      <button id="hudRadioToggle" type="button" class="hud-button" aria-pressed="false"
+        title="Toggle ambient radio">Radio</button>
       <button id="hudTeleportToggle" type="button" class="hud-button" aria-pressed="false"
         title="Toggle click-to-teleport mode">Teleport</button>
       <button id="hudGpsReckon" type="button" class="hud-button" aria-pressed="false"

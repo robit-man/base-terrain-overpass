@@ -1529,6 +1529,91 @@ canvas {
     flex-flow: column;
 }
 
+.hud-radio-panel {
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.hud-radio-status {
+    font-size: 11px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.7);
+    letter-spacing: 0.08em;
+}
+
+.hud-radio-dial {
+    -webkit-appearance: none;
+    width: 100%;
+    background: transparent;
+}
+
+.hud-radio-dial::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, rgba(255,255,255,0.1), rgba(255,255,255,0.45));
+}
+
+.hud-radio-dial::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    cursor: pointer;
+    margin-top: -5px;
+    box-shadow: 0 0 6px rgba(0,0,0,0.4);
+}
+
+.hud-radio-dial::-moz-range-track {
+    height: 4px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, rgba(255,255,255,0.1), rgba(255,255,255,0.45));
+}
+
+.hud-radio-dial::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    cursor: pointer;
+    box-shadow: 0 0 6px rgba(0,0,0,0.4);
+}
+
+.hud-radio-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 160px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.hud-radio-item {
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.05);
+    cursor: pointer;
+    transition: background 0.2s ease, color 0.2s ease;
+    font-size: 12px;
+    line-height: 1.1rem;
+}
+
+.hud-radio-item.active {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+}
+
+.hud-radio-item:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
 #buttonStack .hud-button {
     padding: 6px 12px;
     border-radius: 4px;
@@ -1948,7 +2033,7 @@ canvas {
     left: 0px;
     top: 0px;
     mask: radial-gradient(transparent, transparent, transparent, black, black);
-    backdrop-filter: brightness(0.8) blur(20px) contrast(2) brightness(0.9) saturate(1.2);
+    backdrop-filter:  blur(20px) ;
 }
 
 #buildingHoverToast {

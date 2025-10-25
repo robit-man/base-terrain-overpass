@@ -346,6 +346,10 @@ export class MiniMap {
     this._updateMoveButton();
   }
 
+  enableFollow({ resetManual = false } = {}) {
+    this._setFollow(true, { triggerAuto: false, resetManual });
+  }
+
   _handleMoveRequest() {
     if (!this.moveBtn || this.moveBtn.disabled) return;
     if (!this._pendingTeleport || typeof this.onRequestTeleport !== 'function') return;

@@ -70,6 +70,11 @@ const hudDebugToggle = document.getElementById('hudDebugToggle');
 const hudWireframeToggle = document.getElementById('hudWireframeToggle');
 const hudReset = document.getElementById('hudReset');
 const hudTeleportToggle = document.getElementById('hudTeleportToggle');
+const hudRadioToggle = document.getElementById('hudRadioToggle');
+const hudRadioPanel = document.getElementById('hudRadioPanel');
+const hudRadioStatus = document.getElementById('hudRadioStatus');
+const hudRadioDial = document.getElementById('hudRadioDial');
+const hudRadioList = document.getElementById('hudRadioList');
 const hudGeohash = document.getElementById('hudGeohash');
 const hudLat = document.getElementById('hudLat');
 const hudLon = document.getElementById('hudLon');
@@ -329,6 +334,7 @@ export const ui = {
   hudWeather, hudWeatherIcon, hudWeatherTemp, hudWeatherDesc,
   hudWeatherHumidity, hudWeatherWind, hudWeatherRain, hudWeatherForecast,
   hudWireframeToggle,
+  hudRadioToggle, hudRadioPanel, hudRadioStatus, hudRadioDial, hudRadioList,
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,
   gpsLockToggle, yawAssistToggle, yawOffsetRange, yawOffsetValue,

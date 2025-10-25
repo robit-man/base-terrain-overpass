@@ -20,6 +20,7 @@ import { MiniMap } from './minimap.js';
 import { AdaptiveQualityManager } from './adaptiveQuality.js';
 import { HybridHub } from './hybrid.js';
 import { WeatherManager } from './weather.js';
+import { RadioManager } from './radio.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -220,6 +221,10 @@ class App {
     this._teleportMeditating = false;
     this._teleportRayTargets = [];
     this._teleportHintAt = 0;
+    this.radio = new RadioManager({
+      ui,
+      getLocation: () => this._locationState
+    });
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -873,6 +878,10 @@ class App {
     }
 
     this._maybeUpdateWeatherFromScene({ lat, lon });
+    if (source !== 'manual') {
+      this.miniMap?.enableFollow?.();
+    }
+    this.radio?.refreshRegion?.();
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
