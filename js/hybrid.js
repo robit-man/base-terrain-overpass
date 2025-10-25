@@ -134,6 +134,9 @@ export class HybridHub {
     this._primeNoclipPeers();
     this._ensureResourceLayer();
     this.setNetwork(this.state.network);
+
+    // Check for ?peer= parameter and auto-connect
+    this._connectToPeerFromUrl();
   }
 
   destroy() {
@@ -175,6 +178,99 @@ export class HybridHub {
     });
     this.renderPeers();
     this._markStateDirty();
+  }
+
+  _consumePeerParam() {
+    try {
+      const url = new URL(window.location.href);
+      const peerParam = url.searchParams.get('peer');
+
+      if (!peerParam) return null;
+
+      // Format: <prefix>.<hex64> or just <hex64>
+      const parts = peerParam.split('.');
+      let prefix = '';
+      let hex = '';
+
+      if (parts.length === 2) {
+        // Format: prefix.hex
+        prefix = parts[0];
+        hex = parts[1];
+      } else if (parts.length === 1) {
+        // Format: hex (no prefix)
+        hex = parts[0];
+      } else {
+        console.warn('[hybrid] Invalid peer parameter format:', peerParam);
+        return null;
+      }
+
+      // Validate hex (must be 64 hex characters)
+      const hexLower = hex.toLowerCase();
+      if (!/^[0-9a-f]{64}$/i.test(hexLower)) {
+        console.warn('[hybrid] Invalid peer hex:', hex);
+        return null;
+      }
+
+      // Sanitize prefix (alphanumeric, dash, underscore only)
+      const safePrefix = prefix.replace(/[^a-z0-9_-]/gi, '').slice(0, 32);
+
+      // Remove peer parameter from URL
+      url.searchParams.delete('peer');
+      const newUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+
+      try {
+        window.history.replaceState({}, document.title, newUrl);
+      } catch (err) {
+        console.warn('[hybrid] Failed to update URL:', err);
+      }
+
+      return {
+        prefix: safePrefix || 'peer',
+        pub: hexLower,
+        addr: safePrefix ? `${safePrefix}.${hexLower}` : hexLower
+      };
+
+    } catch (err) {
+      console.warn('[hybrid] Error parsing peer parameter:', err);
+      return null;
+    }
+  }
+
+  async _connectToPeerFromUrl() {
+    const peer = this._consumePeerParam();
+    if (!peer) return;
+
+    console.log('[hybrid] Connecting to peer from URL:', peer.prefix);
+
+    try {
+      // Add to hydra peers immediately
+      this.state.hydra.peers.set(peer.pub, {
+        nknPub: peer.pub,
+        addr: peer.addr,
+        meta: { username: peer.prefix },
+        last: nowSecondsFallback(),
+        online: false,
+        fromUrl: true,
+        hasBridge: true, // Assume bridge capability
+        bridgeStatus: 'detected'
+      });
+
+      // Switch to Hydra network
+      this.setNetwork(NETWORKS.HYDRA);
+
+      // Ensure discovery is running
+      await this.ensureHydraDiscovery();
+
+      // Auto-select the peer (this will trigger handshake)
+      const key = makeScopedKey(NETWORKS.HYDRA, peer.pub);
+      await this.setActivePeer(key);
+
+      pushToast(`Connecting to ${peer.prefix}...`);
+
+    } catch (err) {
+      console.error('[hybrid] Failed to connect to peer from URL:', err);
+      pushToast(`Failed to connect: ${err?.message || err}`);
+    }
   }
 
   async ensureHydraDiscovery() {
@@ -1062,6 +1158,65 @@ export class HybridHub {
       .replace(/:\s*(\d+\.?\d*)/g, ': <span class="json-number">$1</span>')
       .replace(/:\s*(true|false)/g, ': <span class="json-boolean">$1</span>')
       .replace(/:\s*null/g, ': <span class="json-null">null</span>');
+  }
+
+  generatePeerLink(pub) {
+    if (!pub) return null;
+
+    try {
+      // Get peer info for prefix
+      const peer = this.state.hydra.peers.get(pub) || this.state.noclip.peers.get(pub);
+      const prefix = peer?.meta?.username || this.mesh?.displayName || 'noclip';
+
+      // Sanitize prefix
+      const safePrefix = String(prefix).replace(/[^a-z0-9_-]/gi, '').slice(0, 32) || 'peer';
+
+      // Build URL
+      const url = new URL(window.location.href);
+      url.searchParams.set('peer', `${safePrefix}.${pub}`);
+
+      return url.toString();
+
+    } catch (err) {
+      console.warn('[hybrid] Failed to generate peer link:', err);
+      return null;
+    }
+  }
+
+  copyPeerLink(pub) {
+    const link = this.generatePeerLink(pub);
+    if (!link) {
+      pushToast('Failed to generate peer link');
+      return;
+    }
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(link).then(() => {
+          pushToast('Peer link copied to clipboard');
+        }).catch(() => {
+          pushToast('Failed to copy link');
+        });
+      } else {
+        // Fallback for older browsers
+        const textarea = document.createElement('textarea');
+        textarea.value = link;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          pushToast('Peer link copied to clipboard');
+        } catch {
+          pushToast('Failed to copy link');
+        }
+        document.body.removeChild(textarea);
+      }
+    } catch (err) {
+      console.warn('[hybrid] Failed to copy peer link:', err);
+      pushToast('Failed to copy link');
+    }
   }
 }
 
