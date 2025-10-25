@@ -70,9 +70,9 @@ body.theme-day {
     --hud-status-warn: #cf7f24;
     --hud-status-error: #c95454;
     --hud-shadow: 0 18px 34px rgba(96, 118, 168, 0.22);
-    --hud-button-bg: rgba(0, 0, 0, 0.06);
-    --hud-button-border: rgba(0, 0, 0, 0.18);
-    --hud-button-text: rgba(24, 32, 48, 0.9);
+    --hud-button-bg: rgba(0, 0, 0, 0.6);
+    --hud-button-border: rgba(255, 255, 255, 0.18);
+    --hud-button-text: rgba(255, 255, 255, 0.9);
     --hud-glass: saturate(120%) blur(18px);
 }
 
@@ -315,7 +315,6 @@ input[type=text] {
     gap: 10px;
     align-items: flex-start;
     border: 1px solid var(--border);
-    background: rgba(0, 0, 0, 0.45);
     border-radius: 12px;
     padding: 8px
 }
@@ -2137,7 +2136,10 @@ canvas {
 .hud-userlist-footer {
     display: flex;
     flex-direction: column;
+    border-radius: 4px;
     gap: 8px;
+    background: var(--hud-button-bg);
+    color: var(--hud-button-text);
 }
 
 .hud-userlist-footer button {
