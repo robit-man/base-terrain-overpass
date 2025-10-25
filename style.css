@@ -1947,8 +1947,8 @@ canvas {
     height: 100vh;
     left: 0px;
     top: 0px;
-    mask: radial-gradient(transparent, transparent, transparent, transparent, black, black);
-    backdrop-filter: blur(20px);
+    mask: radial-gradient(transparent, transparent, transparent, black, black);
+    backdrop-filter: brightness(0.8) blur(20px) contrast(2) brightness(0.9) saturate(1.2);
 }
 
 #buildingHoverToast {
