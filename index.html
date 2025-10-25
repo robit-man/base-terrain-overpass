@@ -229,6 +229,34 @@
       </div>
     </div>
 
+    <!-- Weather Info -->
+    <div class="hud-weather" id="hudWeather">
+      <div class="weather-stack">
+        <div class="hud-weather-current">
+          <div class="hud-weather-icon" id="hudWeatherIcon">--</div>
+          <div class="hud-weather-temp" id="hudWeatherTemp">--°</div>
+          <div class="hud-weather-desc" id="hudWeatherDesc">--</div>
+        </div>
+        <div class="hud-weather-details">
+          <div class="hud-weather-detail">
+            <span class="hud-weather-detail-label">Humidity</span>
+            <span class="hud-weather-detail-value" id="hudWeatherHumidity">--%</span>
+          </div>
+          <div class="hud-weather-detail">
+            <span class="hud-weather-detail-label">Wind</span>
+            <span class="hud-weather-detail-value" id="hudWeatherWind">-- km/h</span>
+          </div>
+          <div class="hud-weather-detail">
+            <span class="hud-weather-detail-label">Rain</span>
+            <span class="hud-weather-detail-value" id="hudWeatherRain">-- mm</span>
+          </div>
+        </div>
+      </div>
+      <div class="hud-weather-forecast" id="hudWeatherForecast">
+        <!-- Daily forecast will be injected here -->
+      </div>
+    </div>
+
   </div>
 
   <!-- Modal overlay -->
@@ -382,8 +410,7 @@
                 </div>
                 <div class="hybrid-chat-log" id="hybridChatLog"></div>
                 <div class="hybrid-chat-controls">
-                  <input id="hybridChatInput" type="text" placeholder="Message" autocomplete="off"
-                    spellcheck="false">
+                  <input id="hybridChatInput" type="text" placeholder="Message" autocomplete="off" spellcheck="false">
                   <button id="hybridChatSend" class="secondary" type="button">Send</button>
                 </div>
               </div>
@@ -450,7 +477,8 @@
                 </select>
               </div>
               <div class="slider-row">
-                <label for="envImageryTimeline">Timeline <span class="mono" id="envImageryTimelineLabel">—</span></label>
+                <label for="envImageryTimeline">Timeline <span class="mono"
+                    id="envImageryTimelineLabel">—</span></label>
                 <input id="envImageryTimeline" type="range" min="0" max="0" step="1" value="0" />
               </div>
               <p class="tiny">Select historical ARCGIS Wayback imagery. Newer versions are higher quality.</p>
@@ -575,7 +603,8 @@
               <div id="processLeaderboard" class="process-leaderboard">
                 <div class="process-header">
                   <div class="tiny">Sorted by average latency</div>
-                  <button id="processReset" type="button" class="process-reset ghost" title="Clear collected metrics">Reset
+                  <button id="processReset" type="button" class="process-reset ghost"
+                    title="Clear collected metrics">Reset
                     Metrics</button>
                 </div>
                 <div id="processCards" class="process-cards"></div>

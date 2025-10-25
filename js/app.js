@@ -19,6 +19,7 @@ import { PhysicsEngine } from './physics.js';
 import { MiniMap } from './minimap.js';
 import { AdaptiveQualityManager } from './adaptiveQuality.js';
 import { HybridHub } from './hybrid.js';
+import { WeatherManager } from './weather.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -205,6 +206,14 @@ class App {
     this._hudHeadingState = { deg: null, source: null };
     this._hudMetaCached = null;
     this._hudGeoCached = { lat: null, lon: null, hash: null };
+    this.weather = new WeatherManager();
+    this._weatherActive = false;
+    this._weatherHasData = false;
+    this._weatherPending = false;
+    this._weatherMinDeltaDeg = 0.01;
+    this._weatherLastCoords = null;
+    this._weatherUiCache = null;
+    this._initWeatherUi();
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -384,6 +393,10 @@ class App {
     }
 
     ipLocate();
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('weather-updated', (ev) => this._handleWeatherUpdated(ev.detail));
+    }
 
     // Motion / physics shim (jump, crouch, mobile drag, eye height)
     this.move = new Locomotion(this.sceneMgr, this.input, this.sensors.orient);
@@ -840,6 +853,8 @@ class App {
     if (source !== 'manual') {
       this._lastAutoLocation = { lat, lon, source };
     }
+
+    this._maybeUpdateWeatherFromScene({ lat, lon });
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
@@ -3290,6 +3305,176 @@ class App {
     this._updateHudClock(true);
   }
 
+  _initWeatherUi() {
+    this._weatherUiCache = {
+      icon: null,
+      temp: null,
+      desc: null,
+      humidity: null,
+      wind: null,
+      rain: null,
+    };
+    if (ui.hudWeather) {
+      ui.hudWeather.classList.add('is-loading');
+      ui.hudWeather.setAttribute('aria-busy', 'true');
+    }
+    if (ui.hudWeatherForecast) ui.hudWeatherForecast.textContent = '';
+  }
+
+  _maybeUpdateWeatherFromScene(latLon) {
+    if (!this.weather || !latLon) return;
+    const lat = Number(latLon.lat);
+    const lon = Number(latLon.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    const coords = { lat, lon };
+
+    if (!this._weatherActive) {
+      this.weather.start(lat, lon);
+      this._weatherActive = true;
+      this._weatherLastCoords = coords;
+      this._markWeatherPending();
+      return;
+    }
+
+    if (!this._weatherCoordsChanged(coords, this._weatherLastCoords)) return;
+
+    this.weather.updateLocation(lat, lon);
+    this._weatherLastCoords = coords;
+    this._markWeatherPending();
+  }
+
+  _weatherCoordsChanged(next, prev) {
+    if (!prev || !Number.isFinite(prev.lat) || !Number.isFinite(prev.lon)) return true;
+    const deltaLat = Math.abs(next.lat - prev.lat);
+    const deltaLon = Math.abs(next.lon - prev.lon);
+    return deltaLat > this._weatherMinDeltaDeg || deltaLon > this._weatherMinDeltaDeg;
+  }
+
+  _markWeatherPending() {
+    this._weatherPending = true;
+    if (!this._weatherHasData) this._setWeatherLoading(true);
+  }
+
+  _handleWeatherUpdated(detail) {
+    if (!detail) return;
+    this._weatherPending = false;
+    this._weatherHasData = true;
+    this._setWeatherLoading(false);
+    this._updateWeatherHud(detail);
+  }
+
+  _setWeatherLoading(isLoading) {
+    if (!ui.hudWeather) return;
+    ui.hudWeather.classList.toggle('is-loading', !!isLoading);
+    if (isLoading) ui.hudWeather.setAttribute('aria-busy', 'true');
+    else ui.hudWeather.removeAttribute('aria-busy');
+  }
+
+  _applyWeatherText(node, key, value, title = null) {
+    if (!node) return;
+    if (!this._weatherUiCache) this._weatherUiCache = {};
+    if (this._weatherUiCache[key] === value) {
+      if (title != null) node.title = title;
+      return;
+    }
+    node.textContent = value;
+    if (title != null) node.title = title;
+    this._weatherUiCache[key] = value;
+  }
+
+  _updateWeatherHud(weatherData = {}) {
+    if (!weatherData || !weatherData.current) return;
+    const current = weatherData.current;
+    const weatherCode = Number.isFinite(current.weather_code) ? current.weather_code : null;
+    const icon = weatherCode != null ? (this.weather?.getWeatherIcon?.(weatherCode) || '—') : '—';
+    const desc = weatherCode != null ? (this.weather?.getWeatherDescription?.(weatherCode) || '—') : '—';
+    const temp = Number.isFinite(current.temperature_2m) ? `${Math.round(current.temperature_2m)}°` : '--°';
+    const humidity = Number.isFinite(current.relative_humidity_2m) ? `${Math.round(current.relative_humidity_2m)}%` : '--%';
+    const windDir = this._formatWindDirection(current.wind_direction_10m);
+    const windSpeedVal = Number.isFinite(current.wind_speed_10m) ? Math.round(current.wind_speed_10m) : null;
+    const windSpeed = windSpeedVal != null ? `${windSpeedVal} km/h` : '-- km/h';
+    const windLabel = windDir ? `${windSpeed} ${windDir}` : windSpeed;
+    let precipitation = null;
+    if (Number.isFinite(current.precipitation)) precipitation = current.precipitation;
+    else if (Number.isFinite(current.rain)) precipitation = current.rain;
+    const rainLabel = precipitation != null ? `${precipitation.toFixed(1)} mm` : '-- mm';
+
+    this._applyWeatherText(ui.hudWeatherIcon, 'icon', icon, desc);
+    this._applyWeatherText(ui.hudWeatherTemp, 'temp', temp);
+    this._applyWeatherText(ui.hudWeatherDesc, 'desc', desc);
+    this._applyWeatherText(ui.hudWeatherHumidity, 'humidity', humidity);
+    this._applyWeatherText(ui.hudWeatherWind, 'wind', windLabel);
+    this._applyWeatherText(ui.hudWeatherRain, 'rain', rainLabel);
+
+    const forecast = this.weather?.getDailyForecast?.(5) || [];
+    this._updateWeatherForecast(forecast);
+  }
+
+  _formatWindDirection(degVal) {
+    const deg = Number(degVal);
+    if (!Number.isFinite(deg)) return '';
+    const sectors = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const normalized = ((deg % 360) + 360) % 360;
+    const index = Math.round((normalized / 360) * sectors.length) % sectors.length;
+    return sectors[index];
+  }
+
+  _updateWeatherForecast(days = []) {
+    if (typeof document === 'undefined') return;
+    const host = ui.hudWeatherForecast;
+    if (!host) return;
+    host.textContent = '';
+    if (!Array.isArray(days) || !days.length) {
+      host.setAttribute('aria-hidden', 'true');
+      return;
+    }
+    host.removeAttribute('aria-hidden');
+    const limit = Math.min(days.length, 5);
+    for (let i = 0; i < limit; i += 1) {
+      const day = days[i];
+      const card = document.createElement('div');
+      card.className = 'hud-weather-day';
+
+      const name = document.createElement('div');
+      name.className = 'hud-weather-day-name';
+      name.textContent = this._formatForecastDayLabel(day.date, i);
+      card.appendChild(name);
+
+      const icon = document.createElement('div');
+      icon.className = 'hud-weather-day-icon';
+      icon.textContent = Number.isFinite(day.weatherCode)
+        ? (this.weather?.getWeatherIcon?.(day.weatherCode) || '—')
+        : '—';
+      card.appendChild(icon);
+
+      const temps = document.createElement('div');
+      temps.className = 'hud-weather-day-temp';
+      const max = document.createElement('span');
+      max.className = 'hud-weather-day-temp-max';
+      max.textContent = Number.isFinite(day.tempMax) ? `${Math.round(day.tempMax)}°` : '--°';
+      const min = document.createElement('span');
+      min.className = 'hud-weather-day-temp-min';
+      min.textContent = Number.isFinite(day.tempMin) ? `${Math.round(day.tempMin)}°` : '--°';
+      temps.appendChild(max);
+      temps.appendChild(min);
+      card.appendChild(temps);
+
+      host.appendChild(card);
+    }
+  }
+
+  _formatForecastDayLabel(dateStr, index) {
+    if (index === 0) return 'Today';
+    if (!dateStr) return '--';
+    try {
+      const date = new Date(`${dateStr}T00:00:00Z`);
+      return date.toLocaleDateString(undefined, { weekday: 'short' });
+    } catch {
+      return dateStr;
+    }
+  }
+
   _updateHudAltitude() {
     if (!ui.hudAltitude) return;
     const dolly = this.sceneMgr?.dolly;
@@ -4145,7 +4330,10 @@ class App {
     if ((origin && (hudNow >= this._hudGeoNextMs || movedHudSq > 0.5 * 0.5))) {
       measure('hud.geo', () => {
         const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
-        if (hudLatLon) this._updateHudGeo(hudLatLon);
+        if (hudLatLon) {
+          this._updateHudGeo(hudLatLon);
+          this._maybeUpdateWeatherFromScene(hudLatLon);
+        }
       });
       this._hudGeoLastPos.copy(dolly.position);
       this._hudGeoNextMs = hudNow + 100;
@@ -4258,7 +4446,7 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const lift = eyeHeight + 3;
 
-    //this._testBall = this.physics.spawnTestBall({ origin, lift });
+    this._testBall = this.physics.spawnTestBall({ origin, lift });
   }
 }
 

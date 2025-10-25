@@ -78,6 +78,14 @@ const hudClockLocal = document.getElementById('hudClockLocal');
 const hudClockUtc = document.getElementById('hudClockUtc');
 const hudSunInfo = document.getElementById('hudSunInfo');
 const hudMoonInfo = document.getElementById('hudMoonInfo');
+const hudWeather = document.getElementById('hudWeather');
+const hudWeatherIcon = document.getElementById('hudWeatherIcon');
+const hudWeatherTemp = document.getElementById('hudWeatherTemp');
+const hudWeatherDesc = document.getElementById('hudWeatherDesc');
+const hudWeatherHumidity = document.getElementById('hudWeatherHumidity');
+const hudWeatherWind = document.getElementById('hudWeatherWind');
+const hudWeatherRain = document.getElementById('hudWeatherRain');
+const hudWeatherForecast = document.getElementById('hudWeatherForecast');
 const hudScale = document.getElementById('hudScale');
 const hudScaleTrack = document.getElementById('hudScaleTrack');
 const hudScaleLine1 = document.getElementById('hudScaleLine1');
@@ -317,6 +325,8 @@ export const ui = {
   hudScale, hudScaleTrack, hudScaleLine1, hudScaleLine10, hudScaleMarker1, hudScaleMarker10,
   hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
   hudClockLocal, hudClockUtc, hudSunInfo, hudMoonInfo,
+  hudWeather, hudWeatherIcon, hudWeatherTemp, hudWeatherDesc,
+  hudWeatherHumidity, hudWeatherWind, hudWeatherRain, hudWeatherForecast,
   hudWireframeToggle,
   hudStatusNknDot, hudStatusTerrainDot, hudStatusSigDot,
   hudStatusNknLabel, hudStatusTerrainLabel, hudStatusSigLabel,

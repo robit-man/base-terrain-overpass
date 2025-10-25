@@ -100,7 +100,7 @@ button {
     letter-spacing: 0.06em;
     text-transform: uppercase;
     border-radius: 8px;
-    padding:8px;
+    padding: 8px;
     border: 1px solid var(--border);
     background: rgba(255, 255, 255, 0.06);
     color: var(--text);
@@ -1065,9 +1065,6 @@ input[type=text] {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    padding: 0.75rem 0.85rem;
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 #perfHud .hud-qos {
@@ -1141,7 +1138,7 @@ input[type=text] {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 14px;
+    gap: 8px;
 }
 
 canvas {
@@ -1219,9 +1216,6 @@ canvas {
     user-select: none;
 }
 
-#perfHud:hover .hud-overlay {}
-
-
 #metricStack {
     color: var(--hud-text-primary);
     z-index: 2;
@@ -1245,7 +1239,7 @@ canvas {
     position: absolute;
     left: 1.5rem;
     bottom: 1.5rem;
-    z-index: 2;
+    z-index: 12;
     mix-blend-mode: normal;
 }
 
@@ -1596,8 +1590,11 @@ canvas {
 
 #miniMapDock:hover {
     transition-delay: 0s;
-
     opacity: 1;
+}
+
+#miniMapDock:hover .mini-map-panel {
+    filter: brightness(1)contrast(1)invert(0)saturate(1);
 }
 
 #miniMapDock .mini-map-shell {
@@ -2407,4 +2404,138 @@ canvas {
 
 .hybrid-chat-controls input {
     flex: 1;
+}
+
+/* Weather Widget */
+.hud-weather {
+    border-radius: 8px;
+    margin-top: 8px;
+    display: flex;
+    gap: 4px;
+    flex-flow:row;
+    margin-left: auto;
+    width: fit-content;
+}
+
+.hud-weather-current {
+    display: flex;
+    flex-flow: column;
+    gap: 12px;
+    text-align: right;
+    padding-bottom: 12px;
+    width: max-content;
+    margin-left: auto;
+}
+
+.hud-weather-icon {
+    font-size: 13px;
+    font-weight: 500;
+    text-align: right;
+    font-family: ui-monospace, monospace;
+}
+
+.hud-weather-temp {
+    font-size: 13px;
+    font-weight: 500;
+    text-align: right;
+    font-family: ui-monospace, monospace;
+}
+
+.hud-weather-desc {
+    font-size: 10px;
+    text-transform: uppercase;
+    opacity: 0.6;
+    text-align: right;
+    letter-spacing: 0.5px;
+}
+
+.hud-weather-details {
+    display: flex;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    width: max-content;
+    margin-left: auto;
+    text-align: right;
+    flex-flow: column;
+    margin-bottom: 12px;
+}
+
+.hud-weather-detail {
+    display: flex;
+    text-align: right;
+    flex-flow: column;
+    gap: 2px;
+}
+
+.hud-weather-detail-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    opacity: 0.6;
+    text-align: right;
+    letter-spacing: 0.5px;
+}
+
+.hud-weather-detail-value {
+    font-size: 13px;
+    font-weight: 500;
+    text-align: right;
+    font-family: ui-monospace, monospace;
+}
+
+.hud-weather-forecast {
+    display: flex;
+    flex-flow:column;
+    gap: 6px;
+    overflow-x: auto;
+    text-align: right;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(139, 209, 255, 0.3) transparent;
+}
+
+.hud-weather-forecast::-webkit-scrollbar {
+    height: 4px;
+}
+
+.hud-weather-forecast::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.hud-weather-forecast::-webkit-scrollbar-thumb {
+    background: rgba(139, 209, 255, 0.3);
+    border-radius: 2px;
+}
+
+.hud-weather-day {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    border-radius: 6px;
+}
+
+.hud-weather-day-name {
+    font-size: 10px;
+    text-transform: uppercase;
+    opacity: 0.7;
+    font-weight: 600;
+}
+
+.hud-weather-day-icon {
+    font-size: 24px;
+    line-height: 1;
+}
+
+.hud-weather-day-temp {
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+}
+
+.hud-weather-day-temp-max {
+    color: #8bd1ff;
+    font-weight: 600;
+}
+
+.hud-weather-day-temp-min {
+    opacity: 0.6;
 }
