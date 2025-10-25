@@ -450,6 +450,18 @@ export class Sensors {
     this._compassAligned = true;
   }
 
+  /** Force re-alignment to current compass heading (used by snap button). */
+  forceCompassAlign() {
+    if (!Number.isFinite(this.headingRad)) return false;
+    if (!this.orient?.ready) return false;
+
+    const gyYaw = this._yawFromQuat(this._orientationQuat);
+    const err = this._wrapPi(this.headingRad - gyYaw);
+    this._yawOff += err;           // re-align to current compass
+    this._composeFinalQuat();
+    return true;
+  }
+
   // ───────────────────── Auto-enable helpers ─────────────────────
 
   _setupAutoEnable() {

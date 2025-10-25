@@ -1032,8 +1032,17 @@ class App {
   _snapToCompassHeading(explicitHeadingRad = null) {
     const heading = Number.isFinite(explicitHeadingRad) ? explicitHeadingRad : this.sensors?.headingRad;
     if (!Number.isFinite(heading)) return false;
-    if (!this.move?.snapToHeading) return false;
-    return this.move.snapToHeading(heading);
+
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return false;
+
+    // Instantly rotate dolly to compass heading
+    dolly.rotation.set(0, heading, 0);
+
+    // Force sensors to re-align so gyro continues from this heading
+    this.sensors?.forceCompassAlign?.();
+
+    return true;
   }
 
   _resetPlayerPosition() {
@@ -3881,48 +3890,22 @@ class App {
     if (!xrOn) {
       measure('orientation', () => {
         if (this._mobileFPVOn && this.sensors?.orient?.ready) {
-          // Get screen-compensated device quaternion from Sensors
-          const { q: deviceQuat } = this.sensors.getQuaternion?.() || { q: this._deviceQuatForFPV(this.sensors.orient) };
+          // Get cameraQuat (has compass-aligned yaw via _yawOff + device pitch/roll)
+          const { q: cameraQuat } = this.sensors.getCameraQuaternion?.() || { q: this._deviceQuatForFPV(this.sensors.orient) };
 
-          // COMPASS-FIRST ALIGNMENT (like orient.html)
-          // On first compass lock, align gyro yaw to compass heading ONCE
-          if (!this._compassAligned) {
-            const heading = this.sensors.getHeading?.();
-            if (heading?.rad != null && Number.isFinite(heading.rad)) {
-              // Extract gyro yaw from device quaternion
-              this._tmpVec3.set(0, 0, -1).applyQuaternion(deviceQuat);
-              const gyroYaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
-
-              // Calculate error: how much to rotate gyro to match compass
-              const err = this._wrapAngle(heading.rad - gyroYaw);
-              this._compassYawOffset = err;
-              this._compassAligned = true;
-            }
-          }
-
-          // Apply offsets: compass alignment + manual offset
-          const manualOffset = Number.isFinite(this._manualYawOffset) ? this._manualYawOffset : 0;
-          const totalOffset = this._wrapAngle(this._compassYawOffset + manualOffset);
-
-          // Apply yaw offset as quaternion (like orient.html)
-          this._tmpQuat.setFromAxisAngle(this._yAxis, totalOffset);
-          const qFinal = this._tmpQuat2.copy(deviceQuat).premultiply(this._tmpQuat);
-
-          // Extract yaw for dolly (locomotion needs this for movement direction)
-          this._tmpVec3.set(0, 0, -1).applyQuaternion(qFinal);
+          // Extract yaw from cameraQuat (compass-aligned gyro)
+          this._tmpVec3.set(0, 0, -1).applyQuaternion(cameraQuat);
           const yaw = Math.atan2(-this._tmpVec3.x, -this._tmpVec3.z);
-
-          // Set dolly yaw only (not quaternion - would cause double application)
           dolly.rotation.set(0, yaw, 0);
 
-          // Camera gets ONLY pitch/roll (yaw is on dolly)
-          // Remove yaw from qFinal to get pure tilt
+          // Camera (child of dolly) gets ONLY pitch/roll from cameraQuat
+          // Remove yaw from cameraQuat to get pitch/roll only
           this._tmpQuat.setFromAxisAngle(this._yAxis, -yaw);
-          camera.quaternion.copy(qFinal).premultiply(this._tmpQuat);
+          camera.quaternion.copy(cameraQuat).premultiply(this._tmpQuat);
           camera.up.set(0, 1, 0);
 
           // Legacy pitch tracking
-          this._pitch = this._tmpEuler.setFromQuaternion(qFinal, 'YXZ').x;
+          this._pitch = this._tmpEuler.setFromQuaternion(cameraQuat, 'YXZ').x;
 
         } else {
           const e = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ');
