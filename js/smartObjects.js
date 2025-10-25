@@ -52,6 +52,13 @@ class SmartObjectManager {
   }
 
   /**
+   * Get array of all smart objects
+   */
+  get smartObjects() {
+    return Array.from(this.objects.values());
+  }
+
+  /**
    * Create a ghost preview object for placement mode
    */
   _createPlacementPreview() {
@@ -220,13 +227,27 @@ class SmartObjectManager {
 
   /**
    * Create a new Smart Object
+   * @param {object} config - Object configuration
+   * @param {object} options - Creation options
+   * @param {boolean} options.skipBroadcast - Skip broadcasting to peers (for loading from storage)
+   * @param {boolean} options.skipSave - Skip saving to storage (for peer sync)
    */
-  createSmartObject(config) {
+  createSmartObject(config, options = {}) {
     const uuid = config.uuid || this._generateUUID();
 
     if (this.objects.has(uuid)) {
       console.warn(`[SmartObjects] Object ${uuid} already exists`);
       return null;
+    }
+
+    // Ensure visibility defaults to public if not set
+    if (!config.visibility) {
+      config.visibility = 'public';
+    }
+
+    // Ensure owner is set
+    if (!config.owner) {
+      config.owner = this.mesh?.selfPub || 'local';
     }
 
     // Create 3D mesh
@@ -262,11 +283,15 @@ class SmartObjectManager {
       this.spatialAudio.createSource(uuid, mesh.position);
     }
 
-    // Save to storage
-    this._saveToStorage();
+    // Save to storage (unless loading from peer sync)
+    if (!options.skipSave) {
+      this._saveToStorage();
+    }
 
-    // Broadcast to peers
-    this._broadcastObjectSync('create', smartObject);
+    // Broadcast to peers (unless loading from storage or peer sync)
+    if (!options.skipBroadcast) {
+      this._broadcastObjectSync('create', smartObject);
+    }
 
     return smartObject;
   }
@@ -506,6 +531,23 @@ class SmartObjectManager {
   }
 
   /**
+   * Broadcast all public objects to peers (called when new peer connects)
+   */
+  broadcastAllObjects() {
+    if (!this.mesh) return;
+
+    const publicObjects = Array.from(this.objects.values()).filter(
+      obj => (obj.config.visibility || 'public') === 'public'
+    );
+
+    publicObjects.forEach(obj => {
+      this._broadcastObjectSync('create', obj);
+    });
+
+    console.log(`[SmartObjects] Broadcasted ${publicObjects.length} public objects to peers`);
+  }
+
+  /**
    * Handle incoming sync from peers
    */
   handlePeerSync(message) {
@@ -516,18 +558,27 @@ class SmartObjectManager {
     // Don't process our own messages
     if (from === (this.mesh?.selfPub || 'local')) return;
 
-    // Check visibility/permissions
-    const obj = this.objects.get(object.uuid);
-    if (obj) {
-      const visibility = obj.config.visibility;
-      if (visibility === 'private' && obj.config.owner !== from) return;
+    // Check visibility/permissions for existing objects
+    const existingObj = this.objects.get(object.uuid);
+    if (existingObj) {
+      const visibility = existingObj.config.visibility || 'public';
+      // If object is private and we're not the owner, ignore updates
+      if (visibility === 'private' && existingObj.config.owner !== from) return;
       // TODO: Check friends list for 'friends' visibility
+    }
+
+    // For new objects being created, check visibility in the incoming config
+    if (action === 'create' && object.config) {
+      const visibility = object.config.visibility || 'public';
+      // Only create if it's public (or TODO: if we're friends with the sender)
+      if (visibility === 'private') return;
     }
 
     switch (action) {
       case 'create':
         if (!this.objects.has(object.uuid)) {
-          this.createSmartObject(object.config);
+          // Skip broadcast (this is a peer sync) and skip save initially
+          this.createSmartObject(object.config, { skipBroadcast: true, skipSave: false });
         }
         break;
       case 'update':
@@ -566,7 +617,9 @@ class SmartObjectManager {
 
       const objects = JSON.parse(data);
       objects.forEach(objData => {
-        this.createSmartObject(objData.config);
+        // Skip broadcast when loading from storage (avoid duplicate sync messages)
+        // Skip save since we're already loading from storage
+        this.createSmartObject(objData.config, { skipBroadcast: true, skipSave: true });
         if (objData.textContent) {
           const obj = this.objects.get(objData.uuid);
           if (obj) {

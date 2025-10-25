@@ -4659,6 +4659,16 @@ class App {
             this.sceneMgr.smartObjects.handlePeerSync(msg);
           }
         });
+
+        // Broadcast all objects to new peers when they connect
+        this.mesh.on('noclip-peer', (event) => {
+          if (event?.peer && this.sceneMgr.smartObjects) {
+            // Small delay to ensure peer is fully ready
+            setTimeout(() => {
+              this.sceneMgr.smartObjects.broadcastAllObjects();
+            }, 500);
+          }
+        });
       }
 
       console.log('[App] Smart Objects initialized');
