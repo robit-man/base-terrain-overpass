@@ -1891,7 +1891,11 @@ _stitchInteractiveToVisualEdges(tile, {
         if (g < 90) continue;
         if (g < r * 1.15 || g < b * 1.25) continue;
         if (Math.random() > spawnBias) continue;
-        out.push({ u: x / width, v: y / height });
+        out.push({
+          u: x / width,
+          v: y / height,
+          color: { r, g, b }
+        });
         if (out.length >= maxSamples) return out;
       }
     }

@@ -10,7 +10,7 @@ import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { Locomotion } from './locomotion.js';
 import { Remotes } from './remotes.js';
 import { Mesh } from './mesh.js';
-import { ui, applyHudStatusDot } from './ui.js';
+import { ui, applyHudStatusDot, pushToast } from './ui.js';
 import { deg, rad, fmtAgo, shortHex } from './utils.js';
 import { AvatarFactory } from './avatars.js';
 import { ChaseCam } from './chasecam.js';
@@ -214,6 +214,12 @@ class App {
     this._weatherLastCoords = null;
     this._weatherUiCache = null;
     this._initWeatherUi();
+    this._teleportClickEnabled = false;
+    this._teleportTween = null;
+    this._teleportPointerHandler = null;
+    this._teleportMeditating = false;
+    this._teleportRayTargets = [];
+    this._teleportHintAt = 0;
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -491,6 +497,7 @@ class App {
     this._tmpVec4 = new THREE.Vector3();
     this._tmpVec5 = new THREE.Vector3();
     this._tmpVec6 = new THREE.Vector3();
+    this._tmpVecTeleport = new THREE.Vector3();
     this._tmpScaleForward = new THREE.Vector3();
     this._tmpScaleRight = new THREE.Vector3();
     this._tmpScaleBase = new THREE.Vector3();
@@ -690,6 +697,12 @@ class App {
     manualLatInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyManual(); });
     manualLonInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyManual(); });
 
+    if (ui.hudTeleportToggle) {
+      ui.hudTeleportToggle.addEventListener('click', () => this._toggleTeleportClickMode());
+      this._syncTeleportButtonState();
+    }
+    this._setupTeleportPointerHandler();
+
     if (this._locationState) {
       this.miniMap.notifyLocationChange({
         lat: this._locationState.lat,
@@ -700,6 +713,11 @@ class App {
 
     if (typeof window !== 'undefined') {
       window.addEventListener('resize', () => this._refreshRendererPixelRatio(), { passive: true });
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this._clickTeleportEnabled) {
+          this._setTeleportClickEnabled(false);
+        }
+      });
     }
 
     this._initPosePersistence();
@@ -1042,6 +1060,195 @@ class App {
       teleport: true,
       force: true,
     });
+  }
+
+  /* ---------- Click teleport ---------- */
+
+  _setupTeleportPointerHandler(retryDelayMs = 0) {
+    if (this._teleportPointerHandler) return;
+    const canvas = this.sceneMgr?.renderer?.domElement;
+    if (!canvas) {
+      if (retryDelayMs < 2000) {
+        setTimeout(() => this._setupTeleportPointerHandler(retryDelayMs + 200), 200);
+      }
+      return;
+    }
+    this._teleportPointerHandler = (event) => this._maybeHandleTeleportPointer(event);
+    canvas.addEventListener('pointerup', this._teleportPointerHandler, { passive: false });
+  }
+
+  _toggleTeleportClickMode(forceValue = null) {
+    if (this._teleportTween) return;
+    const next = forceValue == null ? !this._clickTeleportEnabled : !!forceValue;
+    this._setTeleportClickEnabled(next);
+  }
+
+  _setTeleportClickEnabled(enabled) {
+    const next = !!enabled && !this._teleportTween;
+    if (next && this.input?.controls?.isLocked) {
+      this.input.controls.unlock?.();
+    }
+    this._clickTeleportEnabled = next;
+    this.move?.setTeleportBoostActive?.(next);
+    if (next) {
+      const now = performance?.now ? performance.now() : Date.now();
+      if (!this._teleportHintAt || now - this._teleportHintAt > 2500) {
+        pushToast('Click terrain to teleport');
+        this._teleportHintAt = now;
+      }
+    }
+    this._syncTeleportButtonState();
+  }
+
+  _syncTeleportButtonState() {
+    const btn = ui.hudTeleportToggle;
+    if (!btn) return;
+    const active = this._clickTeleportEnabled;
+    const busy = !!this._teleportTween;
+    btn.classList.toggle('on', active && !busy);
+    btn.classList.toggle('busy', busy);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.disabled = busy;
+    btn.textContent = busy ? 'Teleporting…' : (active ? 'Teleport (On)' : 'Teleport');
+    if (busy) {
+      btn.title = 'Teleport in progress';
+    } else if (active) {
+      btn.title = 'Click on terrain to teleport';
+    } else {
+      btn.title = 'Toggle click-to-teleport mode';
+    }
+  }
+
+  _maybeHandleTeleportPointer(event) {
+    if (!this._clickTeleportEnabled || this._teleportTween) return;
+    const renderer = this.sceneMgr?.renderer;
+    if (renderer?.xr?.isPresenting) return;
+    if (event.button != null && event.pointerType !== 'touch' && event.button !== 0) return;
+    const canvas = event.currentTarget || renderer?.domElement;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+    const ndc = {
+      x: ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      y: -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    };
+    event.preventDefault();
+    event.stopPropagation();
+    this._executeTeleportRaycast(ndc);
+  }
+
+  _executeTeleportRaycast(ndc) {
+    const camera = this.sceneMgr?.camera;
+    if (!camera || !this._raycaster) return;
+    const targets = this._collectTerrainRaycastTargets();
+    if (!targets.length) {
+      pushToast('Terrain not ready for teleport');
+      return;
+    }
+    this._raycaster.setFromCamera(ndc, camera);
+    const hits = this._raycaster.intersectObjects(targets, true);
+    if (!hits || !hits.length) {
+      pushToast('No terrain under cursor');
+      return;
+    }
+    const hit = hits[0];
+    const origin = this.hexGridMgr?.origin;
+    const latLon = origin ? worldToLatLon(hit.point.x, hit.point.z, origin.lat, origin.lon) : null;
+    this._beginTeleportTween(hit.point, latLon);
+  }
+
+  _collectTerrainRaycastTargets() {
+    const tm = this.hexGridMgr;
+    if (!tm?.tiles) return [];
+    const out = this._teleportRayTargets;
+    out.length = 0;
+    for (const tile of tm.tiles.values()) {
+      const mesh = tile?.grid?.mesh;
+      if (mesh) out.push(mesh);
+    }
+    return out;
+  }
+
+  _beginTeleportTween(hitPoint, latLon) {
+    if (!hitPoint) return;
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return;
+    const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
+    const start = dolly.position.clone();
+    const target = hitPoint.clone();
+    let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
+    if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
+    if (!Number.isFinite(ground)) ground = start.y - eyeHeight;
+    target.y = ground + eyeHeight;
+    const distance = start.distanceTo(target);
+    if (!Number.isFinite(distance) || distance < 0.25) {
+      pushToast(distance < 0.25 ? 'Already at that spot' : 'Teleport failed');
+      return;
+    }
+    const durationMs = THREE.MathUtils.clamp(distance / 2.6, 0.9, 5.0) * 1000;
+    this._teleportTween = {
+      start,
+      end: target,
+      latLon,
+      startTime: performance?.now ? performance.now() : Date.now(),
+      duration: durationMs,
+    };
+    this.move?.setTeleportBoostActive?.(false);
+    this._enterTeleportMeditation(true);
+    this._syncTeleportButtonState();
+  }
+
+  _updateTeleportTween(nowMs, eyeHeight) {
+    const tween = this._teleportTween;
+    const dolly = this.sceneMgr?.dolly;
+    if (!tween || !dolly) return;
+    const duration = Math.max(16, tween.duration);
+    const elapsed = nowMs - tween.startTime;
+    const progress = THREE.MathUtils.clamp(elapsed / duration, 0, 1);
+    const eased = this._easeInOut(progress);
+    const target = this._tmpVecTeleport.lerpVectors(tween.start, tween.end, eased);
+    let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
+    if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
+    target.y = ground + eyeHeight;
+    dolly.position.copy(target);
+    this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
+    if (progress >= 0.999) {
+      this._finishTeleportTween();
+    }
+  }
+
+  _finishTeleportTween() {
+    const tween = this._teleportTween;
+    this._teleportTween = null;
+    this._enterTeleportMeditation(false);
+    if (tween?.latLon && Number.isFinite(tween.latLon.lat) && Number.isFinite(tween.latLon.lon)) {
+      this.miniMap?.notifyLocationChange?.({
+        lat: tween.latLon.lat,
+        lon: tween.latLon.lon,
+        source: 'manual',
+        detail: { teleport: true }
+      });
+    }
+    this._poseDirty = true;
+    this._poseSaveTimer = 0;
+    if (this._clickTeleportEnabled) {
+      this.move?.setTeleportBoostActive?.(true);
+    }
+    this._syncTeleportButtonState();
+  }
+
+  _enterTeleportMeditation(active) {
+    if (this._teleportMeditating === !!active) return;
+    this._teleportMeditating = !!active;
+    if (active) this.localAvatar?.setManualState?.('Meditate');
+    else this.localAvatar?.clearManualState?.('Meditate');
+  }
+
+  _easeInOut(t) {
+    const clamped = THREE.MathUtils.clamp(t, 0, 1);
+    return clamped < 0.5
+      ? 2 * clamped * clamped
+      : 1 - Math.pow(-2 * clamped + 2, 2) / 2;
   }
 
   _snapToCompassHeading(explicitHeadingRad = null) {
@@ -4148,6 +4355,10 @@ class App {
     let groundY = measure('height.locomotion', () => this.hexGridMgr.getHeightAt(finalPos.x, finalPos.z));
     finalPos.y = groundY + eyeHeight;
     dolly.position.copy(finalPos);
+
+    if (this._teleportTween) {
+      this._updateTeleportTween(now, eyeHeight);
+    }
 
     if (this._mobileNav?.active) this._updateMobileAutopilot(dt);
     this._updateCompassDial();

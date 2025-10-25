@@ -11,6 +11,11 @@ export class Locomotion {
     this.audio = new AudioEngine(sceneMgr);
 
     this.baseSpeed = 2; this.runMul = 3.5; this._spd = 0;
+    this._teleportBoostActive = false;
+    this._runBoost = 1;
+    this._runBoostMax = 100;
+    this._runBoostRampUp = 40;
+    this._runBoostDecayRate = 8;
     this.GRAV = 20;
     this.baseEye = 1.6; this.crouchEye = 0.9; this.jumpPeak = 2.4;
     this.eyeY = this.baseEye; this.vertVel = 0; this.jumpState = 'idle';
@@ -105,6 +110,10 @@ export class Locomotion {
     const signForward = this._sign.forward;
     const signStrafe = this._sign.strafe;
     const signYaw = this._sign.yaw;
+    const wantsBoost = this._teleportBoostActive && !isMobileDevice && !xrPresenting && !!(this.input?.m?.run);
+    this._updateRunBoost(dt, wantsBoost);
+    const boostedBaseSpeed = this.baseSpeed * this._runBoost;
+    const boostedRunSpeed = boostedBaseSpeed * this.runMul;
 
     let mobileDx = 0;
     let mobileDy = 0;
@@ -204,9 +213,9 @@ export class Locomotion {
         if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
         forward.normalize();
 
-        const scalar = this.baseSpeed * this.runMul * forwardInput;
+        const scalar = boostedRunSpeed * forwardInput;
         dol.position.addScaledVector(forward, scalar * dt);
-        this._spd = Math.abs(forwardInput) * this.baseSpeed * this.runMul;
+        this._spd = Math.abs(forwardInput) * boostedRunSpeed;
       } else {
         this._spd = 0;
       }
@@ -221,7 +230,7 @@ export class Locomotion {
       mz *= signForward;
       if (mx || mz) {
         const dir = new THREE.Vector3().addScaledVector(right, mx).addScaledVector(fwd, mz).normalize();
-        const s = this.baseSpeed * (m.run ? this.runMul : 1);
+        const s = boostedBaseSpeed * (m.run ? this.runMul : 1);
         dol.position.addScaledVector(dir, s * dt);
         this._spd = s;
       } else { this._spd = 0; }
@@ -250,6 +259,24 @@ export class Locomotion {
     before.y = 0;
     this.sceneMgr.dolly.position.add(before);
     this.sceneMgr.dolly.updateMatrixWorld?.(true);
+  }
+
+  setTeleportBoostActive(active) {
+    const next = !!active;
+    this._teleportBoostActive = next;
+    if (!next) this._runBoost = 1;
+  }
+
+  _updateRunBoost(dt, active) {
+    if (!Number.isFinite(this._runBoost)) this._runBoost = 1;
+    if (active) {
+      this._runBoost += this._runBoostRampUp * Math.max(0, dt);
+      if (this._runBoost > this._runBoostMax) this._runBoost = this._runBoostMax;
+    } else {
+      const decay = Math.min(1, this._runBoostDecayRate * Math.max(0, dt));
+      this._runBoost += (1 - this._runBoost) * decay;
+      if (this._runBoost < 1.0001) this._runBoost = 1;
+    }
   }
 
   _currentYaw() {
@@ -530,12 +557,14 @@ export class Locomotion {
     this._vrRunScalar = THREE.MathUtils.clamp(this._vrRunScalar, 1, this.runMul);
     const runScale = this._vrRunScalar;
 
+    const boostedBaseSpeed = this.baseSpeed * this._runBoost;
+
     if (leftAxes.horizontal) {
-      moveVec.addScaledVector(this._vrRight, leftAxes.horizontal * this.baseSpeed);
+      moveVec.addScaledVector(this._vrRight, leftAxes.horizontal * boostedBaseSpeed);
       moved = true;
     }
     if (leftAxes.vertical) {
-      moveVec.addScaledVector(this._vrForward, leftAxes.vertical * this.baseSpeed * runScale);
+      moveVec.addScaledVector(this._vrForward, leftAxes.vertical * boostedBaseSpeed * runScale);
       moved = true;
       this._pulseHaptics(leftPad, Math.abs(leftAxes.vertical) * runScale);
     }

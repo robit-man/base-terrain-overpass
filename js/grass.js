@@ -1,370 +1,413 @@
-// Grass rendering system for terrain tiles
-// Based on three-grass-demo by github.com/Domenicobrz
 import * as THREE from 'three';
 
-// Inline shaders to avoid MIME type issues with GLSL imports
-const grassVertShader = `
-varying vec2 vUv;
-varying vec2 cloudUV;
-varying vec3 vColor;
-uniform float iTime;
+const GRASS_ALPHA_URL = './assets/grass/grass-alpha.jpeg';
+const GRASS_NOISE_URL = './assets/grass/perlinnoise.webp';
 
-void main() {
-  vUv = uv;
-  cloudUV = uv;
-  vColor = color;
-  vec3 cpos = position;
+class FluffyGrassMaterial {
+  constructor() {
+    this.uniforms = {
+      uTime: { value: 0 },
+      uEnableShadows: { value: 1 },
+      uShadowDarkness: { value: 0.5 },
+      uGrassLightIntensity: { value: 1.0 },
+      uNoiseScale: { value: 1.4 },
+      uNoiseTexture: { value: new THREE.Texture() },
+      uGrassAlphaTexture: { value: new THREE.Texture() },
+      uTerrainSize: { value: 200 },
+      uTipColor1: { value: new THREE.Color('#7abf65') },
+      uTipColor2: { value: new THREE.Color('#1f352a') },
+    };
 
-  float waveSize = 10.0;
-  float tipDistance = 0.3;
-  float centerDistance = 0.1;
+    this.material = new THREE.MeshLambertMaterial({
+      side: THREE.DoubleSide,
+      color: 0xffffff,
+      vertexColors: true,
+      transparent: true,
+      alphaTest: 0.2,
+      shadowSide: THREE.DoubleSide,
+    });
 
-  // Wind animation based on vertex color (tip=white, center=gray, base=black)
-  if (color.x > 0.6) {
-    cpos.x += sin((iTime / 500.) + (uv.x * waveSize)) * tipDistance;
-  } else if (color.x > 0.0) {
-    cpos.x += sin((iTime / 500.) + (uv.x * waveSize)) * centerDistance;
+    this._setupShaderHook();
   }
 
-  float diff = position.x - cpos.x;
-  cloudUV.x += iTime / 20000.;
-  cloudUV.y += iTime / 10000.;
+  _setupShaderHook() {
+    this.material.onBeforeCompile = (shader) => {
+      shader.uniforms = {
+        ...shader.uniforms,
+        uTime: this.uniforms.uTime,
+        uTipColor1: this.uniforms.uTipColor1,
+        uTipColor2: this.uniforms.uTipColor2,
+        uGrassLightIntensity: this.uniforms.uGrassLightIntensity,
+        uShadowDarkness: this.uniforms.uShadowDarkness,
+        uEnableShadows: this.uniforms.uEnableShadows,
+        uNoiseScale: this.uniforms.uNoiseScale,
+        uTerrainSize: this.uniforms.uTerrainSize,
+        uNoiseTexture: this.uniforms.uNoiseTexture,
+        uGrassAlphaTexture: this.uniforms.uGrassAlphaTexture,
+      };
 
-  vec4 worldPosition = vec4(cpos, 1.);
-  vec4 mvPosition = projectionMatrix * modelViewMatrix * vec4(cpos, 1.0);
-  gl_Position = mvPosition;
+      shader.vertexShader = `
+        #include <common>
+        #include <fog_pars_vertex>
+        #include <shadowmap_pars_vertex>
+
+        uniform sampler2D uNoiseTexture;
+        uniform float uNoiseScale;
+        uniform float uTime;
+        uniform float uTerrainSize;
+
+        varying vec3 vColor;
+        varying vec2 vGlobalUV;
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying vec3 vViewPosition;
+        varying vec2 vWindColor;
+
+        void main() {
+          #include <color_vertex>
+          #include <beginnormal_vertex>
+          #include <defaultnormal_vertex>
+          #include <uv_vertex>
+
+          vec2 windDirection = normalize(vec2(1.0, 1.0));
+          float windAmp = 0.12;
+          float windFreq = 42.0;
+          float windSpeed = 1.0;
+          float noiseFactor = 4.25;
+          float noiseSpeed = 0.0015;
+
+          vec4 worldPosition = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vec2 worldXZ = vec2(worldPosition.x, worldPosition.z);
+          float terrainSize = max(uTerrainSize, 1.0);
+          vGlobalUV = worldXZ / terrainSize;
+
+          vec4 noiseSample = texture2D(uNoiseTexture, vGlobalUV + uTime * noiseSpeed);
+          float windWave = sin(windFreq * dot(windDirection, vGlobalUV) + noiseSample.g * noiseFactor + uTime * windSpeed);
+
+          float influence = (1.0 - uv.y);
+          float displacement = windWave * windAmp * influence;
+
+          worldPosition.x += displacement;
+          worldPosition.z += displacement;
+          worldPosition.y += exp(texture2D(uNoiseTexture, vGlobalUV * uNoiseScale).r) * 0.35 * influence;
+
+          vec4 mvPosition = viewMatrix * worldPosition;
+          gl_Position = projectionMatrix * mvPosition;
+
+          vUv = vec2(uv.x, 1.0 - uv.y);
+          vNormal = normalize(normalMatrix * normal);
+          vWindColor = vec2(displacement, displacement);
+          vViewPosition = mvPosition.xyz;
+
+          #include <fog_vertex>
+          #include <worldpos_vertex>
+          #include <shadowmap_vertex>
+        }
+      `;
+
+      shader.fragmentShader = `
+        #include <alphatest_pars_fragment>
+        #include <common>
+        #include <packing>
+        #include <fog_pars_fragment>
+        #include <color_pars_fragment>
+        #include <lights_pars_begin>
+        #include <shadowmap_pars_fragment>
+        #include <shadowmask_pars_fragment>
+
+        uniform float uGrassLightIntensity;
+        uniform float uShadowDarkness;
+        uniform int uEnableShadows;
+        uniform sampler2D uGrassAlphaTexture;
+        uniform sampler2D uNoiseTexture;
+        uniform float uNoiseScale;
+        uniform vec3 uTipColor1;
+        uniform vec3 uTipColor2;
+        uniform float uTime;
+
+        varying vec3 vColor;
+        varying vec2 vUv;
+        varying vec2 vGlobalUV;
+        varying vec3 vNormal;
+        varying vec3 vViewPosition;
+
+        void main() {
+          vec4 grassAlpha = texture2D(uGrassAlphaTexture, vUv);
+          if (grassAlpha.r < 0.1) discard;
+
+          vec4 noiseSample = texture2D(uNoiseTexture, vGlobalUV * uNoiseScale);
+          vec3 tipColor = mix(uTipColor1, uTipColor2, noiseSample.r);
+
+          vec3 sampleColor = vColor;
+          vec3 baseColor = mix(sampleColor * 0.85, sampleColor, noiseSample.g);
+          vec3 bladeColor = mix(baseColor, mix(sampleColor, tipColor, 0.65), vUv.y);
+          bladeColor *= uGrassLightIntensity;
+
+          vec3 geometryNormal = normalize(vNormal);
+          vec3 geometryViewDir = (isOrthographic) ? vec3(0.0, 0.0, 1.0) : normalize(vViewPosition);
+          IncidentLight directLight;
+          float shading = 0.0;
+
+          #if ( NUM_DIR_LIGHTS > 0 )
+            DirectionalLight directionalLight;
+            #pragma unroll_loop_start
+            for ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {
+              directionalLight = directionalLights[ i ];
+              getDirectionalLightInfo( directionalLight, directLight );
+              shading += saturate( dot( geometryNormal, directLight.direction ) ) * directLight.color.r;
+            }
+            #pragma unroll_loop_end
+          #endif
+
+          float shadowFactor = 1.0;
+          if (uEnableShadows == 1) {
+            shadowFactor = getShadowMask();
+            shadowFactor = mix(shadowFactor, 1.0, uShadowDarkness);
+          }
+
+          vec3 finalColor = bladeColor * (0.35 + shading * 0.75) * shadowFactor;
+          gl_FragColor = vec4(finalColor, 1.0);
+
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+          #include <fog_fragment>
+        }
+      `;
+    };
+  }
+
+  setupTextures(alphaTexture, noiseTexture) {
+    if (alphaTexture) {
+      alphaTexture.encoding = THREE.sRGBEncoding;
+      alphaTexture.wrapS = alphaTexture.wrapT = THREE.ClampToEdgeWrapping;
+      alphaTexture.needsUpdate = true;
+      this.uniforms.uGrassAlphaTexture.value = alphaTexture;
+    }
+    if (noiseTexture) {
+      noiseTexture.wrapS = noiseTexture.wrapT = THREE.RepeatWrapping;
+      noiseTexture.encoding = THREE.LinearEncoding;
+      noiseTexture.needsUpdate = true;
+      this.uniforms.uNoiseTexture.value = noiseTexture;
+    }
+  }
+
+  setTerrainSize(size) {
+    this.uniforms.uTerrainSize.value = Math.max(1, size);
+  }
+
+  update(deltaTime = 0) {
+    this.uniforms.uTime.value += deltaTime;
+  }
 }
-`;
-
-const grassFragShader = `
-uniform sampler2D textures[2];
-
-varying vec2 vUv;
-varying vec2 cloudUV;
-varying vec3 vColor;
-
-void main() {
-  float contrast = 1.5;
-  float brightness = 0.1;
-  vec3 color = texture2D(textures[0], vUv).rgb * contrast;
-  color = color + vec3(brightness, brightness, brightness);
-  color = mix(color, texture2D(textures[1], cloudUV).rgb, 0.4);
-  gl_FragColor.rgb = color;
-  gl_FragColor.a = 1.;
-}
-`;
 
 export class GrassManager {
   constructor({ scene, tileManager } = {}) {
     this.scene = scene;
     this.tileManager = tileManager;
+    this.enabled = typeof window !== 'undefined';
+    this.instancesPerSample = 6;
+    this.maxBladesPerTile = 7000;
 
-    // Grass parameters
-    this.BLADE_WIDTH = 0.08;
-    this.BLADE_HEIGHT = 0.6;
-    this.BLADE_HEIGHT_VARIATION = 0.4;
-    this.BLADE_SEGMENTS = 5; // Vertices per blade
-    this.DENSITY_MULTIPLIER = 1.0; // Global grass density control
+    this.tileGrass = new Map();
 
-    // Performance settings
-    this.enabled = true;
-    this.maxBladesPerTile = 5000;
-    this.lodDistances = {
-      high: 100,   // Full density
-      medium: 200, // 50% density
-      low: 300,    // 25% density
-      none: 400    // No grass
-    };
+    this._tempMatrix = new THREE.Matrix4();
+    this._tempQuat = new THREE.Quaternion();
+    this._tempScale = new THREE.Vector3();
+    this._tempPosition = new THREE.Vector3();
+    this._tempBasePosition = new THREE.Vector3();
+    this._tempColor = new THREE.Color('#4b7a34');
+    this._up = new THREE.Vector3(0, 1, 0);
 
-    // Time uniform for wind animation
-    this.startTime = Date.now();
-    this.timeUniform = { type: 'f', value: 0.0 };
-
-    // Material setup
-    this._setupMaterial();
-
-    // Tile grass tracking
-    this.tileGrass = new Map(); // Map of tile key -> grass mesh
-  }
-
-  _setupMaterial() {
-    // Create simple grass texture (green gradient)
-    const grassCanvas = document.createElement('canvas');
-    grassCanvas.width = 64;
-    grassCanvas.height = 64;
-    const ctx = grassCanvas.getContext('2d');
-    const gradient = ctx.createLinearGradient(0, 0, 0, 64);
-    gradient.addColorStop(0, '#5a8f3a');
-    gradient.addColorStop(0.5, '#4a7a2a');
-    gradient.addColorStop(1, '#3a6a1a');
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 64, 64);
-    const grassTexture = new THREE.CanvasTexture(grassCanvas);
-
-    // Create cloud texture for variation
-    const cloudCanvas = document.createElement('canvas');
-    cloudCanvas.width = 128;
-    cloudCanvas.height = 128;
-    const cctx = cloudCanvas.getContext('2d');
-    cctx.fillStyle = '#ffffff';
-    cctx.fillRect(0, 0, 128, 128);
-    for (let i = 0; i < 100; i++) {
-      const x = Math.random() * 128;
-      const y = Math.random() * 128;
-      const radius = Math.random() * 20 + 10;
-      const alpha = Math.random() * 0.3 + 0.1;
-      cctx.fillStyle = `rgba(200, 200, 200, ${alpha})`;
-      cctx.beginPath();
-      cctx.arc(x, y, radius, 0, Math.PI * 2);
-      cctx.fill();
+    if (this.enabled) {
+      this.material = new FluffyGrassMaterial();
+      this._textureLoader = new THREE.TextureLoader();
+      const terrainSize = (this.tileManager?.tileRadius ?? 100) * 2;
+      this.material.setTerrainSize(terrainSize);
+      this._bladeGeometry = this._createBladeGeometry();
+      this._loadTextures();
+    } else {
+      this.material = null;
+      this._textureLoader = null;
+      this._bladeGeometry = null;
     }
-    const cloudTexture = new THREE.CanvasTexture(cloudCanvas);
-    cloudTexture.wrapS = cloudTexture.wrapT = THREE.RepeatWrapping;
-
-    // Shader material
-    const grassUniforms = {
-      textures: { value: [grassTexture, cloudTexture] },
-      iTime: this.timeUniform
-    };
-
-    this.grassMaterial = new THREE.ShaderMaterial({
-      uniforms: grassUniforms,
-      vertexShader: grassVertShader,
-      fragmentShader: grassFragShader,
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      transparent: false
-    });
   }
 
-  update(deltaTime) {
-    if (!this.enabled) return;
-
-    // Update time uniform for wind animation
-    const elapsedTime = Date.now() - this.startTime;
-    this.timeUniform.value = elapsedTime;
-  }
-
-  /**
-   * Generate grass for a tile based on green sample points
-   * @param {Object} tile - Tile object
-   * @param {Array} greenSamples - Array of {u, v} coordinates in [0,1] range
-   * @param {Object} bounds - Tile lat/lon bounds
-   */
-  generateGrassForTile(tile, greenSamples, bounds) {
-    if (!this.enabled || !greenSamples || greenSamples.length === 0) {
-      this.removeGrassForTile(tile);
-      return;
-    }
-
-    const tileKey = `${tile.q},${tile.r}`;
-
-    // Remove existing grass
-    this.removeGrassForTile(tile);
-
-    // Calculate blade count based on samples and density
-    const baseBladeCount = Math.min(greenSamples.length * 20, this.maxBladesPerTile);
-    const bladeCount = Math.round(baseBladeCount * this.DENSITY_MULTIPLIER);
-
-    if (bladeCount === 0) return;
-
-    // Generate grass geometry
-    const geometry = this._generateGrassGeometry(tile, greenSamples, bladeCount, bounds);
-    if (!geometry) return;
-
-    // Create mesh
-    const mesh = new THREE.Mesh(geometry, this.grassMaterial);
-    mesh.castShadow = false;
-    mesh.receiveShadow = true;
-    mesh.frustumCulled = true;
-    mesh.name = `grass-${tileKey}`;
-
-    // Add to tile group
-    tile.grid.group.add(mesh);
-
-    // Track
-    this.tileGrass.set(tileKey, { mesh, tile, bladeCount });
-  }
-
-  _generateGrassGeometry(tile, greenSamples, bladeCount, bounds) {
-    const positions = [];
-    const uvs = [];
-    const indices = [];
-    const colors = [];
-
-    const tileRadius = tile._radiusOverride ?? this.tileManager?.tileRadius ?? 100;
-    const center = tile.grid.group.position;
-
-    // Sample green areas to place grass blades
-    const used = new Set();
-    let placedCount = 0;
-
-    for (let attempt = 0; attempt < bladeCount * 3 && placedCount < bladeCount; attempt++) {
-      // Pick random green sample
-      const sample = greenSamples[Math.floor(Math.random() * greenSamples.length)];
-
-      // Add some jitter within the sample area
-      const jitter = 0.02; // 2% of tile size
-      const u = THREE.MathUtils.clamp(sample.u + (Math.random() - 0.5) * jitter, 0, 1);
-      const v = THREE.MathUtils.clamp(sample.v + (Math.random() - 0.5) * jitter, 0, 1);
-
-      // Convert to world position
-      const worldPos = this._uvToWorldPosition(u, v, bounds, center, tileRadius);
-      if (!worldPos) continue;
-
-      // Check if position is within tile radius
-      const dx = worldPos.x - center.x;
-      const dz = worldPos.z - center.z;
-      const distSq = dx * dx + dz * dz;
-      if (distSq > tileRadius * tileRadius) continue;
-
-      // Avoid duplicates
-      const key = `${Math.round(worldPos.x * 10)},${Math.round(worldPos.z * 10)}`;
-      if (used.has(key)) continue;
-      used.add(key);
-
-      // Get ground height
-      const groundY = this.tileManager?.getHeightAt(worldPos.x, worldPos.z);
-      if (!Number.isFinite(groundY)) continue;
-
-      // Convert to local coordinates
-      // Offset grass base slightly below terrain surface for proper embedding
-      const grassBaseOffset = -0.15; // Push base 15cm underground
-      const localPos = new THREE.Vector3(
-        worldPos.x - center.x,
-        groundY + grassBaseOffset,
-        worldPos.z - center.z
-      );
-
-      // Generate blade geometry
-      const blade = this._generateBlade(localPos, placedCount * this.BLADE_SEGMENTS, [u, v]);
-      blade.verts.forEach(vert => {
-        positions.push(...vert.pos);
-        uvs.push(...vert.uv);
-        colors.push(...vert.color);
-      });
-      blade.indices.forEach(index => indices.push(index));
-
-      placedCount++;
-    }
-
-    if (positions.length === 0) return null;
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-    geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
-    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
-    geometry.setIndex(indices);
-    geometry.computeVertexNormals();
-
+  _createBladeGeometry() {
+    const geometry = new THREE.PlaneGeometry(0.12, 0.9, 1, 3);
+    geometry.translate(0, 0.45, 0);
     return geometry;
   }
 
-  _generateBlade(center, vArrOffset, uv) {
-    const MID_WIDTH = this.BLADE_WIDTH * 0.5;
-    const TIP_OFFSET = 0.1;
-    const height = this.BLADE_HEIGHT + (Math.random() * this.BLADE_HEIGHT_VARIATION);
-
-    const yaw = Math.random() * Math.PI * 2;
-    const yawUnitVec = new THREE.Vector3(Math.sin(yaw), 0, -Math.cos(yaw));
-    const tipBend = Math.random() * Math.PI * 2;
-    const tipBendUnitVec = new THREE.Vector3(Math.sin(tipBend), 0, -Math.cos(tipBend));
-
-    // Find the Bottom Left, Bottom Right, Top Left, Top Right, Top Center vertex positions
-    const bl = new THREE.Vector3().addVectors(center, new THREE.Vector3().copy(yawUnitVec).multiplyScalar((this.BLADE_WIDTH / 2) * 1));
-    const br = new THREE.Vector3().addVectors(center, new THREE.Vector3().copy(yawUnitVec).multiplyScalar((this.BLADE_WIDTH / 2) * -1));
-    const tl = new THREE.Vector3().addVectors(center, new THREE.Vector3().copy(yawUnitVec).multiplyScalar((MID_WIDTH / 2) * 1));
-    const tr = new THREE.Vector3().addVectors(center, new THREE.Vector3().copy(yawUnitVec).multiplyScalar((MID_WIDTH / 2) * -1));
-    const tc = new THREE.Vector3().addVectors(center, new THREE.Vector3().copy(tipBendUnitVec).multiplyScalar(TIP_OFFSET));
-
-    tl.y += height / 2;
-    tr.y += height / 2;
-    tc.y += height;
-
-    // Vertex Colors (used for wind animation)
-    const black = [0, 0, 0];   // Base (no movement)
-    const gray = [0.5, 0.5, 0.5]; // Middle (slight movement)
-    const white = [1.0, 1.0, 1.0]; // Tip (max movement)
-
-    const verts = [
-      { pos: bl.toArray(), uv: uv, color: black },
-      { pos: br.toArray(), uv: uv, color: black },
-      { pos: tr.toArray(), uv: uv, color: gray },
-      { pos: tl.toArray(), uv: uv, color: gray },
-      { pos: tc.toArray(), uv: uv, color: white }
-    ];
-
-    const indices = [
-      vArrOffset,
-      vArrOffset + 1,
-      vArrOffset + 2,
-      vArrOffset + 2,
-      vArrOffset + 4,
-      vArrOffset + 3,
-      vArrOffset + 3,
-      vArrOffset,
-      vArrOffset + 2
-    ];
-
-    return { verts, indices };
+  _loadTexture(url, configure) {
+    return new Promise((resolve, reject) => {
+      if (!this._textureLoader) {
+        resolve(null);
+        return;
+      }
+      this._textureLoader.load(
+        url,
+        (texture) => {
+          if (configure) configure(texture);
+          resolve(texture);
+        },
+        undefined,
+        (err) => reject(err)
+      );
+    });
   }
 
-  _uvToWorldPosition(u, v, bounds, center, tileRadius) {
-    if (!bounds || !this.tileManager?.origin) return null;
+  _loadTextures() {
+    if (!this._textureLoader || !this.material) return;
+    Promise.all([
+      this._loadTexture(GRASS_ALPHA_URL),
+      this._loadTexture(GRASS_NOISE_URL),
+    ]).then(([alpha, noise]) => {
+      this.material.setupTextures(alpha, noise);
+    }).catch((err) => {
+      console.warn('[grass] texture load failed', err);
+    });
+  }
 
-    const { lonMin, lonMax, latMin, latMax } = bounds;
-    const lon = lonMin + (lonMax - lonMin) * u;
-    const lat = latMax - (latMax - latMin) * v;
+  update(deltaTime = 0) {
+    if (!this.material) return;
+    this.material.update(deltaTime);
+    if (this.tileManager?.tileRadius) {
+      this.material.setTerrainSize(this.tileManager.tileRadius * 2);
+    }
+  }
 
-    // Convert lat/lon to world coordinates using approximate method
-    // This matches the tile manager's approach
-    const R = 6371000; // Earth radius in meters
-    const originLat = this.tileManager.origin.lat;
-    const originLon = this.tileManager.origin.lon;
+  generateGrassForTile(tile, samples, bounds) {
+    if (!this.enabled || !this.material || !this._bladeGeometry) return;
+    if (!tile || !samples || !samples.length || !bounds) {
+      this.removeGrassForTile(tile);
+      return;
+    }
+    const group = tile?.grid?.group;
+    if (!group) return;
 
-    const dLat = lat - originLat;
-    const dLon = lon - originLon;
+    this.removeGrassForTile(tile);
 
-    const x = dLon * R * Math.cos((originLat * Math.PI) / 180) * (Math.PI / 180);
-    const z = -dLat * R * (Math.PI / 180);
+    const tileRadius = tile._radiusOverride ?? this.tileManager?.tileRadius ?? 100;
+    const targetCount = Math.min(samples.length * this.instancesPerSample, this.maxBladesPerTile);
+    if (targetCount <= 0) return;
 
-    return { x, z };
+    const origin = this.tileManager?.origin;
+    if (!origin) return;
+    const center = group.position.clone();
+
+    const mesh = new THREE.InstancedMesh(this._bladeGeometry, this.material.material, targetCount);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.name = `grass-${tile.q},${tile.r}`;
+
+    const colorAttr = new THREE.InstancedBufferAttribute(new Float32Array(targetCount * 3), 3);
+    colorAttr.setUsage(THREE.DynamicDrawUsage);
+    mesh.instanceColor = colorAttr;
+
+    let placed = 0;
+    for (const sample of samples) {
+      if (placed >= targetCount) break;
+      const world = this._uvToWorldPosition(sample?.u, sample?.v, bounds, origin);
+      if (!world) continue;
+
+      const dx = world.x - center.x;
+      const dz = world.z - center.z;
+      if ((dx * dx + dz * dz) > tileRadius * tileRadius * 1.1) continue;
+
+      const ground = this.tileManager?.getHeightAt?.(world.x, world.z);
+      if (!Number.isFinite(ground)) continue;
+
+      this._tempBasePosition.set(
+        world.x - center.x,
+        ground - center.y - 0.04,
+        world.z - center.z
+      );
+
+      for (let i = 0; i < this.instancesPerSample && placed < targetCount; i += 1) {
+        const jitterX = (Math.random() - 0.5) * 0.6;
+        const jitterZ = (Math.random() - 0.5) * 0.6;
+        this._tempPosition.copy(this._tempBasePosition);
+        this._tempPosition.x += jitterX;
+        this._tempPosition.z += jitterZ;
+
+        this._tempQuat.setFromAxisAngle(this._up, Math.random() * Math.PI * 2);
+        const heightScale = THREE.MathUtils.lerp(0.7, 1.8, Math.random());
+        const widthScale = THREE.MathUtils.lerp(0.6, 1.1, Math.random());
+        this._tempScale.set(widthScale, heightScale, 1);
+
+        this._tempMatrix.compose(this._tempPosition, this._tempQuat, this._tempScale);
+        mesh.setMatrixAt(placed, this._tempMatrix);
+
+        const color = this._colorFromSample(sample);
+        mesh.setColorAt(placed, color);
+
+        placed += 1;
+      }
+    }
+
+    if (placed === 0) return;
+
+    mesh.count = placed;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    group.add(mesh);
+    this.tileGrass.set(this._tileKey(tile), { mesh, tile });
   }
 
   removeGrassForTile(tile) {
-    const tileKey = `${tile.q},${tile.r}`;
-    const grassData = this.tileGrass.get(tileKey);
-
-    if (grassData) {
-      // Remove from scene
-      if (grassData.mesh.parent) {
-        grassData.mesh.parent.remove(grassData.mesh);
-      }
-
-      // Dispose geometry
-      if (grassData.mesh.geometry) {
-        grassData.mesh.geometry.dispose();
-      }
-
-      this.tileGrass.delete(tileKey);
+    if (!tile) return;
+    const key = this._tileKey(tile);
+    const entry = this.tileGrass.get(key);
+    if (!entry) return;
+    const mesh = entry.mesh;
+    if (mesh?.parent) {
+      mesh.parent.remove(mesh);
     }
+    if (mesh?.instanceColor) {
+      mesh.instanceColor.array.fill(0);
+    }
+    this.tileGrass.delete(key);
   }
 
   dispose() {
-    // Remove all grass
-    for (const [tileKey, grassData] of this.tileGrass.entries()) {
-      if (grassData.mesh.parent) {
-        grassData.mesh.parent.remove(grassData.mesh);
-      }
-      if (grassData.mesh.geometry) {
-        grassData.mesh.geometry.dispose();
-      }
+    for (const entry of this.tileGrass.values()) {
+      if (entry.mesh?.parent) entry.mesh.parent.remove(entry.mesh);
     }
     this.tileGrass.clear();
+    this._bladeGeometry?.dispose?.();
+    this.material?.material?.dispose?.();
+    this.material = null;
+  }
 
-    // Dispose material
-    if (this.grassMaterial) {
-      this.grassMaterial.dispose();
+  _colorFromSample(sample) {
+    if (sample?.color) {
+      this._tempColor.setRGB(
+        (sample.color.r ?? 100) / 255,
+        (sample.color.g ?? 140) / 255,
+        (sample.color.b ?? 80) / 255
+      );
+    } else {
+      this._tempColor.set('#4b7a34');
     }
+    return this._tempColor;
+  }
+
+  _tileKey(tile) {
+    return tile ? `${tile.q},${tile.r},${tile.type}` : 'unknown';
+  }
+
+  _uvToWorldPosition(u, v, bounds, origin) {
+    if (!Number.isFinite(u) || !Number.isFinite(v) || !bounds || !origin) return null;
+    const lon = bounds.lonMin + (bounds.lonMax - bounds.lonMin) * u;
+    const lat = bounds.latMax - (bounds.latMax - bounds.latMin) * v;
+    const R = 6371000;
+    const originLatRad = THREE.MathUtils.degToRad(origin.lat);
+    const dLat = THREE.MathUtils.degToRad(lat - origin.lat);
+    const dLon = THREE.MathUtils.degToRad(lon - origin.lon);
+    const x = dLon * Math.cos(originLatRad) * R;
+    const z = -dLat * R;
+    return { x, z };
   }
 }

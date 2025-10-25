@@ -167,6 +167,7 @@ export class Avatar {
       const clip = gatherClipForState(state);
       if (clip) registerAction(state, clip);
     }
+    if (clips.Meditate) registerAction('Meditate', clips.Meditate);
 
     const startState = this._chooseAvailable(['Idle', 'CrouchIdle', 'WalkForward', 'Sprint', 'Walk']);
     if (startState && this.actions[startState]) {
@@ -175,6 +176,7 @@ export class Avatar {
     this.current = startState || null;
 
     this._isCrouch = false;
+    this._manualState = null;
     this._airborneManual = false;
     this._airborneAuto = false;
     this._lastPos = new THREE.Vector3();
@@ -448,7 +450,8 @@ export class Avatar {
     const strafe = this._velLocal.x;
 
     const airborneFlag = this._airborneManual || this._airborneAuto || this.jumpState !== 'idle' || this.jumpYOffset > 0;
-    const desired = this._selectState({
+    const manualState = this._manualState;
+    const desired = manualState || this._selectState({
       speed: Math.max(this._vSmooth, horizontalSpeed),
       forward,
       strafe,
@@ -491,6 +494,24 @@ export class Avatar {
 
     if (this.mixer) this.mixer.update(dt);
     this._applyHeadLook(dt);
+  }
+
+  setManualState(stateName) {
+    if (!stateName) {
+      this._manualState = null;
+      return true;
+    }
+    if (!this.actions[stateName]) return false;
+    if (this._manualState === stateName) return true;
+    this._manualState = stateName;
+    this._transition(stateName);
+    return true;
+  }
+
+  clearManualState(stateName = null) {
+    if (!this._manualState) return;
+    if (stateName && stateName !== this._manualState) return;
+    this._manualState = null;
   }
 }
 

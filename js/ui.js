@@ -69,6 +69,7 @@ const hudGpsReckon = document.getElementById('hudGpsReckon');
 const hudDebugToggle = document.getElementById('hudDebugToggle');
 const hudWireframeToggle = document.getElementById('hudWireframeToggle');
 const hudReset = document.getElementById('hudReset');
+const hudTeleportToggle = document.getElementById('hudTeleportToggle');
 const hudGeohash = document.getElementById('hudGeohash');
 const hudLat = document.getElementById('hudLat');
 const hudLon = document.getElementById('hudLon');
@@ -323,7 +324,7 @@ export const ui = {
   hexSig, nukeBtn,
   hudFps, hudQos, hudDetail, hudHeadingText, hudCompassNeedle,
   hudScale, hudScaleTrack, hudScaleLine1, hudScaleLine10, hudScaleMarker1, hudScaleMarker10,
-  hudGpsReckon, hudDebugToggle, hudReset, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
+  hudGpsReckon, hudDebugToggle, hudReset, hudTeleportToggle, hudGeohash, hudLat, hudLon, hudAltitude, hudPeerCount,
   hudClockLocal, hudClockUtc, hudSunInfo, hudMoonInfo,
   hudWeather, hudWeatherIcon, hudWeatherTemp, hudWeatherDesc,
   hudWeatherHumidity, hudWeatherWind, hudWeatherRain, hudWeatherForecast,
