@@ -4663,10 +4663,134 @@ class App {
 
       console.log('[App] Smart Objects initialized');
       this._syncPlaceButtonState(true);
+
+      // Handle URL parameters for Hydra/NoClip invites
+      this._handleInviteUrlParams();
     } catch (err) {
       console.error('[App] Failed to initialize Smart Objects:', err);
       this._syncPlaceButtonState(true, false);
     }
+  }
+
+  /**
+   * Handle URL parameters for Hydra node invites
+   * Supports: ?hydra=hydra.<hex>&node=<nodeId>&object=<uuid>
+   * Also: ?noclip=noclip.<hex>&object=<uuid>
+   */
+  _handleInviteUrlParams() {
+    try {
+      const url = new URL(window.location.href);
+
+      // Check for hydra parameter (from Hydra graph)
+      const hydraParam = url.searchParams.get('hydra');
+      const nodeParam = url.searchParams.get('node');
+      const objectParam = url.searchParams.get('object');
+
+      // Check for noclip parameter (from another NoClip instance)
+      const noclipParam = url.searchParams.get('noclip');
+
+      if (hydraParam && nodeParam) {
+        // Parse Hydra address: hydra.<hex> or just <hex>
+        const parts = hydraParam.split('.');
+        const hydraPub = parts.length === 2 ? parts[1] : hydraParam;
+
+        console.log('[App] Hydra invite detected:', { hydraPub, nodeParam, objectParam });
+
+        // If object UUID provided, try to find/create that object
+        if (objectParam) {
+          // Check if object already exists
+          const existing = this.sceneMgr.smartObjects?.smartObjects?.find(
+            obj => obj.uuid === objectParam
+          );
+
+          if (existing) {
+            // Object exists, bind node and open modal
+            setTimeout(() => {
+              this._bindHydraNodeToObject(existing, hydraPub, nodeParam);
+              this.sceneMgr.smartModal?.show(existing);
+            }, 1000);
+          } else {
+            // Object doesn't exist, show notification
+            console.log('[App] Object not found, user should create it manually');
+            setTimeout(() => {
+              alert(`Smart Object ${objectParam} not found.\nPlease create a Smart Object to connect to Hydra node: ${nodeParam}`);
+            }, 1000);
+          }
+        } else {
+          // No object specified, just show connection info
+          setTimeout(() => {
+            alert(`Ready to connect to Hydra node: ${nodeParam}\nCreate or select a Smart Object to configure the connection.`);
+          }, 1000);
+        }
+
+        // Clean up URL
+        url.searchParams.delete('hydra');
+        url.searchParams.delete('node');
+        url.searchParams.delete('object');
+        const newUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+        window.history.replaceState({}, document.title, newUrl);
+
+      } else if (noclipParam && objectParam) {
+        // Handle NoClip-to-NoClip invite (peer connection)
+        const parts = noclipParam.split('.');
+        const noclipPub = parts.length === 2 ? parts[1] : noclipParam;
+
+        console.log('[App] NoClip peer invite detected:', { noclipPub, objectParam });
+
+        // Try to connect to peer via mesh
+        if (this.mesh) {
+          const peerAddr = `noclip.${noclipPub}`;
+          console.log('[App] Attempting to connect to NoClip peer:', peerAddr);
+          // Mesh will handle the connection via existing peer discovery
+        }
+
+        // Clean up URL
+        url.searchParams.delete('noclip');
+        url.searchParams.delete('object');
+        const newUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+        window.history.replaceState({}, document.title, newUrl);
+      }
+
+    } catch (err) {
+      console.error('[App] Failed to parse invite URL parameters:', err);
+    }
+  }
+
+  /**
+   * Bind Hydra node to Smart Object
+   */
+  _bindHydraNodeToObject(smartObject, hydraPub, nodeId) {
+    if (!smartObject) return;
+
+    // Store connection info
+    if (!smartObject.config.connectedNodes) {
+      smartObject.config.connectedNodes = [];
+    }
+
+    const existing = smartObject.config.connectedNodes.find(
+      n => n.hydraPub === hydraPub && n.nodeId === nodeId
+    );
+
+    if (!existing) {
+      smartObject.config.connectedNodes.push({
+        hydraPub,
+        nodeId,
+        connectedAt: Date.now()
+      });
+    }
+
+    // Auto-configure audio source with this node
+    if (!smartObject.config.sources) {
+      smartObject.config.sources = {};
+    }
+    if (!smartObject.config.sources.audio) {
+      smartObject.config.sources.audio = {};
+    }
+
+    smartObject.config.sources.audio.nodeId = nodeId;
+    smartObject.config.sources.audio.enabled = true;
+
+    console.log(`[App] Bound Hydra node ${nodeId} to Smart Object ${smartObject.uuid}`);
   }
 
   _updateSmartObjectPlacementPreview() {
