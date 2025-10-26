@@ -4962,20 +4962,101 @@ this.radio = new RadioManager({
       this._beginOrbitDrag(e);
     }
   }
+  /**
+   * Handle an intentional click on the 3D canvas (i.e. not a camera drag).
+   *
+   * Behaviors:
+   * 1. If we're in Smart Object placement mode:
+   *    - finalize placement at the preview point
+   *    - open the Smart Object modal for the new object
+   *
+   * 2. If we're NOT in placement mode:
+   *    - raycast Smart Objects under the cursor
+   *    - if we're allowed to interact, open the modal for that object
+   */
+  _handleSmartObjectPointerClick(e) {
+    const smartObjects = this.sceneMgr?.smartObjects;
+    if (!smartObjects) return;
+
+    // Only care about primary click / tap
+    const isLeftButton = (e.button == null || e.button === 0);
+    if (!isLeftButton) return;
+
+    // --- Case 1: placement mode -> drop object + open modal ---
+    if (smartObjects.placementMode) {
+      // Remember how many we had before placing
+      const beforeLen = smartObjects.smartObjects.length;
+
+      // This will create the Smart Object at the preview position
+      // and flip placementMode off internally.
+      smartObjects.exitPlacementModeAndPlace();
+
+      // Grab the newly created object (last inserted)
+      const afterArr = smartObjects.smartObjects;
+      const newObj = afterArr[beforeLen];
+
+      // Keep the HUD "Place" button state honest
+      this._syncPlaceButtonState(true);
+
+      // Pop modal for the new object
+      if (newObj && this.sceneMgr.smartModal) {
+        this.sceneMgr.smartModal.show(newObj);
+      }
+      return;
+    }
+
+    // --- Case 2: normal click -> select existing Smart Object ---
+    const camera = this.sceneMgr?.camera;
+    const dom = this.sceneMgr?.renderer?.domElement;
+    if (!camera || !dom || !this._raycaster) return;
+
+    // Compute NDC from the pointer event so taps work even without pointermove
+    const rect = dom.getBoundingClientRect();
+    const ndc = {
+      x: ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      y: -(((e.clientY - rect.top) / rect.height) * 2 - 1),
+    };
+
+    this._raycaster.setFromCamera(ndc, camera);
+
+    const clickedObj = smartObjects.getObjectAtPosition?.(this._raycaster);
+    if (!clickedObj) return;
+
+    // Range / permission gate (warn, but don't block modal)
+    const verdict = smartObjects.canInteract?.(clickedObj);
+    if (verdict && verdict.canInteract === false) {
+      if (verdict.reason) {
+        // still tell the user they're far, but allow edit anyway
+        pushToast(verdict.reason, { duration: 2000 });
+      }
+      // no early return anymore
+    }
+
+    // Open config modal regardless of distance
+    if (this.sceneMgr.smartModal) {
+      this.sceneMgr.smartModal.show(clickedObj);
+    }
+
+  }
 
   _onCanvasPointerUp(e) {
     if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
       this._cancelPointerHold();
     }
 
-    // Treat it as a drag only if we actually moved the camera.
+    // It's only a "real click" if we *didn't* orbit the camera.
     const wasDraggingCamera = this._orbitDragActive && this._orbitDragMoved;
 
     this._endOrbitDrag(e);
 
-    // If we didn't drag, forward as a click so SmartObjects can consume it.
-    if (!wasDraggingCamera && this.sceneMgr?.handleCanvasClick) {
-      this.sceneMgr.handleCanvasClick(e);
+    if (!wasDraggingCamera) {
+      // 1. Smart Object / placement / modal flow
+      this._handleSmartObjectPointerClick(e);
+
+      // 2. Preserve whatever SceneManager already does on click
+      if (this.sceneMgr?.handleCanvasClick) {
+        this.sceneMgr.handleCanvasClick(e);
+      }
     }
   }
 
@@ -4983,8 +5064,11 @@ this.radio = new RadioManager({
     if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
       this._cancelPointerHold();
     }
-    this._endOrbitDrag(e);
+    if (this._orbitDragActive && e.pointerId === this._orbitDragPointerId) {
+      this._endOrbitDrag(e);
+    }
   }
+
 
   _onCanvasPointerMove(e) {
     // Update scene mouse position for hover detection

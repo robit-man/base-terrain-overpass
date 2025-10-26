@@ -233,7 +233,7 @@ class SmartObjectManager {
    * @param {boolean} options.skipBroadcast - Skip broadcasting to peers (for loading from storage)
    * @param {boolean} options.skipSave - Skip saving to storage (for peer sync)
    */
-  createSmartObject(config, options = {}) {
+    createSmartObject(config, options = {}) {
     const uuid = config.uuid || this._generateUUID();
 
     if (this.objects.has(uuid)) {
@@ -251,24 +251,35 @@ class SmartObjectManager {
       config.owner = this.mesh?.selfPub || 'local';
     }
 
-    // Create 3D mesh
+    // 1. Create 3D mesh
     const mesh = this._createObjectMesh(config);
     if (!mesh) return null;
 
-    // Create wireframe highlight (hidden by default)
+    // 2. Add mesh to scene BEFORE computing helpers
+    this.scene.add(mesh);
+
+    // force world matrix so BoxHelper sees correct scale/rotation/position
+    mesh.updateWorldMatrix(true, true);
+
+    // 3. Create wireframe/highlight box AFTER mesh is in scene
     const wireframeHelper = new THREE.BoxHelper(mesh, 0xffffff);
     wireframeHelper.visible = false;
     wireframeHelper.name = 'wireframeHelper';
+
+    // make sure helper lines match the fresh worldbounds
+    wireframeHelper.update();
+
+    // add helper to scene
     this.scene.add(wireframeHelper);
 
-    // Create text label if needed
+    // 4. Create text label if needed
     let label = null;
     if (config.mesh?.label) {
       label = this._createTextLabel(config.mesh.label);
       mesh.add(label);
     }
 
-    // Create object data structure
+    // 5. Create object data structure
     const smartObject = {
       uuid,
       config,
@@ -280,29 +291,27 @@ class SmartObjectManager {
       lastUpdate: Date.now()
     };
 
-    // Add to scene
-    this.scene.add(mesh);
-
-    // Store object
+    // 6. Store object
     this.objects.set(uuid, smartObject);
 
-    // Setup audio if enabled
+    // 7. Setup audio if enabled
     if (config.sources?.audio?.enabled && this.spatialAudio) {
       this.spatialAudio.createSource(uuid, mesh.position);
     }
 
-    // Save to storage (unless loading from peer sync)
+    // 8. Save to storage (unless loading from peer sync)
     if (!options.skipSave) {
       this._saveToStorage();
     }
 
-    // Broadcast to peers (unless loading from storage or peer sync)
+    // 9. Broadcast to peers (unless loading from storage or peer sync)
     if (!options.skipBroadcast) {
       this._broadcastObjectSync('create', smartObject);
     }
 
     return smartObject;
   }
+
 
   /**
    * Update an existing Smart Object

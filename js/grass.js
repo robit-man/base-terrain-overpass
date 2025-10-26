@@ -26,7 +26,7 @@ class AdvancedGrassMaterial {
 
     // Blade geometry parameters
     this.bladeWidth = 0.12;
-    this.bladeHeight = 1.0;
+    this.bladeHeight = 0.5;
     this.joints = 4;
 
     this.material = new THREE.RawShaderMaterial({

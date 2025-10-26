@@ -583,11 +583,21 @@ export class AvatarFactory {
   create() {
     // Deep clone preserves skinning and bone hierarchy
     const root = SkeletonUtils.clone(this.template);
+
+    // IMPORTANT:
+    // The master template is forced invisible:
+    //   template.visible = false;
+    // That flag gets copied into the clone.
+    // So without this, every avatar (local + remote) stays hidden.
+    root.visible = true;
+    root.traverse(obj => { obj.visible = true; });
+
     const mixer = new THREE.AnimationMixer(root);
     const clips = {};
     for (const [key, clip] of Object.entries(this.clips || {})) {
       clips[key] = clip ? clip.clone() : null;
     }
+
     return new Avatar(root, mixer, clips, this.footYOffset, this.height);
   }
 }
