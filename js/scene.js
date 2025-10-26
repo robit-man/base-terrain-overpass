@@ -4,7 +4,7 @@ import { Sky } from 'Sky';
 
 const TWILIGHT_ALTITUDE = THREE.MathUtils.degToRad(-0.5);
 const NIGHT_ALTITUDE = THREE.MathUtils.degToRad(-12);
-const DAY_EXPOSURE = 1.15;
+const DAY_EXPOSURE = 1;
 const NIGHT_EXPOSURE = 0.18;
 const NIGHT_FOG_COLOR = new THREE.Color(0x05070d);
 const NIGHT_AMBIENT_COLOR = new THREE.Color(0x05060a);
@@ -20,14 +20,14 @@ export class SceneManager {
     this.renderer.outputEncoding = THREE.sRGBEncoding;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = DAY_EXPOSURE;
-    this.renderer.physicallyCorrectLights = true;
+    this.renderer.physicallyCorrectLights = false;
     this.renderer.xr.enabled = true;
     try {
       this.renderer.xr.setReferenceSpaceType?.('local-floor');
     } catch (_) {
       this.renderer.xr.setReferenceSpaceType?.('local');
     }
-    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.enabled = false;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.renderer.domElement.classList.add('scene-canvas');
@@ -37,7 +37,7 @@ export class SceneManager {
     this.pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene = new THREE.Scene();
 
-    // 🎯 Camera stays at (0,0,0) in dolly local space; dolly handles eye height
+    // Camera stays at (0,0,0) in dolly local space; dolly handles eye height
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
     this.camera.position.set(0, 0, 0);
     this.camera.up.set(0, 1, 0);
@@ -65,9 +65,9 @@ export class SceneManager {
     this.sunLight.castShadow = true;
 
     // OPTIMIZED: Higher quality shadow maps for buildings/trees
-    this.sunLight.shadow.mapSize.set(2048, 2048);  // Increased from 1024 for sharper shadows
-    this.sunLight.shadow.camera.near = 10;
-    this.sunLight.shadow.camera.far = 2000;        // Extended to cover more area
+    this.sunLight.shadow.mapSize.set(1024, 1024);  // Increased from 1024 for sharper shadows
+    this.sunLight.shadow.camera.near = 0;
+    this.sunLight.shadow.camera.far = 3000;        // Extended to cover more area
     this.sunLight.shadow.camera.left = -800;       // Wider coverage
     this.sunLight.shadow.camera.right = 800;
     this.sunLight.shadow.camera.top = 800;
@@ -80,7 +80,7 @@ export class SceneManager {
     this.scene.add(this.sunLight.target);
 
     // OPTIMIZED: Enhanced ambient lighting for better shadow visibility
-    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.15);  // Increased from 0.18 to fill shadows
+    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.18);  // Increased from 0.18 to fill shadows
     this.scene.add(this.ambient);
     this._ambientDayColor = DAY_AMBIENT_COLOR.clone();
     this._ambientNightColor = NIGHT_AMBIENT_COLOR.clone();
@@ -163,8 +163,8 @@ export class SceneManager {
     // We look forward (-Z). The "below horizon" band is a few pixels *below* mid-height.
     this._probeCamera = new THREE.PerspectiveCamera(75, 1, 1, 100000);
     this._probeCamera.position.set(0, 0, 0);
-    this._probeCamera.up.set(0, 1, 0);
-    this._probeCamera.lookAt(new THREE.Vector3(0, 0, -1));
+    this._probeCamera.up.set(0, -10, 0);
+    this._probeCamera.lookAt(new THREE.Vector3(0, -100, 0));
 
     // How far beneath the horizon to sample (in degrees of vertical FOV).
     // ~2–3° below the horizon matches human perception for distant fade.

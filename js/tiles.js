@@ -214,30 +214,42 @@ export class TileManager {
     this._overlayCache = new Map();
     this._overlayCanvas = null;
     this._overlayCtx = null;
-    this._overlayVersion = DEFAULT_WAYBACK_VERSION;
+        this._overlayVersion = DEFAULT_WAYBACK_VERSION;
     this._overlayVersions = [];
     this._overlayVersionPromise = null;
     this._overlayVersionLastFetch = 0;
-    this._treeEnabled = true;
+
+    // Mobile guard: disable heavy trees on phones/tablets by default
+    const _tmOnMobile = (typeof navigator !== 'undefined')
+      && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
+
+    this._treeEnabled = !_tmOnMobile; // off on mobile, on otherwise
+
     this._treeLib = (typeof window !== 'undefined') ? window['@dgreenheck/ez-tree'] || null : null;
     this._treeLibPromise = null;
     this._treeLibWarned = false;
-    this._treeComplexity = 0.35;
-    this._treeTargetComplexity = 0.35;
+
+    // Dial back complexity on mobile to reduce instance counts and leaf density
+    this._treeComplexity = _tmOnMobile ? 0.22 : 0.35;        // min is clamped at 0.20 internally
+    this._treeTargetComplexity = this._treeComplexity;
+
     this._treePerfSamples = [];
     this._treePerfSampleTime = 0;
+
     this._treePerfEvalTimer = 0;
     this._treeRegenQueue = null;
     this._treeRegenSet = new Set();
     this._primeWaybackVersions();
 
-    // ---- Grass system ----
-    this.grassManager = new GrassManager({
+    // On mobile: don't even construct the manager (avoids buffers & per-frame update)
+    this.grassManager = _tmOnMobile ? null : new GrassManager({
       scene: this.scene,
       tileManager: this,
       camera: this.camera
     });
-    this._grassEnabled = true;
+
+    // Toggle for generation + per-frame updates (used elsewhere in the file)
+    this._grassEnabled = !_tmOnMobile;
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -245,6 +257,7 @@ export class TileManager {
       sun.position.set(50, 100, 50); sun.castShadow = false; scene.add(sun);
       scene.userData._tmLightsAdded = true;
     }
+
 
     this._baseLod = {
       interactiveRing: this.INTERACTIVE_RING,
