@@ -15,11 +15,20 @@ function ensureJson(obj) {
 }
 
 export class TerrainRelay {
-  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null } = {}) {
+  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null, wsEndpoint = 'wss://noclip-elevation.loca.lt' } = {}) {
     this.relayAddress = defaultRelay.trim();
     this.dataset = dataset.trim() || 'mapzen';
     this.mode = mode === 'latlng' ? 'latlng' : 'geohash';
     this._onStatus = typeof onStatus === 'function' ? onStatus : null;
+
+    // WebSocket fallback
+    this.wsEndpoint = wsEndpoint.trim();
+    this._wsSocket = null;
+    this._wsConnected = false;
+    this._wsPending = new Map();
+    this._wsRetryTimer = null;
+    this._wsRetryDelay = 1000;
+    this._useWsFallback = true; // Enable WebSocket fallback by default
 
     this._clientProvider = typeof clientProvider === 'function' ? clientProvider : null;
     this._internalClient = null;
@@ -55,6 +64,12 @@ export class TerrainRelay {
     };
     this._heartbeatTimer = null;
     this._healthLast = null;
+
+    // Start WebSocket connection immediately if enabled
+    if (this._useWsFallback && this.wsEndpoint) {
+      // Defer to next tick to allow constructor to complete
+      setTimeout(() => this._connectWs(), 0);
+    }
   }
 
   setRelayAddress(addr) {
@@ -67,6 +82,29 @@ export class TerrainRelay {
 
   setMode(mode) {
     this.mode = mode === 'latlng' ? 'latlng' : 'geohash';
+  }
+
+  setWsEndpoint(endpoint) {
+    const newEndpoint = (endpoint || '').trim();
+    if (this.wsEndpoint !== newEndpoint) {
+      this.wsEndpoint = newEndpoint;
+      // Reconnect with new endpoint
+      if (this._wsSocket) {
+        this._disconnectWs();
+        if (this._useWsFallback) {
+          this._connectWs();
+        }
+      }
+    }
+  }
+
+  setWsFallbackEnabled(enabled) {
+    this._useWsFallback = !!enabled;
+    if (enabled && !this._wsConnected && this.wsEndpoint) {
+      this._connectWs();
+    } else if (!enabled && this._wsSocket) {
+      this._disconnectWs();
+    }
   }
 
   _emitStatus(text, level = 'info') {
@@ -180,6 +218,136 @@ export class TerrainRelay {
     } catch (err) {
       this._recordFailure(err, { kind: 'heartbeat' });
     }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // WebSocket Fallback Methods
+  // ─────────────────────────────────────────────────────────────────────────
+
+  _connectWs() {
+    if (!this.wsEndpoint || this._wsSocket) return;
+
+    try {
+      const io = globalThis.io;
+      if (!io) {
+        console.warn('[TerrainRelay] socket.io-client not loaded, WebSocket fallback disabled');
+        return;
+      }
+
+      this._emitStatus('connecting to ws fallback…', 'info');
+      this._wsSocket = io(this.wsEndpoint, {
+        transports: ['websocket'],
+        reconnection: true,
+        reconnectionDelay: this._wsRetryDelay,
+        reconnectionDelayMax: 10000,
+      });
+
+      this._wsSocket.on('connect', () => {
+        this._wsConnected = true;
+        this._wsRetryDelay = 1000;
+        console.log('[TerrainRelay] WebSocket fallback connected:', this.wsEndpoint);
+        this._emitStatus(`ws fallback ready (${this.wsEndpoint})`, 'ok');
+      });
+
+      this._wsSocket.on('disconnect', () => {
+        this._wsConnected = false;
+        console.log('[TerrainRelay] WebSocket fallback disconnected');
+        this._emitStatus('ws fallback disconnected', 'warn');
+      });
+
+      this._wsSocket.on('elevation-response', (data) => {
+        this._handleWsResponse(data);
+      });
+
+      this._wsSocket.on('connect_error', (err) => {
+        console.warn('[TerrainRelay] WebSocket connection error:', err.message);
+        this._wsRetryDelay = Math.min(this._wsRetryDelay * 1.5, 10000);
+      });
+
+    } catch (err) {
+      console.error('[TerrainRelay] Failed to create WebSocket connection:', err);
+    }
+  }
+
+  _disconnectWs() {
+    if (this._wsSocket) {
+      this._wsSocket.disconnect();
+      this._wsSocket = null;
+      this._wsConnected = false;
+    }
+    if (this._wsRetryTimer) {
+      clearTimeout(this._wsRetryTimer);
+      this._wsRetryTimer = null;
+    }
+    // Reject all pending WS requests
+    for (const [id, pending] of this._wsPending.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('WebSocket disconnected'));
+    }
+    this._wsPending.clear();
+  }
+
+  _handleWsResponse(data) {
+    if (!data || typeof data !== 'object') return;
+
+    // Try to find matching request by matching geohashes or request ID
+    for (const [id, pending] of this._wsPending.entries()) {
+      // Check if this response matches the request
+      const matches = pending.checkMatch?.(data) ?? true;
+      if (matches) {
+        this._wsPending.delete(id);
+        clearTimeout(pending.timeout);
+        pending.resolve(data);
+        return;
+      }
+    }
+  }
+
+  async _queryViaWebSocket(geohashes, timeoutMs = 15000) {
+    if (!this._wsConnected || !this._wsSocket) {
+      throw new Error('WebSocket not connected');
+    }
+
+    const id = globalThis.crypto?.randomUUID?.() || Math.random().toString(16).slice(2);
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this._wsPending.has(id)) {
+          this._wsPending.delete(id);
+          reject(new Error('WebSocket elevation request timeout'));
+        }
+      }, timeoutMs);
+
+      // Store with a matcher function to identify the response
+      const checkMatch = (data) => {
+        // If error, don't match
+        if (data.error) return false;
+
+        // For geohash mode, check if response contains our geohashes
+        if (data.mode === 'geohash' && data.results && Array.isArray(data.results)) {
+          const responseHashes = new Set(data.results.map(r => r.geohash));
+          const requestHashes = new Set(geohashes);
+          // Check if there's significant overlap
+          let matches = 0;
+          for (const hash of requestHashes) {
+            if (responseHashes.has(hash)) matches++;
+          }
+          return matches >= Math.min(requestHashes.size, responseHashes.size) * 0.8;
+        }
+
+        return true; // Default to accepting if we can't determine
+      };
+
+      this._wsPending.set(id, { resolve, reject, timeout, checkMatch });
+
+      // Send request
+      const payload = {
+        dataset: this.dataset,
+        geohashes: geohashes,
+      };
+
+      this._wsSocket.emit('elevation-request', payload);
+    });
   }
 
   async ensureClient() {
@@ -314,6 +482,25 @@ export class TerrainRelay {
   }
 
   async queryBatch(dest, payload, timeoutMs = 45000) {
+    // Try WebSocket fallback first if available and we're in geohash mode
+    if (this._useWsFallback && this._wsConnected && this.mode === 'geohash' && payload.geohashes) {
+      try {
+        const wsStart = this._nowMs();
+        const wsResult = await this._queryViaWebSocket(payload.geohashes, 10000);
+        const wsDuration = this._nowMs() - wsStart;
+
+        if (wsResult && !wsResult.error && wsResult.results) {
+          this._recordSuccess(wsDuration, { kind: 'query', status: 200 });
+          console.log(`[TerrainRelay] WebSocket query succeeded in ${wsDuration.toFixed(0)}ms`);
+          return wsResult;
+        }
+      } catch (wsErr) {
+        console.warn('[TerrainRelay] WebSocket query failed, falling back to NKN:', wsErr.message);
+        // Continue to NKN fallback
+      }
+    }
+
+    // NKN relay path (original implementation)
     const mc = await this.ensureClient();
     const m = this._metrics;
     m.inflight += 1;
@@ -418,6 +605,12 @@ export class TerrainRelay {
       status: { text: this._statusText, level: this._statusLevel },
       metrics,
       heartbeat: this._healthLast,
+      websocket: {
+        enabled: this._useWsFallback,
+        endpoint: this.wsEndpoint || null,
+        connected: this._wsConnected,
+        pendingRequests: this._wsPending.size,
+      },
     };
   }
 
@@ -425,5 +618,20 @@ export class TerrainRelay {
     this.connected = false;
     this._stopHeartbeat();
     this._emitStatus('disconnected', 'warn');
+  }
+
+  dispose() {
+    this._stopHeartbeat();
+    this._disconnectWs();
+    if (this._internalClient) {
+      try {
+        this._internalClient.close?.();
+      } catch {
+        // ignore
+      }
+      this._internalClient = null;
+    }
+    this.connected = false;
+    this.client = null;
   }
 }
