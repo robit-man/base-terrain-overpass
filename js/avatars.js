@@ -525,6 +525,13 @@ export class AvatarFactory {
       try {
         const gltf = await loader.loadAsync(MODEL_URL);
         const template = gltf.scene;
+
+        // Ensure template is never added to a scene (it's just a template for cloning)
+        if (template.parent) {
+          template.parent.remove(template);
+        }
+        template.visible = false; // Extra safety: make template invisible
+
         template.rotation.y = Math.PI;
         template.updateMatrixWorld(true);
         const animations = gltf.animations || [];
