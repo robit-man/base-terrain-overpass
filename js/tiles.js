@@ -573,11 +573,13 @@ export class TileManager {
 
   _getTerrainMaterial() {
     if (!this._terrainMat) {
-      this._terrainMat = new THREE.MeshStandardMaterial({
+      this._terrainMat = new THREE.MeshPhysicalMaterial({
         vertexColors: true,
         side: THREE.DoubleSide,  // CHANGED: DoubleSide to receive shadows properly
-        metalness: 0.05,
-        roughness: 0.75,
+        metalness: 0.005,
+        roughness: 0.85,
+        receiveShadow: true,
+
       });
     }
     return this._terrainMat;

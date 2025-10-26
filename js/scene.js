@@ -80,7 +80,7 @@ export class SceneManager {
     this.scene.add(this.sunLight.target);
 
     // OPTIMIZED: Enhanced ambient lighting for better shadow visibility
-    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.25);  // Increased from 0.18 to fill shadows
+    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.15);  // Increased from 0.18 to fill shadows
     this.scene.add(this.ambient);
     this._ambientDayColor = DAY_AMBIENT_COLOR.clone();
     this._ambientNightColor = NIGHT_AMBIENT_COLOR.clone();
