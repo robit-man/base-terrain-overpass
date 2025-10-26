@@ -495,6 +495,15 @@ def install_signal_handlers():
     if hasattr(signal, "SIGQUIT"): signal.signal(signal.SIGQUIT, _signal_handler)
 
 # ─── HTTPS Server (Python) ───────────────────────────────────────────────────
+class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
+    """Suppress SSL EOF errors when clients disconnect abruptly (mobile crash)"""
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ssl.SSLEOFError, BrokenPipeError, ConnectionResetError):
+            # Client disconnected mid-transfer (crash, navigation, etc) - ignore
+            pass
+
 class ReusableHTTPSServer(HTTPServer):
     allow_reuse_address = True
 
@@ -502,7 +511,7 @@ def bind_https_server(context, start_port=HTTPS_PORT, tries=PORT_TRIES):
     last_err = None
     for p in range(start_port, start_port + tries):
         try:
-            httpd = ReusableHTTPSServer(("0.0.0.0", p), SimpleHTTPRequestHandler)
+            httpd = ReusableHTTPSServer(("0.0.0.0", p), QuietHTTPRequestHandler)
             httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
             return httpd, p
         except OSError as e:

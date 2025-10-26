@@ -24,6 +24,7 @@ import { RadioManager } from './radio.js';
 import { SmartObjectManager } from './smartObjects.js';
 import { SpatialAudioManager } from './spatialAudio.js';
 import { SmartObjectModal } from './smartModal.js';
+import { ProgressiveLoader } from './progressiveLoader.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -261,6 +262,10 @@ this.radio = new RadioManager({
     this._nextHexUpdateMs = 0;
     this._nextBuildingsUpdateMs = 0;
 
+    // CRITICAL: Detect mobile FIRST - needed by multiple systems
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
+    this._isMobile = isMobile;
+
     // How often we let buildings.update() run (ms between calls).
     // Desktop: ~every frame (12ms cadence).
     // Mobile: ~10Hz (100ms cadence) to avoid 20ms+ build/resnap bursts killing weak GPUs.
@@ -286,6 +291,10 @@ this.radio = new RadioManager({
     this._timeFetchFailedUntil = 0;
     this._fetchRemoteTime();
 
+    // CRITICAL: Unified progressive loader - controls ALL systems
+    // Prevents crash by spreading work across frames with conservative budgets
+    this.progressiveLoader = new ProgressiveLoader({ isMobile });
+
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
     this._meshClientPromise = null;
@@ -293,6 +302,12 @@ this.radio = new RadioManager({
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
       camera: this.sceneMgr.camera,
+      progressiveLoader: this.progressiveLoader,
+    });
+
+    // Register terrain handler with progressive loader
+    this.progressiveLoader.setHandler('terrain', (tile, opts) => {
+      this.hexGridMgr?._finalizeTile?.(tile, opts);
     });
     this.sceneMgr.setTileRadiusSource(() => {
       const tm = this.hexGridMgr;
@@ -311,6 +326,28 @@ this.radio = new RadioManager({
       scene: this.sceneMgr.scene,
       camera: this.sceneMgr.camera,
       tileManager: this.hexGridMgr,
+      progressiveLoader: this.progressiveLoader,
+    });
+
+    // Register building handler with progressive loader
+    this.progressiveLoader.setHandler('buildings', (pseudoTile, data) => {
+      const { job, featureIndex } = data;
+      if (!job || featureIndex == null) return;
+
+      const state = this.buildings?._tileStates?.get(job.tileKey);
+      if (!state || job.cancelled) return;
+
+      const feature = job.features[featureIndex];
+      if (feature) {
+        this.buildings?._instantiateFeature?.(state, job, feature);
+        job.featureIndex = Math.max(job.featureIndex || 0, featureIndex + 1);
+
+        // Check if job is complete
+        if (job.featureIndex >= job.features.length) {
+          job.done = true;
+          this.buildings?._finishBuildJob?.(job, false);
+        }
+      }
     });
     this.buildings.setEnvironment(this.sceneMgr.scene.environment || null);
     this._wireframeMode = false;
@@ -4494,13 +4531,30 @@ this.radio = new RadioManager({
     this._updateCompassDial();
     end('movement');
 
+    // CRITICAL: Drain progressive loader FIRST - spreads heavy work across frames
+    // This prevents crash from terrain/buildings/trees/grass loading simultaneously
+    measure('progressive.drain', () => this.progressiveLoader?.drain());
+
     const hexNow = performance.now ? performance.now() : Date.now();
     const movedSq = this._lastHexUpdatePos.distanceToSquared(dolly.position);
     const movedEnough = movedSq > 0.25 * 0.25;
     const timeOk = hexNow >= this._nextHexUpdateMs;
     if (movedEnough || timeOk) {
       if (performance?.mark) performance.mark('hex-update-start');
-      measure('tiles.update', () => this.hexGridMgr.update(dolly.position));
+      measure('tiles.update', () => {
+        this.hexGridMgr.update(dolly.position);
+
+        // Update progressive loader center for priority calculation
+        if (this.progressiveLoader && this.hexGridMgr.origin) {
+          const tileRadius = this.hexGridMgr.tileRadius || 100;
+          const a = tileRadius;
+          const qf = (2 / 3 * dolly.position.x) / a;
+          const rf = ((-1 / 3 * dolly.position.x) + (Math.sqrt(3) / 3 * dolly.position.z)) / a;
+          const q0 = Math.round(qf);
+          const r0 = Math.round(rf);
+          this.progressiveLoader.setCenter(q0, r0);
+        }
+      });
       if (performance?.mark) {
         performance.mark('hex-update-end');
         performance.measure('hex-update', 'hex-update-start', 'hex-update-end');

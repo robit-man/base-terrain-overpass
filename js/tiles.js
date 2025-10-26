@@ -136,6 +136,7 @@ export class TileManager {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
     this.camera = opts.camera || null;  // camera for grass shader updates
+    this.progressiveLoader = opts.progressiveLoader || null;  // unified progressive loading queue
     this.tiles = new Map(); this.origin = null;
     this._perfLogNext = 0;
     this._perfUpdateNext = 0;
@@ -308,6 +309,8 @@ export class TileManager {
       address: this.relayAddress,
     };
     this._relayWasConnected = false;
+    this._relayWarmupActive = false;
+    this._relayWarmupTimer = null;
 
     this.terrainRelay = new TerrainRelay({
       defaultRelay: this.relayAddress,
@@ -321,6 +324,9 @@ export class TileManager {
     this._populateInflight = 0;
     this._populateBusy = false;        // legacy flag
     this._populateDrainPending = false;
+
+    // CRITICAL: Global queue size limits to prevent crash on NKN connect
+    this.MAX_POPULATE_QUEUE_SIZE = this._isMobile ? 30 : 100;
 
     // mobile vs desktop defaults for how hard we slam the relay / geometry
     if (this._isMobile) {
@@ -339,7 +345,10 @@ export class TileManager {
     // instead of finalizing every tile immediately (which can nuke FPS when NKN connects),
     // we queue that heavy work and drain it incrementally each frame.
     this._finalizeQueue = [];
-    this._finalizeBudgetMs = this._isMobile ? 3 : 6;
+    // CRITICAL: Budget needs to be large enough to actually process tiles
+    // Each tile takes ~10-20ms to finalize (BFS + smooth + normals)
+    // Too small = queue balloons and tiles stay unfinalized forever
+    this._finalizeBudgetMs = this._isMobile ? 8 : 16;
 
     // ---- network governor (token bucket) ----
     this._rateTokensQ = this.RATE_QPS;
@@ -353,8 +362,14 @@ export class TileManager {
     this._backfillTimer = null;
     this._lastBackfillTime = 0; // Track last backfill time for debouncing
     this._backfillIntervalMs = 3000; // Reduced from 1200ms to prevent excessive re-queuing
+    this._backfillMinDebounceMs = 1500; // Minimum time between backfill executions
+    this._periodicBackfillPaused = false; // Pause periodic during warmup
     this._periodicBackfill = setInterval(
-      () => this._backfillMissing({ onlyIfRelayReady: true }),
+      () => {
+        // CRITICAL: Pause periodic backfill during warmup to prevent cascade
+        if (this._periodicBackfillPaused) return;
+        this._backfillMissing({ onlyIfRelayReady: true });
+      },
       this._backfillIntervalMs
     );
 
@@ -559,7 +574,16 @@ export class TileManager {
 
     pos.needsUpdate = true;
     try {
-      tile.grid.geometry.computeVertexNormals();
+      // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
+      if (!this._isMobile) {
+        tile.grid.geometry.computeVertexNormals();
+      } else if (tile.grid?.geometry) {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
     } catch { }
     // keep CPU buffers in sync for relax/coloring:
     this._pullGeometryToBuffers(tile);
@@ -748,6 +772,27 @@ export class TileManager {
       world: { x: wx, y: wy, z: wz },
       type: tile?.type || null,
     };
+    for (const listener of this._heightListeners) {
+      try { listener(payload); } catch { /* ignore listener error */ }
+    }
+  }
+
+  _notifyHeightListenersBatch(tile, samples) {
+    // CRITICAL: Batch notification to prevent RAF flooding during NKN connect
+    // Fire listeners ONCE per tile instead of once per sample
+    if (!this._heightListeners || !this._heightListeners.size) return;
+    if (!samples || !samples.length) return;
+
+    // Use first sample as representative (listeners like tree resnap work per-tile anyway)
+    const firstSample = samples[0];
+    const payload = {
+      tile,
+      index: firstSample.idx,
+      world: { x: firstSample.wx, y: firstSample.wy, z: firstSample.wz },
+      type: tile?.type || null,
+      batchSize: samples.length, // signal this is a batch update
+    };
+
     for (const listener of this._heightListeners) {
       try { listener(payload); } catch { /* ignore listener error */ }
     }
@@ -960,7 +1005,10 @@ export class TileManager {
 
     pos.needsUpdate = true;
     this._markFarfieldAdapterDirty(tile);
-    try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    }
   }
 
   /* ---------------- Edge subdivision for seamless farfield transitions ---------------- */
@@ -1054,7 +1102,10 @@ export class TileManager {
     }
 
     pos.needsUpdate = true;
-    try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    }
   }
 
   _robustSampleHeightFromMesh(mesh, wx, wz) {
@@ -2838,11 +2889,55 @@ _ensureTileUv(tile, bounds) {
     const tile = sample?.tile;
     if (!tile || !tile._treeInstances || !tile._treeInstances.length) return;
     if (tile._treeSnapScheduled) return;
+
+    // CRITICAL: During warmup, defer tree resnap to prevent RAF flooding
+    // Hundreds of tiles populating simultaneously would queue hundreds of RAF callbacks
+    if (this._relayWarmupActive) {
+      // Mark for resnap but don't schedule RAF yet - will be handled after warmup
+      tile._treeResnapPending = true;
+      return;
+    }
+
     tile._treeSnapScheduled = true;
     requestAnimationFrame(() => {
       tile._treeSnapScheduled = false;
       this._resnapTreesForTile(tile);
     });
+  }
+
+  _processPendingTreeResnaps() {
+    // CRITICAL: Process deferred tree resnaps gradually after warmup
+    // Spread across multiple frames to avoid RAF spike
+    const tilesToResnap = [];
+    for (const tile of this.tiles.values()) {
+      if (tile._treeResnapPending) {
+        tilesToResnap.push(tile);
+        tile._treeResnapPending = false;
+      }
+    }
+
+    if (!tilesToResnap.length) return;
+
+    // Process 3-5 tiles per frame
+    const perFrame = this._isMobile ? 2 : 4;
+    let currentIndex = 0;
+
+    const processNextBatch = () => {
+      const end = Math.min(currentIndex + perFrame, tilesToResnap.length);
+      for (let i = currentIndex; i < end; i++) {
+        const tile = tilesToResnap[i];
+        if (tile && tile._treeInstances?.length) {
+          this._resnapTreesForTile(tile);
+        }
+      }
+      currentIndex = end;
+
+      if (currentIndex < tilesToResnap.length) {
+        requestAnimationFrame(processNextBatch);
+      }
+    };
+
+    requestAnimationFrame(processNextBatch);
   }
 
   _disposeTreeObject(obj) {
@@ -3292,6 +3387,9 @@ _ensureTileUv(tile, bounds) {
     const pos = tile.pos;
     if (!tile.col) this._ensureColorAttr(tile);
 
+    // CRITICAL: Track samples for batch listener notification to prevent RAF flooding
+    const listenerSamples = [];
+
     for (const { idx, height } of updates) {
       // Update position
       pos.setY(idx, height);
@@ -3315,16 +3413,19 @@ _ensureTileUv(tile, bounds) {
       tile.col.array[o + 1] = color.g;
       tile.col.array[o + 2] = color.b;
 
-      // Fire height listener per sample for audio/effects
-      const wx = tile.grid.group.position.x + tile.pos.getX(idx);
-      const wy = height;
-      const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
-      if (this.audio) {
-        this.audio.triggerScratch(wx, wy, wz, 0.9);
-      }
+      // Collect samples for batch notification (don't fire per-sample)
       if (this._heightListeners?.size) {
-        this._notifyHeightListeners(tile, idx, wx, wy, wz);
+        const wx = tile.grid.group.position.x + tile.pos.getX(idx);
+        const wy = height;
+        const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
+        listenerSamples.push({ tile, idx, wx, wy, wz });
       }
+    }
+
+    // CRITICAL: Fire height listeners ONCE per batch, not per sample
+    // This prevents thousands of RAF callbacks flooding the main thread during NKN connect
+    if (listenerSamples.length > 0) {
+      this._notifyHeightListenersBatch(tile, listenerSamples);
     }
 
     // CRITICAL: Mark needsUpdate ONCE for entire batch instead of per sample
@@ -3775,7 +3876,10 @@ _ensureTileUv(tile, bounds) {
     const cols = new Float32Array(verts.length * 3);
     for (let i = 0; i < verts.length; i++) { const o = 3 * i; cols[o] = cols[o + 1] = cols[o + 2] = this.LUM_MIN; }
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
-    geom.computeVertexNormals();
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      geom.computeVertexNormals();
+    }
 
     const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide });
     const mesh = new THREE.Mesh(geom, this._getTerrainMaterial());
@@ -3823,7 +3927,10 @@ _ensureTileUv(tile, bounds) {
     for (let i = 0; i < pos.count; i++) ready[i] = 1;
     tile.unreadyCount = 0;
     pos.needsUpdate = true;
-    try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    }
     this._applyAllColorsGlobal(tile);
   }
 
@@ -3856,7 +3963,10 @@ _ensureTileUv(tile, bounds) {
     const cols = new Float32Array(verts.length * 3);
     for (let i = 0; i < verts.length; i++) { const o = 3 * i; cols[o] = cols[o + 1] = cols[o + 2] = this.LUM_MIN; }
     geom.setAttribute('color', new THREE.BufferAttribute(cols, 3).setUsage(THREE.DynamicDrawUsage));
-    geom.computeVertexNormals();
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      geom.computeVertexNormals();
+    }
 
     const mat = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -4068,7 +4178,10 @@ _ensureTileUv(tile, bounds) {
       pos.setY(i, Number.isFinite(y) ? y : 0);
     }
     pos.needsUpdate = true;
-    grid.geometry.computeVertexNormals();
+    // CRITICAL: Skip expensive normal computation on mobile
+    if (!this._isMobile) {
+      grid.geometry.computeVertexNormals();
+    }
 
     this._ensureTileBuffers(t);
     this._pullGeometryToBuffers(t);
@@ -4087,10 +4200,9 @@ _ensureTileUv(tile, bounds) {
       v.wire?.material?.dispose?.();
     } catch { }
 
-    // Seal edges with corner-safe snapping and relax inner corner band
-    this._sealEdgesCornerSafe(t);
-    this._stitchInteractiveToVisualEdges(t);
-    this._fixStuckZeros(t, /*rimOnly=*/true);
+    // CRITICAL: Defer heavy edge sealing work to finalize queue
+    // Running synchronously here causes lag spike when promoting many tiles
+    this._queueTileFinalize(t, { skipBlend: false, phase: null, isPromotion: true });
 
     // Fetch phased full-res now
     this._queuePopulate(t, true);
@@ -4373,7 +4485,17 @@ _ensureTileUv(tile, bounds) {
     this._relaxCornerInnerBand(tile, cls, 2);
 
     pos.needsUpdate = true;
-    tile.grid.geometry.computeVertexNormals();
+
+    // CRITICAL: Defer expensive normal computation
+    if (!this._isMobile) {
+      try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    } else if (tile.grid?.geometry) {
+      if (!tile._deferredNormalsUpdate) {
+        tile._deferredNormalsUpdate = true;
+        if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+        this._deferredNormalsTiles.add(tile);
+      }
+    }
   }
 
   _relaxCornerInnerBand(tile, cls, iters = 1) {
@@ -4431,7 +4553,16 @@ _ensureTileUv(tile, bounds) {
     }
     if (touched) {
       pos.needsUpdate = true;
-      tile.grid.geometry.computeVertexNormals();
+      // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
+      if (!this._isMobile) {
+        tile.grid.geometry.computeVertexNormals();
+      } else if (tile.grid?.geometry) {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
     }
   }
 
@@ -4644,6 +4775,13 @@ _ensureTileUv(tile, bounds) {
   _queuePopulatePhase(tile, phase, priority = false) {
     if (!tile) return;
     if (this._isPhaseQueued(tile, phase)) return;
+
+    // CRITICAL: Enforce global queue size limit to prevent crash on NKN connect
+    if (this._populateQueue.length >= this.MAX_POPULATE_QUEUE_SIZE) {
+      // Queue is full - skip this tile, it will be picked up by next backfill
+      return;
+    }
+
     const key = this._phaseKey(phase);
     tile._queuedPhases?.add(key);
     const entry = { tile, phase, priority: !!priority };
@@ -4905,9 +5043,64 @@ _ensureTileUv(tile, bounds) {
       }
     }
 
+    // CRITICAL: Queue heavy finalize work instead of running synchronously
+    // When 100+ tiles finish simultaneously, running this synchronously crashes the browser
+    this._queueTileFinalize(tile, { skipBlend, phase });
+  }
+
+  _queueTileFinalize(tile, opts = {}) {
+    if (!tile) return;
+
+    // CRITICAL: Use unified progressive loader if available
+    // This spreads terrain finalize across frames with buildings/trees/grass
+    if (this.progressiveLoader) {
+      this.progressiveLoader.enqueue('terrain', tile, opts);
+      return;
+    }
+
+    // Fallback: use local queue if no progressive loader
+    const existingIndex = this._finalizeQueue.findIndex(entry => entry.tile === tile);
+    if (existingIndex !== -1) {
+      this._finalizeQueue.splice(existingIndex, 1);
+    }
+    this._finalizeQueue.push({ tile, opts });
+  }
+
+  _drainFinalizeQueue() {
+    if (!this._finalizeQueue.length) return;
+
+    const nowPerf = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
+      ? performance.now()
+      : Date.now();
+    const start = nowPerf();
+    const budget = this._finalizeBudgetMs;
+
+    while (this._finalizeQueue.length > 0) {
+      if (nowPerf() - start > budget) break;
+
+      const entry = this._finalizeQueue.shift();
+      if (!entry || !entry.tile) continue;
+
+      this._finalizeTile(entry.tile, entry.opts);
+    }
+  }
+
+  _finalizeTile(tile, opts = {}) {
+    const { skipBlend = false, phase, isPromotion = false } = opts;
+    const pos = tile.pos;
+
     if (skipBlend) {
       pos.needsUpdate = true;
-      tile.grid.geometry.computeVertexNormals();
+      // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
+      if (!this._isMobile) {
+        tile.grid.geometry.computeVertexNormals();
+      } else if (tile.grid?.geometry) {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
       this._applyAllColorsGlobal(tile);
     } else {
       // ---- blend / seal with pinned edges acting as anchors ----
@@ -4917,25 +5110,36 @@ _ensureTileUv(tile, bounds) {
       this._fixStuckZeros(tile, /*rimOnly=*/true);
 
       pos.needsUpdate = true;
-      tile.grid.geometry.computeVertexNormals();
+      // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
+      if (!this._isMobile) {
+        tile.grid.geometry.computeVertexNormals();
+      } else if (tile.grid?.geometry) {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
       this._applyAllColorsGlobal(tile);
     }
 
-
     // Finally, if any side borders a visual/farfield tile, feather to a straight edge line
-    // derived from the neighbor’s tip heights. This guarantees no cracks at the LOD boundary.
+    // derived from the neighbor's tip heights. This guarantees no cracks at the LOD boundary.
     if (tile.type === 'interactive') {
       this._stitchInteractiveToVisualEdges(tile, { bandRatio: 0.07, sideArc: Math.PI / 10 });
     }
 
     // ---- mark phase complete & chain next ----
-    if (tile.type === 'interactive') {
-      this._handleInteractivePhaseCompletion(tile, phase);
-    } else {
-      tile._phase.fullDone = true;
-      this._saveTileToCache(tile);
+    // Skip phase completion for promotions (they don't have a phase)
+    if (!isPromotion) {
+      if (tile.type === 'interactive' && phase != null) {
+        this._handleInteractivePhaseCompletion(tile, phase);
+      } else {
+        tile._phase.fullDone = true;
+        this._saveTileToCache(tile);
+      }
+      if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
     }
-    if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
   }
 
   _gatherFarfieldBatch(primary) {
@@ -5171,7 +5375,7 @@ return new Promise((resolve) => {
     const actualDelay = Math.max(minDelay, delayMs, minDelay - timeSinceLastBackfill);
 
     this._backfillTimer = setTimeout(() => {
-      this._lastBackfillTime = this._nowMs();
+      // Note: _backfillMissing will update _lastBackfillTime internally
       this._backfillMissing({ onlyIfRelayReady: false });
     }, actualDelay);
   }
@@ -5181,8 +5385,17 @@ return new Promise((resolve) => {
 
     if (onlyIfRelayReady && !(this._relayStatus?.text === 'connected' || this._relayStatus?.level === 'ok')) return;
 
+    // CRITICAL: Debounce to prevent multiple overlapping backfills during NKN connect
+    const now = this._nowMs();
+    const timeSinceLastBackfill = this._lastBackfillTime ? (now - this._lastBackfillTime) : Infinity;
+    if (timeSinceLastBackfill < this._backfillMinDebounceMs) {
+      // Too soon since last backfill - skip this call
+      return;
+    }
+    this._lastBackfillTime = now;
+
     const phase = this._fetchPhase;
-    const entries = [...this.tiles.values()]
+    let entries = [...this.tiles.values()]
       .filter(t => this._tileNeedsFetch(t) && !t.populating && !this._isPhaseQueued(t, PHASE_SEED) && !this._isPhaseQueued(t, PHASE_EDGE) && !this._isPhaseQueued(t, PHASE_FULL))
       .map(t => {
         let priority = 2;
@@ -5202,6 +5415,23 @@ return new Promise((resolve) => {
         return { t, priority, d: this._hexDist(t.q, t.r, 0, 0) };
       })
       .sort((a, b) => (a.priority - b.priority) || (a.d - b.d));
+
+    // CRITICAL: Limit how many tiles we queue at once to prevent crash
+    // During warmup: extremely conservative (3-5 tiles max)
+    // Mobile: 10 tiles max
+    // Desktop: 20 tiles max
+    let maxEntries;
+    if (this._relayWarmupActive) {
+      maxEntries = this._isMobile ? 3 : 5;
+    } else if (this._isMobile) {
+      maxEntries = 10;
+    } else {
+      maxEntries = 20;
+    }
+
+    if (entries.length > maxEntries) {
+      entries = entries.slice(0, maxEntries);
+    }
 
     for (const { t } of entries) {
       const p = (t.type === 'interactive') || (t.q === 0 && t.r === 0);
@@ -5281,6 +5511,9 @@ return new Promise((resolve) => {
     this._predictivePreloadTiles(playerPos, q0, r0);
 
     const maintenance = () => {
+      // CRITICAL: Drain finalize queue FIRST - this processes heavy geometry ops incrementally
+      this._drainFinalizeQueue?.();
+
       this._ensureRelaxList?.();
       this._drainRelaxQueue?.();
       if (this._globalDirty) {
@@ -5300,7 +5533,16 @@ return new Promise((resolve) => {
         for (const tile of this._deferredNormalsTiles) {
           if (processed >= maxPerFrame) break;
           if (tile.grid?.geometry && tile.type !== 'farfield') {
-            tile.grid.geometry.computeVertexNormals();
+            // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
+      if (!this._isMobile) {
+        tile.grid.geometry.computeVertexNormals();
+      } else if (tile.grid?.geometry) {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
           }
           tile._deferredNormalsUpdate = false;
           this._deferredNormalsTiles.delete(tile);
@@ -5356,13 +5598,18 @@ return new Promise((resolve) => {
     let budgetHit = false;
     let workDone = 0;
 
+    // CRITICAL: During warmup, severely limit tile creation to prevent cascade
+    const warmupTileLimit = this._relayWarmupActive ? (this._isMobile ? 3 : 6) : Infinity;
+
     // 1) interactive ring
     for (let dq = -this.INTERACTIVE_RING; dq <= this.INTERACTIVE_RING; dq++) {
       if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+      if (workDone >= warmupTileLimit) { budgetHit = true; break; }
       const rMin = Math.max(-this.INTERACTIVE_RING, -dq - this.INTERACTIVE_RING);
       const rMax = Math.min(this.INTERACTIVE_RING, -dq + this.INTERACTIVE_RING);
       for (let dr = rMin; dr <= rMax; dr++) {
         if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
+        if (workDone >= warmupTileLimit) { budgetHit = true; break; }
         const q = q0 + dq, r = r0 + dr;
         const id = `${q},${r}`;
         const cur = this.tiles.get(id);
@@ -5377,7 +5624,8 @@ return new Promise((resolve) => {
     }
 
     // 2) visual ring (respect budget)
-    if (!budgetHit) {
+    // CRITICAL: Skip visual ring creation entirely during warmup
+    if (!budgetHit && !this._relayWarmupActive) {
       let created = 0;
       outerVisual:
       for (let dq = -this.VISUAL_RING; dq <= this.VISUAL_RING; dq++) {
@@ -5406,7 +5654,8 @@ return new Promise((resolve) => {
     }
 
     // 3) farfield (strided + sparse) (respect budget)
-    if (!budgetHit) {
+    // CRITICAL: Skip farfield creation entirely during warmup
+    if (!budgetHit && !this._relayWarmupActive) {
       let farCreated = 0;
       farOuter:
       for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
@@ -5631,6 +5880,10 @@ return new Promise((resolve) => {
       // CRITICAL: Start with very low concurrency and gradually ramp up
       // to prevent massive lag spike / crash on NKN connect
       this._relayWarmupActive = true;
+
+      // CRITICAL: Pause periodic backfill during warmup to prevent cascade
+      this._periodicBackfillPaused = true;
+
       this.MAX_CONCURRENT_POPULATES = this._isMobile ? 1 : 3;
       this.RATE_QPS = 6;
       this.RATE_BPS = 128 * 1024;
@@ -5656,6 +5909,14 @@ return new Promise((resolve) => {
           this.RATE_QPS = targetQPS;
           this.RATE_BPS = targetBPS;
           this._relayWarmupActive = false;
+
+          // CRITICAL: Resume periodic backfill after warmup completes
+          this._periodicBackfillPaused = false;
+
+          // CRITICAL: Process any pending tree resnaps that were deferred during warmup
+          // Gradually process them to avoid sudden RAF spike
+          this._processPendingTreeResnaps();
+
           clearInterval(this._relayWarmupTimer);
           this._relayWarmupTimer = null;
         } else {

@@ -155,6 +155,7 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
+    progressiveLoader = null,
     radius = 300,
     tileSize,
     color = 0x333333,
@@ -182,6 +183,7 @@ export class BuildingManager {
     this.scene = scene;
     this.camera = camera;
     this.tileManager = tileManager;
+    this.progressiveLoader = progressiveLoader;
     this._radiusOverride = Number.isFinite(radius) ? radius : null;
     const visualRadius = this._computeVisualRingRadius();
     const initialRadius = Number.isFinite(this._radiusOverride)
@@ -501,10 +503,13 @@ export class BuildingManager {
     const stepChanged = (lastStep == null) || (Math.abs(qStep - lastStep) >= QUALITY_STEP);
 
     // ── Budgets scale with normalized quality (safe to adjust every call) ───────
-    this._frameBudgetMs = THREE.MathUtils.lerp(0.35, BUILD_FRAME_BUDGET_MS, qNorm);
-    this._idleBudgetMs = THREE.MathUtils.lerp(1.8, BUILD_IDLE_BUDGET_MS, qNorm);
-    this._mergeBudgetMs = THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, qNorm);
-    this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm);
+    // CRITICAL: Enforce minimum budget floor to prevent death spiral
+    // When FPS drops, budget shrinks, causing more blocking, causing more FPS drop
+    // Minimum ensures we can always make forward progress
+    this._frameBudgetMs = Math.max(2.0, THREE.MathUtils.lerp(0.35, BUILD_FRAME_BUDGET_MS, qNorm));
+    this._idleBudgetMs = Math.max(3.0, THREE.MathUtils.lerp(1.8, BUILD_IDLE_BUDGET_MS, qNorm));
+    this._mergeBudgetMs = Math.max(2.0, THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, qNorm));
+    this._resnapFrameBudgetMs = Math.max(1.0, THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm));
     this._resnapInterval = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, qNorm);
     this._resnapHotBudgetMs = THREE.MathUtils.lerp(0.18, 0.8, qNorm);
     this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, qNorm)));
@@ -706,7 +711,7 @@ export class BuildingManager {
       }
     }
 
-    this._drainBuildQueue(this._frameBudgetMs);
+    // REMOVED: _drainBuildQueue - buildings now build synchronously
     this._processMergeQueue();
     const dirtyBefore = this._resnapDirtyQueue.length;
     this._drainDirtyResnapQueue(this._resnapHotBudgetMs);
@@ -715,7 +720,11 @@ export class BuildingManager {
     this._resnapTimer += dt;
     if (this._resnapTimer > this._resnapInterval) {
       this._resnapTimer = 0;
-      this._queueResnapSweep();
+      // CRITICAL: Skip resnap sweeps on mobile for first 30s after load to prevent crash
+      const skipSweep = this._isMobile && this.tileManager?._relayWarmupActive;
+      if (!skipSweep) {
+        this._queueResnapSweep();
+      }
     }
     this._drainResnapQueue(this._resnapFrameBudgetMs);
 
@@ -1652,9 +1661,56 @@ export class BuildingManager {
     if (state) state.status = 'building';
     job.cancelled = false;
     job.done = false;
-    this._buildJobMap.set(job.tileKey, job);
-    this._buildQueue.push(job);
-    this._scheduleBuildTick();
+
+    // CRITICAL: On mobile, drastically limit building count to prevent crash
+    // Progressive loader will spread the work, but we need to limit total count
+    if (this._isMobile && job.features.length > 0) {
+      // Mobile: only keep first 5-8 buildings per tile (largest/most important)
+      // Sort by area descending, keep largest
+      const sorted = job.features.slice().sort((a, b) => {
+        const areaA = (a.properties?.area || 0);
+        const areaB = (b.properties?.area || 0);
+        return areaB - areaA;
+      });
+      const maxMobileBuildings = 6;
+      job.features = sorted.slice(0, maxMobileBuildings);
+
+      // If tile has no significant buildings after filtering, skip entirely
+      if (job.features.length === 0) {
+        job.done = true;
+        job.cancelled = true;
+        if (state) state.status = 'idle';
+        return;
+      }
+    }
+
+    // CRITICAL: Use progressive loader if available
+    // This spreads building work across frames with terrain/trees/grass
+    if (this.progressiveLoader) {
+      // Store job for progressive processing
+      this._buildJobMap.set(job.tileKey, job);
+
+      // Enqueue each feature as a separate work item
+      // This allows fine-grained control and interleaving with other systems
+      for (let i = 0; i < job.features.length; i++) {
+        const pseudoTile = { q: 0, r: 0, _key: job.tileKey, _featureIndex: i };
+        this.progressiveLoader.enqueue('buildings', pseudoTile, { job, featureIndex: i });
+      }
+      return;
+    }
+
+    // Fallback: process immediately if no progressive loader (desktop only)
+    while (job.featureIndex < job.features.length) {
+      if (job.cancelled || !this._tileStates.has(job.tileKey)) {
+        return;
+      }
+      const feature = job.features[job.featureIndex++];
+      this._instantiateFeature(state, job, feature);
+    }
+
+    // Mark complete
+    job.done = true;
+    this._finishBuildJob(job, false);
   }
 
   _scheduleBuildTick() {
@@ -1777,9 +1833,11 @@ export class BuildingManager {
         this.group.add(render);
         if (solid) this.group.add(solid);
         this._pickerRoot.add(pick);
-        render.updateMatrixWorld(true);
-        pick.updateMatrixWorld(true);
-        if (solid) solid.updateMatrixWorld(true);
+
+        // CRITICAL: REMOVE recursive matrix updates during instantiation - causes stack overflow on mobile
+        // render.updateMatrixWorld(true);  // REMOVED
+        // pick.updateMatrixWorld(true);     // REMOVED
+        // if (solid) solid.updateMatrixWorld(true);  // REMOVED
 
         // CRITICAL: Skip immediate resnap during instantiation to prevent cascading lag
         // The building will be resnapped by the dirty resnap queue in a controlled manner
@@ -1887,7 +1945,7 @@ export class BuildingManager {
     while (job.index < job.sources.length) {
       const b = job.sources[job.index++];
       if (!b.render) continue;
-      b.render.updateMatrixWorld(true);
+      // REMOVED: b.render.updateMatrixWorld(true);  // Causes recursive stack overflow
       updated++;
       const elapsed = this._nowMs() - start;
       if (elapsed > this._mergeBudgetMs) break;
@@ -2000,11 +2058,14 @@ export class BuildingManager {
     // Solid + picker: generated directly from same footprint
     const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
 
-    const pickMesh = new THREE.Mesh(solidGeo.clone(), this._pickMaterial);
+    // CRITICAL: Share geometry between meshes instead of cloning
+    // Cloning duplicates memory - 50 buildings × 2 clones = 100 geometry buffers!
+    // Sharing saves 66% memory per building
+    const pickMesh = new THREE.Mesh(solidGeo, this._pickMaterial);
     pickMesh.position.set(0, baseline, 0);
     pickMesh.visible = false;
 
-    const solidMesh = new THREE.Mesh(solidGeo.clone(), this._buildingMaterial);
+    const solidMesh = new THREE.Mesh(solidGeo, this._buildingMaterial);
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
     solidMesh.castShadow = true;
@@ -2490,18 +2551,18 @@ export class BuildingManager {
       building.render.geometry.dispose();
       building.render.geometry = newGeom;
       building.render.position.set(0, this.extraDepth, 0);
-      building.render.updateMatrixWorld(true);
+      // REMOVED: building.render.updateMatrixWorld(true);  // Deferred to renderer
     }
     if (building.solid) {
       building.solid.position.y = baseline;
-      building.solid.updateMatrixWorld(true);
+      // REMOVED: building.solid.updateMatrixWorld(true);  // Deferred to renderer
       const color = this._elevationColor(groundBase + info.height * 0.5);
       this._applyGeometryColor(building.solid.geometry, color);
       this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
     }
     if (building.pick) {
       building.pick.position.y = baseline;
-      building.pick.updateMatrixWorld(true);
+      // REMOVED: building.pick.updateMatrixWorld(true);  // Deferred to renderer
     }
     if (this._hoverInfo === info) {
       if (this._hoverEdges) {
