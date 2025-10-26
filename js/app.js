@@ -118,7 +118,7 @@ class PerfLogger {
           .join(' | ');
         if (peakList) peaks = ` | peaks ${peakList}`;
       }
-      console.log(`[perf] frame ${frameDuration.toFixed(2)}ms | top ${top}${peaks}`);
+      //console.log(`[perf] frame ${frameDuration.toFixed(2)}ms | top ${top}${peaks}`);
       this._nextReportAt = end + this.reportIntervalMs;
     }
     this._frameCounter += 1;
