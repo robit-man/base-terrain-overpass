@@ -229,6 +229,9 @@ export class TileManager {
     const _tmOnMobile = (typeof navigator !== 'undefined')
       && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
 
+    // Persist a flag so other subsystems (populate, rate limiting) can clamp for mobile too
+    this._isMobile = _tmOnMobile;
+
     this._treeEnabled = !_tmOnMobile; // off on mobile, on otherwise
 
     this._treeLib = (typeof window !== 'undefined') ? window['@dgreenheck/ez-tree'] || null : null;
@@ -256,6 +259,7 @@ export class TileManager {
 
     // Toggle for generation + per-frame updates (used elsewhere in the file)
     this._grassEnabled = !_tmOnMobile;
+
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -316,16 +320,27 @@ export class TileManager {
     this._populateInflight = 0;
     this._populateBusy = false;        // legacy flag
     this._populateDrainPending = false;
-    this.MAX_CONCURRENT_POPULATES = 18; // allow aggressive concurrent fetch/populate passes
+
+    // Mobile-safe defaults before relay health tuning:
+    // phones/tablets get a tiny concurrency and slower network rate up front
+    if (this._isMobile) {
+      this.MAX_CONCURRENT_POPULATES = 3;
+      this.RATE_QPS = 6;               // max terrainRelay calls per second
+      this.RATE_BPS = 160 * 1024;      // max payload bytes per second
+    } else {
+      this.MAX_CONCURRENT_POPULATES = 18; // allow aggressive concurrent fetch/populate passes
+      this.RATE_QPS = 36;               // max terrainRelay calls per second
+      this.RATE_BPS = 768 * 1024;       // max payload bytes per second
+    }
+
     this._encoder = new TextEncoder();
 
     // ---- network governor (token bucket) ----
-    this.RATE_QPS = 36;               // max terrainRelay calls per second
-    this.RATE_BPS = 768 * 1024;       // max payload bytes per second
     this._rateTokensQ = this.RATE_QPS;
     this._rateTokensB = this.RATE_BPS;
     this._rateLastRefillAt = this._nowMs();
     this._rateTicker = null;
+
 
     // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
@@ -4809,9 +4824,13 @@ _ensureTileUv(tile, bounds) {
 
     await Promise.allSettled(queries);
 
+    // Yield back to the event loop before heavy finalize work (normals / smoothing / color rebuild).
+    await new Promise(r => setTimeout(r, 0));
+
     const missing = Array.isArray(indices)
       ? indices.filter((idx) => tile.ready[idx] !== 1)
       : [];
+
     if (missing.length) {
       if (tile.type === 'farfield' && this._fallbackFarfieldTile(tile)) {
         if (tile && typeof tile === 'object') tile.populating = false;
@@ -5525,11 +5544,19 @@ return new Promise((resolve) => {
       this.RATE_QPS = 36; this.RATE_BPS = 768 * 1024;
     }
 
+    // Hard cap for mobile so we never go "full send" on phones/tablets
+    if (this._isMobile) {
+      this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 3);
+      this.RATE_QPS = Math.min(this.RATE_QPS, 6);
+      this.RATE_BPS = Math.min(this.RATE_BPS, 160 * 1024);
+    }
+
     if (isConnected && !this._relayWasConnected) {
       this._relayWasConnected = true;
       this._scheduleBackfill(0);
     }
   }
+
 
   /* ---------------- LOD / perf ---------------- */
 

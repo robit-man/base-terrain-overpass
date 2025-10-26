@@ -14,20 +14,46 @@ const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
 const CACHE_PREFIX = 'bm.tile';
 const CACHE_LIMIT = 1320;
 const CACHE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
-const MERGE_BUDGET_MS = 8; // milliseconds per idle slice
-const BUILD_FRAME_BUDGET_MS = 8; // ms budget to spend per frame on feature builds
-const BUILD_IDLE_BUDGET_MS = 8; // ms budget when we have idle time available
-const IS_MOBILE =
+
+// ---- Performance / QoS tuning (must come BEFORE BuildingManager) ----
+
+// Runtime mobile check we reuse everywhere in this module
+const _bmIsMobile =
   /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
   (globalThis.matchMedia?.('(pointer: coarse)').matches ?? false);
 
+// Core budgets for mesh/build work
+const MERGE_BUDGET_MS = 8;          // ms per idle slice for geometry merge
+const BUILD_FRAME_BUDGET_MS = 8;    // ms per frame for building mesh construction
+const BUILD_IDLE_BUDGET_MS = 8;     // ms per idle slice for building work
+
+// Target FPS assumption for QoS adaptation
 const TARGET_FPS = 60;
-const RESNAP_FRAME_BUDGET_MS = IS_MOBILE ? 6 : 12;  // was 150ms (!)
-const RESNAP_INTERVAL = IS_MOBILE ? 4 : 2;          // slower sweep cadence on mobile
-const RESNAP_HEIGHT_TOLERANCE = IS_MOBILE ? 0.25 : 0.15;
+
+// ── Grounding / resnap tuning ───────────────────────────────────────────
+// Hard cap on how long we let resnap run per animation frame.
+// (Prevents 150ms hitch spikes on phones when terrain + NKN spam hits.)
+const RESNAP_FRAME_BUDGET_MS = _bmIsMobile ? 6 : 12;
+
+// How often (in seconds) we sweep buildings against terrain
+const RESNAP_INTERVAL = _bmIsMobile ? 4 : 2;
+
+// Vertical delta (meters) before we actually move a building toward terrain.
+// Looser tolerance on mobile means fewer tiny micro-adjustments.
+const RESNAP_HEIGHT_TOLERANCE = _bmIsMobile ? 0.25 : 0.15;
+
+// How far (meters) a "locked" building can drift vertically before we unlock it
+// and correct the height again.
 const RESNAP_LOCK_TOLERANCE = 0.75;
-const RESNAP_LOCK_FRAMES = IS_MOBILE ? 10 : 6;
+
+// How many consecutive stable frames before we consider that building "locked"
+const RESNAP_LOCK_FRAMES = _bmIsMobile ? 10 : 6;
+
+// How strict we are during routine verify sweeps
 const RESNAP_VERIFY_TOLERANCE = 0.5;
+
+// Older code still refers to this name, so keep the alias alive.
+const RESNAP_VERIFY_LOCK_TOLERANCE = RESNAP_LOCK_TOLERANCE;
 
 /* ---------------- helpers ---------------- */
 // --- DuckDuckGo helpers (use HTML/Lite for embeddable results) ---
@@ -281,28 +307,27 @@ export class BuildingManager {
     this._lastFetchMs = -Infinity;
     this._pendingFetchTiles = new Set();
     this._pendingFetchDrainPending = false;
-    this._pendingFetchBudgetMs = 3.2;
-    this._maxFetchBatchPerDrain = 6;
+    this._pendingFetchBudgetMs = 20;
+    this._maxFetchBatchPerDrain = 3;
     this._fetchTokens = 1;
     this._fetchTokenCapacity = 1;
     this._fetchLastTokenRefill = this._nowMs();
-    this._resnapVerifyIntervalMs = 1500;
+    this._resnapVerifyIntervalMs = 2500;
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
     this._resnapVerifyBatch = 12;
     this._resnapVerifyTolerance = RESNAP_VERIFY_TOLERANCE;
     this._resnapVerifyLockTolerance = RESNAP_VERIFY_LOCK_TOLERANCE;
     this._pendingTerrainTiles = new Set();
+    if (_bmIsMobile) {
+      // Drain elevation/height requests in smaller bursts.
+      this._pendingFetchBudgetMs = Math.min(this._pendingFetchBudgetMs, 1.6);
+      this._maxFetchBatchPerDrain = Math.min(this._maxFetchBatchPerDrain, 3);
 
-    // Mobile: soften initial fetch/verify pressure
-    if (_bmIsMobile === true) {
-      this._pendingFetchBudgetMs = Math.min(this._pendingFetchBudgetMs, 1.6); // half the per-drain budget
-      this._maxFetchBatchPerDrain = Math.min(this._maxFetchBatchPerDrain, 3); // smaller bursts
+      // Slow down verify loops so we aren't hammering terrain locks every frame.
       this._resnapVerifyIntervalMs = Math.max(this._resnapVerifyIntervalMs, 3000);
       this._resnapVerifyBatch = Math.min(this._resnapVerifyBatch, 6);
     }
-
-
     this._wireframeMode = false;
 
     const envTexture = scene?.environment || null;
@@ -387,41 +412,21 @@ export class BuildingManager {
       this._heightListenerDispose = this.tileManager.addHeightListener((evt) => this._handleTerrainHeightChange(evt));
     }
 
-// QoS / performance state (auto-tuned via updateQoS)
-this._qosLevel = 'high';
-this._smoothedFps = TARGET_FPS;
-this._frameBudgetMs = BUILD_FRAME_BUDGET_MS;
-this._idleBudgetMs = BUILD_IDLE_BUDGET_MS;
-this._mergeBudgetMs = MERGE_BUDGET_MS;
-this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
-this._resnapInterval = RESNAP_INTERVAL;
-this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
-this._tileUpdateTimer = 0;
-this._resnapTimer = 0;
-this._qosTargetFps = TARGET_FPS;
+    // QoS / performance state (auto-tuned via updateQoS)
+    this._qosLevel = 'high';
+    this._smoothedFps = TARGET_FPS;
+    this._frameBudgetMs = BUILD_FRAME_BUDGET_MS;
+    this._idleBudgetMs = BUILD_IDLE_BUDGET_MS;
+    this._mergeBudgetMs = MERGE_BUDGET_MS;
+    this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
+    this._resnapInterval = RESNAP_INTERVAL;
+    this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
+    this._tileUpdateTimer = 0;
+    this._resnapTimer = 0;
+    this._qosTargetFps = TARGET_FPS;
 
-// Mobile-safe initial defaults so the first seconds don't spike before AQM adapts
-const _bmIsMobile = (typeof navigator !== 'undefined') &&
-  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent || '');
-
-if (_bmIsMobile) {
-  // Resnap slower & cheaper per frame on phones
-  this._resnapInterval = Math.max(this._resnapInterval, 0.9);   // was 0.2s
-  this._resnapFrameBudgetMs = Math.min(this._resnapFrameBudgetMs, 2.0); // was 10ms
-
-  // Update tiles less aggressively right away
-  this._tileUpdateInterval = Math.max(this._tileUpdateInterval, 0.5);
-
-  // Merge/build budgets will still be auto-tuned by applyPerfProfile soon,
-  // but these lower starting points avoid early death spirals.
-  this._frameBudgetMs = Math.min(this._frameBudgetMs, 2.5);
-  this._idleBudgetMs  = Math.min(this._idleBudgetMs, 2.5);
-  this._mergeBudgetMs = Math.min(this._mergeBudgetMs, 2.0);
-}
-
-// Init CSS3D (non-invasive overlay)
-this._ensureCSS3DLayer();
-
+    // Init CSS3D (non-invasive overlay)
+    this._ensureCSS3DLayer();
   }
 
   _nowMs() {
@@ -1791,8 +1796,8 @@ this._ensureCSS3DLayer();
         const water = this._buildWater(feature.flat, feature.tags, feature.id);
         if (!water) return;
         water.userData.tile = tileKey;
-        this.group.add(water);
-        state.extras.push(water);
+        //this.group.add(water);
+        //state.extras.push(water);
         break;
       }
       case 'area': {
