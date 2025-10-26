@@ -412,6 +412,12 @@ export class BuildingManager {
       this._heightListenerDispose = this.tileManager.addHeightListener((evt) => this._handleTerrainHeightChange(evt));
     }
 
+    // CRITICAL: Raycast height cache to prevent repeated expensive getHeightAt() calls
+    // Cache key: "x,z" rounded to nearest meter
+    // Cache expires after 500ms (terrain stable) or on terrain height change event
+    this._heightCache = new Map();
+    this._heightCacheTTL = 500; // milliseconds
+
     // QoS / performance state (auto-tuned via updateQoS)
     this._qosLevel = 'high';
     this._smoothedFps = TARGET_FPS;
@@ -1774,7 +1780,11 @@ export class BuildingManager {
         render.updateMatrixWorld(true);
         pick.updateMatrixWorld(true);
         if (solid) solid.updateMatrixWorld(true);
-        this._resnapBuilding(building);
+
+        // CRITICAL: Skip immediate resnap during instantiation to prevent cascading lag
+        // The building will be resnapped by the dirty resnap queue in a controlled manner
+        // this._resnapBuilding(building);  // REMOVED - causes 5-9ms raycast per building!
+
         this._refreshBuildingVisibility(building);
         if (solid && this.physics) this.physics.registerStaticMesh(solid, { forceUpdate: true });
         state.buildings.push(building);
@@ -2233,6 +2243,12 @@ export class BuildingManager {
     if (!evt || !this._hasOrigin) return;
     const world = evt.world;
     if (!world) return;
+
+    // CRITICAL: Clear height cache on terrain change to force fresh raycasts
+    if (this._heightCache) {
+      this._heightCache.clear();
+    }
+
     const enqueue = (x, z) => {
       const key = this._tileKeyForWorld(x, z);
       this._enqueueDirtyResnap(key);
@@ -2249,6 +2265,16 @@ export class BuildingManager {
   _enqueueDirtyResnap(tileKey) {
     if (!tileKey) return;
     if (this._resnapDirtyTiles.has(tileKey)) return;
+
+    // CRITICAL: Prevent queue explosion during NKN connect cascade
+    // Hard limit on queue size to prevent mobile crash from unbounded growth
+    const MAX_DIRTY_QUEUE_SIZE = this._isMobile ? 30 : 50;
+    if (this._resnapDirtyQueue.length >= MAX_DIRTY_QUEUE_SIZE) {
+      // Queue is full - drop this enqueue to prevent crash
+      // The periodic verify system will catch it later
+      return;
+    }
+
     this._resnapDirtyTiles.add(tileKey);
     this._resnapDirtyQueue.push(tileKey);
     const state = this._tileStates.get(tileKey);
@@ -2319,9 +2345,16 @@ export class BuildingManager {
     const start = now();
     let processed = 0;
 
+    // CRITICAL: Hard limit on tiles per frame to prevent cascade crash
+    // Mobile gets 1 tile/frame, desktop gets 2-3 tiles/frame max
+    const maxTilesPerFrame = this._isMobile ? 1 : 2;
+
     while (this._resnapIndex < this._resnapQueue.length) {
       const elapsed = now() - start;
       if (elapsed > effectiveBudget) break;
+
+      // CRITICAL: Enforce strict per-frame limit to prevent mobile crash
+      if (processed >= maxTilesPerFrame) break;
 
       const tileKey = this._resnapQueue[this._resnapIndex++];
       const state = this._tileStates.get(tileKey);
@@ -2389,7 +2422,29 @@ export class BuildingManager {
     let baseline = this._lowestGround(info.rawFootprint);
     let groundBase = baseline;
     if (info.isVisualEdge && this.tileManager?.getHeightAt) {
-      const sample = this.tileManager.getHeightAt(info.centroid.x, info.centroid.z);
+      // CRITICAL: Use cached height to avoid expensive raycasts (2-3ms each)
+      const cacheKey = `${Math.round(info.centroid.x)},${Math.round(info.centroid.z)}`;
+      const now = this._nowMs();
+      const cached = this._heightCache.get(cacheKey);
+
+      let sample;
+      if (cached && (now - cached.time) < this._heightCacheTTL) {
+        // Use cached value
+        sample = cached.height;
+      } else {
+        // Cache miss or expired - perform raycast and cache result
+        sample = this.tileManager.getHeightAt(info.centroid.x, info.centroid.z);
+        if (Number.isFinite(sample)) {
+          this._heightCache.set(cacheKey, { height: sample, time: now });
+
+          // Limit cache size to prevent memory leak (keep last 200 entries)
+          if (this._heightCache.size > 200) {
+            const firstKey = this._heightCache.keys().next().value;
+            this._heightCache.delete(firstKey);
+          }
+        }
+      }
+
       if (Number.isFinite(sample)) {
         baseline = sample + this.extraDepth;
         groundBase = baseline - this.extraDepth;

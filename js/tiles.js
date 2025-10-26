@@ -155,11 +155,12 @@ export class TileManager {
     this.FARFIELD_NEAR_PAD = 6;
 
     // ---- interactive (high-res) relaxation ----
-    this.RELAX_ITERS_PER_FRAME = 20;
+    // CRITICAL: Reduce relaxation iterations on mobile to prevent frame stalls
+    this.RELAX_ITERS_PER_FRAME = this._isMobile ? 10 : 20;  // Mobile: 10 iters, Desktop: 20 iters
     this.RELAX_ALPHA = 0.2;
-    this.NORMALS_EVERY = 10;
+    this.NORMALS_EVERY = this._isMobile ? 20 : 10;  // Mobile: compute normals less frequently
     // keep relax cheap so fetching dominates
-    this.RELAX_FRAME_BUDGET_MS = 1;
+    this.RELAX_FRAME_BUDGET_MS = this._isMobile ? 0.5 : 1;  // Mobile: tighter budget
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
     this.LUM_MIN = 0.05;
