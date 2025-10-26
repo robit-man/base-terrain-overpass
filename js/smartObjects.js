@@ -406,6 +406,79 @@ class SmartObjectManager {
   }
 
   /**
+   * Check if a smart object is within interaction range of the camera/player
+   * @param {Object} smartObject - Smart object to check
+   * @param {number} maxDistance - Maximum interaction distance (default: 10 units)
+   * @returns {boolean} - True if within range
+   */
+  isWithinInteractionRange(smartObject, maxDistance = 10) {
+    if (!smartObject || !smartObject.mesh || !this.camera) {
+      return false;
+    }
+
+    const objPosition = smartObject.mesh.position;
+    const cameraPosition = this.camera.position;
+    const distance = objPosition.distanceTo(cameraPosition);
+
+    return distance <= maxDistance;
+  }
+
+  /**
+   * Check if player can interact with a smart object
+   * Considers proximity and ownership/permissions
+   * @param {Object} smartObject - Smart object to check
+   * @returns {Object} - { canInteract: boolean, reason: string }
+   */
+  canInteract(smartObject) {
+    if (!smartObject) {
+      return { canInteract: false, reason: 'Object not found' };
+    }
+
+    // Check proximity
+    if (!this.isWithinInteractionRange(smartObject)) {
+      return { canInteract: false, reason: 'Too far away' };
+    }
+
+    // Check visibility/privacy
+    const visibility = smartObject.config.visibility || 'public';
+    const owner = smartObject.config.owner;
+    const selfPub = this.mesh?.selfPub || 'local';
+
+    if (visibility === 'private' && owner !== selfPub) {
+      return { canInteract: false, reason: 'Private object' };
+    }
+
+    // TODO: Check friends list for 'friends' visibility
+    if (visibility === 'friends' && owner !== selfPub) {
+      return { canInteract: false, reason: 'Friends only' };
+    }
+
+    return { canInteract: true, reason: 'OK' };
+  }
+
+  /**
+   * Update visual indicators for all objects based on proximity
+   * Called in animation loop
+   */
+  updateProximityIndicators() {
+    if (!this.camera) return;
+
+    for (const [uuid, obj] of this.objects.entries()) {
+      if (!obj.mesh || !obj.mesh.material) continue;
+
+      const inRange = this.isWithinInteractionRange(obj);
+      const material = obj.mesh.material;
+
+      // Update emissive intensity based on proximity
+      if (inRange) {
+        material.emissiveIntensity = 0.3; // Brighter when in range
+      } else {
+        material.emissiveIntensity = 0.1; // Dimmer when out of range
+      }
+    }
+  }
+
+  /**
    * Create 3D mesh for object
    */
   _createObjectMesh(config) {

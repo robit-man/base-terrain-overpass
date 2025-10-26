@@ -293,6 +293,14 @@ export class Mesh {
       return;
     }
 
+    // Smart Object Sync - forward to SmartObjectManager
+    if (msg.type === 'smart-object-sync') {
+      if (this.app?.sceneMgr?.smartObjects) {
+        this.app.sceneMgr.smartObjects.handlePeerSync(msg);
+      }
+      return;
+    }
+
     if (msg.type === 'pose' && msg.from && Array.isArray(msg.pose?.p) && Array.isArray(msg.pose?.q)) {
       if (this._isSelf(msg.from)) return;
       const pub = msg.from.toLowerCase();
@@ -556,6 +564,11 @@ export class Mesh {
     this._joinAnnouncements.add(key);
     const label = this._aliasFor(pub);
     pushToast?.(`${label} joined!`);
+
+    // Broadcast all public smart objects to the new peer
+    if (this.app?.sceneMgr?.smartObjects) {
+      this.app.sceneMgr.smartObjects.broadcastAllObjects();
+    }
   }
 
   /* ───────── Signaller config ───────── */
@@ -1744,6 +1757,18 @@ export class Mesh {
     const msg = JSON.stringify(obj);
     this._noteBytes(msg);
     for (const to of this._targets()) { this._sendRaw(to, msg).catch(() => { }); }
+  }
+
+  /**
+   * Public broadcast method for smart objects and other app-level messages
+   * @param {Object} message - Message object to broadcast to all peers
+   */
+  broadcast(message) {
+    if (!message || typeof message !== 'object') {
+      console.warn('[Mesh] broadcast() requires a valid message object');
+      return;
+    }
+    this._blast(message);
   }
 
   /**

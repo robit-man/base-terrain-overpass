@@ -535,8 +535,19 @@ export class SceneManager {
     const clickedObject = this.smartObjects.getObjectAtPosition(this.raycaster);
 
     if (clickedObject) {
-      // Open modal for this object
-      this.smartModal.show(clickedObject);
+      // Check if player can interact with this object (proximity + permissions)
+      const { canInteract, reason } = this.smartObjects.canInteract(clickedObject);
+
+      if (canInteract) {
+        // Open modal for this object
+        this.smartModal.show(clickedObject);
+      } else {
+        // Show feedback why interaction is blocked
+        if (typeof pushToast === 'function') {
+          pushToast(`Cannot interact: ${reason}`, { duration: 2000 });
+        }
+        console.log(`[SmartObjects] Interaction blocked: ${reason}`);
+      }
     }
   }
 
@@ -548,6 +559,9 @@ export class SceneManager {
 
     // Update placement preview position
     this.smartObjects.updatePlacementPreview();
+
+    // Update proximity indicators for all objects
+    this.smartObjects.updateProximityIndicators();
 
     // Update spatial audio listener position
     if (this.spatialAudio) {
