@@ -260,6 +260,12 @@ this.radio = new RadioManager({
     this._lastHexUpdatePos = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._nextHexUpdateMs = 0;
     this._nextBuildingsUpdateMs = 0;
+
+    // How often we let buildings.update() run (ms between calls).
+    // Desktop: ~every frame (12ms cadence).
+    // Mobile: ~10Hz (100ms cadence) to avoid 20ms+ build/resnap bursts killing weak GPUs.
+    this._buildingsUpdateIntervalMs = isMobile ? 100 : 12;
+
     this._hudGeoNextMs = 0;
     this._hudGeoLastPos = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._perfLogger = new PerfLogger({ slowFrameMs: 33, reportIntervalMs: 2000, labelLimit: 6 });
@@ -4511,8 +4517,11 @@ this.radio = new RadioManager({
         performance.mark('build-update-end');
         performance.measure('build-update', 'build-update-start', 'build-update-end');
       }
-      this._nextBuildingsUpdateMs = nowMs + 12;
+
+      // Use the per-device cadence we set in the constructor.
+      this._nextBuildingsUpdateMs = nowMs + this._buildingsUpdateIntervalMs;
     }
+
 
     measure('hover.update', () => this._updateBuildingHover(xrOn));
 

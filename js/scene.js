@@ -14,20 +14,44 @@ const DAY_SUN_COLOR = new THREE.Color(0xffffff);
 
 export class SceneManager {
   constructor() {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true  });
+
+    // Lightweight mobile detection
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i
+      .test(navigator.userAgent || '');
+
+    // On mobile we want:
+    // - no MSAA (antialias:false)
+    // - lower power hint
+    // - capped pixel ratio
+    // - shadows off
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !isMobile,
+      alpha: true,
+      powerPreference: isMobile ? 'low-power' : 'high-performance'
+    });
+
     this.renderer.setSize(innerWidth, innerHeight);
-    this.renderer.setPixelRatio(devicePixelRatio);
+
+    // Clamp DPR. High-DPI phones report DPR 3–4, which explodes fill rate.
+    const safePR = isMobile
+      ? Math.min(window.devicePixelRatio * 0.5, 1.0) // ~half res, never above 1.0
+      : window.devicePixelRatio;
+    this.renderer.setPixelRatio(safePR);
+
     this.renderer.outputEncoding = THREE.sRGBEncoding;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = DAY_EXPOSURE;
-    this.renderer.physicallyCorrectLights = false;
+    this.renderer.physicallyCorrectLights = true;
+
     this.renderer.xr.enabled = true;
     try {
       this.renderer.xr.setReferenceSpaceType?.('local-floor');
     } catch (_) {
       this.renderer.xr.setReferenceSpaceType?.('local');
     }
-    this.renderer.shadowMap.enabled = false;
+
+    // Shadows are super expensive on tiled mobile GPUs
+    this.renderer.shadowMap.enabled = !isMobile;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.renderer.domElement.classList.add('scene-canvas');
@@ -36,6 +60,7 @@ export class SceneManager {
 
     this.pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene = new THREE.Scene();
+
 
     // Camera stays at (0,0,0) in dolly local space; dolly handles eye height
     this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
