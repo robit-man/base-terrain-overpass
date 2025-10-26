@@ -229,7 +229,7 @@ export class TileManager {
     const _tmOnMobile = (typeof navigator !== 'undefined')
       && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
 
-    // Persist a flag so other subsystems (populate, rate limiting) can clamp for mobile too
+    // Persist this so other systems (populate/relay throttling, finalize budget) can branch on mobile
     this._isMobile = _tmOnMobile;
 
     this._treeEnabled = !_tmOnMobile; // off on mobile, on otherwise
@@ -321,8 +321,7 @@ export class TileManager {
     this._populateBusy = false;        // legacy flag
     this._populateDrainPending = false;
 
-    // Mobile-safe defaults before relay health tuning:
-    // phones/tablets get a tiny concurrency and slower network rate up front
+    // mobile vs desktop defaults for how hard we slam the relay / geometry
     if (this._isMobile) {
       this.MAX_CONCURRENT_POPULATES = 3;
       this.RATE_QPS = 6;               // max terrainRelay calls per second
@@ -335,11 +334,18 @@ export class TileManager {
 
     this._encoder = new TextEncoder();
 
+    // ---- finalize queue (post-populate smoothing / normals / color) ----
+    // instead of finalizing every tile immediately (which can nuke FPS when NKN connects),
+    // we queue that heavy work and drain it incrementally each frame.
+    this._finalizeQueue = [];
+    this._finalizeBudgetMs = this._isMobile ? 3 : 6;
+
     // ---- network governor (token bucket) ----
     this._rateTokensQ = this.RATE_QPS;
     this._rateTokensB = this.RATE_BPS;
     this._rateLastRefillAt = this._nowMs();
     this._rateTicker = null;
+
 
 
     // Backfill scheduler (faster cadence)
@@ -5544,7 +5550,7 @@ return new Promise((resolve) => {
       this.RATE_QPS = 36; this.RATE_BPS = 768 * 1024;
     }
 
-    // Hard cap for mobile so we never go "full send" on phones/tablets
+    // Hard cap for mobile so we never go "full send" on phones or tablets.
     if (this._isMobile) {
       this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 3);
       this.RATE_QPS = Math.min(this.RATE_QPS, 6);
@@ -5556,6 +5562,7 @@ return new Promise((resolve) => {
       this._scheduleBackfill(0);
     }
   }
+
 
 
   /* ---------------- LOD / perf ---------------- */
