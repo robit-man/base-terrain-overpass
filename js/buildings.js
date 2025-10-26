@@ -17,8 +17,8 @@ const CACHE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
 const MERGE_BUDGET_MS = 8; // milliseconds per idle slice
 const BUILD_FRAME_BUDGET_MS = 8; // ms budget to spend per frame on feature builds
 const BUILD_IDLE_BUDGET_MS = 8; // ms budget when we have idle time available
-const RESNAP_INTERVAL = 0.2; // seconds between ground rescan passes
-const RESNAP_FRAME_BUDGET_MS = 10; // ms per frame allotted to resnap tiles
+const RESNAP_INTERVAL = 2; // seconds between ground rescan passes
+const RESNAP_FRAME_BUDGET_MS = 150; // ms per frame allotted to resnap tiles
 const RESNAP_HEIGHT_TOLERANCE = 0.15; // meters delta before adjusting height
 const RESNAP_LOCK_TOLERANCE = 0.75; // meters delta allowed before unlocking a locked building
 const RESNAP_LOCK_FRAMES = 6; // consecutive stable frames before locking
@@ -126,7 +126,7 @@ export class BuildingManager {
     scene,
     camera,
     tileManager,
-    radius = 600,
+    radius = 300,
     tileSize,
     color = 0x333333,
     roadWidth = 3,
@@ -278,12 +278,12 @@ export class BuildingManager {
     this._lastFetchMs = -Infinity;
     this._pendingFetchTiles = new Set();
     this._pendingFetchDrainPending = false;
-    this._pendingFetchBudgetMs = 3.2;
-    this._maxFetchBatchPerDrain = 6;
+    this._pendingFetchBudgetMs = 20;
+    this._maxFetchBatchPerDrain = 3;
     this._fetchTokens = 1;
     this._fetchTokenCapacity = 1;
     this._fetchLastTokenRefill = this._nowMs();
-    this._resnapVerifyIntervalMs = 1500;
+    this._resnapVerifyIntervalMs = 2500;
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
     this._resnapVerifyBatch = 12;
@@ -1961,7 +1961,7 @@ export class BuildingManager {
     solidMesh.position.set(0, baseline, 0);
     solidMesh.renderOrder = 1;
     solidMesh.castShadow = true;
-    solidMesh.receiveShadow = true;
+    solidMesh.receiveShadow = false;
     solidMesh.visible = false;
 
     const centroid = averagePoint(rawFootprint);
@@ -2764,7 +2764,7 @@ export class BuildingManager {
     const mesh = new THREE.Mesh(geo, this._roadMaterial);
     this._applyGeometryColor(mesh.geometry, color);
     mesh.castShadow = !!this.roadShadows;
-    mesh.receiveShadow = true;
+    mesh.receiveShadow = false;
 
     mesh.userData.type = 'road';
     mesh.userData.osmId = id;
