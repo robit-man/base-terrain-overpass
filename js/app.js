@@ -285,6 +285,7 @@ this.radio = new RadioManager({
     const terrainClientProvider = () => this._getMeshClient();
     this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
       terrainRelayClient: terrainClientProvider,
+      camera: this.sceneMgr.camera,
     });
     this.sceneMgr.setTileRadiusSource(() => {
       const tm = this.hexGridMgr;
@@ -4983,6 +4984,12 @@ this.radio = new RadioManager({
   }
 
   _onCanvasPointerMove(e) {
+    // Update scene mouse position for hover detection
+    if (this.sceneMgr?.mouse && this._pointerNdc.has) {
+      this.sceneMgr.mouse.x = this._pointerNdc.x;
+      this.sceneMgr.mouse.y = this._pointerNdc.y;
+    }
+
     if (this._orbitDragActive && e.pointerId === this._orbitDragPointerId) {
       e.preventDefault();
       this._handleOrbitDrag(e);

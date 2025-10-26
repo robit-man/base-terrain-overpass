@@ -506,6 +506,13 @@ export class SceneManager {
   }
 
   /**
+   * Public method for handling canvas clicks from app.js
+   */
+  handleCanvasClick(event) {
+    this._handleClick(event);
+  }
+
+  /**
    * Handle click for Smart Object interaction
    */
   _handleClick(event) {
@@ -563,9 +570,34 @@ export class SceneManager {
     // Update proximity indicators for all objects
     this.smartObjects.updateProximityIndicators();
 
+    // Update hover detection for smart objects
+    this._updateSmartObjectHover();
+
     // Update spatial audio listener position
     if (this.spatialAudio) {
       this.spatialAudio.updateListenerPosition();
     }
+  }
+
+  /**
+   * Update hover state for smart objects based on mouse position
+   */
+  _updateSmartObjectHover() {
+    if (!this.smartObjects || this.smartObjects.placementMode) {
+      // Clear hover if in placement mode
+      if (this.smartObjects) {
+        this.smartObjects.updateHoverState(null);
+      }
+      return;
+    }
+
+    // Update raycaster from current mouse position
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    // Check for smart object intersection
+    const hoveredObject = this.smartObjects.getObjectAtPosition(this.raycaster);
+
+    // Update hover state
+    this.smartObjects.updateHoverState(hoveredObject);
   }
 }

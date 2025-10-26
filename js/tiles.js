@@ -126,9 +126,10 @@ function computeNormalMapFromImage(img, opts = {}) {
 }
 
 export class TileManager {
-  constructor(scene, spacing = 20, tileRadius = 100, audio = null) {
+  constructor(scene, spacing = 20, tileRadius = 100, audio = null, opts = {}) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
     this.audio = audio;   // spatial audio engine
+    this.camera = opts.camera || null;  // camera for grass shader updates
     this.tiles = new Map(); this.origin = null;
     this._perfLogNext = 0;
     this._perfUpdateNext = 0;
@@ -231,7 +232,11 @@ export class TileManager {
     this._primeWaybackVersions();
 
     // ---- Grass system ----
-    this.grassManager = new GrassManager({ scene: this.scene, tileManager: this });
+    this.grassManager = new GrassManager({
+      scene: this.scene,
+      tileManager: this,
+      camera: this.camera
+    });
     this._grassEnabled = true;
 
     if (!scene.userData._tmLightsAdded) {

@@ -23,6 +23,7 @@ class SmartObjectManager {
     // Object storage
     this.objects = new Map(); // uuid -> SmartObject
     this.selectedObject = null;
+    this.hoveredObject = null; // Currently hovered object
 
     // Placement mode
     this.placementMode = false;
@@ -254,6 +255,12 @@ class SmartObjectManager {
     const mesh = this._createObjectMesh(config);
     if (!mesh) return null;
 
+    // Create wireframe highlight (hidden by default)
+    const wireframeHelper = new THREE.BoxHelper(mesh, 0x00ff00);
+    wireframeHelper.visible = false;
+    wireframeHelper.name = 'wireframeHelper';
+    this.scene.add(wireframeHelper);
+
     // Create text label if needed
     let label = null;
     if (config.mesh?.label) {
@@ -267,6 +274,7 @@ class SmartObjectManager {
       config,
       mesh,
       label,
+      wireframeHelper,
       audioSource: null, // Will be created by SpatialAudioManager
       textContent: config.mesh?.label?.text || '',
       lastUpdate: Date.now()
@@ -335,8 +343,19 @@ class SmartObjectManager {
     const obj = this.objects.get(uuid);
     if (!obj) return false;
 
+    // Clear hover if this is the hovered object
+    if (this.hoveredObject === obj) {
+      this.updateHoverState(null);
+    }
+
     // Remove from scene
     this.scene.remove(obj.mesh);
+
+    // Remove wireframe helper
+    if (obj.wireframeHelper) {
+      this.scene.remove(obj.wireframeHelper);
+      obj.wireframeHelper.dispose();
+    }
 
     // Cleanup audio
     if (this.spatialAudio) {
@@ -474,6 +493,31 @@ class SmartObjectManager {
         material.emissiveIntensity = 0.3; // Brighter when in range
       } else {
         material.emissiveIntensity = 0.1; // Dimmer when out of range
+      }
+    }
+  }
+
+  /**
+   * Update hover state for an object (called from raycasting)
+   * @param {Object|null} hoveredObject - The object being hovered, or null to clear hover
+   */
+  updateHoverState(hoveredObject) {
+    // Clear previous hover
+    if (this.hoveredObject && this.hoveredObject !== hoveredObject) {
+      if (this.hoveredObject.wireframeHelper) {
+        this.hoveredObject.wireframeHelper.visible = false;
+      }
+    }
+
+    // Set new hover
+    this.hoveredObject = hoveredObject;
+
+    if (this.hoveredObject) {
+      // Show wireframe highlight
+      if (this.hoveredObject.wireframeHelper) {
+        this.hoveredObject.wireframeHelper.visible = true;
+        // Update wireframe position to match mesh
+        this.hoveredObject.wireframeHelper.update();
       }
     }
   }
