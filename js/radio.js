@@ -1,42 +1,188 @@
-import * as THREE from 'three';
+// radio.js — Radio Garden (unofficial) integration (WEB-ONLY)
+// Fetches places near a given lat/lon (within a configurable radius in miles),
+// loads their channels from Radio Garden, and populates a front-end list ordered
+// nearest → farthest. No local proxy required — this file fetches over the open web.
+//
+// Endpoints used (from the spec you shared):
+//   GET /ara/content/places
+//   GET /ara/content/page/{placeId}/channels
+//   GET /ara/content/listen/{channelId}/channel.mp3   (302 → real stream)
+//
+// IMPORTANT
+// - Browsers sometimes block RG JSON with CORS. To avoid requiring your own proxy,
+//   this module will try DIRECT fetch first, then automatically fall back to a
+//   public, read-only CORS relay (r.jina.ai). No local hosting needed.
+// - The <audio> element points at Radio Garden directly and follows the 302.
 
-const RADIO_API_HOSTS = [
-  'https://de1.api.radio-browser.info',
-  'https://nl1.api.radio-browser.info',
-  'https://us1.api.radio-browser.info'
-];
+// =============================
+// Config
+// =============================
+const RG_DIRECT_BASE = 'https://radio.garden/api';
+const RG_CORS_RELAY_BASE = 'https://r.jina.ai/http://radio.garden/api';
+const JSON_HEADERS = { Accept: 'application/json' };
+const MI_TO_KM = 1.609344; // exact
 
-const DEFAULT_STATIONS = [
-  { name: 'Lofi Beats', url: 'https://stream.nightride.fm/lofi.ogg', country: 'Global' },
-  { name: 'SomaFM Groove Salad', url: 'https://ice2.somafm.com/groovesalad-128-mp3', country: 'US' },
-  { name: 'FIP', url: 'https://icecast.radiofrance.fr/fip-midfi.mp3', country: 'FR' },
-  { name: 'Cafe del Mar', url: 'https://streams.cafedelmarradio.com:8443/cafedelmarradio', country: 'ES' },
-  { name: 'ABC Lounge', url: 'https://ais-sa2.cdnstream1.com/1987_128.mp3', country: 'FR' }
-];
+// Auto-tune limits when moving
+const AUTOTUNE_DEFAULTS = {
+  enabled: true,
+  minMoveKm: 5,                 // only rebuild if moved ≥ 5 km
+  minSecondsBetweenRebuild: 10,  // and at most once every N seconds
+  selectStrategy: 'first',       // or 'random'
+  maxPlacesToScan: 10            // cap nearby places to avoid hammering the API
+};
 
-const clamp = THREE.MathUtils.clamp;
+// =============================
+// Utils
+// =============================
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const toRad = (deg) => deg * Math.PI / 180;
+function haversineKm(aLat, aLon, bLat, bLon) {
+  const R = 6371; // km
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const s1 = Math.sin(dLat / 2);
+  const s2 = Math.sin(dLon / 2);
+  const c = s1 * s1 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * s2 * s2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(c)));
+}
+function fmtMiles(km) { return (km / MI_TO_KM).toFixed(1) + ' mi'; }
+function parseChannelIdFromHref(href) {
+  const m = /\/listen\/[^/]+\/([A-Za-z0-9_-]+)$/.exec(href || '');
+  return m ? m[1] : null;
+}
 
+// Robust JSON fetch that tries DIRECT first, then a public CORS relay.
+async function getJSONWithFallback(path, { signal } = {}) {
+  const bases = [RG_DIRECT_BASE, RG_CORS_RELAY_BASE];
+  let lastErr;
+  for (const base of bases) {
+    const url = `${base}${path}`;
+    try {
+      const res = await fetch(url, { signal, headers: JSON_HEADERS, credentials: 'omit' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // r.jina.ai may return text/plain; still parse as JSON
+      const text = await res.text();
+      try { return JSON.parse(text); } catch {
+        // If it's already JSON, res.json() works; if not, try parse text
+        return await (await fetch(url, { signal, headers: JSON_HEADERS })).json();
+      }
+    } catch (e) {
+      lastErr = e;
+      // try next base
+    }
+  }
+  throw lastErr || new Error('Failed to fetch Radio Garden JSON');
+}
+
+// =============================
+// RadioManager
+// =============================
 export class RadioManager {
-  constructor({ ui, getLocation }) {
-    this.ui = ui;
-    this.getLocation = getLocation;
+  /**
+   * @param {Object} opts
+   * @param {{ hudRadioToggle?:HTMLElement, hudRadioDial?:HTMLInputElement, hudRadioList?:HTMLElement, hudRadioPanel?:HTMLElement, hudRadioStatus?:HTMLElement }} opts.ui
+   * @param {() => {lat:number, lon:number}} opts.getLocation  Function returning current lat/lon
+   * @param {Object} [opts.autotune]
+   * @param {number} [opts.radiusMiles=30]                     Search radius in miles
+   */
+  constructor({ ui, getLocation, autotune = {}, radiusMiles = 30 } = {}) {
+    this.ui = ui || {};
+    this.getLocation = getLocation || (() => ({ lat: 0, lon: 0 }));
+
+    // state
     this.active = false;
     this.stations = [];
     this.currentIndex = -1;
     this._dialValue = 0;
-    this._fetchAbort = null;
 
-    this._audioCtx = null;
-    this._noiseSource = null;
+    // audio
+    this._audio = null;
+    this._audioFadeRAF = null;
+    this._ac = null;
+    this._noise = null;
     this._noiseGain = null;
-    this._noiseStopTimer = null;
-    this._streamAudio = null;
-    this._streamFadeTimer = null;
+
+    // data caches
+    this._places = null;                 // Array<{id,title,country,lat,lon}>
+    this._placesBuf = null;              // Float32Array [lat, lon, lat, lon, ...]
+    this._channelsByPlace = new Map();   // placeId -> Array<{title, channelId}>
+
+    // movement/autotune
+    this._autotune = { ...AUTOTUNE_DEFAULTS, ...(autotune || {}) };
+    this._lastCenter = null;             // { lat, lon }
+    this._lastRebuildAt = 0;             // seconds
+    this._pipelineAbort = null;          // AbortController
+
+    // params
+    this._radiusMiles = radiusMiles;
+    this._radiusKm = radiusMiles * MI_TO_KM;
+
+    // listen endpoint is always direct RG (audio can cross-origin and follow 302)
+    this._listenBase = RG_DIRECT_BASE;
 
     this._bindUI();
     this._updatePanelVisibility();
   }
 
+  // -------- public API --------
+  setRadiusMiles(miles) {
+    if (!Number.isFinite(miles) || miles <= 0) return;
+    this._radiusMiles = miles;
+    this._radiusKm = miles * MI_TO_KM;
+  }
+
+  toggle(force) {
+    const next = force == null ? !this.active : !!force;
+    if (next === this.active) return;
+    return next ? this.enable() : this.disable();
+  }
+
+  async enable() {
+    if (this.active) return;
+    this.active = true;
+    this._updateButton();
+    this._updatePanelVisibility();
+    await this._ensureAudio();
+
+    try {
+      if (!this._places) await this._loadAllPlaces();
+      await this.refreshRegion(true);
+    } catch (err) {
+      console.warn('[radio] enable failed', err);
+      this._clearStationsUI('Radio unavailable');
+    }
+  }
+
+  disable() {
+    if (!this.active) return;
+    this.active = false;
+    this._stopStream(true);
+    this._updateButton();
+    this._updatePanelVisibility();
+  }
+
+  async refreshRegion(immediate = false) {
+    if (!this.active) return;
+    const { lat, lon } = this.getLocation();
+    await this._pipelineFetchNearby(lat, lon, immediate);
+  }
+
+  async updateFromLatLon(lat, lon) {
+    if (!this.active || !this._autotune.enabled) return;
+    try {
+      if (!this._places) await this._loadAllPlaces();
+      const nowSec = performance.now() / 1000;
+      const movedKm = this._lastCenter ? haversineKm(lat, lon, this._lastCenter.lat, this._lastCenter.lon) : Infinity;
+      const cooled = (nowSec - this._lastRebuildAt) >= this._autotune.minSecondsBetweenRebuild;
+      if (movedKm >= this._autotune.minMoveKm && cooled) {
+        await this._pipelineFetchNearby(lat, lon, false);
+      }
+    } catch (e) {
+      console.warn('[radio] updateFromLatLon error', e);
+    }
+  }
+
+  // -------- UI --------
   _bindUI() {
     this.ui.hudRadioToggle?.addEventListener('click', () => this.toggle());
     this.ui.hudRadioDial?.addEventListener('input', (e) => {
@@ -48,53 +194,10 @@ export class RadioManager {
       const item = e.target.closest('[data-index]');
       if (!item) return;
       const idx = Number(item.dataset.index);
-      if (!Number.isFinite(idx)) return;
-      const snapped = this._valueForIndex(idx);
-      this._setDial(snapped);
-      this._handleDialValue(snapped, { forceStation: idx });
+      const snap = this._valueForIndex(idx);
+      this._setDial(snap);
+      this._handleDialValue(snap, { forceStation: idx, immediate: true });
     });
-  }
-
-  toggle(force) {
-    const next = force == null ? !this.active : !!force;
-    if (next === this.active) return;
-    if (next) this.enable();
-    else this.disable();
-  }
-
-  async enable() {
-    if (this.active) return;
-    this.active = true;
-    this._updateButton();
-    this._updatePanelVisibility();
-    await this._ensureAudio();
-    this._setStatus('Tuning regional stations…');
-    this._startStaticFade(0.4, 0.6);
-    if (!this.stations.length) {
-      await this._loadStations();
-    }
-    if (!this.stations.length) {
-      this._setStatus('No stations available');
-    } else {
-      this._populateList();
-      this._setDial(this._valueForIndex(0));
-      this._handleDialValue(this._dialValue, { forceStation: 0, immediate: true });
-    }
-  }
-
-  disable() {
-    if (!this.active) return;
-    this.active = false;
-    this._stopStream(true);
-    this._startStaticFade(0, 0.35);
-    this._updateButton();
-    this._updatePanelVisibility();
-  }
-
-  async refreshRegion() {
-    if (!this.active) return;
-    await this._loadStations();
-    this._populateList();
   }
 
   _updatePanelVisibility() {
@@ -112,106 +215,24 @@ export class RadioManager {
     btn.textContent = this.active ? 'Radio (On)' : 'Radio';
   }
 
-  async _ensureAudio() {
-    if (this._noiseStopTimer) {
-      clearTimeout(this._noiseStopTimer);
-      this._noiseStopTimer = null;
-    }
-    if (!this._audioCtx) {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      this._audioCtx = new AudioContext();
-    }
-    if (this._audioCtx.state === 'suspended') {
-      try { await this._audioCtx.resume(); } catch { }
-    }
-    if (!this._noiseSource) {
-      const buffer = this._audioCtx.createBuffer(1, this._audioCtx.sampleRate * 2, this._audioCtx.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-      this._noiseGain = this._audioCtx.createGain();
-      this._noiseGain.gain.value = 0;
-      this._noiseSource = this._audioCtx.createBufferSource();
-      this._noiseSource.buffer = buffer;
-      this._noiseSource.loop = true;
-      this._noiseSource.connect(this._noiseGain).connect(this._audioCtx.destination);
-      this._noiseSource.start();
-    }
-    if (!this._streamAudio) {
-      this._streamAudio = new Audio();
-      this._streamAudio.crossOrigin = 'anonymous';
-      this._streamAudio.preload = 'none';
-      this._streamAudio.volume = 0;
-      this._streamAudio.addEventListener('error', () => {
-        this._setStatus('Stream error');
-        this._startStaticFade(0.5, 0.4);
-      });
-    }
-  }
-
-  async _loadStations() {
-    this._abortFetch();
-    const controller = new AbortController();
-    this._fetchAbort = controller;
-    try {
-      const { lat, lon } = this.getLocation() || {};
-      const targetLat = Number.isFinite(lat) ? lat : 40.7;
-      const targetLon = Number.isFinite(lon) ? lon : -74;
-      let result = null;
-      for (const host of RADIO_API_HOSTS) {
-        const url = `${host}/json/stations/bygeo?lat=${encodeURIComponent(targetLat)}&lon=${encodeURIComponent(targetLon)}&limit=30&hidebroken=true`;
-        try {
-          const resp = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'noclip-radio/1.0' } });
-          if (!resp.ok) continue;
-          const data = await resp.json();
-          if (Array.isArray(data) && data.length) {
-            result = data;
-            break;
-          }
-        } catch (err) {
-          if (controller.signal.aborted) return;
-        }
-      }
-      if (!result) {
-        this.stations = DEFAULT_STATIONS;
-      } else {
-        this.stations = result
-          .filter((station) => station && station.urlResolved)
-          .map((station) => ({
-            id: station.stationuuid || station.id || station.urlResolved,
-            name: station.name || station.urlResolved,
-            country: station.country || station.countrycode || 'Unknown',
-            url: station.urlResolved || station.url
-          }));
-        if (!this.stations.length) this.stations = DEFAULT_STATIONS;
-      }
-      this.currentIndex = -1;
-      this._setStatus(`Loaded ${this.stations.length} stations`);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      this._setStatus('Failed to load stations');
-      this.stations = DEFAULT_STATIONS;
-    } finally {
-      this._fetchAbort = null;
-    }
-  }
-
-  _abortFetch() {
-    if (this._fetchAbort) {
-      this._fetchAbort.abort();
-      this._fetchAbort = null;
-    }
-  }
-
   _populateList() {
     const list = this.ui.hudRadioList;
     if (!list) return;
     list.innerHTML = '';
-    this.stations.forEach((station, idx) => {
+    this.stations.forEach((s, idx) => {
       const li = document.createElement('li');
       li.className = `hud-radio-item${idx === this.currentIndex ? ' active' : ''}`;
       li.dataset.index = idx;
-      li.innerHTML = `<strong>${station.name}</strong><br><span>${station.country || ''}</span>`;
+      const dist = s.distanceKm != null ? ` · ${fmtMiles(s.distanceKm)}` : '';
+      const sub = s.placeTitle ? `${s.placeTitle}, ${s.country}` : (s.country || '');
+      li.innerHTML = `<strong>${s.name}</strong><br><span>${sub}${dist}</span>`;
       list.appendChild(li);
+    });
+  }
+
+  _highlightActive() {
+    this.ui.hudRadioList?.querySelectorAll('.hud-radio-item').forEach((el) => {
+      el.classList.toggle('active', Number(el.dataset.index) === this.currentIndex);
     });
   }
 
@@ -221,128 +242,21 @@ export class RadioManager {
     const approxIndex = slot > 0 ? value / slot : 0;
     let targetIndex = forceStation != null ? forceStation : Math.round(approxIndex);
     targetIndex = clamp(targetIndex, 0, this.stations.length - 1);
-    const distance = Math.abs(approxIndex - targetIndex);
-    const withinStation = distance <= 0.3;
-    if (withinStation) {
-      this._tuneToStation(targetIndex, immediate);
-    } else {
-      this._setStatus('Static');
-      this._startStaticFade(0.5, 0.3);
-      this._stopStream();
-    }
+    this._tuneToStation(targetIndex, immediate);
   }
 
   _tuneToStation(index, immediate = false) {
     if (index < 0 || index >= this.stations.length) return;
     if (this.currentIndex === index && !immediate) return;
     this.currentIndex = index;
-    const station = this.stations[index];
-    this._setStatus(`Tuning ${station.name}`);
+    const s = this.stations[index];
+    this._setStatus(`Tuning ${s.name}`);
     this._highlightActive();
-    this._startStaticFade(0.35, immediate ? 0.05 : 0.25);
-    this._playStream(station.url, () => {
-      this._setStatus(`${station.name} · ${station.country || ''}`);
-      this._startStaticFade(0.05, 0.6);
-    });
+    this._playStream(s.url, () => this._setStatus(`${s.name} · ${s.placeTitle || s.country || ''}`));
   }
 
-  _highlightActive() {
-    if (!this.ui.hudRadioList) return;
-    this.ui.hudRadioList.querySelectorAll('.hud-radio-item').forEach((item) => {
-      const idx = Number(item.dataset.index);
-      item.classList.toggle('active', idx === this.currentIndex);
-    });
-  }
-
-  _playStream(url, onStart) {
-    if (!url) {
-      this._setStatus('Invalid stream');
-      return;
-    }
-    this._ensureAudio();
-    if (!this._streamAudio) return;
-    if (this._streamFadeTimer) {
-      cancelAnimationFrame(this._streamFadeTimer);
-      this._streamFadeTimer = null;
-    }
-    const audio = this._streamAudio;
-    audio.src = url;
-    audio.volume = 0;
-    audio.play().then(() => {
-      this._fadeAudioVolume(1, 800);
-      if (typeof onStart === 'function') onStart();
-    }).catch(() => {
-      this._setStatus('Unable to play stream');
-      this._startStaticFade(0.5, 0.4);
-    });
-  }
-
-  _stopStream(immediate = false) {
-    if (!this._streamAudio) return;
-    if (immediate) {
-      try { this._streamAudio.pause(); } catch { }
-      this._streamAudio.currentTime = 0;
-      this._streamAudio.src = '';
-      this._streamAudio.volume = 0;
-      return;
-    }
-    this._fadeAudioVolume(0, 500, () => {
-      try { this._streamAudio.pause(); } catch { }
-      this._streamAudio.src = '';
-    });
-  }
-
-  _fadeAudioVolume(target, duration, cb) {
-    if (!this._streamAudio) return;
-    const start = this._streamAudio.volume;
-    const delta = target - start;
-    const startTime = performance.now();
-    const step = () => {
-      const now = performance.now();
-      const t = clamp((now - startTime) / Math.max(duration, 1), 0, 1);
-      this._streamAudio.volume = clamp(start + delta * t, 0, 1);
-      if (t < 1) {
-        this._streamFadeTimer = requestAnimationFrame(step);
-      } else {
-        this._streamFadeTimer = null;
-        if (cb) cb();
-      }
-    };
-    this._streamFadeTimer = requestAnimationFrame(step);
-  }
-
-  _startStaticFade(target, duration, stopAfter = false) {
-    if (!this._noiseGain || !this._audioCtx) return;
-    const now = this._audioCtx.currentTime;
-    this._noiseGain.gain.cancelScheduledValues(now);
-    this._noiseGain.gain.setTargetAtTime(target, now, Math.max(0.01, duration));
-    if (this._noiseStopTimer) {
-      clearTimeout(this._noiseStopTimer);
-      this._noiseStopTimer = null;
-    }
-    if (stopAfter) {
-      const timeout = Math.max(50, duration * 1000 * 2);
-      this._noiseStopTimer = setTimeout(() => {
-        this._noiseStopTimer = null;
-        this._stopStatic();
-      }, timeout);
-    }
-  }
-
-  _stopStatic() {
-    if (this._noiseSource) {
-      try { this._noiseSource.stop(); } catch { }
-      this._noiseSource.disconnect?.();
-      this._noiseSource = null;
-    }
-    if (this._noiseGain) {
-      this._noiseGain.disconnect?.();
-      this._noiseGain = null;
-    }
-  }
-
-  _setDial(value) {
-    this._dialValue = clamp(value, 0, 100);
+  _setDial(v) {
+    this._dialValue = clamp(v, 0, 100);
     if (this.ui.hudRadioDial) this.ui.hudRadioDial.value = String(this._dialValue);
   }
 
@@ -354,5 +268,224 @@ export class RadioManager {
 
   _setStatus(text) {
     if (this.ui.hudRadioStatus) this.ui.hudRadioStatus.textContent = text;
+  }
+
+  _clearStationsUI(status='') {
+    this.stations = [];
+    this._populateList();
+    this._stopStream(true);
+    this.currentIndex = -1;
+    if (status) this._setStatus(status);
+  }
+
+  // -------- Audio --------
+  async _ensureAudio() {
+    if (!this._audio) {
+      const audio = new Audio();
+      audio.crossOrigin = 'anonymous';
+      audio.preload = 'none';
+      audio.volume = 0;
+      audio.addEventListener('error', () => this._setStatus('Stream error'));
+      this._audio = audio;
+    }
+    if (!this._noise) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      this._ac = new Ctx();
+      const buf = this._ac.createBuffer(1, this._ac.sampleRate * 2, this._ac.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      const src = this._ac.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      const gain = this._ac.createGain();
+      gain.gain.value = 0.08; // subtle tuning hiss
+      src.connect(gain).connect(this._ac.destination);
+      src.start();
+      this._noise = src; this._noiseGain = gain;
+    }
+  }
+
+  _fadeAudioVolume(target, durationMs, cb) {
+    if (!this._audio) return;
+    if (this._audioFadeRAF) cancelAnimationFrame(this._audioFadeRAF);
+    const start = this._audio.volume;
+    const delta = target - start;
+    const t0 = performance.now();
+    const step = () => {
+      const t = clamp((performance.now() - t0) / Math.max(1, durationMs), 0, 1);
+      this._audio.volume = clamp(start + delta * t, 0, 1);
+      if (t < 1) this._audioFadeRAF = requestAnimationFrame(step);
+      else { this._audioFadeRAF = null; cb && cb(); }
+    };
+    this._audioFadeRAF = requestAnimationFrame(step);
+  }
+
+  _playStream(endpointUrl, onStart) {
+    const a = this._audio; if (!a) return;
+    a.src = endpointUrl; // browser follows 302 to final stream
+    a.volume = 0;
+    a.play().then(() => this._fadeAudioVolume(1, 800, onStart)).catch(() => this._setStatus('Unable to play'));
+  }
+
+  _stopStream(immediate = false) {
+    const a = this._audio; if (!a) return;
+    if (immediate) {
+      try { a.pause(); } catch {}
+      a.removeAttribute('src');
+      a.load();
+      a.volume = 0;
+      return;
+    }
+    this._fadeAudioVolume(0, 400, () => { try { a.pause(); } catch {}; a.removeAttribute('src'); a.load(); });
+  }
+
+  // -------- Radio Garden JSON --------
+  async _loadAllPlaces() {
+    const json = await getJSONWithFallback('/ara/content/places');
+    const list = json?.data?.list || [];
+    this._places = list.map(p => ({
+      id: p.id,
+      title: p.title,
+      country: p.country,
+      lat: Array.isArray(p.geo) ? Number(p.geo[1]) : null, // [lon, lat] → lat
+      lon: Array.isArray(p.geo) ? Number(p.geo[0]) : null  // → lon
+    })).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+
+    const n = this._places.length;
+    const buf = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) { buf[i*2] = this._places[i].lat; buf[i*2+1] = this._places[i].lon; }
+    this._placesBuf = buf;
+  }
+
+  async _loadChannelsForPlace(placeId) {
+    const json = await getJSONWithFallback(`/ara/content/page/${encodeURIComponent(placeId)}/channels`);
+    const blocks = json?.data?.content || [];
+    const out = [];
+    for (const b of blocks) {
+      const items = b?.items || [];
+      for (const it of items) {
+        if (it?.type === 'more') continue; // skip "View all" entries
+        const id = parseChannelIdFromHref(it?.href);
+        if (!id) continue;
+        out.push({ title: it.title, channelId: id });
+      }
+    }
+    return out;
+  }
+
+  // -------- Nearby pipeline (abortable + concurrent) --------
+  _cancelPipeline() {
+    if (this._pipelineAbort) {
+      try { this._pipelineAbort.abort(); } catch {}
+      this._pipelineAbort = null;
+    }
+  }
+
+  async _pipelineFetchNearby(lat, lon, immediate) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    if (!this._places) await this._loadAllPlaces();
+
+    this._cancelPipeline();
+    const ctrl = new AbortController();
+    this._pipelineAbort = ctrl;
+    const { signal } = ctrl;
+
+    // compute distances to all places, filter by radius, sort by distance
+    const annotated = this._places.map((p, i) => ({
+      p,
+      dKm: haversineKm(lat, lon, this._placesBuf[i*2], this._placesBuf[i*2+1])
+    }))
+    .filter(x => x.dKm <= this._radiusKm)
+    .sort((a, b) => a.dKm - b.dKm);
+
+    if (!annotated.length) {
+      this._clearStationsUI(`No Radio Garden cities within ${this._radiusMiles} miles`);
+      this._lastCenter = { lat, lon };
+      this._lastRebuildAt = performance.now() / 1000;
+      this._pipelineAbort = null;
+      return;
+    }
+
+    const limited = annotated.slice(0, this._autotune.maxPlacesToScan);
+
+    // per-place tasks
+    const tasks = limited.map(({ p, dKm }) => async () => {
+      if (signal.aborted) return [];
+      let channels = this._channelsByPlace.get(p.id);
+      if (!channels) {
+        channels = await this._loadChannelsForPlace(p.id);
+        this._channelsByPlace.set(p.id, channels);
+      }
+      return channels.map(c => ({
+        id: c.channelId,
+        name: c.title,
+        placeTitle: p.title,
+        country: p.country,
+        distanceKm: dKm,
+        url: `${this._listenBase}/ara/content/listen/${c.channelId}/channel.mp3`
+      }));
+    });
+
+    // run with a small pool
+    const results = await this._runPool(tasks, 4, ({ done, total }) => {
+      this._setStatus(`Loading stations… ${done}/${total}`);
+    });
+    if (signal.aborted) return;
+
+    // flatten + dedupe by channelId
+    const seen = new Set();
+    const stations = [];
+    for (const arr of results) {
+      if (!arr) continue;
+      for (const s of arr) {
+        if (!s || seen.has(s.id)) continue;
+        seen.add(s.id);
+        stations.push(s);
+      }
+    }
+    stations.sort((a, b) => (a.distanceKm ?? 1e9) - (b.distanceKm ?? 1e9));
+
+    this.stations = stations;
+    this._populateList();
+
+    let targetIndex = 0;
+    if (this._autotune.selectStrategy === 'random' && this.stations.length) {
+      targetIndex = Math.floor(Math.random() * this.stations.length);
+    }
+
+    if (this.stations.length) {
+      this._setDial(this._valueForIndex(targetIndex));
+      this._handleDialValue(this._dialValue, { forceStation: targetIndex, immediate });
+    } else {
+      this._stopStream(true);
+      this.currentIndex = -1;
+    }
+
+    this._lastCenter = { lat, lon };
+    this._lastRebuildAt = performance.now() / 1000;
+    this._pipelineAbort = null;
+  }
+
+  async _runPool(tasks, concurrency = 4, onProgress) {
+    const total = tasks.length;
+    let done = 0;
+    const results = new Array(total);
+    let i = 0;
+    const worker = async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= total) break;
+        try {
+          results[idx] = await tasks[idx]();
+        } catch (e) {
+          console.warn('[radio] task failed', e);
+          results[idx] = null;
+        } finally {
+          done++;
+          onProgress && onProgress({ done, total });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, total) }, worker));
+    return results;
   }
 }

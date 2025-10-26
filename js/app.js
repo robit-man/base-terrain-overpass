@@ -227,8 +227,21 @@ class App {
     this._teleportHintAt = 0;
     this.radio = new RadioManager({
       ui,
-      getLocation: () => this._locationState
+      getLocation: () => this._locationState,
+      proxyBase: '/rg',          // JSON via your proxy (avoid CORS)
+      listenBase: 'https://radio.garden/api', // <audio> points directly at RG
+      radiusMiles: 30,           // set any radius here
+      autotune: {
+        enabled: true,
+        minMoveKm: 5,
+        minSecondsBetweenRebuild: 10,
+        selectStrategy: 'first',
+        maxPlacesToScan: 10
+      }
     });
+
+
+
     this._pointerLockArmed = false;
     this._pointerLockActive = false;
     this._pointerLockHoldTimer = null;
@@ -795,6 +808,8 @@ class App {
         if (source !== 'manual') {
           this._lastAutoLocation = { lat, lon, source };
           this._locationState = { lat, lon };
+          this.radio.updateFromLatLon(lat, lon);
+
         }
       }
       return;
@@ -857,6 +872,8 @@ class App {
   _applyLocation({ lat, lon, source, detail = {} }) {
     this._locationSource = source;
     this._locationState = { lat, lon };
+    this.radio.updateFromLatLon(lat, lon);
+
 
     if (this._manualLatInput) this._manualLatInput.value = lat.toFixed(6);
     if (this._manualLonInput) this._manualLonInput.value = lon.toFixed(6);
@@ -919,7 +936,7 @@ class App {
     if (source !== 'manual') {
       this.miniMap?.enableFollow?.();
     }
-    this.radio?.refreshRegion?.();
+    this.radio?.updateFromLatLon?.(lat, lon);
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
@@ -2795,7 +2812,7 @@ class App {
     this._locationState = { lat, lon };
     if (detail.source) this._locationSource = detail.source;
     if (detail.source !== 'manual') this._lastAutoLocation = { lat, lon, source: detail.source };
-
+    this.radio.updateFromLatLon(lat, lon);
     this.miniMap?.notifyLocationChange?.({ lat, lon, source: detail.source || this._locationSource });
   }
 
