@@ -583,6 +583,29 @@
             </section>
 
             <section class="modal-section">
+              <h3 class="section-title">Normal Maps</h3>
+              <div class="button-row">
+                <button id="envNormalToggle" class="ghost" type="button" data-state="off">Disabled</button>
+              </div>
+              <div class="slider-row">
+                <label for="envNormalProminence">Prominence <span class="mono" id="envNormalProminenceValue">0.8</span></label>
+                <input id="envNormalProminence" type="range" min="0.1" max="3.0" step="0.1" value="0.8" />
+              </div>
+              <div class="slider-row">
+                <label for="envNormalGamma">Gamma <span class="mono" id="envNormalGammaValue">1.0</span></label>
+                <input id="envNormalGamma" type="range" min="0.5" max="2.0" step="0.05" value="1.0" />
+              </div>
+              <div class="slider-row">
+                <label for="envNormalHighpass">High-pass (px) <span class="mono" id="envNormalHighpassValue">2</span></label>
+                <input id="envNormalHighpass" type="range" min="0" max="8" step="1" value="2" />
+              </div>
+              <div class="button-row">
+                <button id="envNormalApply" class="secondary" type="button">Regenerate Normals</button>
+              </div>
+              <div class="modal-note">Enable to add surface detail from texture luminance. Adjust prominence, gamma, and high-pass filtering, then regenerate to apply.</div>
+            </section>
+
+            <section class="modal-section">
               <h3 class="section-title">Buildings</h3>
               <div class="slider-row">
                 <label for="envBuildingRadius">Building Radius <span class="mono" id="envBuildingRadiusValue">3000

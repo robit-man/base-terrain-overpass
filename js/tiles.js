@@ -30,6 +30,101 @@ const HEX_DIRS = [
   [-1, 0], [-1, 1], [0, 1],
 ];
 
+// Normal map generation parameters (defaults - adjustable via UI)
+const NORMAL_MAP_PROMINENCE = 0.8;  // Reduced from 2.0
+const NORMAL_MAP_GAMMA = 1.0;
+const NORMAL_MAP_HIGHPASS = 2;
+
+/**
+ * Normal map generation utilities (ported from normals-tiles.html)
+ */
+
+function boxBlur1DFloat(src, w, h, r, horizontal) {
+  const N = src.length;
+  const out = new Float32Array(N);
+  if (r <= 0) { out.set(src); return out; }
+  const norm = 1 / (2 * r + 1);
+
+  if (horizontal) {
+    for (let y = 0; y < h; y++) {
+      let sum = 0;
+      for (let x = -r; x <= r; x++) {
+        const xx = Math.min(w - 1, Math.max(0, x));
+        sum += src[y * w + xx];
+      }
+      out[y * w] = sum * norm;
+      for (let x = 1; x < w; x++) {
+        const add = Math.min(w - 1, x + r);
+        const rem = Math.max(0, x - 1 - r);
+        sum += src[y * w + add] - src[y * w + rem];
+        out[y * w + x] = sum * norm;
+      }
+    }
+  } else {
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let y = -r; y <= r; y++) {
+        const yy = Math.min(h - 1, Math.max(0, y));
+        sum += src[yy * w + x];
+      }
+      out[x] = sum * norm;
+      for (let y = 1; y < h; y++) {
+        const add = Math.min(h - 1, y + r);
+        const rem = Math.max(0, y - 1 - r);
+        sum += src[add * w + x] - src[rem * w + x];
+        out[y * w + x] = sum * norm;
+      }
+    }
+  }
+  return out;
+}
+
+function blurFloat(src, w, h, r) {
+  if (r <= 0) return new Float32Array(src);
+  return boxBlur1DFloat(boxBlur1DFloat(src, w, h, r, true), w, h, r, false);
+}
+
+function computeNormalMapFromImage(img, opts = {}) {
+  const { prominence = NORMAL_MAP_PROMINENCE, gamma = NORMAL_MAP_GAMMA, highpass = NORMAL_MAP_HIGHPASS, size = 256 } = opts;
+  const w = size, h = size;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  let imgData;
+  try { imgData = ctx.getImageData(0, 0, w, h); } catch (e) { console.warn('[TileManager] Cannot read image pixels (CORS):', e); return null; }
+  const pixels = imgData.data;
+  const H = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < pixels.length; i += 4, p++) {
+    const luma = pixels[i] * 0.2126 + pixels[i + 1] * 0.7152 + pixels[i + 2] * 0.0722;
+    H[p] = Math.pow(luma / 255, gamma);
+  }
+  if (highpass > 0) {
+    const B = blurFloat(H, w, h, highpass);
+    for (let i = 0; i < H.length; i++) H[i] -= B[i];
+  }
+  const p = new Float32Array(w * h), q = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, xm = (x > 0 ? x - 1 : 0), xp = (x < w - 1 ? x + 1 : w - 1), ym = (y > 0 ? y - 1 : 0), yp = (y < h - 1 ? y + 1 : h - 1);
+      p[i] = (H[y * w + xp] - H[y * w + xm]) * prominence;
+      q[i] = (H[yp * w + x] - H[ym * w + x]) * prominence;
+    }
+  }
+  const nrgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    let nx = -p[i], ny = -q[i], nz = 1;
+    const inv = 1 / Math.hypot(nx, ny, nz);
+    nx *= inv; ny *= inv; nz *= inv;
+    const o = i * 4;
+    nrgba[o] = ((nx * 0.5 + 0.5) * 255) | 0;
+    nrgba[o + 1] = ((ny * 0.5 + 0.5) * 255) | 0;
+    nrgba[o + 2] = ((nz * 0.5 + 0.5) * 255) | 0;
+    nrgba[o + 3] = 255;
+  }
+  return nrgba;
+}
+
 export class TileManager {
   constructor(scene, spacing = 20, tileRadius = 100, audio = null) {
     this.scene = scene; this.spacing = spacing; this.tileRadius = tileRadius;
@@ -70,6 +165,12 @@ export class TileManager {
     // ---- wireframe colors ----
     this.VISUAL_WIREFRAME_COLOR = 0x222222;
     this.INTERACTIVE_WIREFRAME_COLOR = 0x222222;
+
+    // ---- normal map parameters ----
+    this.normalMapsEnabled = false;  // Disabled by default
+    this.normalProminence = NORMAL_MAP_PROMINENCE;
+    this.normalGamma = NORMAL_MAP_GAMMA;
+    this.normalHighpass = NORMAL_MAP_HIGHPASS;
 
     // ---- caching config ----
     this.CACHE_VER = 'v1';
@@ -573,13 +674,12 @@ export class TileManager {
 
   _getTerrainMaterial() {
     if (!this._terrainMat) {
-      this._terrainMat = new THREE.MeshPhysicalMaterial({
+      this._terrainMat = new THREE.MeshStandardMaterial({
         vertexColors: true,
-        side: THREE.DoubleSide,  // CHANGED: DoubleSide to receive shadows properly
+        side: THREE.BackSide,  // CHANGED: DoubleSide to receive shadows properly
         metalness: 0.005,
         roughness: 0.85,
         receiveShadow: true,
-
       });
     }
     return this._terrainMat;
@@ -1200,7 +1300,7 @@ export class TileManager {
       const mesh = new THREE.Mesh(geom, this._getFarfieldMaterial());
       mesh.frustumCulled = false;
       mesh.renderOrder = tile.grid.mesh ? tile.grid.mesh.renderOrder - 1 : -5;
-      mesh.receiveShadow = false;
+      mesh.receiveShadow = true;
       mesh.castShadow = false;
       tile.grid.group.add(mesh);
       const arr = colAttr.array;
@@ -2003,6 +2103,36 @@ _ensureTileUv(tile, bounds) {
 
     // IMPORTANT: use BackSide for your setup (as you confirmed)
     mat.side = THREE.BackSide;
+
+    // Generate and apply normal map from texture (if enabled)
+    if (this.normalMapsEnabled && texture.image && !mat.normalMap) {
+      try {
+        const normalData = computeNormalMapFromImage(texture.image, {
+          size: imgW,
+          prominence: this.normalProminence,
+          gamma: this.normalGamma,
+          highpass: this.normalHighpass
+        });
+        if (normalData) {
+          const normalCanvas = document.createElement('canvas');
+          normalCanvas.width = imgW;
+          normalCanvas.height = imgH;
+          const normalCtx = normalCanvas.getContext('2d');
+          const normalImageData = new ImageData(normalData, imgW, imgH);
+          normalCtx.putImageData(normalImageData, 0, 0);
+
+          const normalTexture = new THREE.CanvasTexture(normalCanvas);
+          normalTexture.wrapS = THREE.ClampToEdgeWrapping;
+          normalTexture.wrapT = THREE.ClampToEdgeWrapping;
+          normalTexture.needsUpdate = true;
+
+          mat.normalMap = normalTexture;
+          mat.normalScale = new THREE.Vector2(1, 1);
+        }
+      } catch (e) {
+        console.warn('[TileManager] Normal map generation failed:', e);
+      }
+    }
 
     // Keep ordering stable (farfield < visual < interactive)
     if (typeof mesh.renderOrder === 'number') {

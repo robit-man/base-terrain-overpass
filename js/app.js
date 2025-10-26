@@ -1577,6 +1577,14 @@ this.radio = new RadioManager({
       envBuildingAuto,
       envBuildingTargetFps,
       envBuildingTargetFpsValue,
+      envNormalProminence,
+      envNormalProminenceValue,
+      envNormalGamma,
+      envNormalGammaValue,
+      envNormalHighpass,
+      envNormalHighpassValue,
+      envNormalToggle,
+      envNormalApply,
     } = ui;
 
     if (!envInteractiveRing || !envVisualRing) {
@@ -1734,6 +1742,39 @@ this.radio = new RadioManager({
     envBuildingTargetFps?.addEventListener('input', (e) => {
       const val = Number(e.target.value);
       this._handleTargetFpsChange(val);
+    });
+
+    // Normal map controls
+    envNormalToggle?.addEventListener('click', () => {
+      const isEnabled = envNormalToggle.getAttribute('data-state') === 'on';
+      const newState = !isEnabled;
+      envNormalToggle.setAttribute('data-state', newState ? 'on' : 'off');
+      envNormalToggle.textContent = newState ? 'Enabled' : 'Disabled';
+      if (this.hexGridMgr) {
+        this.hexGridMgr.normalMapsEnabled = newState;
+        // Trigger regeneration if enabling
+        if (newState) {
+          this._regenerateNormalMaps();
+        }
+      }
+    });
+    envNormalProminence?.addEventListener('input', () => {
+      const val = parseFloat(envNormalProminence.value);
+      setText(envNormalProminenceValue, val.toFixed(1));
+      if (this.hexGridMgr) this.hexGridMgr.normalProminence = val;
+    });
+    envNormalGamma?.addEventListener('input', () => {
+      const val = parseFloat(envNormalGamma.value);
+      setText(envNormalGammaValue, val.toFixed(2));
+      if (this.hexGridMgr) this.hexGridMgr.normalGamma = val;
+    });
+    envNormalHighpass?.addEventListener('input', () => {
+      const val = parseInt(envNormalHighpass.value, 10);
+      setText(envNormalHighpassValue, val);
+      if (this.hexGridMgr) this.hexGridMgr.normalHighpass = val;
+    });
+    envNormalApply?.addEventListener('click', () => {
+      this._regenerateNormalMaps();
     });
 
     // Imagery vintage controls
@@ -2054,6 +2095,31 @@ this.radio = new RadioManager({
     if (profile) {
       this._updateHudMeta(profile);
       this._updatePidDiagnostics(profile);
+    }
+  }
+
+  _regenerateNormalMaps() {
+    if (!this.hexGridMgr) return;
+
+    // Clear normal maps from all tiles to force regeneration
+    let count = 0;
+    for (const tile of this.hexGridMgr.tiles.values()) {
+      const mesh = tile.grid?.mesh;
+      if (!mesh || !mesh.material) continue;
+
+      // Dispose old normal map
+      if (mesh.material.normalMap) {
+        mesh.material.normalMap.dispose();
+        mesh.material.normalMap = null;
+        count++;
+      }
+    }
+
+    // Trigger overlay refresh which will regenerate normal maps
+    const currentVersion = this.hexGridMgr._overlayVersion;
+    if (currentVersion) {
+      this.hexGridMgr._applyOverlayVersion(currentVersion);
+      console.log(`[App] Regenerating normal maps for ${count} tiles`);
     }
   }
 
@@ -4899,7 +4965,14 @@ this.radio = new RadioManager({
     if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
       this._cancelPointerHold();
     }
+
+    const wasOrbiting = this._orbitDragActive;
     this._endOrbitDrag(e);
+
+    // Only handle click if not orbiting (to avoid clicking while dragging camera)
+    if (!wasOrbiting && this.sceneMgr?.handleCanvasClick) {
+      this.sceneMgr.handleCanvasClick(e);
+    }
   }
 
   _onCanvasPointerLeave(e) {
