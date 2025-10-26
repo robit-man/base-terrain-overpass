@@ -903,6 +903,21 @@ export class HybridHub {
       this._handleSmartObjectText(from, payload);
       return;
     }
+    if (type === 'noclip-bridge-sync-accepted') {
+      // Hydra approved our sync request and created a bridge
+      this._handleSyncAccepted(from, payload);
+      return;
+    }
+    if (type === 'noclip-bridge-sync-rejected') {
+      // Hydra rejected our sync request
+      this._handleSyncRejected(from, payload);
+      return;
+    }
+    if (type === 'ping') {
+      // Ping from Hydra - send pong response
+      this._handlePing(from, payload);
+      return;
+    }
   }
 
   /**
@@ -1454,6 +1469,79 @@ export class HybridHub {
     } catch (err) {
       console.warn('[hybrid] Failed to copy peer link:', err);
       pushToast('Failed to copy link');
+    }
+  }
+
+  /**
+   * Handle sync accepted response from Hydra
+   */
+  _handleSyncAccepted(from, payload) {
+    console.log('[Hybrid] Sync accepted by Hydra:', from, payload);
+
+    const bridgeNodeId = payload.bridgeNodeId;
+
+    // Notify user via UI
+    if (typeof pushToast === 'function') {
+      pushToast(`✓ Connected to Hydra bridge: ${bridgeNodeId}`, { duration: 4000 });
+    }
+
+    // Log to Smart Object modal if open
+    if (this.sceneMgr?.smartModal) {
+      this.sceneMgr.smartModal._log(`✓ Sync accepted! Bridge node: ${bridgeNodeId}`, 'success');
+    }
+
+    // Send acknowledgment back
+    const discovery = this.state.hydra?.discovery;
+    if (discovery) {
+      discovery.dm(from, {
+        type: 'noclip-bridge-sync-accepted',
+        timestamp: Date.now()
+      }).catch(err => {
+        console.error('[Hybrid] Failed to send sync acknowledgment:', err);
+      });
+    }
+  }
+
+  /**
+   * Handle sync rejected response from Hydra
+   */
+  _handleSyncRejected(from, payload) {
+    console.log('[Hybrid] Sync rejected by Hydra:', from, payload);
+
+    const reason = payload.reason || 'Unknown reason';
+
+    // Notify user via UI
+    if (typeof pushToast === 'function') {
+      pushToast(`✗ Sync rejected: ${reason}`, { duration: 4000 });
+    }
+
+    // Log to Smart Object modal if open
+    if (this.sceneMgr?.smartModal) {
+      this.sceneMgr.smartModal._log(`✗ Sync rejected: ${reason}`, 'error');
+    }
+  }
+
+  /**
+   * Handle ping request from Hydra
+   */
+  _handlePing(from, payload) {
+    console.log('[Hybrid] Ping received from:', from);
+
+    // Send pong response
+    const discovery = this.state.hydra?.discovery;
+    if (discovery) {
+      discovery.dm(from, {
+        type: 'pong',
+        timestamp: Date.now(),
+        originalTimestamp: payload.timestamp
+      }).catch(err => {
+        console.error('[Hybrid] Failed to send pong:', err);
+      });
+    }
+
+    // Log to Smart Object modal if open
+    if (this.sceneMgr?.smartModal) {
+      this.sceneMgr.smartModal._log(`✓ Ping received from ${from.slice(0, 8)}...`, 'info');
     }
   }
 }

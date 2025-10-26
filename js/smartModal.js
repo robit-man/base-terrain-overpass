@@ -180,6 +180,24 @@ class SmartObjectModal {
                 <p class="result-success">✓ Connected to: <span id="smart-connected-node"></span></p>
               </div>
             </div>
+
+            <!-- Discovered Hydra Peers -->
+            <div class="smart-form-group">
+              <label>Discovered Hydra Peers:</label>
+              <div id="smart-hydra-peer-list" class="smart-peer-list">
+                <p class="smart-peer-empty">No Hydra peers discovered yet...</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- Connection Log -->
+          <section class="smart-modal-section">
+            <h3>Connection Log</h3>
+            <div class="smart-form-group">
+              <div id="smart-connection-log" class="smart-connection-log">
+                <p class="log-empty">No connection activity yet...</p>
+              </div>
+            </div>
           </section>
         </div>
 
@@ -261,7 +279,198 @@ class SmartObjectModal {
 
     this.currentObject = smartObject;
     this._populateForm(smartObject);
+    this._refreshHydraPeerList();
     this.modal.style.display = 'flex';
+  }
+
+  /**
+   * Refresh the list of discovered Hydra peers
+   */
+  _refreshHydraPeerList() {
+    const peerListContainer = this.modal.querySelector('#smart-hydra-peer-list');
+    if (!peerListContainer) return;
+
+    // Get Hydra peers from hybrid hub via app
+    const app = this.mesh?.app;
+    const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+
+    if (!hydraDiscovery) {
+      peerListContainer.innerHTML = '<p class="smart-peer-empty">Hydra discovery not available</p>';
+      return;
+    }
+
+    const peers = hydraDiscovery.peers || [];
+
+    if (peers.length === 0) {
+      peerListContainer.innerHTML = '<p class="smart-peer-empty">No Hydra peers discovered yet...</p>';
+      return;
+    }
+
+    // Build peer list
+    peerListContainer.innerHTML = '';
+    peers.forEach(peer => {
+      const peerItem = document.createElement('div');
+      peerItem.className = 'smart-peer-item';
+
+      const peerInfo = document.createElement('div');
+      peerInfo.className = 'smart-peer-info';
+
+      const peerName = document.createElement('div');
+      peerName.className = 'smart-peer-name';
+      peerName.textContent = peer.meta?.name || `Hydra ${peer.nknPub.slice(0, 8)}...`;
+
+      const peerAddr = document.createElement('div');
+      peerAddr.className = 'smart-peer-addr';
+      peerAddr.textContent = `hydra.${peer.nknPub}`;
+
+      peerInfo.appendChild(peerName);
+      peerInfo.appendChild(peerAddr);
+
+      const peerActions = document.createElement('div');
+      peerActions.className = 'smart-peer-actions';
+
+      const pingBtn = document.createElement('button');
+      pingBtn.className = 'smart-btn smart-btn-small';
+      pingBtn.textContent = 'Ping';
+      pingBtn.addEventListener('click', () => this._pingHydraPeer(peer));
+
+      const syncBtn = document.createElement('button');
+      syncBtn.className = 'smart-btn smart-btn-small smart-btn-primary';
+      syncBtn.textContent = 'Sync';
+      syncBtn.addEventListener('click', () => this._syncWithHydraPeer(peer));
+
+      peerActions.appendChild(pingBtn);
+      peerActions.appendChild(syncBtn);
+
+      peerItem.appendChild(peerInfo);
+      peerItem.appendChild(peerActions);
+
+      peerListContainer.appendChild(peerItem);
+    });
+  }
+
+  /**
+   * Ping a Hydra peer to check connectivity
+   */
+  async _pingHydraPeer(peer) {
+    this._log(`Pinging ${peer.nknPub.slice(0, 8)}...`);
+
+    try {
+      const app = this.mesh?.app;
+      const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+
+      if (!hydraDiscovery) {
+        this._log('Error: Hydra discovery not available', 'error');
+        return;
+      }
+
+      // Send ping via NATS discovery
+      await hydraDiscovery.dm(peer.nknPub, {
+        type: 'ping',
+        from: this.mesh?.selfPub || 'unknown',
+        timestamp: Date.now()
+      });
+
+      this._log(`✓ Ping sent to ${peer.nknPub.slice(0, 8)}`, 'success');
+    } catch (err) {
+      this._log(`✗ Ping failed: ${err.message}`, 'error');
+      console.error('[SmartModal] Ping error:', err);
+    }
+  }
+
+  /**
+   * Request sync/handshake with a Hydra peer
+   */
+  async _syncWithHydraPeer(peer) {
+    this._log(`Requesting sync with ${peer.nknPub.slice(0, 8)}...`);
+
+    try {
+      const app = this.mesh?.app;
+      const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+
+      if (!hydraDiscovery || !this.currentObject) {
+        this._log('Error: Discovery or Smart Object not available', 'error');
+        return;
+      }
+
+      const noclipPub = this.mesh?.selfPub || this.mesh?.selfAddr || '';
+      if (!noclipPub) {
+        this._log('Error: NoClip address not available', 'error');
+        return;
+      }
+
+      // Send sync request
+      const syncRequest = {
+        type: 'noclip-bridge-sync-request',
+        from: noclipPub,
+        noclipAddr: `noclip.${noclipPub}`,
+        objectId: this.currentObject.uuid,
+        objectConfig: {
+          position: this.currentObject.config.position,
+          label: this.currentObject.config.mesh?.label?.text || 'Smart Object'
+        },
+        timestamp: Date.now()
+      };
+
+      await hydraDiscovery.dm(peer.nknPub, syncRequest);
+
+      this._log(`✓ Sync request sent to ${peer.nknPub.slice(0, 8)}`, 'success');
+      this._log(`Waiting for approval from Hydra user...`, 'info');
+
+      // Store pending sync
+      if (!this.currentObject.config._pendingSyncs) {
+        this.currentObject.config._pendingSyncs = [];
+      }
+      this.currentObject.config._pendingSyncs.push({
+        hydraPub: peer.nknPub,
+        requestedAt: Date.now(),
+        status: 'pending'
+      });
+
+    } catch (err) {
+      this._log(`✗ Sync request failed: ${err.message}`, 'error');
+      console.error('[SmartModal] Sync error:', err);
+    }
+  }
+
+  /**
+   * Add a log message to the connection log
+   */
+  _log(message, type = 'info') {
+    const logContainer = this.modal.querySelector('#smart-connection-log');
+    if (!logContainer) return;
+
+    // Remove empty placeholder if present
+    const emptyMsg = logContainer.querySelector('.log-empty');
+    if (emptyMsg) {
+      emptyMsg.remove();
+    }
+
+    const logEntry = document.createElement('div');
+    logEntry.className = `log-entry log-${type}`;
+
+    const timestamp = document.createElement('span');
+    timestamp.className = 'log-timestamp';
+    const now = new Date();
+    timestamp.textContent = `[${now.toLocaleTimeString()}]`;
+
+    const text = document.createElement('span');
+    text.className = 'log-text';
+    text.textContent = message;
+
+    logEntry.appendChild(timestamp);
+    logEntry.appendChild(text);
+
+    logContainer.appendChild(logEntry);
+
+    // Auto-scroll to bottom
+    logContainer.scrollTop = logContainer.scrollHeight;
+
+    // Limit log entries to 50
+    const entries = logContainer.querySelectorAll('.log-entry');
+    if (entries.length > 50) {
+      entries[0].remove();
+    }
   }
 
   /**
