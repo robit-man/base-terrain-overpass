@@ -2311,10 +2311,13 @@ export class BuildingManager {
       if (budget > 0 && (this._nowMs() - start) > budget) break;
       const tileKey = this._resnapDirtyQueue[this._resnapDirtyIndex++];
       this._resnapDirtyTiles.delete(tileKey);
+
+      // CRITICAL: Always increment processed to prevent infinite loop
+      processed++;
+
       const state = this._tileStates.get(tileKey);
       if (!state) continue;
       this._resnapTile(tileKey, state);
-      processed++;
     }
     if (this._resnapDirtyIndex >= this._resnapDirtyQueue.length) {
       this._resnapDirtyQueue.length = 0;
@@ -2358,9 +2361,13 @@ export class BuildingManager {
 
       const tileKey = this._resnapQueue[this._resnapIndex++];
       const state = this._tileStates.get(tileKey);
+
+      // CRITICAL: Always increment processed to prevent infinite loop
+      // even if we skip this tile
+      processed++;
+
       if (!state || (state.resnapFrozen && (!state.extras || !state.extras.length))) continue;
       this._resnapTile(tileKey, state);
-      processed++;
     }
 
     if (this._resnapIndex >= this._resnapQueue.length) {

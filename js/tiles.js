@@ -901,7 +901,16 @@ export class TileManager {
 
     tile.normTick = (tile.normTick + 1) % this.NORMALS_EVERY;
     if (tile.normTick === 0) {
-      if (tile.type !== 'farfield') tile.grid.geometry.computeVertexNormals();
+      // CRITICAL: Defer expensive computeVertexNormals to reduce GPU sync stalls
+      // Only recompute if there's been significant height changes
+      if (tile.type !== 'farfield') {
+        if (!tile._deferredNormalsUpdate) {
+          tile._deferredNormalsUpdate = true;
+          // Queue for batch processing instead of immediate compute
+          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+          this._deferredNormalsTiles.add(tile);
+        }
+      }
       this._applyAllColorsGlobal(tile);
     }
   }
@@ -3250,6 +3259,10 @@ _ensureTileUv(tile, bounds) {
   }
 
   _applyRelayResults(tile, results, { mode, indexByLatLon, indexByGeohash }) {
+    // CRITICAL: Batch sample updates to reduce GPU sync stalls
+    // Instead of marking needsUpdate per sample, collect all updates and mark once
+    const updates = [];
+
     for (const res of results) {
       let idx;
       if (mode === 'geohash') {
@@ -3265,44 +3278,69 @@ _ensureTileUv(tile, bounds) {
       if (!Number.isFinite(height)) continue;
       // unlock if we had pinned this vertex previously
       if (tile.locked) tile.locked[idx] = 0;
-      this._applySample(tile, idx, height);
+      updates.push({ idx, height });
+    }
+
+    // Apply all samples in batch
+    if (updates.length > 0) {
+      this._applySampleBatch(tile, updates);
+    }
+  }
+
+  _applySampleBatch(tile, updates) {
+    // CRITICAL: Process multiple samples in single batch to minimize GPU sync
+    const pos = tile.pos;
+    if (!tile.col) this._ensureColorAttr(tile);
+
+    for (const { idx, height } of updates) {
+      // Update position
+      pos.setY(idx, height);
+
+      // Update readiness tracking
+      if (tile.ready[idx] !== 1) tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
+      tile.ready[idx] = 1;
+      tile.fetched.add(idx);
+
+      // Release pin
+      if (tile.locked) tile.locked[idx] = 0;
+
+      // Update buffer
+      this._pullGeometryToBuffers(tile, idx);
+      this._updateGlobalFromValue(height);
+
+      // Update color
+      const o = 3 * idx;
+      const color = this._colorFromNormalized(this._normalizedHeight(height));
+      tile.col.array[o] = color.r;
+      tile.col.array[o + 1] = color.g;
+      tile.col.array[o + 2] = color.b;
+
+      // Fire height listener per sample for audio/effects
+      const wx = tile.grid.group.position.x + tile.pos.getX(idx);
+      const wy = height;
+      const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
+      if (this.audio) {
+        this.audio.triggerScratch(wx, wy, wz, 0.9);
+      }
+      if (this._heightListeners?.size) {
+        this._notifyHeightListeners(tile, idx, wx, wy, wz);
+      }
+    }
+
+    // CRITICAL: Mark needsUpdate ONCE for entire batch instead of per sample
+    pos.needsUpdate = true;
+    tile.col.needsUpdate = true;
+    if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
+
+    // Mark farfield adapter dirty if this is a farfield tile
+    if (tile.type === 'farfield') {
+      this._markFarfieldAdapterDirty(tile);
     }
   }
 
   _applySample(tile, idx, height) {
-    const pos = tile.pos;
-    pos.setY(idx, height);
-    pos.needsUpdate = true;
-
-    if (tile.ready[idx] !== 1) tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
-    tile.ready[idx] = 1;
-    tile.fetched.add(idx);
-
-    // data landed: make sure the pin is released
-    if (tile.locked) tile.locked[idx] = 0;
-
-    this._pullGeometryToBuffers(tile, idx);
-    this._updateGlobalFromValue(height);
-
-    if (!tile.col) this._ensureColorAttr(tile);
-    const o = 3 * idx;
-    const color = this._colorFromNormalized(this._normalizedHeight(height));
-    tile.col.array[o] = color.r;
-    tile.col.array[o + 1] = color.g;
-    tile.col.array[o + 2] = color.b;
-    tile.col.needsUpdate = true;
-    if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
-
-    const wx = tile.grid.group.position.x + tile.pos.getX(idx);
-    const wy = height;
-    const wz = tile.grid.group.position.z + tile.pos.getZ(idx);
-    if (this.audio) {
-      this.audio.triggerScratch(wx, wy, wz, 0.9);
-    }
-    if (this._heightListeners?.size) {
-      this._notifyHeightListeners(tile, idx, wx, wy, wz);
-    }
-    if (tile.type === 'farfield') this._markFarfieldAdapterDirty(tile);
+    // Legacy single-sample path - use batch internally
+    this._applySampleBatch(tile, [{ idx, height }]);
   }
 
   _nearestAnchorFill(tile) {
@@ -5253,6 +5291,23 @@ return new Promise((resolve) => {
           this._lastRecolorAt = t;
         }
       }
+
+      // CRITICAL: Process deferred normals updates in batches to reduce GPU sync stalls
+      // Limit to 2-3 tiles per frame to stay under budget
+      if (this._deferredNormalsTiles && this._deferredNormalsTiles.size > 0) {
+        const maxPerFrame = this._isMobile ? 1 : 2;
+        let processed = 0;
+        for (const tile of this._deferredNormalsTiles) {
+          if (processed >= maxPerFrame) break;
+          if (tile.grid?.geometry && tile.type !== 'farfield') {
+            tile.grid.geometry.computeVertexNormals();
+          }
+          tile._deferredNormalsUpdate = false;
+          this._deferredNormalsTiles.delete(tile);
+          processed++;
+        }
+      }
+
       this._updateFarfieldMergedMesh();
       const treeRefreshPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 3, this._treeComplexity ?? 0.35)));
       this._serviceTreeRefresh(treeRefreshPerFrame);
