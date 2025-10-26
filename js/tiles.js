@@ -10,9 +10,15 @@ import { GrassManager } from './grass.js';
 
 const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
-const DM_BUDGET_BYTES = 9600;
-const MAX_LOCATIONS_PER_BATCH = 1800;
-const TERRAIN_FETCH_BOOST = 2;
+const IS_MOBILE =
+  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
+  (globalThis.matchMedia?.('(pointer: coarse)').matches ?? false);
+
+// Smaller per-message budget + far fewer items per batch → lower parse/mem spikes
+const DM_BUDGET_BYTES = 4800;
+const MAX_LOCATIONS_PER_BATCH = IS_MOBILE ? 64 : 160;   // was 1800 (!)
+const TERRAIN_FETCH_BOOST = IS_MOBILE ? 1 : 2;          // don't accelerate fetch on mobile
+
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
 const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
@@ -4984,42 +4990,70 @@ _ensureTileUv(tile, bounds) {
       this._applySample(ref.tile, ref.index, height);
     };
 
-    const requests = batches.map((batch) => {
-      const payload = { type: 'elev.query', dataset: this.relayDataset };
-      if (mode === 'geohash') {
-        payload.geohashes = batch.items;
-        payload.enc = 'geohash';
-        payload.prec = precision;
-      } else {
-        payload.locations = batch.items;
-      }
+    const CONC = IS_MOBILE ? 2 : 4;
 
-      const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
-      return this._acquireNetBudget(approxBytes).then(() =>
-        this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs)
-          .then((json) => {
-            const results = json?.results || [];
-            for (const res of results) {
-              let idx = null;
-              if (mode === 'geohash') {
-                const key = res.geohash || res.hash;
-                const list = key ? geohashMap?.get(key) : null;
-                if (list && list.length) idx = list.shift();
-              } else if (res.location) {
-                const { lat, lng } = res.location;
-                const key = `${(+lat).toFixed(6)},${(+lng).toFixed(6)}`;
-                const list = latLngMap?.get(key);
-                if (list && list.length) idx = list.shift();
-              }
-              if (idx == null) continue;
-              const height = Number(res.elevation);
-              if (!Number.isFinite(height)) continue;
-              applyIdx(idx, height);
-            }
-          })
-          .catch(() => { /* ignore; backfill will retry */ })
-      );
-    });
+// Reuse locals from your scope: mode, precision, geohashMap, lookupIndex, indexToRef, etc.
+const _handleBatch = (batch) => {
+  const payload = { type: 'elev.query', dataset: this.relayDataset };
+  if (mode === 'geohash') {
+    payload.geohashes = batch.items;
+    payload.enc = 'geohash';
+    payload.prec = precision;
+  } else {
+    payload.locations = batch.items;
+  }
+
+  const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
+
+  return this._acquireNetBudget(approxBytes)
+    .then(() => this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs))
+    .then((json) => {
+      const results = json?.results || [];
+      for (const res of results) {
+        let idx = null;
+        if (mode === 'geohash') {
+          const key = res.geohash || res.hash;
+          const list = key ? geohashMap?.get(key) : null;
+          if (list && list.length) idx = list.shift();
+        } else if (res.location) {
+          const { lat, lng } = res.location;
+          idx = lookupIndex?.[lat + ',' + lng];
+        }
+        const ref = idx != null ? indexToRef(idx) : null;
+        const height = res?.elev ?? res?.height ?? res?.z ?? res?.h;
+        if (!ref || !Number.isFinite(height)) continue;
+        this._applySample(ref.tile, ref.index, height);
+      }
+    })
+    .catch((err) => console.warn('[Tiles] elevation batch failed', err));
+};
+
+let cursor = 0, active = 0;
+
+return new Promise((resolve) => {
+  const tick = () => {
+    while (active < CONC && cursor < batches.length) {
+      active++;
+      const b = batches[cursor++];
+      _handleBatch(b)
+        .finally(() => {
+          active--;
+          // Yield to frame on mobile to avoid long microtask runs
+          if (IS_MOBILE) requestAnimationFrame(tick); else tick();
+          if (active === 0 && cursor >= batches.length) {
+            this._applyPendingSamples();
+            resolve();
+          }
+        });
+    }
+    if (active === 0 && cursor >= batches.length) {
+      this._applyPendingSamples();
+      resolve();
+    }
+  };
+  tick();
+});
+
 
     await Promise.allSettled(requests);
 

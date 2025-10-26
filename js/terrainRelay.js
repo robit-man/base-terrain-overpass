@@ -191,7 +191,7 @@ export class TerrainRelay {
 
   _startHeartbeat() {
     this._stopHeartbeat();
-    const run = () => this._performHeartbeat().catch(() => {});
+    const run = () => this._performHeartbeat().catch(() => { });
     this._heartbeatTimer = setInterval(run, 20000);
     run();
   }
@@ -385,12 +385,17 @@ export class TerrainRelay {
       try { localStorage.setItem(LS_SEED_KEY, seed); } catch { /* ignore */ }
     }
 
+    const IS_MOBILE =
+      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
+      (globalThis.matchMedia?.('(pointer: coarse)').matches ?? false);
+
     const mc = new window.nkn.MultiClient({
       seed,
       identifier: 'terrain',
-      numSubClients: 4,
+      numSubClients: IS_MOBILE ? 1 : 2,   // was 4
       originalClient: false,
     });
+
 
     this._emitStatus('connecting…', 'warn');
 
