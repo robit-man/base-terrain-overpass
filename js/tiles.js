@@ -350,7 +350,8 @@ export class TileManager {
 
     // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
-    this._backfillIntervalMs = 1200; // was 2500
+    this._lastBackfillTime = 0; // Track last backfill time for debouncing
+    this._backfillIntervalMs = 3000; // Reduced from 1200ms to prevent excessive re-queuing
     this._periodicBackfill = setInterval(
       () => this._backfillMissing({ onlyIfRelayReady: true }),
       this._backfillIntervalMs
@@ -5123,9 +5124,17 @@ return new Promise((resolve) => {
 
   _scheduleBackfill(delayMs = 0) {
     if (this._backfillTimer) clearTimeout(this._backfillTimer);
+
+    // Enforce minimum 500ms between backfills to prevent excessive re-queuing
+    const now = this._nowMs();
+    const timeSinceLastBackfill = this._lastBackfillTime ? (now - this._lastBackfillTime) : Infinity;
+    const minDelay = 500;
+    const actualDelay = Math.max(minDelay, delayMs, minDelay - timeSinceLastBackfill);
+
     this._backfillTimer = setTimeout(() => {
+      this._lastBackfillTime = this._nowMs();
       this._backfillMissing({ onlyIfRelayReady: false });
-    }, Math.max(0, delayMs));
+    }, actualDelay);
   }
 
   _backfillMissing({ onlyIfRelayReady = false } = {}) {
@@ -5536,7 +5545,10 @@ return new Promise((resolve) => {
     const consecutive = metrics?.consecutiveFailures ?? 0;
     const heartbeatFail = metrics?.heartbeatFail ?? 0;
 
-    if (!isConnected) {
+    // If we're in warmup period after initial connect, skip normal logic
+    if (this._relayWarmupActive) {
+      // Warmup logic manages concurrency levels
+    } else if (!isConnected) {
       this.MAX_CONCURRENT_POPULATES = 6;
       this.RATE_QPS = 6; this.RATE_BPS = 160 * 1024;
     } else if (consecutive >= 6 || heartbeatFail > 2) {
@@ -5559,7 +5571,49 @@ return new Promise((resolve) => {
 
     if (isConnected && !this._relayWasConnected) {
       this._relayWasConnected = true;
-      this._scheduleBackfill(0);
+
+      // CRITICAL: Start with very low concurrency and gradually ramp up
+      // to prevent massive lag spike / crash on NKN connect
+      this._relayWarmupActive = true;
+      this.MAX_CONCURRENT_POPULATES = this._isMobile ? 1 : 3;
+      this.RATE_QPS = 6;
+      this.RATE_BPS = 128 * 1024;
+
+      // Clear any existing warmup timer
+      if (this._relayWarmupTimer) {
+        clearInterval(this._relayWarmupTimer);
+      }
+
+      // Gradually ramp up concurrency over 30 seconds
+      const targetConcurrent = this._isMobile ? 3 : 18;
+      const targetQPS = this._isMobile ? 6 : 36;
+      const targetBPS = this._isMobile ? (160 * 1024) : (768 * 1024);
+      const steps = 15; // 15 steps over 30 seconds = 2 second intervals
+      let currentStep = 0;
+
+      this._relayWarmupTimer = setInterval(() => {
+        currentStep++;
+
+        if (currentStep >= steps) {
+          // Warmup complete - reached target values
+          this.MAX_CONCURRENT_POPULATES = targetConcurrent;
+          this.RATE_QPS = targetQPS;
+          this.RATE_BPS = targetBPS;
+          this._relayWarmupActive = false;
+          clearInterval(this._relayWarmupTimer);
+          this._relayWarmupTimer = null;
+        } else {
+          // Gradually increase (linear ramp)
+          const progress = currentStep / steps;
+          const initialConcurrent = this._isMobile ? 1 : 3;
+          this.MAX_CONCURRENT_POPULATES = Math.floor(initialConcurrent + (targetConcurrent - initialConcurrent) * progress);
+          this.RATE_QPS = Math.floor(6 + (targetQPS - 6) * progress);
+          this.RATE_BPS = Math.floor(128 * 1024 + (targetBPS - 128 * 1024) * progress);
+        }
+      }, 2000);
+
+      // Delay initial backfill by 2 seconds to let connection stabilize
+      this._scheduleBackfill(2000);
     }
   }
 
@@ -6155,6 +6209,7 @@ return new Promise((resolve) => {
     if (this._backfillTimer) { clearTimeout(this._backfillTimer); this._backfillTimer = null; }
     if (this._periodicBackfill) { clearInterval(this._periodicBackfill); this._periodicBackfill = null; }
     if (this._rateTicker) { clearInterval(this._rateTicker); this._rateTicker = null; }
+    if (this._relayWarmupTimer) { clearInterval(this._relayWarmupTimer); this._relayWarmupTimer = null; }
     this._resetAllTiles();
     this.tiles.clear();
     if (this._farfieldMat) {
