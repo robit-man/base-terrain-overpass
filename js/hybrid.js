@@ -633,6 +633,38 @@ export class HybridHub {
     this._markStateDirty();
   }
 
+  _handleHydraPeer(peer) {
+    if (!peer?.pub) return;
+    const pub = peer.pub.toLowerCase();
+
+    // Filter out self
+    const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
+    if (pub === selfPub) return;
+
+    const loc = peer.meta?.loc;
+    const geo = loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lon)
+      ? { lat: Number(loc.lat), lon: Number(loc.lon), gh: loc.gh, radius: loc.radius }
+      : null;
+
+    // Add network prefix to identify as Hydra peer
+    const addrWithPrefix = peer.addr || `hydra.${pub}`;
+
+    this.state.hydra.peers.set(pub, {
+      nknPub: pub,
+      addr: addrWithPrefix,
+      last: peer.last || nowSecondsFallback(),
+      online: peer.online !== false,
+      meta: { ...peer.meta, network: 'hydra' },
+      geo,
+      type: 'hydra'
+    });
+
+    if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
+    this._markStateDirty();
+
+    console.log('[HybridHub] Hydra peer discovered via NATS:', pub, addrWithPrefix);
+  }
+
   _logRawMessage(from, msg, network) {
     if (!msg || typeof msg !== 'object') return;
 

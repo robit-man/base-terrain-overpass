@@ -18,7 +18,13 @@
 // Config
 // =============================
 const RG_DIRECT_BASE = 'https://radio.garden/api';
-const RG_CORS_RELAY_BASE = 'https://r.jina.ai/http://radio.garden/api';
+// make relay first to avoid the direct CORS error line in console
+const RG_CORS_RELAY_BASES = [
+  'https://r.jina.ai/https://radio.garden/api',
+  'https://r.jina.ai/http://radio.garden/api'
+];
+const TRY_BASES = [...RG_CORS_RELAY_BASES, 'https://radio.garden/api'];
+
 const JSON_HEADERS = { Accept: 'application/json' };
 const MI_TO_KM = 1.609344; // exact
 
@@ -53,22 +59,25 @@ function parseChannelIdFromHref(href) {
 
 // Robust JSON fetch that tries DIRECT first, then a public CORS relay.
 async function getJSONWithFallback(path, { signal } = {}) {
-  const bases = [RG_DIRECT_BASE, RG_CORS_RELAY_BASE];
+  // Try direct first (will CORS-fail in the browser), then fall back to permissive relays
+  const bases = [RG_DIRECT_BASE, ...RG_CORS_RELAY_BASES];
   let lastErr;
   for (const base of bases) {
     const url = `${base}${path}`;
     try {
-      const res = await fetch(url, { signal, headers: JSON_HEADERS, credentials: 'omit' });
+      const res = await fetch(url, { signal, headers: JSON_HEADERS, credentials: 'omit', mode: 'cors' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      // r.jina.ai may return text/plain; still parse as JSON
-      const text = await res.text();
-      try { return JSON.parse(text); } catch {
-        // If it's already JSON, res.json() works; if not, try parse text
-        return await (await fetch(url, { signal, headers: JSON_HEADERS })).json();
+      // Some relays return text/plain; parse text manually if needed
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) {
+        return await res.json();
+      } else {
+        const text = await res.text();
+        return JSON.parse(text);
       }
     } catch (e) {
       lastErr = e;
-      // try next base
+      continue; // try next base
     }
   }
   throw lastErr || new Error('Failed to fetch Radio Garden JSON');

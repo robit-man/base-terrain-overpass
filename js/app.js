@@ -225,20 +225,12 @@ class App {
     this._teleportMeditating = false;
     this._teleportRayTargets = [];
     this._teleportHintAt = 0;
-    this.radio = new RadioManager({
-      ui,
-      getLocation: () => this._locationState,
-      proxyBase: '/rg',          // JSON via your proxy (avoid CORS)
-      listenBase: 'https://radio.garden/api', // <audio> points directly at RG
-      radiusMiles: 30,           // set any radius here
-      autotune: {
-        enabled: true,
-        minMoveKm: 5,
-        minSecondsBetweenRebuild: 10,
-        selectStrategy: 'first',
-        maxPlacesToScan: 10
-      }
-    });
+this.radio = new RadioManager({
+  ui,
+  getLocation: () => this._locationState, // { lat, lon }
+  radiusMiles: 30,                        // tweak if you want
+  autotune: { enabled: true, minMoveKm: 5, minSecondsBetweenRebuild: 10 }
+});
 
 
 
