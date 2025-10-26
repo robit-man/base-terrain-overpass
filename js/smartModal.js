@@ -292,14 +292,16 @@ class SmartObjectModal {
 
     // Get Hydra peers from hybrid hub via app
     const app = this.mesh?.app;
-    const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+    const hybridState = app?.hybrid?.state?.hydra;
 
-    if (!hydraDiscovery) {
-      peerListContainer.innerHTML = '<p class="smart-peer-empty">Hydra discovery not available</p>';
+    if (!hybridState || !hybridState.discovery) {
+      peerListContainer.innerHTML = '<p class="smart-peer-empty">Hydra discovery not available. Enable Hydra network in main UI.</p>';
       return;
     }
 
-    const peers = hydraDiscovery.peers || [];
+    // Get peers from the hydra.peers Map
+    const peersMap = hybridState.peers || new Map();
+    const peers = Array.from(peersMap.values()).filter(p => p && p.nknPub);
 
     if (peers.length === 0) {
       peerListContainer.innerHTML = '<p class="smart-peer-empty">No Hydra peers discovered yet...</p>';
@@ -357,15 +359,15 @@ class SmartObjectModal {
 
     try {
       const app = this.mesh?.app;
-      const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+      const hybridState = app?.hybrid?.state?.hydra;
 
-      if (!hydraDiscovery) {
+      if (!hybridState || !hybridState.discovery) {
         this._log('Error: Hydra discovery not available', 'error');
         return;
       }
 
       // Send ping via NATS discovery
-      await hydraDiscovery.dm(peer.nknPub, {
+      await hybridState.discovery.dm(peer.nknPub, {
         type: 'ping',
         from: this.mesh?.selfPub || 'unknown',
         timestamp: Date.now()
@@ -386,9 +388,9 @@ class SmartObjectModal {
 
     try {
       const app = this.mesh?.app;
-      const hydraDiscovery = app?.hybrid?.state?.hydra?.discovery;
+      const hybridState = app?.hybrid?.state?.hydra;
 
-      if (!hydraDiscovery || !this.currentObject) {
+      if (!hybridState || !hybridState.discovery || !this.currentObject) {
         this._log('Error: Discovery or Smart Object not available', 'error');
         return;
       }
@@ -412,7 +414,7 @@ class SmartObjectModal {
         timestamp: Date.now()
       };
 
-      await hydraDiscovery.dm(peer.nknPub, syncRequest);
+      await hybridState.discovery.dm(peer.nknPub, syncRequest);
 
       this._log(`✓ Sync request sent to ${peer.nknPub.slice(0, 8)}`, 'success');
       this._log(`Waiting for approval from Hydra user...`, 'info');

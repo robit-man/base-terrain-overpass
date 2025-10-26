@@ -1609,7 +1609,9 @@ function decodeGeohash(hash) {
 }
 
 function sanitizeRoom() {
-  return 'hybrid-bridge';
+  // Use 'nexus' as the shared discovery room for both Hydra and NoClip
+  // This enables cross-application peer discovery across hydra.nexus and noclip.nexus
+  return 'nexus';
 }
 
 function formatLast(last) {
@@ -1721,8 +1723,9 @@ class HydraDiscovery extends EventHub {
     this.nc = null;
     this.sc = null;
     this._hb = null;
-    this.presenceSubject = `hydra.${this.room}.presence`;
-    this.dmSubject = (pub) => `hydra.${this.room}.dm.${pub}`;
+    // Use the same subject pattern as Hydra's nats.js for cross-discovery
+    this.presenceSubject = `discovery.${this.room}.presence`;
+    this.dmSubject = (pub) => `discovery.dm.${pub}`;
   }
 
   async connect() {
