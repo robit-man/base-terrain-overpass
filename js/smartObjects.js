@@ -256,7 +256,7 @@ class SmartObjectManager {
     if (!mesh) return null;
 
     // Create wireframe highlight (hidden by default)
-    const wireframeHelper = new THREE.BoxHelper(mesh, 0x00ff00);
+    const wireframeHelper = new THREE.BoxHelper(mesh, 0xffffff);
     wireframeHelper.visible = false;
     wireframeHelper.name = 'wireframeHelper';
     this.scene.add(wireframeHelper);

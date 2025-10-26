@@ -242,6 +242,7 @@ this.radio = new RadioManager({
     this._pointerLockButtonState = 'idle';
     this._orbitDragActive = false;
     this._orbitDragPointerId = null;
+    this._orbitDragMoved = false;
     this._orbitDragLastX = 0;
     this._orbitDragLastY = 0;
     this._orbitDragSensitivity = 0.0022;
@@ -4967,11 +4968,13 @@ this.radio = new RadioManager({
       this._cancelPointerHold();
     }
 
-    const wasOrbiting = this._orbitDragActive;
+    // Treat it as a drag only if we actually moved the camera.
+    const wasDraggingCamera = this._orbitDragActive && this._orbitDragMoved;
+
     this._endOrbitDrag(e);
 
-    // Only handle click if not orbiting (to avoid clicking while dragging camera)
-    if (!wasOrbiting && this.sceneMgr?.handleCanvasClick) {
+    // If we didn't drag, forward as a click so SmartObjects can consume it.
+    if (!wasDraggingCamera && this.sceneMgr?.handleCanvasClick) {
       this.sceneMgr.handleCanvasClick(e);
     }
   }
@@ -5035,6 +5038,7 @@ this.radio = new RadioManager({
     if (this._orbitDragActive) return;
     this._orbitDragActive = true;
     this._orbitDragPointerId = e.pointerId;
+    this._orbitDragMoved = false;
     this._orbitDragLastX = e.clientX;
     this._orbitDragLastY = e.clientY;
     const canvas = this.sceneMgr?.renderer?.domElement;
@@ -5046,6 +5050,7 @@ this.radio = new RadioManager({
     const dx = e.clientX - this._orbitDragLastX;
     const dy = e.clientY - this._orbitDragLastY;
     if (dx === 0 && dy === 0) return;
+    this._orbitDragMoved = true;
     this._orbitDragLastX = e.clientX;
     this._orbitDragLastY = e.clientY;
     this._applyDesktopOrbitDelta(dx, dy);
@@ -5056,6 +5061,7 @@ this.radio = new RadioManager({
     if (e && e.pointerId != null && e.pointerId !== this._orbitDragPointerId) return;
     this._orbitDragActive = false;
     this._orbitDragPointerId = null;
+    this._orbitDragMoved = false;
     const canvas = this.sceneMgr?.renderer?.domElement;
     if (canvas) canvas.style.cursor = '';
   }
