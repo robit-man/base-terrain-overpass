@@ -887,6 +887,119 @@ export class HybridHub {
     return sessions.length;
   }
 
+  _sendBridgeAck(pub, messageId, status = 'ok', detail = '', extras = {}) {
+    if (!messageId) return;
+    const discovery = this.state.hydra.discovery;
+    if (!discovery) return;
+    const packet = {
+      type: 'hybrid-bridge-ack',
+      inReplyTo: messageId,
+      status,
+      ...(detail ? { detail } : {}),
+      ...extras,
+      ts: nowSecondsFallback()
+    };
+    discovery.dm(pub, packet).catch((err) => {
+      console.error('[Hybrid] Failed to send bridge ack:', err);
+    });
+  }
+
+  _handleSmartObjectStateMessage(from, payload) {
+    const sessionId = payload.sessionId || payload.session?.sessionId || null;
+    const objectUuid = payload.objectUuid || payload.objectId;
+    if (!objectUuid) {
+      return { status: 'error', detail: 'objectUuid missing', sessionId };
+    }
+    const manager = this.sceneMgr?.smartObjects;
+    if (!manager) {
+      return { status: 'error', detail: 'SmartObjectManager unavailable', sessionId, objectUuid };
+    }
+    const updates = {};
+    if (payload.position) updates.position = payload.position;
+    if (payload.state?.position && !updates.position) updates.position = payload.state.position;
+    if (payload.state?.mesh || payload.mesh) updates.mesh = payload.state?.mesh || payload.mesh;
+    if (payload.state?.sources) updates.sources = payload.state.sources;
+    if (payload.state?.audioInput) updates.audioInput = payload.state.audioInput;
+    if (payload.state?.visibility) updates.visibility = payload.state.visibility;
+
+    const ok = manager.updateSmartObject(objectUuid, updates);
+    if (!ok) {
+      return { status: 'error', detail: `Smart object ${objectUuid} not found`, sessionId, objectUuid };
+    }
+
+    const sessionPatch = {
+      ...(payload.session || {}),
+      sessionId,
+      status: payload.status || payload.session?.status || 'updated',
+      position: payload.position || updates.position || undefined,
+      capabilities: payload.capabilities || undefined,
+      metadata: payload.metadata || undefined
+    };
+    if (sessionPatch.sessionId) {
+      manager.attachSession(objectUuid, sessionPatch);
+    }
+
+    return { status: 'ok', detail: 'Smart object state applied', sessionId, objectUuid };
+  }
+
+  _handleDecisionResultMessage(from, payload) {
+    const sessionId = payload.sessionId || payload.session?.sessionId || null;
+    const objectUuid = payload.objectUuid || payload.objectId;
+    if (!objectUuid) {
+      return { status: 'error', detail: 'objectUuid missing', sessionId };
+    }
+    const manager = this.sceneMgr?.smartObjects;
+    if (!manager) {
+      return { status: 'error', detail: 'SmartObjectManager unavailable', sessionId, objectUuid };
+    }
+    const sessionPatch = {
+      ...(payload.session || {}),
+      sessionId,
+      status: payload.status || payload.session?.status || 'decision',
+      decision: payload.decision || payload.result || payload
+    };
+    if (sessionPatch.sessionId) {
+      manager.attachSession(objectUuid, sessionPatch);
+    }
+    const key = makeScopedKey(NETWORKS.HYDRA, from);
+    this._appendChat(key, {
+      dir: 'in',
+      kind: 'log',
+      text: `Decision result for ${objectUuid}`,
+      meta: { decision: payload },
+      ts: payload.ts || nowSecondsFallback()
+    });
+    return { status: 'ok', detail: 'Decision result recorded', sessionId, objectUuid };
+  }
+
+  _handleGraphQueryMessage(from, payload) {
+    const queryId = payload.queryId || payload.messageId || '';
+    const sessionId = payload.sessionId || null;
+    const key = makeScopedKey(NETWORKS.HYDRA, from);
+    this._appendChat(key, {
+      dir: 'in',
+      kind: 'log',
+      text: `Graph query received (${queryId || 'n/a'})`,
+      meta: { query: payload },
+      ts: payload.ts || nowSecondsFallback()
+    });
+    return { status: 'error', detail: 'graph-query handling not implemented', sessionId, queryId };
+  }
+
+  _handleGraphResponseMessage(from, payload) {
+    const queryId = payload.queryId || payload.messageId || '';
+    const sessionId = payload.sessionId || null;
+    const key = makeScopedKey(NETWORKS.HYDRA, from);
+    this._appendChat(key, {
+      dir: 'in',
+      kind: 'log',
+      text: `Graph response received (${queryId || 'n/a'})`,
+      meta: { response: payload },
+      ts: payload.ts || nowSecondsFallback()
+    });
+    return { status: 'ok', detail: 'Graph response logged', sessionId, queryId };
+  }
+
   onSmartObjectCreated(smartObject) {
     if (!smartObject) return;
     const uuid = smartObject.uuid || smartObject.config?.uuid;
@@ -1093,6 +1206,54 @@ export class HybridHub {
     const peerRecord = this.state.hydra.peers.get(from);
     if (peerRecord) peerRecord.last = payload.ts || nowSecondsFallback();
     if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
+    if (type === 'smart-object-state') {
+      const result = this._handleSmartObjectStateMessage(from, payload);
+      if (payload.messageId) {
+        const extras = {};
+        const sessionRef = result.sessionId || payload.sessionId || payload.session?.sessionId;
+        if (sessionRef) extras.sessionId = sessionRef;
+        const objectRef = result.objectUuid || payload.objectUuid || payload.objectId;
+        if (objectRef) extras.objectUuid = objectRef;
+        this._sendBridgeAck(from, payload.messageId, result.status, result.detail, extras);
+      }
+      return;
+    }
+    if (type === 'decision-result') {
+      const result = this._handleDecisionResultMessage(from, payload);
+      if (payload.messageId) {
+        const extras = {};
+        const sessionRef = result.sessionId || payload.sessionId || payload.session?.sessionId;
+        if (sessionRef) extras.sessionId = sessionRef;
+        const objectRef = result.objectUuid || payload.objectUuid || payload.objectId;
+        if (objectRef) extras.objectUuid = objectRef;
+        this._sendBridgeAck(from, payload.messageId, result.status, result.detail, extras);
+      }
+      return;
+    }
+    if (type === 'graph-query') {
+      const result = this._handleGraphQueryMessage(from, payload);
+      if (payload.messageId) {
+        const extras = {};
+        const sessionRef = result.sessionId || payload.sessionId || payload.session?.sessionId;
+        if (sessionRef) extras.sessionId = sessionRef;
+        const queryRef = result.queryId || payload.queryId;
+        if (queryRef) extras.queryId = queryRef;
+        this._sendBridgeAck(from, payload.messageId, result.status, result.detail, extras);
+      }
+      return;
+    }
+    if (type === 'graph-response') {
+      const result = this._handleGraphResponseMessage(from, payload);
+      if (payload.messageId) {
+        const extras = {};
+        const sessionRef = result.sessionId || payload.sessionId || payload.session?.sessionId;
+        if (sessionRef) extras.sessionId = sessionRef;
+        const queryRef = result.queryId || payload.queryId;
+        if (queryRef) extras.queryId = queryRef;
+        this._sendBridgeAck(from, payload.messageId, result.status, result.detail, extras);
+      }
+      return;
+    }
     if (type === 'hybrid-bridge-resource') {
       this._handleResource(from, payload);
       return;
