@@ -48,8 +48,9 @@ export class Input {
         dx = clamp(dx, -MAXD, MAXD);
         dy = clamp(dy, -MAXD, MAXD);
 
-        this.touch.dxNorm = dx / MAXD;
-        this.touch.dyNorm = dy / MAXD;
+        // Flip horizontal sign so swipe-left turns left (mobile only path)
+        this.touch.dxNorm = -dx / MAXD;
+        this.touch.dyNorm =  dy / MAXD;
 
         // Prevent page scroll while the gesture that began on the canvas is active
         e.preventDefault();
@@ -99,8 +100,10 @@ export class Input {
           const t = e.touches[0];
           let dx = t.clientX - this.touch.x0, dy = t.clientY - this.touch.y0;
           dx = clamp(dx, -MAXD, MAXD); dy = clamp(dy, -MAXD, MAXD);
-          this.touch.dxNorm = dx / MAXD;
-          this.touch.dyNorm = dy / MAXD;
+
+          // Flip horizontal sign so swipe-left turns left (mobile only path)
+          this.touch.dxNorm = -dx / MAXD;
+          this.touch.dyNorm =  dy / MAXD;
           e.preventDefault();
         };
         const onEnd = () => {

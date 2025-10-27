@@ -227,12 +227,12 @@ class App {
     this._teleportMeditating = false;
     this._teleportRayTargets = [];
     this._teleportHintAt = 0;
-this.radio = new RadioManager({
-  ui,
-  getLocation: () => this._locationState, // { lat, lon }
-  radiusMiles: 30,                        // tweak if you want
-  autotune: { enabled: true, minMoveKm: 5, minSecondsBetweenRebuild: 10 }
-});
+    this.radio = new RadioManager({
+      ui,
+      getLocation: () => this._locationState, // { lat, lon }
+      radiusMiles: 30,                        // tweak if you want
+      autotune: { enabled: true, minMoveKm: 5, minSecondsBetweenRebuild: 10 }
+    });
 
 
 
@@ -524,7 +524,8 @@ this.radio = new RadioManager({
     this.remotes = new Remotes(
       this.sceneMgr,
       (x, z) => this.hexGridMgr.getHeightAt(x, z),
-      this.avatarFactoryPromise
+      avatarFactoryPromise,
+      { selfPub: this.mesh?.selfPub }
     );
     this.mesh = new Mesh(this);
     this.hybrid = new HybridHub({ mesh: this.mesh });

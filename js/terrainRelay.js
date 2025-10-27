@@ -15,7 +15,7 @@ function ensureJson(obj) {
 }
 
 export class TerrainRelay {
-  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null, wsEndpoint = 'wss://noclip-elevation.loca.lt' } = {}) {
+  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null, wsEndpoint = 'https://noclip-elevation.loca.lt' } = {}) {
     this.relayAddress = defaultRelay.trim();
     this.dataset = dataset.trim() || 'mapzen';
     this.mode = mode === 'latlng' ? 'latlng' : 'geohash';

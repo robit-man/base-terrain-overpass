@@ -17,15 +17,41 @@ function smoothAlpha(ratePerSec, dt) {
 }
 
 export class Remotes {
-  constructor(sceneMgr, heightSampler, avatarFactoryPromise) {
+  constructor(sceneMgr, heightSampler, avatarFactoryPromise, opts = {}) {
     this.sceneMgr = sceneMgr;
     this.heightAt = heightSampler;
     this.map = new Map();
     this.latest = new Map();
     this.avatarFactoryPromise = avatarFactoryPromise;
+
+    // NEW: self-awareness
+    this.selfPub = typeof opts.selfPub === 'string' ? opts.selfPub.toLowerCase() : null;
+    this.isSelf = (pub) => {
+      if (!pub || !this.selfPub) return false;
+      return String(pub).toLowerCase() === this.selfPub;
+    };
   }
 
+
   async ensure(pub, alias) {
+    // NEW: never create a "remote" for self
+    if (this.isSelf(pub)) {
+      // If a stale self-entry exists (from an earlier bug), remove it now.
+      const stale = this.map.get(pub);
+      if (stale) {
+        try {
+          this.sceneMgr.remoteLayer.remove(stale.group);
+          if (stale.label) {
+            stale.group.remove(stale.label);
+            stale.label.material.map.dispose();
+            stale.label.material.dispose();
+          }
+        } catch { }
+        this.map.delete(pub);
+      }
+      return null;
+    }
+
     if (this.map.has(pub)) {
       if (typeof alias === 'string') this.setAlias(pub, alias);
       return this.map.get(pub);
@@ -34,7 +60,7 @@ export class Remotes {
     if (!factory) return null;
 
     const group = new THREE.Group();
-    group.name = `remote-${pub.slice(0,8)}`;
+    group.name = `remote-${pub.slice(0, 8)}`;
     this.sceneMgr.remoteLayer.add(group);
 
     const avatar = factory.create();
@@ -63,6 +89,25 @@ export class Remotes {
     this.map.set(pub, ent);
     this._refreshLabel(ent, this._composeLabelText(ent), now());
     return ent;
+  }
+
+  setSelfPub(pub) {
+    const next = typeof pub === 'string' ? pub.toLowerCase() : null;
+    if (this.selfPub === next) return;
+    this.selfPub = next;
+    // Clean up any mistakenly-spawned self remote
+    if (next && this.map.has(next)) {
+      const ent = this.map.get(next);
+      try {
+        this.sceneMgr.remoteLayer.remove(ent.group);
+        if (ent.label) {
+          ent.group.remove(ent.label);
+          ent.label.material.map.dispose();
+          ent.label.material.dispose();
+        }
+      } catch { }
+      this.map.delete(next);
+    }
   }
 
   setAlias(pub, alias) {

@@ -5128,9 +5128,9 @@ export class TileManager {
 
   // CRITICAL: Texture application queue - ONLY processes tiles with elevation data
   _queueTextureApplication(tile) {
-    if (!tile || !tile._elevationFetched) return;
-    if (!this._textureQueue) this._textureQueue = [];
-    if (this._textureQueue.includes(tile)) return;
+    //if (!tile || !tile._elevationFetched) return;
+    //if (!this._textureQueue) this._textureQueue = [];
+    //if (this._textureQueue.includes(tile)) return;
     this._textureQueue.push(tile);
   }
 
