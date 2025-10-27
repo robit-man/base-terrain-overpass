@@ -5226,11 +5226,15 @@ export class TileManager {
       // CRITICAL: DO NOT apply textures during finalize - defer until after elevation fetch
       // this._applyAllColorsGlobal(tile);  // REMOVED - moved to deferred queue
     } else {
-      // ---- blend / seal with pinned edges acting as anchors ----
-      this._nearestAnchorFill(tile);
-      this._smoothUnknowns(tile, 1);
-      this._sealEdgesCornerSafe(tile);
-      this._fixStuckZeros(tile, /*rimOnly=*/true);
+      // CRITICAL: On MOBILE skip ALL expensive synchronous operations
+      // These operations block main thread for 200-400ms and CRASH the tab
+      if (!this._isMobile) {
+        // Desktop only - run blend/seal operations
+        this._nearestAnchorFill(tile);
+        this._smoothUnknowns(tile, 1);
+        this._sealEdgesCornerSafe(tile);
+        this._fixStuckZeros(tile, /*rimOnly=*/true);
+      }
 
       pos.needsUpdate = true;
       // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
