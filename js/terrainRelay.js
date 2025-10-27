@@ -423,6 +423,7 @@ export class TerrainRelay {
     return mc;
   }
 
+  // terrainRelay.js
   _handleIncoming(_src, payload) {
     let text = payload;
     if (payload instanceof Uint8Array) {
@@ -430,19 +431,29 @@ export class TerrainRelay {
     }
     if (typeof text !== 'string') return;
 
-    let msg = null;
-    try { msg = JSON.parse(text); } catch { return; }
-    if (!msg || typeof msg !== 'object') return;
+    const doParse = () => {
+      let msg = null;
+      try { msg = JSON.parse(text); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
 
-    const id = msg.id;
-    if (id && this._pending.has(id)) {
-      const pending = this._pending.get(id);
-      this._pending.delete(id);
-      clearTimeout(pending.timeout);
-      pending.resolve(msg);
-      return;
+      const id = msg.id;
+      if (id && this._pending.has(id)) {
+        const pending = this._pending.get(id);
+        this._pending.delete(id);
+        clearTimeout(pending.timeout);
+        pending.resolve(msg);
+        return;
+      }
+    };
+
+    // Defer parse so a flood of replies doesn’t block a frame
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(doParse, { timeout: 50 });
+    } else {
+      setTimeout(doParse, 0);
     }
   }
+
 
   _sendWithReply(dest, payload, timeoutMs = 25000, clientOverride = null) {
     if (!dest) return Promise.reject(new Error('No relay address configured'));

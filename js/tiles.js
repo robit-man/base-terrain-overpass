@@ -222,7 +222,7 @@ export class TileManager {
     this._overlayCache = new Map();
     this._overlayCanvas = null;
     this._overlayCtx = null;
-        this._overlayVersion = DEFAULT_WAYBACK_VERSION;
+    this._overlayVersion = DEFAULT_WAYBACK_VERSION;
     this._overlayVersions = [];
     this._overlayVersionPromise = null;
     this._overlayVersionLastFetch = 0;
@@ -1909,114 +1909,114 @@ export class TileManager {
   }
 
   _fetchOverlayTile(cacheKey, entry) {
-  const { version, zoom } = entry;
-  if (!version) { entry.status = 'error'; return; }
+    const { version, zoom } = entry;
+    if (!version) { entry.status = 'error'; return; }
 
-  // helper to finish & notify waiters
-  const finalizeReady = (canvas, bounds) => {
-    // Reuse your existing processing so samples/etc keep working
-    const overlayData = this._processOverlayImage(canvas, bounds);
-    const texCanvas   = overlayData.canvas || canvas;
+    // helper to finish & notify waiters
+    const finalizeReady = (canvas, bounds) => {
+      // Reuse your existing processing so samples/etc keep working
+      const overlayData = this._processOverlayImage(canvas, bounds);
+      const texCanvas = overlayData.canvas || canvas;
 
-    // Create texture from canvas (works for <img> or <canvas>)
-    const texture = new THREE.CanvasTexture(texCanvas);
-    texture.wrapS = THREE.ClampToEdgeWrapping;
-    texture.wrapT = THREE.ClampToEdgeWrapping;
-    texture.minFilter = THREE.LinearMipmapLinearFilter;
-    texture.magFilter = THREE.LinearFilter;
-    texture.generateMipmaps = true;
-    texture.anisotropy = (this.renderer?.capabilities?.getMaxAnisotropy?.() || 1);
-    texture.encoding = THREE.sRGBEncoding;
+      // Create texture from canvas (works for <img> or <canvas>)
+      const texture = new THREE.CanvasTexture(texCanvas);
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      texture.minFilter = THREE.LinearMipmapLinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.generateMipmaps = true;
+      texture.anisotropy = (this.renderer?.capabilities?.getMaxAnisotropy?.() || 1);
+      texture.encoding = THREE.sRGBEncoding;
 
-    texture.flipY = false;               // ★ IMPORTANT: keep Mercator v “top-origin”
-    texture.needsUpdate = true;          // ★ ensure the flip takes effect
+      texture.flipY = false;               // ★ IMPORTANT: keep Mercator v “top-origin”
+      texture.needsUpdate = true;          // ★ ensure the flip takes effect
 
-    entry.texture   = texture;
-    entry.samples   = overlayData.samples || [];
-    entry.imageSize = overlayData.imageSize || { width: texCanvas.width, height: texCanvas.height };
-    entry.status    = 'ready';
+      entry.texture = texture;
+      entry.samples = overlayData.samples || [];
+      entry.imageSize = overlayData.imageSize || { width: texCanvas.width, height: texCanvas.height };
+      entry.status = 'ready';
 
-    // wake the tiles waiting for this entry
-    const waiters = entry.waiters ? Array.from(entry.waiters) : [];
-    entry.waiters?.clear?.();
-    for (const t of waiters) {
-      if (!t || !this.tiles.has(`${t.q},${t.r}`)) continue;
-      this._applyOverlayEntryToTile(t, entry);
-      t._overlay = { status: 'ready', cacheKey };
+      // wake the tiles waiting for this entry
+      const waiters = entry.waiters ? Array.from(entry.waiters) : [];
+      entry.waiters?.clear?.();
+      for (const t of waiters) {
+        if (!t || !this.tiles.has(`${t.q},${t.r}`)) continue;
+        this._applyOverlayEntryToTile(t, entry);
+        t._overlay = { status: 'ready', cacheKey };
+      }
+    };
+
+    const fail = () => {
+      entry.status = 'error';
+      const waiters = entry.waiters ? Array.from(entry.waiters) : [];
+      entry.waiters?.clear?.();
+      for (const t of waiters) { if (t) t._overlay = null; }
+    };
+
+    // ---- SINGLE TILE path ----------------------------------------------------
+    if (!entry.composite) {
+      const bounds = entry.bounds || this._slippyTileBounds(entry.x, entry.y, zoom);
+      const url = this._buildWaybackTileUrl(version, zoom, entry.x, entry.y);
+      if (!url || typeof Image === 'undefined') return fail();
+
+      const image = new Image();
+      image.crossOrigin = 'anonymous';
+      image.onload = () => finalizeReady(image, bounds);   // handled above (flipY=false)
+      image.onerror = fail;
+      image.src = url;
+      return;
     }
-  };
 
-  const fail = () => {
-    entry.status = 'error';
-    const waiters = entry.waiters ? Array.from(entry.waiters) : [];
-    entry.waiters?.clear?.();
-    for (const t of waiters) { if (t) t._overlay = null; }
-  };
+    // ---- COMPOSITE (3×3) path -----------------------------------------------
+    if (typeof document === 'undefined' || typeof Image === 'undefined') return fail();
 
-  // ---- SINGLE TILE path ----------------------------------------------------
-  if (!entry.composite) {
-    const bounds = entry.bounds || this._slippyTileBounds(entry.x, entry.y, zoom);
-    const url = this._buildWaybackTileUrl(version, zoom, entry.x, entry.y);
-    if (!url || typeof Image === 'undefined') return fail();
+    const x0 = entry.x0, x1 = entry.x1, y0 = entry.y0, y1 = entry.y1;
+    const cols = Math.max(1, x1 - x0 + 1);
+    const rows = Math.max(1, y1 - y0 + 1);
 
-    const image = new Image();
-    image.crossOrigin = 'anonymous';
-    image.onload  = () => finalizeReady(image, bounds);   // handled above (flipY=false)
-    image.onerror = fail;
-    image.src = url;
-    return;
+    // assume 256px tiles initially; will resize after first load if needed
+    const tileSizeGuess = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = cols * tileSizeGuess;
+    canvas.height = rows * tileSizeGuess;
+    const ctx = canvas.getContext('2d', { willReadFrequently: false });
+
+    const N = 1 << zoom;
+    let remaining = cols * rows;
+    let tileSizeKnown = false;
+
+    const drawAt = (img, cx, cy) => {
+      const ts = img.naturalWidth || img.width || tileSizeGuess;
+      if (!tileSizeKnown && ts !== tileSizeGuess) {
+        const prev = document.createElement('canvas');
+        prev.width = canvas.width; prev.height = canvas.height;
+        prev.getContext('2d').drawImage(canvas, 0, 0);
+        canvas.width = cols * ts; canvas.height = rows * ts;
+        ctx.drawImage(prev, 0, 0);
+        tileSizeKnown = true;
+      }
+      const tileSize = tileSizeKnown ? (canvas.width / cols) : tileSizeGuess;
+      ctx.drawImage(img, cx * tileSize, cy * tileSize, tileSize, tileSize);
+    };
+
+    const loadOne = (x, y, cx, cy) => {
+      const nx = ((x % N) + N) % N;                    // wrap X
+      const ny = Math.max(0, Math.min(N - 1, y));      // clamp Y
+      const url = this._buildWaybackTileUrl(version, zoom, nx, ny);
+      if (!url) { remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); return; }
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => { drawAt(img, cx, cy); remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); };
+      img.onerror = () => { remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); };
+      img.src = url;
+    };
+
+    for (let yy = y0; yy <= y1; yy++) {
+      for (let xx = x0; xx <= x1; xx++) {
+        loadOne(xx, yy, xx - x0, yy - y0);
+      }
+    }
   }
-
-  // ---- COMPOSITE (3×3) path -----------------------------------------------
-  if (typeof document === 'undefined' || typeof Image === 'undefined') return fail();
-
-  const x0 = entry.x0, x1 = entry.x1, y0 = entry.y0, y1 = entry.y1;
-  const cols = Math.max(1, x1 - x0 + 1);
-  const rows = Math.max(1, y1 - y0 + 1);
-
-  // assume 256px tiles initially; will resize after first load if needed
-  const tileSizeGuess = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width  = cols * tileSizeGuess;
-  canvas.height = rows * tileSizeGuess;
-  const ctx = canvas.getContext('2d', { willReadFrequently: false });
-
-  const N = 1 << zoom;
-  let remaining = cols * rows;
-  let tileSizeKnown = false;
-
-  const drawAt = (img, cx, cy) => {
-    const ts = img.naturalWidth || img.width || tileSizeGuess;
-    if (!tileSizeKnown && ts !== tileSizeGuess) {
-      const prev = document.createElement('canvas');
-      prev.width = canvas.width; prev.height = canvas.height;
-      prev.getContext('2d').drawImage(canvas, 0, 0);
-      canvas.width = cols * ts; canvas.height = rows * ts;
-      ctx.drawImage(prev, 0, 0);
-      tileSizeKnown = true;
-    }
-    const tileSize = tileSizeKnown ? (canvas.width / cols) : tileSizeGuess;
-    ctx.drawImage(img, cx * tileSize, cy * tileSize, tileSize, tileSize);
-  };
-
-  const loadOne = (x, y, cx, cy) => {
-    const nx = ((x % N) + N) % N;                    // wrap X
-    const ny = Math.max(0, Math.min(N - 1, y));      // clamp Y
-    const url = this._buildWaybackTileUrl(version, zoom, nx, ny);
-    if (!url) { remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); return; }
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload  = () => { drawAt(img, cx, cy); remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); };
-    img.onerror = () => { remaining--; if (remaining <= 0) finalizeReady(canvas, entry.bounds); };
-    img.src = url;
-  };
-
-  for (let yy = y0; yy <= y1; yy++) {
-    for (let xx = x0; xx <= x1; xx++) {
-      loadOne(xx, yy, xx - x0, yy - y0);
-    }
-  }
-}
 
   _unionTileBounds(x0, x1, y0, y1, zoom) {
     const N = 1 << zoom;
@@ -2070,67 +2070,67 @@ export class TileManager {
       cacheKey: `${entry.version}/${entry.zoom}/${entry.x}/${entry.y}`,
     };
   }
-// DROP-IN REPLACEMENT
-_ensureTileUv(tile, bounds) {
-  if (!tile || !bounds || !this.origin) return;
+  // DROP-IN REPLACEMENT
+  _ensureTileUv(tile, bounds) {
+    if (!tile || !bounds || !this.origin) return;
 
-  const geom  = tile.grid?.geometry;
-  const pos   = tile.pos;
-  const group = tile.grid?.group;
-  if (!geom || !pos || !group) return;
+    const geom = tile.grid?.geometry;
+    const pos = tile.pos;
+    const group = tile.grid?.group;
+    if (!geom || !pos || !group) return;
 
-  // Ensure a UV buffer sized to positions
-  let uv = geom.getAttribute('uv');
-  if (!uv || uv.count !== pos.count) {
-    uv = new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2)
-      .setUsage(THREE.DynamicDrawUsage);
-    geom.setAttribute('uv', uv);
+    // Ensure a UV buffer sized to positions
+    let uv = geom.getAttribute('uv');
+    if (!uv || uv.count !== pos.count) {
+      uv = new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2)
+        .setUsage(THREE.DynamicDrawUsage);
+      geom.setAttribute('uv', uv);
+    }
+
+    const data = uv.array;
+
+    // ---- Slippy math ---------------------------------------------------------
+    // u is linear in longitude
+    const lonMin = bounds.lonMin;
+    const lonMax = bounds.lonMax;
+    const lonSpan = Math.max(1e-12, lonMax - lonMin);
+
+    // v is linear in Web Mercator Y, not latitude
+    const mercY = (latDeg) => {
+      // clamp to valid Web Mercator range to avoid infinities
+      const lat = THREE.MathUtils.clamp(latDeg, -85.05112878, 85.05112878);
+      const phi = THREE.MathUtils.degToRad(lat);
+      return Math.log(Math.tan(Math.PI * 0.25 + phi * 0.5));
+    };
+    const mMax = mercY(bounds.latMax);
+    const mMin = mercY(bounds.latMin);
+    const mSpan = Math.max(1e-12, mMax - mMin);
+    // -------------------------------------------------------------------------
+
+    // small clamp to avoid border texel sampling (keeps alignment exact)
+    const epsU = 1 / 2048;
+    const epsV = 1 / 2048;
+
+    const base = group.position;
+    for (let i = 0; i < pos.count; i++) {
+      const wx = base.x + pos.getX(i);
+      const wz = base.z + pos.getZ(i);
+
+      // world -> WGS84
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      const lon = Number.isFinite(ll?.lon) ? ll.lon : (lonMin + lonMax) * 0.5;
+      const lat = Number.isFinite(ll?.lat) ? ll.lat : (bounds.latMin + bounds.latMax) * 0.5;
+
+      // u: linear in lon; v: linear in Mercator-Y (top = latMax)
+      const u = (lon - lonMin) / lonSpan;
+      const v = (mMax - mercY(lat)) / mSpan;
+
+      data[i * 2] = THREE.MathUtils.clamp(u, epsU, 1 - epsU);
+      data[i * 2 + 1] = THREE.MathUtils.clamp(v, epsV, 1 - epsV);
+    }
+
+    uv.needsUpdate = true;
   }
-
-  const data = uv.array;
-
-  // ---- Slippy math ---------------------------------------------------------
-  // u is linear in longitude
-  const lonMin  = bounds.lonMin;
-  const lonMax  = bounds.lonMax;
-  const lonSpan = Math.max(1e-12, lonMax - lonMin);
-
-  // v is linear in Web Mercator Y, not latitude
-  const mercY = (latDeg) => {
-    // clamp to valid Web Mercator range to avoid infinities
-    const lat = THREE.MathUtils.clamp(latDeg, -85.05112878, 85.05112878);
-    const phi = THREE.MathUtils.degToRad(lat);
-    return Math.log(Math.tan(Math.PI * 0.25 + phi * 0.5));
-  };
-  const mMax  = mercY(bounds.latMax);
-  const mMin  = mercY(bounds.latMin);
-  const mSpan = Math.max(1e-12, mMax - mMin);
-  // -------------------------------------------------------------------------
-
-  // small clamp to avoid border texel sampling (keeps alignment exact)
-  const epsU = 1 / 2048;
-  const epsV = 1 / 2048;
-
-  const base = group.position;
-  for (let i = 0; i < pos.count; i++) {
-    const wx = base.x + pos.getX(i);
-    const wz = base.z + pos.getZ(i);
-
-    // world -> WGS84
-    const ll  = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
-    const lon = Number.isFinite(ll?.lon) ? ll.lon : (lonMin + lonMax) * 0.5;
-    const lat = Number.isFinite(ll?.lat) ? ll.lat : (bounds.latMin + bounds.latMax) * 0.5;
-
-    // u: linear in lon; v: linear in Mercator-Y (top = latMax)
-    const u = (lon - lonMin) / lonSpan;
-    const v = (mMax - mercY(lat)) / mSpan;
-
-    data[i * 2]     = THREE.MathUtils.clamp(u, epsU, 1 - epsU);
-    data[i * 2 + 1] = THREE.MathUtils.clamp(v, epsV, 1 - epsV);
-  }
-
-  uv.needsUpdate = true;
-}
 
 
   _applyOverlayTexture(tile, texture) {
@@ -5261,67 +5261,69 @@ _ensureTileUv(tile, bounds) {
 
     const CONC = IS_MOBILE ? 2 : 4;
 
-// Reuse locals from your scope: mode, precision, geohashMap, lookupIndex, indexToRef, etc.
-const _handleBatch = (batch) => {
-  const payload = { type: 'elev.query', dataset: this.relayDataset };
-  if (mode === 'geohash') {
-    payload.geohashes = batch.items;
-    payload.enc = 'geohash';
-    payload.prec = precision;
-  } else {
-    payload.locations = batch.items;
-  }
-
-  const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
-
-  return this._acquireNetBudget(approxBytes)
-    .then(() => this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs))
-    .then((json) => {
-      const results = json?.results || [];
-      for (const res of results) {
-        let idx = null;
-        if (mode === 'geohash') {
-          const key = res.geohash || res.hash;
-          const list = key ? geohashMap?.get(key) : null;
-          if (list && list.length) idx = list.shift();
-        } else if (res.location) {
-          const { lat, lng } = res.location;
-          idx = lookupIndex?.[lat + ',' + lng];
-        }
-        const ref = idx != null ? indexToRef(idx) : null;
-        const height = res?.elev ?? res?.height ?? res?.z ?? res?.h;
-        if (!ref || !Number.isFinite(height)) continue;
-        this._applySample(ref.tile, ref.index, height);
+    // Reuse locals from your scope: mode, precision, geohashMap, lookupIndex, indexToRef, etc.
+    const _handleBatch = (batch) => {
+      const payload = { type: 'elev.query', dataset: this.relayDataset };
+      if (mode === 'geohash') {
+        payload.geohashes = batch.items;
+        payload.enc = 'geohash';
+        payload.prec = precision;
+      } else {
+        payload.locations = batch.items;
       }
-    })
-    .catch((err) => console.warn('[Tiles] elevation batch failed', err));
-};
 
-let cursor = 0, active = 0;
+      const approxBytes = batch.bytes ?? JSON.stringify(payload).length;
 
-return new Promise((resolve) => {
-  const tick = () => {
-    while (active < CONC && cursor < batches.length) {
-      active++;
-      const b = batches[cursor++];
-      _handleBatch(b)
-        .finally(() => {
-          active--;
-          // Yield to frame on mobile to avoid long microtask runs
-          if (IS_MOBILE) requestAnimationFrame(tick); else tick();
-          if (active === 0 && cursor >= batches.length) {
-            this._applyPendingSamples();
-            resolve();
+      return this._acquireNetBudget(approxBytes)
+        .then(() => this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs))
+        .then((json) => {
+          const results = json?.results || [];
+          for (const res of results) {
+            let idx = null;
+            if (mode === 'geohash') {
+              const key = res.geohash || res.hash;
+              const list = key ? geohashMap?.get(key) : null;
+              if (list && list.length) idx = list.shift();
+            } else if (res.location) {
+              const { lat, lng } = res.location;
+              idx = lookupIndex?.[lat + ',' + lng];
+            }
+            const ref = idx != null ? indexToRef(idx) : null;
+            const height = res?.elev ?? res?.height ?? res?.z ?? res?.h;
+            if (!ref || !Number.isFinite(height)) continue;
+            this._applySample(ref.tile, ref.index, height);
           }
-        });
-    }
-    if (active === 0 && cursor >= batches.length) {
-      this._applyPendingSamples();
-      resolve();
-    }
-  };
-  tick();
-});
+        })
+        .catch((err) => console.warn('[Tiles] elevation batch failed', err));
+    };
+
+    let cursor = 0, active = 0;
+
+    return new Promise((resolve) => {
+      // tiles.js (inside the populate batching loop)
+      const tick = () => {
+        while (active < CONC && cursor < batches.length) {
+          active++;
+          const b = batches[cursor++];
+          _handleBatch(b)
+            .finally(() => {
+              active--;
+              // Always yield a frame between bursts on all platforms
+              requestAnimationFrame(tick);
+              if (active === 0 && cursor >= batches.length) {
+                this._applyPendingSamples();
+                resolve();
+              }
+            });
+        }
+        if (active === 0 && cursor >= batches.length) {
+          this._applyPendingSamples();
+          resolve();
+        }
+      };
+      tick();
+
+    });
 
 
     await Promise.allSettled(requests);
@@ -5534,15 +5536,15 @@ return new Promise((resolve) => {
           if (processed >= maxPerFrame) break;
           if (tile.grid?.geometry && tile.type !== 'farfield') {
             // CRITICAL: Skip expensive normal computation on mobile - defer to batch processor
-      if (!this._isMobile) {
-        tile.grid.geometry.computeVertexNormals();
-      } else if (tile.grid?.geometry) {
-        if (!tile._deferredNormalsUpdate) {
-          tile._deferredNormalsUpdate = true;
-          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
-          this._deferredNormalsTiles.add(tile);
-        }
-      }
+            if (!this._isMobile) {
+              tile.grid.geometry.computeVertexNormals();
+            } else if (tile.grid?.geometry) {
+              if (!tile._deferredNormalsUpdate) {
+                tile._deferredNormalsUpdate = true;
+                if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+                this._deferredNormalsTiles.add(tile);
+              }
+            }
           }
           tile._deferredNormalsUpdate = false;
           this._deferredNormalsTiles.delete(tile);
