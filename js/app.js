@@ -524,7 +524,7 @@ class App {
     this.remotes = new Remotes(
       this.sceneMgr,
       (x, z) => this.hexGridMgr.getHeightAt(x, z),
-      avatarFactoryPromise,
+      this.avatarFactoryPromise,
       { selfPub: this.mesh?.selfPub }
     );
     this.mesh = new Mesh(this);
