@@ -39,7 +39,7 @@ export class SceneManager {
     this.renderer.setPixelRatio(safePR);
 
     this.renderer.outputEncoding = THREE.sRGBEncoding;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    //this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = DAY_EXPOSURE;
     this.renderer.physicallyCorrectLights = true;
 

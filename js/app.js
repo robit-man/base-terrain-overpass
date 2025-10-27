@@ -326,7 +326,7 @@ class App {
       const tm = this.hexGridMgr;
       if (!tm) return 4000;
       const ring = Math.max(1, tm.FARFIELD_RING ?? tm.VISUAL_RING ?? 1);
-      return Math.max(200, tm.tileRadius * ring);
+      return Math.max(300, tm.tileRadius * ring);
     });
     this.sceneMgr.setTerrainTargetProvider(() => this._collectTerrainRaycastTargets());
 
