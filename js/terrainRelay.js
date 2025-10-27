@@ -28,7 +28,7 @@ export class TerrainRelay {
     this._wsPending = new Map();
     this._wsRetryTimer = null;
     this._wsRetryDelay = 1000;
-    this._useWsFallback = true; // Enable WebSocket fallback by default
+    this._useWsFallback = false; // Enable WebSocket fallback by default
 
     this._clientProvider = typeof clientProvider === 'function' ? clientProvider : null;
     this._internalClient = null;
@@ -344,6 +344,8 @@ export class TerrainRelay {
       const payload = {
         dataset: this.dataset,
         geohashes: geohashes,
+        dest: this.relayAddress || undefined, // <-- add this
+
       };
 
       this._wsSocket.emit('elevation-request', payload);

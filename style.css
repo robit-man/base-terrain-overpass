@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;500;600;700&display=swap');
+
 :root {
     color-scheme: dark;
     --bg: #000000;
@@ -5,7 +7,7 @@
     --panel: #000000aa;
     --panel2: rgba(255, 255, 255, .05);
     --border: rgba(255, 255, 255, .12);
-    --accent: #5ee3a6;
+    --accent: #ffffff;
     --accent2: #a8ff60;
     --text: #e8f1f8;
     --muted: #a9b6c3;
@@ -388,8 +390,8 @@ input[type=text] {
 
 .control-tab.is-active {
     background: rgba(94, 227, 166, 0.15);
-    border-color: var(--accent);
-    color: var(--accent);
+    border-color: var(--text);
+    color: var(--text);
     box-shadow: 0 0 12px rgba(94, 227, 166, 0.25);
 }
 
@@ -2835,19 +2837,18 @@ canvas {
   left: 0;
   width: 100%;
   height: 100%;
-  background: rgba(0, 0, 0, 0.7);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 10000;
-  backdrop-filter: blur(4px);
+    background: rgba(0, 0, 0, .5);
+    backdrop-filter: blur(20px);
 }
 
 .smart-modal-content {
-  background: linear-gradient(135deg, #1a1d2e 0%, #0f1118 100%);
-  border: 2px solid #5ee3a6;
-  border-radius: 12px;
-  box-shadow: 0 20px 60px rgba(94, 227, 166, 0.3), 0 0 40px rgba(94, 227, 166, 0.1);
+    background-color: #000000aa;
+    border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 14px;
   max-width: 600px;
   width: 90%;
   max-height: 85vh;
@@ -2856,9 +2857,7 @@ canvas {
 }
 
 .smart-modal-header {
-  background: linear-gradient(90deg, rgba(94, 227, 166, 0.1), rgba(168, 255, 96, 0.1));
   padding: 20px 24px;
-  border-bottom: 1px solid rgba(94, 227, 166, 0.3);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2866,16 +2865,15 @@ canvas {
 
 .smart-modal-header h2 {
   margin: 0;
-  color: #5ee3a6;
+  color: #e8f1f8;
   font-size: 24px;
   font-weight: 600;
-  text-shadow: 0 0 10px rgba(94, 227, 166, 0.5);
 }
 
 .smart-modal-close {
   background: none;
   border: none;
-  color: #5ee3a6;
+  color: #e8f1f8;
   font-size: 32px;
   cursor: pointer;
   line-height: 1;
@@ -2889,11 +2887,12 @@ canvas {
 }
 
 .smart-modal-close:hover {
-  color: #a8ff60;
+  color: #e8f1f8;
   transform: scale(1.1);
 }
 
 .smart-modal-body {
+    color:#a9b6c3;
   padding: 24px;
 }
 
@@ -2910,7 +2909,7 @@ canvas {
 }
 
 .smart-modal-section h3 {
-  color: #a8ff60;
+  color: #a9b6c3;
   font-size: 18px;
   font-weight: 600;
   margin: 0 0 16px 0;
@@ -2936,7 +2935,7 @@ canvas {
   width: 100%;
   padding: 10px 12px;
   background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(94, 227, 166, 0.3);
+  border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 6px;
   color: #e8f1f8;
   font-size: 14px;
@@ -2948,8 +2947,8 @@ canvas {
 .smart-form-group input[type="number"]:focus,
 .smart-form-group select:focus {
   outline: none;
-  border-color: #5ee3a6;
-  box-shadow: 0 0 10px rgba(94, 227, 166, 0.3);
+  border-color: #ffffff;
+  box-shadow: 0 0 10px rgba(255, 255, 255, .12);
 }
 
 .smart-form-group input[type="text"]:read-only {
@@ -2973,7 +2972,7 @@ canvas {
   width: 60px;
   height: 40px;
   padding: 4px;
-  border: 1px solid rgba(94, 227, 166, 0.3);
+  border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.3);
   cursor: pointer;
@@ -2981,7 +2980,7 @@ canvas {
 
 .smart-modal-footer {
   padding: 20px 24px;
-  border-top: 1px solid rgba(94, 227, 166, 0.3);
+  border-top: 1px solid rgba(255, 255, 255, .12);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3006,13 +3005,12 @@ canvas {
 }
 
 .smart-btn-save {
-  background: linear-gradient(135deg, #5ee3a6, #a8ff60);
+  background:#ffffff;
   color: #000;
 }
 
 .smart-btn-save:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(94, 227, 166, 0.4);
 }
 
 .smart-btn-cancel {
@@ -3028,13 +3026,11 @@ canvas {
 .smart-btn-delete {
   background: rgba(255, 107, 107, 0.2);
   color: #ff6b6b;
-  border: 1px solid rgba(255, 107, 107, 0.3);
 }
 
 .smart-btn-delete:hover {
   background: rgba(255, 107, 107, 0.3);
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(255, 107, 107, 0.3);
 }
 
 /* Scrollbar styling for modal */
@@ -3047,12 +3043,12 @@ canvas {
 }
 
 .smart-modal-content::-webkit-scrollbar-thumb {
-  background: rgba(94, 227, 166, 0.3);
+  background: rgba(255, 255, 255, .12);
   border-radius: 4px;
 }
 
 .smart-modal-content::-webkit-scrollbar-thumb:hover {
-  background: rgba(94, 227, 166, 0.5);
+  background: rgba(255, 255, 255, 0.5);
 }
 
 /* QR Code and Scanner Styles */
@@ -3069,7 +3065,7 @@ canvas {
 
 .smart-btn-invite,
 .smart-btn-scan {
-  background: linear-gradient(135deg, #5ee3a6, #a8ff60);
+  background: #ffffff;
   color: #000;
   padding: 10px 16px;
   font-size: 13px;
@@ -3079,12 +3075,11 @@ canvas {
 .smart-btn-invite:hover,
 .smart-btn-scan:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(94, 227, 166, 0.4);
 }
 
 .smart-qr-display {
   background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(94, 227, 166, 0.3);
+  border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 8px;
   padding: 16px;
   text-align: center;
@@ -3100,7 +3095,7 @@ canvas {
 .smart-qr-url {
   font-family: monospace;
   font-size: 12px;
-  color: #a8ff60;
+  color: #ffffff;
   word-break: break-all;
   margin: 8px 0;
   padding: 8px;
@@ -3117,7 +3112,7 @@ canvas {
 .smart-scanner {
   position: relative;
   background: #000;
-  border: 2px solid #5ee3a6;
+  border: 2px solid #ffffff;
   border-radius: 8px;
   overflow: hidden;
   margin-top: 12px;
@@ -3146,7 +3141,7 @@ canvas {
 .smart-scanner-frame {
   width: 200px;
   height: 200px;
-  border: 3px solid #5ee3a6;
+  border: 3px solid #ffffff;
   border-radius: 12px;
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
 }
@@ -3168,21 +3163,21 @@ canvas {
 
 .smart-scan-result {
   background: rgba(94, 227, 166, 0.1);
-  border: 1px solid rgba(94, 227, 166, 0.3);
+  border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 6px;
   padding: 12px;
   margin-top: 12px;
 }
 
 .result-success {
-  color: #5ee3a6;
+  color: #ffffff;
   font-size: 14px;
   margin: 0;
 }
 
 .result-success span {
   font-weight: 600;
-  color: #a8ff60;
+  color: #ffffff;
 }
 
 .scan-icon {
