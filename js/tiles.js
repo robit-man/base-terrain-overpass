@@ -3407,11 +3407,12 @@ export class TileManager {
         idx = key ? indexByGeohash?.get(key) : undefined;
       } else if (res.location) {
         const { lat, lng } = res.location;
-        const key = `${(+lat).toFixed(6)},${(+lng).toFixed(6)}`;
+        const key = `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
         idx = indexByLatLon?.get(key);
       }
       if (idx == null) continue;
-      const height = Number(res.elevation);
+      const rawHeight = res?.elev ?? res?.height ?? res?.z ?? res?.h ?? res?.value ?? res?.elevation;
+      const height = rawHeight != null ? Number(rawHeight) : NaN;
       if (!Number.isFinite(height)) continue;
       // unlock if we had pinned this vertex previously
       if (tile.locked) tile.locked[idx] = 0;
@@ -4695,6 +4696,7 @@ export class TileManager {
       }
       this._fetchPhase = 'farfield';
       this._primePhaseWork('farfield');
+      this._kickFarfieldIfIdle();
       this._scheduleBackfill(0);
     }
     if (this._fetchPhase === 'farfield') {
@@ -4923,12 +4925,6 @@ export class TileManager {
         tile.populating = false;
         continue;
       }
-      if (tile.type === 'farfield' && this._fetchPhase !== 'farfield') {
-        const k = this._phaseKey(phase);
-        tile._queuedPhases?.delete(k);
-        tile.populating = false;
-        continue;
-      }
 
       if (tile.populating) {
         this._populateQueue.push(next);
@@ -5145,17 +5141,20 @@ export class TileManager {
   _drainTextureQueue() {
     if (!this._textureQueue || !this._textureQueue.length) return;
 
-    // Only apply textures if FPS is healthy
+    // Apply textures even under poor FPS, but throttle aggressively when needed
     const fpsHealth = this.adaptiveBatchScheduler?._fpsHealth;
-    if (fpsHealth === 'POOR' || fpsHealth === 'CRITICAL') {
-      // Skip texture application when FPS is struggling
-      return;
+    let budget = this._isMobile ? 4 : 8; // ms
+    let maxPerFrame = this._isMobile ? 2 : 4;
+    if (fpsHealth === 'POOR') {
+      budget = this._isMobile ? 3 : 5;
+      maxPerFrame = 1;
+    } else if (fpsHealth === 'CRITICAL') {
+      budget = this._isMobile ? 2 : 4;
+      maxPerFrame = 1;
     }
 
-    const budget = this._isMobile ? 4 : 8; // ms
     const start = performance.now();
     let processed = 0;
-    const maxPerFrame = this._isMobile ? 2 : 4;
 
     while (this._textureQueue.length > 0 && processed < maxPerFrame) {
       if (performance.now() - start > budget) break;
@@ -5386,6 +5385,18 @@ export class TileManager {
       ? latLonAll.map(({ lat, lng }) => geohashEncode(lat, lng, precision))
       : null;
 
+    const dedupeKeyForRes = (res) => {
+      if (mode === 'geohash') {
+        return res.geohash || res.hash || null;
+      }
+      const loc = res.location;
+      if (!loc) return null;
+      const lat = Number(loc.lat ?? loc.latitude ?? loc[0]);
+      const lng = Number(loc.lng ?? loc.lon ?? loc.longitude ?? loc[1]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+      return `${lat.toFixed(6)},${lng.toFixed(6)}`;
+    };
+
     const batches = (mode === 'geohash')
       ? this._indicesToBatchesGeohash(indices, geohashes, precision)
       : this._indicesToBatchesLatLng(indices, latLonAll);
@@ -5407,13 +5418,6 @@ export class TileManager {
       });
     }
 
-    const applyIdx = (idx, height) => {
-      if (idx == null) return;
-      const ref = refs[idx];
-      if (!ref || !Number.isFinite(height)) return;
-      this._applySample(ref.tile, ref.index, height);
-    };
-
     const CONC = IS_MOBILE ? 2 : 4;
 
     // Reuse locals from your scope: mode, precision, geohashMap, lookupIndex, indexToRef, etc.
@@ -5433,7 +5437,11 @@ export class TileManager {
         .then(() => this.terrainRelay.queryBatch(this.relayAddress, payload, this.relayTimeoutMs))
         .then((json) => {
           const results = json?.results || [];
+          const seen = new Set();
           for (const res of results) {
+            const dKey = dedupeKeyForRes(res);
+            if (dKey && seen.has(dKey)) continue;
+
             let idx = null;
             if (mode === 'geohash') {
               const key = res.geohash || res.hash;
@@ -5441,11 +5449,24 @@ export class TileManager {
               if (list && list.length) idx = list.shift();
             } else if (res.location) {
               const { lat, lng } = res.location;
-              idx = lookupIndex?.[lat + ',' + lng];
+              const key = `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
+              const list = latLngMap?.get(key);
+              if (list && list.length) idx = list.shift();
             }
-            const ref = idx != null ? indexToRef(idx) : null;
-            const height = res?.elev ?? res?.height ?? res?.z ?? res?.h;
+
+            if (idx == null) {
+              const altKey = dedupeKeyForRes(res);
+              if (altKey && latLngMap) {
+                const list = latLngMap.get(altKey);
+                if (list && list.length) idx = list.shift();
+              }
+            }
+
+            const ref = idx != null ? refs[idx] : null;
+            const rawHeight = res?.elev ?? res?.height ?? res?.z ?? res?.h ?? res?.value ?? res?.elevation;
+            const height = rawHeight != null ? Number(rawHeight) : NaN;
             if (!ref || !Number.isFinite(height)) continue;
+            if (dKey) seen.add(dKey);
             this._applySample(ref.tile, ref.index, height);
           }
         })
@@ -5454,7 +5475,7 @@ export class TileManager {
 
     let cursor = 0, active = 0;
 
-    return new Promise((resolve) => {
+    await new Promise((resolve) => {
       // tiles.js (inside the populate batching loop)
       const tick = () => {
         while (active < CONC && cursor < batches.length) {
@@ -5479,9 +5500,6 @@ export class TileManager {
       tick();
 
     });
-
-
-    await Promise.allSettled(requests);
 
     // finalize tiles (derive missing verts if we used sparse sampling)
     for (const tile of tiles) {
@@ -5536,6 +5554,30 @@ export class TileManager {
       this._backfillMissing({ onlyIfRelayReady: false });
     }, actualDelay);
   }
+
+  // Nudge farfield fetch if everything looks idle
+_kickFarfieldIfIdle() {
+  // Only kick if nothing is currently being populated
+  const idle =
+    (this._populateInflight === 0) &&
+    (this._populateQueue.length === 0);
+
+  if (!idle) return;
+
+  // Make sure we’re actually in farfield fetch phase
+  if (this._fetchPhase !== 'farfield') {
+    this._fetchPhase = 'farfield';
+  }
+
+  // Ensure farfield tiles are prewarmed for the current center
+  const q = this._lastQR?.q ?? 0;
+  const r = this._lastQR?.r ?? 0;
+  this._prewarmFarfieldRing?.(q, r);
+
+  // Immediately schedule a backfill pass
+  this._scheduleBackfill(0);
+}
+
 
   _backfillMissing({ onlyIfRelayReady = false } = {}) {
     if (!this.origin) return;
@@ -5896,6 +5938,7 @@ export class TileManager {
 
     // Keep sweeping next frame if we hit the budget or we still did meaningful work
     this._pendingHeavySweep = budgetHit || (workDone > 0);
+    this._kickFarfieldIfIdle();
 
     // (Optional) one-time faster fill: bump budget for first few frames after spawn
     // if (this._spawnBoostUntil && nowMs() < this._spawnBoostUntil) this._pendingHeavySweep = true;
@@ -6052,6 +6095,8 @@ export class TileManager {
       // Mark warmup as inactive - adaptive scheduler handles this now
       this._relayWarmupActive = false;
       this._periodicBackfillPaused = false;
+      this._kickFarfieldIfIdle();
+
 
       // Set conservative initial concurrency - adaptive scheduler will override based on FPS
       this.MAX_CONCURRENT_POPULATES = this._isMobile ? 3 : 6;
@@ -6065,6 +6110,36 @@ export class TileManager {
   }
 
 
+// tiles.js
+_applyPendingSamples() {
+  if (!this.tiles) return;
+  for (const tile of this.tiles.values()) {
+    if (!tile?.pos) continue;
+
+    // If this batch actually wrote vertices, push them once
+    if (tile.fetched && tile.fetched.size > 0) {
+      this._pushBuffersToGeometry?.(tile);
+
+      // When all verts are ready, flip the elevation gate
+      if ((tile.unreadyCount | 0) === 0) {
+        tile._elevationFetched = true;
+      }
+
+      // Prevent endless refetch loops: if everything is populated, clear pending phases.
+      if (tile.unreadyCount === 0) {
+        tile._queuedPhases?.clear?.();
+        tile._phase = tile._phase || {};
+        tile._phase.fullDone = true;
+        tile.populating = false;
+      }
+
+      // clear the per-batch marker
+      tile.fetched.clear?.();
+    }
+  }
+  // Let global color/texture passes run
+  this._globalDirty = true;
+}
 
   /* ---------------- LOD / perf ---------------- */
 

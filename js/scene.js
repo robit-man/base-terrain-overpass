@@ -350,30 +350,34 @@ export class SceneManager {
 
   // Start close for atmospheric perspective; scale far with tile radius; tighten at night/haze
   _computeFogDistances(tileRadius, altitude, turbidity) {
-    const R = Math.max(50, tileRadius);
+    const radius = Math.max(50, tileRadius);
     const nightMix = this.currentNightMix ?? 0;
     const dayFactor = 1 - nightMix;
 
-    let far = Math.min(R, this.camera.far - 50);
+    let far = Math.min(radius, this.camera.far - 25);
     if (nightMix > 0) {
-      far = THREE.MathUtils.lerp(far * 0.35, far, Math.pow(dayFactor, 0.65));
-      if (nightMix > 0.65) {
-        const clampFar = THREE.MathUtils.lerp(R * 0.18, R * 0.35, Math.pow(dayFactor, 0.8));
-        far = Math.min(far, clampFar);
-      }
+      const duskClamp = THREE.MathUtils.lerp(far * 0.5, far, Math.pow(dayFactor, 0.65));
+      far = Math.min(far, duskClamp);
     }
-    let near = Math.max(this.camera.near + 10, Math.min(far - 20, R * 0.06));
+    far = Math.max(this.camera.near + 30, Math.min(radius, far));
+
+    let near = Math.max(this.camera.near + 10, radius * 0.12);
     if (nightMix > 0) {
-      const nightNear = Math.min(far - 15, near + 35 * nightMix);
+      const nightNear = Math.min(far - 12, radius * 0.18 + 20 * nightMix);
       near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
     }
-    if (near >= far - 5) near = Math.max(this.camera.near + 5, far - 5);
+    near = Math.min(near, far - 10);
 
     return { near, far };
   }
 
   _syncFogToSky() {
     const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
+
+    const tileRadius = this._sampleTileRadius();
+    const cameraHeight = Math.abs(this.camera?.position?.y ?? 0);
+    const edgeAngleRad = Math.atan2(cameraHeight, Math.max(10, tileRadius));
+    this._horizonOffsetDeg = THREE.MathUtils.clamp(THREE.MathUtils.radToDeg(edgeAngleRad), 0.75, 12);
 
     // 🔍 Sample the true color just BELOW the horizon from the Sky shader
     const fogColor = this._sampleSkyHorizonColor();
@@ -385,7 +389,6 @@ export class SceneManager {
     }
 
     // Distances based on tile radius + atmosphere
-    const tileRadius = this._sampleTileRadius();
     const { near, far } = this._computeFogDistances(tileRadius, this.currentSunAltitude ?? 0, turbidity);
 
     if (!this.scene.fog) {

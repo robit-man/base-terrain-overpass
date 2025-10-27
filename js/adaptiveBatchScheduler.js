@@ -45,6 +45,8 @@ export class AdaptiveBatchScheduler {
     // Paused state (when FPS critical)
     this._paused = false;
     this._pauseReason = null;
+    this._pauseReason = null;
+    this._pauseReason = null;
 
     // Separate queues by tile type
     this._interactiveQueue = [];
@@ -62,6 +64,7 @@ export class AdaptiveBatchScheduler {
     // CRITICAL: Process VERY slowly to prevent crash
     // Mobile: 1 batch per second, Desktop: 1 batch per 500ms
     this._minProcessIntervalMs = this._isMobile ? 1000 : 500;
+    this._processIntervalMs = this._minProcessIntervalMs;
 
     // Statistics
     this._stats = {
@@ -99,15 +102,9 @@ export class AdaptiveBatchScheduler {
     // Adjust batch sizes based on health
     this._adjustBatchSizes(health, metadata);
 
-    // Resume if we were paused and health improved
-    if (this._paused && health !== 'CRITICAL' && health !== 'POOR') {
-      this._resume();
-    }
-
-    // Pause if health critical
-    if (health === 'CRITICAL' && !this._paused) {
-      this._pause('FPS_CRITICAL');
-    }
+    // Never fully pause terrain loading; instead we throttle batch sizes when FPS tanks
+    this._paused = false;
+    this._pauseReason = null;
 
     // Emit status change
     if (this._onStatusChange) {
@@ -125,34 +122,39 @@ export class AdaptiveBatchScheduler {
     if (this._isMobile) {
       switch (health) {
         case 'EXCELLENT':
-          // ULTRA CONSERVATIVE on mobile - each tile blocks 100-400ms
+          // Keep cadence tight but still conservative for mobile GPUs
           interactiveBatch = 1;
           visualBatch = 1;
           farfieldBatch = 1;
+          this._processIntervalMs = 1000;
           break;
         case 'GOOD':
-          // Minimal - good balance
+          // Maintain full coverage with slightly longer spacing
           interactiveBatch = 1;
           visualBatch = 1;
-          farfieldBatch = 0;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1150;
           break;
         case 'MODERATE':
-          // Ultra conservative - prioritize interactive only
+          // Allow all queues to progress, but stretch the interval further
           interactiveBatch = 1;
-          visualBatch = 0;
-          farfieldBatch = 0;
+          visualBatch = 1;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1300;
           break;
         case 'POOR':
-          // Minimal - one tile at a time
+          // One tile per queue with a long breather between passes
           interactiveBatch = 1;
-          visualBatch = 0;
-          farfieldBatch = 0;
+          visualBatch = 1;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1500;
           break;
         default: // CRITICAL or UNKNOWN
-          // Paused - no new batches
-          interactiveBatch = 0;
-          visualBatch = 0;
-          farfieldBatch = 0;
+          // Never stall entirely – trickle load with the slowest cadence
+          interactiveBatch = 1;
+          visualBatch = 1;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1700;
       }
     } else {
       // Desktop - more conservative than before
@@ -163,38 +165,51 @@ export class AdaptiveBatchScheduler {
           interactiveBatch = 3;
           visualBatch = 2;
           farfieldBatch = 1;
+          this._processIntervalMs = 500;
           break;
         case 'GOOD':
           // Moderate batching
           interactiveBatch = 2;
           visualBatch = 1;
           farfieldBatch = 1;
+          this._processIntervalMs = 650;
           break;
         case 'MODERATE':
           // Conservative batching
           interactiveBatch = 1;
           visualBatch = 1;
           farfieldBatch = 1;
+          this._processIntervalMs = 800;
           break;
         case 'POOR':
           // Minimal batching
           interactiveBatch = 1;
           visualBatch = 1;
-          farfieldBatch = 0;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1050;
           break;
         default: // CRITICAL or UNKNOWN
-          interactiveBatch = 0;
-          visualBatch = 0;
-          farfieldBatch = 0;
+          // Keep a trickle flowing even when FPS telemetry is unavailable
+          interactiveBatch = 1;
+          visualBatch = 1;
+          farfieldBatch = 1;
+          this._processIntervalMs = 1250;
       }
     }
 
     // If FPS is degrading, be more conservative
     if (metadata.trend === 'degrading') {
       interactiveBatch = Math.max(1, Math.floor(interactiveBatch * 0.7));
-      visualBatch = Math.floor(visualBatch * 0.5);
-      farfieldBatch = Math.floor(farfieldBatch * 0.5);
+      visualBatch = Math.max(1, Math.floor(visualBatch * 0.5));
+      farfieldBatch = Math.max(1, Math.floor(farfieldBatch * 0.5));
+      this._processIntervalMs = Math.max(
+        this._processIntervalMs,
+        Math.ceil((this._processIntervalMs || this._minProcessIntervalMs) * 1.25)
+      );
     }
+
+    // Clamp interval to platform safety baseline
+    this._processIntervalMs = Math.max(this._minProcessIntervalMs, this._processIntervalMs || this._minProcessIntervalMs);
 
     // Check if batch sizes changed
     const changed =
@@ -347,10 +362,11 @@ export class AdaptiveBatchScheduler {
 
     const now = performance.now();
     const timeSinceLastProcess = now - this._lastProcessTime;
+    const interval = Math.max(this._minProcessIntervalMs, this._processIntervalMs || this._minProcessIntervalMs);
 
-    if (timeSinceLastProcess < this._minProcessIntervalMs) {
+    if (timeSinceLastProcess < interval) {
       // Too soon, schedule for later
-      const delay = this._minProcessIntervalMs - timeSinceLastProcess;
+      const delay = interval - timeSinceLastProcess;
       setTimeout(() => this._processBatches(), delay);
     } else {
       // Process immediately
@@ -396,9 +412,11 @@ export class AdaptiveBatchScheduler {
       }
     }
 
-    // Only process farfield if both interactive and visual queues are small
-    if (interactiveBacklog === 0 && this._visualQueue.length < 3 && this._currentFarfieldBatchSize > 0 && this._farfieldQueue.length > 0) {
-      const farfieldBatch = this._farfieldQueue.splice(0, this._currentFarfieldBatchSize);
+    // Always advance farfield at least a trickle so distant terrain resolves
+    if (this._farfieldQueue.length > 0) {
+      const desired = this._currentFarfieldBatchSize > 0 ? this._currentFarfieldBatchSize : 1;
+      const quota = interactiveBacklog > 0 ? 1 : desired;
+      const farfieldBatch = this._farfieldQueue.splice(0, Math.max(1, quota));
       for (const { tile } of farfieldBatch) {
         if (!tile.populating) {
           this._tileManager._queuePopulateIfNeeded(tile, false);
@@ -416,7 +434,8 @@ export class AdaptiveBatchScheduler {
                     this._farfieldQueue.length > 0;
 
     if (hasWork && !this._paused) {
-      setTimeout(() => this._scheduleBatchProcess(), this._minProcessIntervalMs);
+      const interval = Math.max(this._minProcessIntervalMs, this._processIntervalMs || this._minProcessIntervalMs);
+      setTimeout(() => this._scheduleBatchProcess(), interval);
     }
   }
 
