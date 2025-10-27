@@ -56,15 +56,24 @@ export class ProgressiveLoader {
   enqueue(type, tile, data = null) {
     if (!tile || !this._handlers[type]) return;
 
-    const key = `${type}:${tile.q},${tile.r}`;
+    const queueKey = tile.__plKey
+      || (data && data.queueKey)
+      || (type === 'buildings' && data?.job?.tileKey != null && data?.featureIndex != null
+        ? `${data.job.tileKey}:${data.featureIndex}`
+        : null);
+
+    const q = Number.isFinite(tile.q) ? tile.q : this._centerQ;
+    const r = Number.isFinite(tile.r) ? tile.r : this._centerR;
+
+    const key = queueKey ? `${type}:${queueKey}` : `${type}:${q},${r}`;
 
     // Skip if already in queue or processing
     if (this._processing.has(key)) return;
-    if (this._queue.some(item => `${item.type}:${item.tile.q},${item.tile.r}` === key)) return;
+    if (this._queue.some(item => item.key === key)) return;
 
     // Calculate distance from center (hex distance)
-    const dq = Math.abs(tile.q - this._centerQ);
-    const dr = Math.abs(tile.r - this._centerR);
+    const dq = Math.abs(q - this._centerQ);
+    const dr = Math.abs(r - this._centerR);
     const distance = Math.max(dq, dr, Math.abs(dq - dr));
 
     // Priority: lower distance = higher priority (process first)
@@ -99,6 +108,8 @@ export class ProgressiveLoader {
     const start = performance.now();
     const budget = this._frameBudgetMs;
 
+    let processedThisDrain = 0;
+
     while (this._queue.length > 0) {
       // Check budget
       if (performance.now() - start > budget) break;
@@ -127,7 +138,14 @@ export class ProgressiveLoader {
 
       // Only process one item per drain to be extra conservative
       // This ensures we never block the main thread
-      break;
+      processedThisDrain++;
+
+      if (processedThisDrain >= 1) {
+        const timeUsed = performance.now() - start;
+        const next = this._queue[0];
+        const allowSecond = processedThisDrain < 2 && next && next.type !== item.type && timeUsed <= budget * 0.6;
+        if (!allowSecond) break;
+      }
     }
 
     this._stats.queueLength = this._queue.length;

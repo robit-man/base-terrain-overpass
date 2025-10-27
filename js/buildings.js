@@ -1690,10 +1690,20 @@ export class BuildingManager {
       // Store job for progressive processing
       this._buildJobMap.set(job.tileKey, job);
 
+      const axial = this._axialForTileKey(job.tileKey);
+      const baseQ = axial?.q ?? 0;
+      const baseR = axial?.r ?? 0;
+
       // Enqueue each feature as a separate work item
       // This allows fine-grained control and interleaving with other systems
       for (let i = 0; i < job.features.length; i++) {
-        const pseudoTile = { q: 0, r: 0, _key: job.tileKey, _featureIndex: i };
+        const pseudoTile = {
+          q: baseQ,
+          r: baseR,
+          _key: job.tileKey,
+          _featureIndex: i,
+          __plKey: `${job.tileKey}:${i}`
+        };
         this.progressiveLoader.enqueue('buildings', pseudoTile, { job, featureIndex: i });
       }
       return;
@@ -2597,49 +2607,53 @@ export class BuildingManager {
     const info = building.info;
     const inside = info.insideRadius !== false;
     const snapped = !!info.resnapFrozen;
-    const shouldShow = inside && snapped;
+    const wireMode = !!this._wireframeMode;
 
-    // ANIMATION: Start animation when building first becomes snapped
-    if (shouldShow && !info.animating && info.animationProgress === 0) {
+    const ghostVisible = inside;
+    const solidVisible = inside && snapped && !wireMode;
+    const wireVisible = wireMode ? inside : (inside && !snapped);
+
+    if (building.render) {
+      building.render.visible = wireVisible;
+    }
+
+    // ANIMATION: Start animation once the solid first becomes available
+    if (solidVisible && !info.animating && info.animationProgress === 0) {
       info.animating = true;
       info.animationProgress = 0;
       info.animationStartTime = performance.now() / 1000;
     }
 
-    // Buildings are ALWAYS solid (no wireframe mode)
-    if (building.render) building.render.visible = false;  // Never show wireframe
     if (building.solid) {
-      building.solid.visible = shouldShow;
-      // Apply animation scale if animating
-      if (info.animating && building.solid) {
+      building.solid.visible = solidVisible;
+      if (!solidVisible) {
+        // Ensure hidden solids don't keep stale animation scale
+        if (!info.animating) building.solid.scale.y = 1;
+      }
+
+      if (info.animating && solidVisible) {
         const elapsed = (performance.now() / 1000) - info.animationStartTime;
         info.animationProgress = Math.min(1, elapsed / info.animationDuration);
-
-        // Ease out cubic for smooth deceleration
         const eased = 1 - Math.pow(1 - info.animationProgress, 3);
-
-        // Scale Y from 0 to 1
         building.solid.scale.y = eased;
-
-        // Complete animation
         if (info.animationProgress >= 1) {
           info.animating = false;
           building.solid.scale.y = 1;
         }
       } else if (!info.animating && info.animationProgress > 0) {
-        // Ensure scale is reset to 1 after animation completes
         building.solid.scale.y = 1;
       }
     }
+
     if (building.pick) {
-      building.pick.visible = shouldShow;
-      // Sync picker scale with solid mesh
-      if (info.animating && building.pick) {
-        building.pick.scale.y = building.solid?.scale.y || 1;
+      building.pick.visible = ghostVisible;
+      if (info.animating && building.pick && building.solid) {
+        building.pick.scale.y = building.solid.scale.y;
       } else if (!info.animating && info.animationProgress > 0) {
         building.pick.scale.y = 1;
       }
     }
+
     this._updateMergedGroupVisibility(info.tile);
   }
 
@@ -2681,7 +2695,13 @@ export class BuildingManager {
     let visible = false;
     if (state.buildings?.length) {
       for (const building of state.buildings) {
-        if ((building?.solid && building.solid.visible) || (building?.render && building.render.visible)) {
+        const info = building?.info;
+        const inside = info ? info.insideRadius !== false : false;
+        const snapped = info ? !!info.resnapFrozen : false;
+        const solidVis = !!(building?.solid && building.solid.visible);
+        const renderVis = !!(building?.render && building.render.visible);
+        const ghostNeeded = inside && !snapped;
+        if (solidVis || renderVis || ghostNeeded) {
           visible = true;
           break;
         }
@@ -3347,6 +3367,32 @@ export class BuildingManager {
     const rawSpan = Math.ceil((radius + diag) / this.tileSize);
     const cap = Number.isFinite(this._tileSpanCap) ? this._tileSpanCap : rawSpan;
     return Math.max(1, Math.min(rawSpan, cap));
+  }
+
+  _axialForTileKey(tileKey) {
+    if (!this.tileManager) return null;
+    const parts = String(tileKey || '').split(',');
+    if (parts.length !== 2) return null;
+    const tx = Number(parts[0]);
+    const tz = Number(parts[1]);
+    if (!Number.isFinite(tx) || !Number.isFinite(tz)) return null;
+
+    const worldX = (tx + 0.5) * this.tileSize;
+    const worldZ = (tz + 0.5) * this.tileSize;
+
+    const toAxial = this.tileManager._worldToAxialFloat;
+    const roundAxial = this.tileManager._axialRound;
+    if (typeof toAxial !== 'function' || typeof roundAxial !== 'function') return null;
+
+    try {
+      const axialFloat = toAxial.call(this.tileManager, worldX, worldZ);
+      if (!axialFloat) return null;
+      const axial = roundAxial.call(this.tileManager, axialFloat.q, axialFloat.r);
+      if (!axial || !Number.isFinite(axial.q) || !Number.isFinite(axial.r)) return null;
+      return axial;
+    } catch {
+      return null;
+    }
   }
 
   _bboxForTile(tileKey) {

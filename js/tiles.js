@@ -357,6 +357,14 @@ export class TileManager {
       this.RATE_BPS = 768 * 1024;       // max payload bytes per second
     }
 
+    this._mobileSafeModeActive = !!this._isMobile;
+    this._mobileSafeModeInteractiveDone = 0;
+    this._mobileSafeModeTimer = null;
+    if (this._mobileSafeModeActive && typeof setTimeout === 'function') {
+      this._mobileSafeModeTimer = setTimeout(() => this._exitMobileSafeMode('timeout'), 20000);
+    }
+    this._applyMobileSafeModeLimits();
+
     this._encoder = new TextEncoder();
 
     // ---- finalize queue (post-populate smoothing / normals / color) ----
@@ -1388,6 +1396,7 @@ export class TileManager {
     tile.unreadyCount = tile.pos?.count ?? 0;
     if (tile.fetched) tile.fetched.clear();
     tile.populating = false;
+    tile._fetchedEver = false;
     this._ensureRoadMask(tile, { reset: true });
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     else this._applyAllColorsGlobal(tile);
@@ -2083,13 +2092,6 @@ export class TileManager {
     if (!tile || !entry || entry.status !== 'ready') return;
     const bounds = entry.bounds;
     if (!bounds) return;
-
-    // CRITICAL: BLOCK ALL OVERLAY/TEXTURE/GRASS until elevation data is fetched
-    // This prevents ARCGIS imagery and grass from appearing before terrain geometry
-    if (!tile._elevationFetched) {
-      // Elevation not fetched yet - defer this overlay application
-      return;
-    }
 
     // Pass image size for half-texel inset in UVs
     this._ensureTileUv(tile, bounds, entry.imageSize);
@@ -3441,6 +3443,7 @@ export class TileManager {
       if (tile.ready[idx] !== 1) tile.unreadyCount = Math.max(0, tile.unreadyCount - 1);
       tile.ready[idx] = 1;
       tile.fetched.add(idx);
+      tile._fetchedEver = true;
 
       // Release pin
       if (tile.locked) tile.locked[idx] = 0;
@@ -4134,7 +4137,8 @@ export class TileManager {
       _radiusOverride: radius,
       _farSampleMode: sampleMode,
       _adapter: null,
-      _adapterDirty: true
+      _adapterDirty: true,
+      _fetchedEver: false
     };
     this.tiles.set(id, tile);
     const seededFromNeighbors = this._seedTileFromNeighbors(tile);
@@ -4860,6 +4864,7 @@ export class TileManager {
       this._deferredInteractive.delete(tile);
       if (tile.locked) tile.locked.fill(0);
       this._saveTileToCache(tile);
+      this._noteMobileInteractiveCompletion(tile);
     }
   }
 
@@ -5508,7 +5513,7 @@ export class TileManager {
       // If we fetched sparse samples, complete locally now.
       if ((tile._farSampleMode === 'center' || tile._farSampleMode === 'tips') && tile.unreadyCount > 0) {
         // Only complete if at least one sample landed; otherwise let retry logic handle.
-        if (tile.fetched && tile.fetched.size > 0) {
+        if (tile._fetchedEver) {
           this._completeFarfieldFromSparse(tile);
         }
       }
@@ -6067,14 +6072,12 @@ _kickFarfieldIfIdle() {
       this.MAX_CONCURRENT_POPULATES = 18;
       this.RATE_QPS = 36; this.RATE_BPS = 768 * 1024;
     }
- if (this._periodicBackfillPaused && this._relayWasConnected) {
-   this._periodicBackfillPaused = false; // resume periodic backfill
- }
-    // Hard cap for mobile so we never go "full send" on phones or tablets.
+    if (this._periodicBackfillPaused && this._relayWasConnected) {
+      this._periodicBackfillPaused = false; // resume periodic backfill
+    }
+
     if (this._isMobile) {
-      this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 3);
-      this.RATE_QPS = Math.min(this.RATE_QPS, 6);
-      this.RATE_BPS = Math.min(this.RATE_BPS, 160 * 1024);
+      this._applyMobileSafeModeLimits();
     }
 
     if (isConnected && !this._relayWasConnected) {
@@ -6103,10 +6106,46 @@ _kickFarfieldIfIdle() {
       this.RATE_QPS = 6;
       this.RATE_BPS = 160 * 1024;
 
+      if (this._isMobile) this._applyMobileSafeModeLimits();
+
       // Trigger initial backfill after brief delay to let connection stabilize
       // AdaptiveBatchScheduler will control how many tiles actually get queued
       this._scheduleBackfill(1000);
     }
+  }
+
+  _applyMobileSafeModeLimits() {
+    if (!this._isMobile) return;
+    if (this._mobileSafeModeActive) {
+      this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 1);
+      this.RATE_QPS = Math.min(this.RATE_QPS, 2);
+      this.RATE_BPS = Math.min(this.RATE_BPS, 96 * 1024);
+    } else {
+      this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 4);
+      this.RATE_QPS = Math.min(this.RATE_QPS, 8);
+      this.RATE_BPS = Math.min(this.RATE_BPS, 256 * 1024);
+    }
+  }
+
+  _noteMobileInteractiveCompletion(tile) {
+    if (!this._mobileSafeModeActive || !tile) return;
+    if (tile._mobileSafeCounted) return;
+    tile._mobileSafeCounted = true;
+    this._mobileSafeModeInteractiveDone = (this._mobileSafeModeInteractiveDone || 0) + 1;
+    if (this._mobileSafeModeInteractiveDone >= 6) {
+      this._exitMobileSafeMode('interactive');
+    }
+  }
+
+  _exitMobileSafeMode(reason = 'manual') {
+    if (!this._mobileSafeModeActive) return;
+    this._mobileSafeModeActive = false;
+    if (this._mobileSafeModeTimer) {
+      clearTimeout(this._mobileSafeModeTimer);
+      this._mobileSafeModeTimer = null;
+    }
+    this._applyMobileSafeModeLimits();
+    console.log(`[tiles] mobile safe mode released (${reason})`);
   }
 
 
@@ -6125,7 +6164,6 @@ _applyPendingSamples() {
         tile._elevationFetched = true;
       }
 
-      // Prevent endless refetch loops: if everything is populated, clear pending phases.
       if (tile.unreadyCount === 0) {
         tile._queuedPhases?.clear?.();
         tile._phase = tile._phase || {};
@@ -6133,8 +6171,7 @@ _applyPendingSamples() {
         tile.populating = false;
       }
 
-      // clear the per-batch marker
-      tile.fetched.clear?.();
+      tile.fetched?.clear?.();
     }
   }
   // Let global color/texture passes run
@@ -6732,6 +6769,7 @@ _applyPendingSamples() {
     if (this._periodicBackfill) { clearInterval(this._periodicBackfill); this._periodicBackfill = null; }
     if (this._rateTicker) { clearInterval(this._rateTicker); this._rateTicker = null; }
     if (this._relayWarmupTimer) { clearInterval(this._relayWarmupTimer); this._relayWarmupTimer = null; }
+    if (this._mobileSafeModeTimer) { clearTimeout(this._mobileSafeModeTimer); this._mobileSafeModeTimer = null; }
     this._resetAllTiles();
     this.tiles.clear();
     if (this._farfieldMat) {
