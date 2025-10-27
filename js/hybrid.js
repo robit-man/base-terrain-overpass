@@ -417,12 +417,13 @@ export class HybridHub {
       });
       await discovery.init();
       discovery.on('peer', (peer) => {
-        const pub = peer?.nknPub ? peer.nknPub.toLowerCase() : '';
-        if (!pub) return;
+        const rawPub = peer?.nknPub || '';
+        const normalizedPub = normalizeHex64(rawPub) || rawPub.toLowerCase();
+        if (!normalizedPub) return;
 
         // Filter out self
-        const selfPub = (this.mesh?.selfPub || this.mesh?.selfAddr || '').toLowerCase();
-        if (pub === selfPub) return;
+        const selfPub = normalizeHex64(this.mesh?.selfPub || this.mesh?.selfAddr || '');
+        if (normalizedPub && selfPub && normalizedPub === selfPub) return;
 
         // Filter out NoClip peers (they should be in noclip.peers, not hydra.peers)
         if (peer.meta?.network === 'noclip') return;
@@ -436,11 +437,11 @@ export class HybridHub {
         const hasBridge = this._detectBridgeCapability(peer.meta);
 
         // Add network prefix to identify as Hydra peer
-        const addrWithPrefix = `hydra.${pub}`;
+        const addrWithPrefix = peer.addr || `hydra.${normalizedPub}`;
 
-        this.state.hydra.peers.set(pub, {
+        this.state.hydra.peers.set(normalizedPub, {
           ...peer,
-          nknPub: pub,
+          nknPub: normalizedPub,
           addr: addrWithPrefix,
           geo,
           last: peer.last || nowSecondsFallback(),
