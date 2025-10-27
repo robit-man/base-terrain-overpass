@@ -294,6 +294,15 @@ class SmartObjectManager {
     // 6. Store object
     this.objects.set(uuid, smartObject);
 
+    // 6a. Notify hybrid hub for bookkeeping
+    if (this.hybrid?.onSmartObjectCreated) {
+      try {
+        this.hybrid.onSmartObjectCreated(smartObject);
+      } catch (err) {
+        console.warn('[SmartObjects] hybrid onSmartObjectCreated error', err);
+      }
+    }
+
     // 7. Setup audio if enabled
     if (config.sources?.audio?.enabled && this.spatialAudio) {
       this.spatialAudio.createSource(uuid, mesh.position);
@@ -310,6 +319,25 @@ class SmartObjectManager {
     }
 
     return smartObject;
+  }
+
+  /**
+   * Attach or update session metadata for a Smart Object
+   */
+  attachSession(uuid, session) {
+    if (!uuid || !session) return false;
+    const obj = this.objects.get(uuid);
+    if (!obj) return false;
+    const now = Date.now();
+    obj.config.session = {
+      ...(obj.config.session || {}),
+      ...session,
+      updatedAt: now
+    };
+    obj.config.updatedAt = now;
+    obj.lastUpdate = now;
+    this._saveToStorage();
+    return true;
   }
 
 

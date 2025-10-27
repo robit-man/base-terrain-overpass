@@ -9,8 +9,16 @@ const NETWORKS = {
 
 const DEFAULT_SERVERS = ['wss://demo.nats.io:8443'];
 const DEFAULT_HEARTBEAT_SEC = 12;
+const SESSION_STORAGE_KEY = 'noclip.hydra.sessions.v1';
 
 const makeScopedKey = (network, pub) => `${network}:${pub}`;
+
+const normalizeHex64 = (value) => {
+  if (!value) return '';
+  const text = typeof value === 'string' ? value : String(value);
+  const match = text.match(/([0-9a-f]{64})$/i);
+  return match ? match[1].toLowerCase() : '';
+};
 
 class EventHub {
   constructor() {
@@ -51,16 +59,21 @@ export class HybridHub {
         connecting: false
       },
       noclip: {
-        peers: new Map()
-      },
-      chat: new Map()
-    };
-    this._disposers = [];
-    this._uiBound = false;
-    this.resources = new Map();
-    this.resourceLayer = null;
-    this._stateTimer = null;
-  }
+      peers: new Map()
+    },
+    chat: new Map(),
+    sessions: new Map()
+  };
+  this._disposers = [];
+  this._uiBound = false;
+  this.resources = new Map();
+  this.resourceLayer = null;
+  this._stateTimer = null;
+  this._sessionIndexByObject = new Map();
+  this._pendingSessionBindings = new Set();
+  this._sessionBindTimer = null;
+  this._loadSessions();
+}
 
   init() {
     if (this._uiBound) return;
@@ -688,6 +701,143 @@ export class HybridHub {
     if (this.state.rawMessageView) {
       this.renderRawMessages();
     }
+  }
+
+  _normalizeSession(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId.trim() : '';
+    const objectUuid = typeof raw.objectUuid === 'string' ? raw.objectUuid.trim() : '';
+    const noclipPub = normalizeHex64(raw.noclipPub || raw.noclipAddr || raw.from);
+    if (!sessionId || !objectUuid || !noclipPub) return null;
+    const now = Date.now();
+    const record = {
+      sessionId,
+      objectUuid,
+      objectLabel: typeof raw.objectLabel === 'string' ? raw.objectLabel : '',
+      noclipPub,
+      noclipAddr: typeof raw.noclipAddr === 'string' ? raw.noclipAddr : `noclip.${noclipPub}`,
+      hydraBridgeNodeId: typeof raw.hydraBridgeNodeId === 'string' ? raw.hydraBridgeNodeId : '',
+      hydraGraphId: typeof raw.hydraGraphId === 'string' ? raw.hydraGraphId : '',
+      hydraPub: normalizeHex64(raw.hydraPub),
+      hydraAddr: typeof raw.hydraAddr === 'string' ? raw.hydraAddr : '',
+      bridgeNodeId: typeof raw.bridgeNodeId === 'string' ? raw.bridgeNodeId : '',
+      status: typeof raw.status === 'string' ? raw.status : 'pending-handshake',
+      createdAt: Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : now,
+      updatedAt: Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : now
+    };
+    if (typeof raw.rejectionReason === 'string') record.rejectionReason = raw.rejectionReason;
+    return record;
+  }
+
+  _saveSessions() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const list = Array.from(this.state.sessions.values());
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(list));
+    } catch (err) {
+      console.warn('[HybridHub] Failed to save sessions:', err);
+    }
+  }
+
+  _loadSessions() {
+    if (!this.state.sessions) this.state.sessions = new Map();
+    else this.state.sessions.clear();
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (raw) {
+          const arr = JSON.parse(raw);
+          if (Array.isArray(arr)) {
+            arr.forEach((entry) => {
+              const normalized = this._normalizeSession(entry);
+              if (normalized) this.state.sessions.set(normalized.sessionId, normalized);
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('[HybridHub] Failed to load sessions:', err);
+      }
+    }
+    this._rebuildSessionIndex();
+    this._scheduleSessionRebind(0);
+  }
+
+  _rebuildSessionIndex() {
+    this._sessionIndexByObject.clear();
+    this.state.sessions.forEach((session) => {
+      if (!session?.objectUuid) return;
+      const list = this._sessionIndexByObject.get(session.objectUuid) || new Set();
+      list.add(session.sessionId);
+      this._sessionIndexByObject.set(session.objectUuid, list);
+    });
+  }
+
+  _scheduleSessionRebind(delay = 400) {
+    if (this._sessionBindTimer) return;
+    this._sessionBindTimer = setTimeout(() => {
+      this._sessionBindTimer = null;
+      this._rebindSessionsToObjects();
+    }, Math.max(0, delay));
+  }
+
+  _rebindSessionsToObjects() {
+    if (!this.sceneMgr?.smartObjects) {
+      if (this.state.sessions.size) this._scheduleSessionRebind(800);
+      return;
+    }
+    this.state.sessions.forEach((session) => {
+      this._bindSessionToObject(session);
+    });
+  }
+
+  _bindSessionToObject(session) {
+    if (!session || !session.objectUuid) return false;
+    if (!this.sceneMgr?.smartObjects) {
+      this._pendingSessionBindings.add(session.sessionId);
+      this._scheduleSessionRebind(800);
+      return false;
+    }
+    const attached = this.sceneMgr.smartObjects.attachSession(session.objectUuid, session);
+    if (!attached) {
+      this._pendingSessionBindings.add(session.sessionId);
+      this._scheduleSessionRebind(800);
+      return false;
+    }
+    this._pendingSessionBindings.delete(session.sessionId);
+    return true;
+  }
+
+  _sessionsForObject(uuid) {
+    if (!uuid) return [];
+    const index = this._sessionIndexByObject.get(uuid);
+    if (!index || !index.size) return [];
+    return Array.from(index).map((sessionId) => this.state.sessions.get(sessionId)).filter(Boolean);
+  }
+
+  _upsertSession(raw) {
+    const normalized = this._normalizeSession(raw);
+    if (!normalized) return null;
+    const existing = this.state.sessions.get(normalized.sessionId) || {};
+    const merged = {
+      ...existing,
+      ...normalized,
+      updatedAt: Date.now()
+    };
+    this.state.sessions.set(merged.sessionId, merged);
+    this._rebuildSessionIndex();
+    this._saveSessions();
+    this._bindSessionToObject(merged);
+    this._markStateDirty();
+    return merged;
+  }
+
+  onSmartObjectCreated(smartObject) {
+    if (!smartObject) return;
+    const uuid = smartObject.uuid || smartObject.config?.uuid;
+    if (!uuid) return;
+    const sessions = this._sessionsForObject(uuid);
+    if (!sessions.length) return;
+    sessions.forEach((session) => this._bindSessionToObject(session));
   }
 
   _handleNoclipChat({ from, payload }) {
@@ -1479,6 +1629,34 @@ export class HybridHub {
     console.log('[Hybrid] Sync accepted by Hydra:', from, payload);
 
     const bridgeNodeId = payload.bridgeNodeId;
+    const sessionPayload = payload.session;
+    let storedSession = null;
+
+    if (sessionPayload) {
+      storedSession = this._upsertSession({
+        ...sessionPayload,
+        hydraPub: sessionPayload.hydraPub || normalizeHex64(from),
+        status: 'acknowledged'
+      });
+    }
+
+    if (!storedSession && payload.objectId) {
+      const selfPub = normalizeHex64(this.mesh?.selfPub || this.mesh?.selfAddr);
+      const hydraPub = normalizeHex64(from);
+      if (selfPub && hydraPub) {
+        storedSession = this._upsertSession({
+          sessionId: `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          objectUuid: payload.objectId,
+          objectLabel: payload.objectLabel || '',
+          noclipPub: selfPub,
+          noclipAddr: `noclip.${selfPub}`,
+          hydraBridgeNodeId: bridgeNodeId || '',
+          hydraPub,
+          hydraAddr: payload.hydraAddr || '',
+          status: 'acknowledged'
+        });
+      }
+    }
 
     // Notify user via UI
     if (typeof pushToast === 'function') {
@@ -1493,10 +1671,15 @@ export class HybridHub {
     // Send acknowledgment back
     const discovery = this.state.hydra?.discovery;
     if (discovery) {
-      discovery.dm(from, {
+      const ackPayload = {
         type: 'noclip-bridge-sync-accepted',
+        bridgeNodeId,
         timestamp: Date.now()
-      }).catch(err => {
+      };
+      if (storedSession) {
+        ackPayload.session = storedSession;
+      }
+      discovery.dm(from, ackPayload).catch(err => {
         console.error('[Hybrid] Failed to send sync acknowledgment:', err);
       });
     }
@@ -1509,6 +1692,23 @@ export class HybridHub {
     console.log('[Hybrid] Sync rejected by Hydra:', from, payload);
 
     const reason = payload.reason || 'Unknown reason';
+    if (payload?.session?.sessionId) {
+      this._upsertSession({
+        ...payload.session,
+        hydraPub: payload.session.hydraPub || normalizeHex64(from),
+        status: 'rejected',
+        rejectionReason: reason
+      });
+    } else if (payload?.objectId) {
+      const sessions = this._sessionsForObject(payload.objectId);
+      sessions.forEach((session) => {
+        this._upsertSession({
+          ...session,
+          status: 'rejected',
+          rejectionReason: reason
+        });
+      });
+    }
 
     // Notify user via UI
     if (typeof pushToast === 'function') {
