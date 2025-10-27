@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { worldToLatLon, latLonToWorld } from './geolocate.js';
+import { geohashEncode } from './geohash.js';
 
 /**
  * SmartObjectManager
@@ -50,6 +52,154 @@ class SmartObjectManager {
     } catch (err) {
       console.warn('[SmartObjects] placement mode callback error', err);
     }
+  }
+
+  _originLatLon() {
+    if (typeof this.mesh?._originLatLon === 'function') {
+      try {
+        const origin = this.mesh._originLatLon();
+        if (origin && Number.isFinite(origin.lat) && Number.isFinite(origin.lon)) return origin;
+      } catch (_) {
+        // ignore access issues
+      }
+    }
+    const app = this.mesh?.app || this.hybrid?.app;
+    const hexOrigin = app?.hexGridMgr?.origin;
+    if (hexOrigin && Number.isFinite(hexOrigin.lat) && Number.isFinite(hexOrigin.lon)) return hexOrigin;
+    const locationState = app?._locationState;
+    if (locationState && Number.isFinite(locationState.lat) && Number.isFinite(locationState.lon)) return locationState;
+    return null;
+  }
+
+  _geoToWorld(lat, lon) {
+    const origin = this._originLatLon();
+    if (!origin || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return latLonToWorld(lat, lon, origin.lat, origin.lon);
+  }
+
+  _worldToGeo(x, z) {
+    const origin = this._originLatLon();
+    if (!origin || !Number.isFinite(x) || !Number.isFinite(z)) return null;
+    return worldToLatLon(x, z, origin.lat, origin.lon);
+  }
+
+  _getGroundHeight(x, z) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+    if (typeof this.mesh?._localGroundAt === 'function') {
+      const ground = this.mesh._localGroundAt(x, z);
+      if (Number.isFinite(ground)) return ground;
+    }
+    const sample = this.mesh?.app?.hexGridMgr?.getHeightAt?.(x, z);
+    return Number.isFinite(sample) ? sample : null;
+  }
+
+  _normalizePosition(position = {}, fallback = {}) {
+    const base = { ...(fallback || {}), ...(position || {}) };
+    let { x, y, z } = base;
+    let lat = base.lat;
+    let lon = base.lon;
+    const lng = base.lng;
+    const latitude = base.latitude;
+    const longitude = base.longitude;
+    let alt = base.alt ?? base.altitude;
+    let ground = base.ground;
+    const snapToGround = base.snapToGround;
+
+    if (x !== undefined) x = Number(x);
+    if (y !== undefined) y = Number(y);
+    if (z !== undefined) z = Number(z);
+    if (lat !== undefined) lat = Number(lat);
+    if (lon !== undefined) lon = Number(lon);
+    if (alt !== undefined) alt = Number(alt);
+    if (ground !== undefined) ground = Number(ground);
+
+    if (!Number.isFinite(lat) && Number.isFinite(latitude)) lat = latitude;
+    if (!Number.isFinite(lon) && Number.isFinite(longitude)) lon = longitude;
+    if (!Number.isFinite(lon) && Number.isFinite(lng)) lon = lng;
+    if (!Number.isFinite(lng) && Number.isFinite(lon)) base.lng = lon;
+
+    const origin = this._originLatLon();
+
+    if (origin && Number.isFinite(lat) && Number.isFinite(lon)) {
+      const world = this._geoToWorld(lat, lon);
+      if (world) {
+        x = world.x;
+        z = world.z;
+      }
+    }
+
+    if (!Number.isFinite(x)) x = Number.isFinite(fallback?.x) ? fallback.x : 0;
+    if (!Number.isFinite(z)) z = Number.isFinite(fallback?.z) ? fallback.z : 0;
+
+    if (!Number.isFinite(ground)) {
+      const maybeGround = this._getGroundHeight(x, z);
+      if (Number.isFinite(maybeGround)) ground = maybeGround;
+    }
+
+    if (!Number.isFinite(alt)) alt = Number.isFinite(fallback?.alt) ? fallback.alt : undefined;
+
+    if (!Number.isFinite(y)) {
+      if (Number.isFinite(alt)) y = alt;
+      else if (Number.isFinite(fallback?.y)) y = fallback.y;
+      else y = 0;
+    }
+
+    if (snapToGround === true && Number.isFinite(ground)) {
+      y = ground;
+      alt = ground;
+    } else if (!Number.isFinite(alt)) {
+      alt = y;
+    }
+
+    if (origin && (!Number.isFinite(lat) || !Number.isFinite(lon))) {
+      const geo = this._worldToGeo(x, z);
+      if (geo) {
+        lat = geo.lat;
+        lon = geo.lon;
+      }
+    }
+
+    const result = {
+      x: Number.isFinite(x) ? +x.toFixed(3) : 0,
+      y: Number.isFinite(y) ? +y.toFixed(3) : 0,
+      z: Number.isFinite(z) ? +z.toFixed(3) : 0
+    };
+
+    if (Number.isFinite(lat)) result.lat = +lat.toFixed(7);
+    if (Number.isFinite(lon)) {
+      const roundedLon = +lon.toFixed(7);
+      result.lon = roundedLon;
+      result.lng = roundedLon;
+    }
+    if (Number.isFinite(ground)) result.ground = +ground.toFixed(3);
+    if (Number.isFinite(alt)) result.alt = +alt.toFixed(3);
+    if (Number.isFinite(result.y) && Number.isFinite(result.ground)) {
+      result.altAboveGround = +(result.y - result.ground).toFixed(3);
+    }
+    if (snapToGround == null && Number.isFinite(result.alt) && Number.isFinite(result.ground)) {
+      const delta = Math.abs(result.alt - result.ground);
+      if (delta < 0.05) result.snapToGround = true;
+    } else if (snapToGround != null) {
+      result.snapToGround = !!snapToGround;
+    }
+
+    if (Number.isFinite(result.lat) && Number.isFinite(result.lon)) {
+      try {
+        result.gh = geohashEncode(result.lat, result.lon, 9);
+        result.prec = 9;
+      } catch (_) {
+        // ignore geohash failures
+      }
+    }
+
+    return result;
+  }
+
+  estimateGroundHeight(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const world = this._geoToWorld(lat, lon);
+    if (!world) return null;
+    return this._getGroundHeight(world.x, world.z);
   }
 
   /**
@@ -137,9 +287,10 @@ class SmartObjectManager {
         x: position.x,
         y: position.y,
         z: position.z,
-        lat: null, // Will be calculated from scene position
+        lat: null,
         lng: null,
-        alt: position.y
+        alt: position.y,
+        snapToGround: true
       },
       mesh: {
         type: 'box',
@@ -251,6 +402,11 @@ class SmartObjectManager {
       config.owner = this.mesh?.selfPub || 'local';
     }
 
+    // Normalize position (ensures lat/lon/world coords in sync)
+    if (!config.position) config.position = {};
+    else config.position = { ...config.position };
+    config.position = this._normalizePosition(config.position);
+
     // 1. Create 3D mesh
     const mesh = this._createObjectMesh(config);
     if (!mesh) return null;
@@ -334,9 +490,19 @@ class SmartObjectManager {
       ...session,
       updatedAt: now
     };
+
+    if (session.position && typeof session.position === 'object') {
+      const normalized = this._normalizePosition(session.position, obj.config.position);
+      obj.config.position = normalized;
+      obj.mesh.position.set(normalized.x || 0, normalized.y || 0, normalized.z || 0);
+      obj.mesh.updateWorldMatrix(true, true);
+      obj.wireframeHelper?.update();
+    }
+
     obj.config.updatedAt = now;
     obj.lastUpdate = now;
     this._saveToStorage();
+    this._broadcastObjectSync('update', obj);
     if (this.hybrid?.onSmartObjectSessionUpdate) {
       try {
         this.hybrid.onSmartObjectSessionUpdate(obj);
@@ -355,25 +521,56 @@ class SmartObjectManager {
     const obj = this.objects.get(uuid);
     if (!obj) return false;
 
-    // Update config
-    Object.assign(obj.config, updates);
-    obj.config.updatedAt = Date.now();
-    obj.lastUpdate = Date.now();
+    const now = Date.now();
 
-    // Update visual representation
     if (updates.position) {
-      obj.mesh.position.set(
-        updates.position.x || obj.mesh.position.x,
-        updates.position.y || obj.mesh.position.y,
-        updates.position.z || obj.mesh.position.z
-      );
+      const normalizedPosition = this._normalizePosition(updates.position, obj.config.position);
+      obj.config.position = normalizedPosition;
+      obj.mesh.position.set(normalizedPosition.x || 0, normalizedPosition.y || 0, normalizedPosition.z || 0);
+      obj.mesh.updateWorldMatrix(true, true);
+      obj.wireframeHelper?.update();
     }
 
-    if (updates.mesh?.label?.text !== undefined) {
-      this._updateTextLabel(obj, updates.mesh.label.text);
+    if (updates.mesh) {
+      obj.config.mesh = { ...obj.config.mesh, ...updates.mesh };
+      if (updates.mesh.label) {
+        obj.config.mesh.label = { ...obj.config.mesh.label, ...updates.mesh.label };
+      }
+      if (updates.mesh.color) {
+        obj.mesh.material.color.set(updates.mesh.color);
+        obj.mesh.material.emissive.set(updates.mesh.color);
+      }
+      if (updates.mesh.label?.text !== undefined) {
+        this._updateTextLabel(obj, updates.mesh.label.text);
+      }
+      if (updates.mesh.label?.offset !== undefined && obj.label) {
+        obj.label.position.y = updates.mesh.label.offset;
+      }
     }
 
-    // Save and broadcast
+    if (updates.sources) {
+      obj.config.sources = { ...obj.config.sources, ...updates.sources };
+      if (updates.sources.audio) {
+        obj.config.sources.audio = { ...obj.config.sources.audio, ...updates.sources.audio };
+      }
+      if (updates.sources.text) {
+        obj.config.sources.text = { ...obj.config.sources.text, ...updates.sources.text };
+      }
+    }
+
+    if (updates.audioInput) {
+      obj.config.audioInput = { ...obj.config.audioInput, ...updates.audioInput };
+    }
+
+    const specialKeys = new Set(['position', 'mesh', 'sources', 'audioInput']);
+    Object.keys(updates).forEach((key) => {
+      if (specialKeys.has(key)) return;
+      obj.config[key] = updates[key];
+    });
+
+    obj.config.updatedAt = now;
+    obj.lastUpdate = now;
+
     this._saveToStorage();
     this._broadcastObjectSync('update', obj);
 
@@ -791,6 +988,8 @@ class SmartObjectManager {
       });
 
       console.log(`[SmartObjects] Loaded ${objects.length} objects from storage`);
+      // Persist normalized positions back to storage
+      this._saveToStorage();
     } catch (err) {
       console.error('[SmartObjects] Failed to load from storage:', err);
     }

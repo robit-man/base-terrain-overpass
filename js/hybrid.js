@@ -740,6 +740,10 @@ export class HybridHub {
     const noclipPub = normalizeHex64(raw.noclipPub || raw.noclipAddr || raw.from);
     if (!sessionId || !objectUuid || !noclipPub) return null;
     const now = Date.now();
+    const latVal = Number(raw.lat);
+    const lonVal = Number(raw.lon ?? raw.lng);
+    const position = raw.position && typeof raw.position === 'object' ? { ...raw.position } : null;
+    const geo = raw.geo && typeof raw.geo === 'object' ? { ...raw.geo } : null;
     const record = {
       sessionId,
       objectUuid,
@@ -756,6 +760,10 @@ export class HybridHub {
       updatedAt: Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : now
     };
     if (typeof raw.rejectionReason === 'string') record.rejectionReason = raw.rejectionReason;
+    if (Number.isFinite(latVal)) record.lat = latVal;
+    if (Number.isFinite(lonVal)) record.lon = lonVal;
+    if (position) record.position = position;
+    if (geo) record.geo = geo;
     return record;
   }
 

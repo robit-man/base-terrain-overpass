@@ -58,6 +58,30 @@ class SmartObjectModal {
             <div id="smart-session-status" class="smart-session-status muted">No active Hydra session</div>
           </section>
 
+          <!-- Geolocation -->
+          <section class="smart-modal-section">
+            <h3>Geolocation</h3>
+            <div class="smart-form-group">
+              <label>Latitude:</label>
+              <input type="number" id="smart-lat" step="0.000001" placeholder="e.g. 37.7749">
+            </div>
+            <div class="smart-form-group">
+              <label>Longitude:</label>
+              <input type="number" id="smart-lon" step="0.000001" placeholder="e.g. -122.4194">
+            </div>
+            <div class="smart-form-group">
+              <label>Altitude (m):</label>
+              <input type="number" id="smart-alt" step="0.1" placeholder="Height above sea level">
+            </div>
+            <div class="smart-form-group">
+              <label>
+                <input type="checkbox" id="smart-auto-alt">
+                Snap to terrain height
+              </label>
+              <p id="smart-ground-hint" class="smart-ground-hint muted" style="margin-top:4px;"></p>
+            </div>
+          </section>
+
           <!-- Audio Source -->
           <section class="smart-modal-section">
             <h3>Audio Source (TTS from Hydra)</h3>
@@ -275,6 +299,24 @@ class SmartObjectModal {
     // Cancel scan button
     const cancelScanBtn = this.modal.querySelector('#smart-cancel-scan');
     cancelScanBtn.addEventListener('click', () => this._stopQRScanner());
+
+    const latInput = this.modal.querySelector('#smart-lat');
+    const lonInput = this.modal.querySelector('#smart-lon');
+    const altInput = this.modal.querySelector('#smart-alt');
+    const autoAltCheckbox = this.modal.querySelector('#smart-auto-alt');
+
+    const handleGeoChange = () => {
+      this._refreshGroundDisplay();
+      if (autoAltCheckbox?.checked) this._applyGroundToAltitude();
+    };
+
+    latInput?.addEventListener('change', handleGeoChange);
+    latInput?.addEventListener('input', handleGeoChange);
+    lonInput?.addEventListener('change', handleGeoChange);
+    lonInput?.addEventListener('input', handleGeoChange);
+    altInput?.addEventListener('change', () => this._refreshGroundDisplay());
+    altInput?.addEventListener('input', () => this._refreshGroundDisplay());
+    autoAltCheckbox?.addEventListener('change', () => this._applyGroundToAltitude());
   }
 
   /**
@@ -414,7 +456,7 @@ class SmartObjectModal {
         noclipAddr: `noclip.${noclipPub}`,
         objectId: this.currentObject.uuid,
         objectConfig: {
-          position: this.currentObject.config.position,
+          position: { ...this.currentObject.config.position },
           label: this.currentObject.config.mesh?.label?.text || 'Smart Object'
         },
         timestamp: Date.now()
@@ -525,6 +567,21 @@ class SmartObjectModal {
     // Privacy
     this.modal.querySelector('#smart-visibility').value = config.visibility || 'public';
 
+    const position = config.position || {};
+    const latField = this.modal.querySelector('#smart-lat');
+    const lonField = this.modal.querySelector('#smart-lon');
+    const altField = this.modal.querySelector('#smart-alt');
+    const autoAltCheckbox = this.modal.querySelector('#smart-auto-alt');
+    const groundHint = this.modal.querySelector('#smart-ground-hint');
+
+    if (latField) latField.value = Number.isFinite(position.lat) ? position.lat.toFixed(7) : '';
+    if (lonField) lonField.value = Number.isFinite(position.lon ?? position.lng) ? (position.lon ?? position.lng).toFixed(7) : '';
+    if (altField) altField.value = Number.isFinite(position.alt ?? position.y) ? (position.alt ?? position.y).toFixed(2) : '';
+    if (autoAltCheckbox) autoAltCheckbox.checked = position.snapToGround === true;
+    if (groundHint) groundHint.textContent = '';
+
+    this._applyGroundToAltitude();
+    this._refreshGroundDisplay();
     this.updateSessionStatus(obj);
   }
 
@@ -533,6 +590,21 @@ class SmartObjectModal {
    */
   _save() {
     if (!this.currentObject) return;
+
+    const latValue = parseFloat(this.modal.querySelector('#smart-lat')?.value);
+    const lonValue = parseFloat(this.modal.querySelector('#smart-lon')?.value);
+    const altValue = parseFloat(this.modal.querySelector('#smart-alt')?.value);
+    const autoAlt = this.modal.querySelector('#smart-auto-alt')?.checked ?? false;
+    const currentPosition = this.currentObject.config.position || {};
+    const positionUpdates = { ...currentPosition };
+
+    if (Number.isFinite(latValue)) positionUpdates.lat = latValue;
+    if (Number.isFinite(lonValue)) {
+      positionUpdates.lon = lonValue;
+      positionUpdates.lng = lonValue;
+    }
+    if (Number.isFinite(altValue)) positionUpdates.alt = altValue;
+    positionUpdates.snapToGround = !!autoAlt;
 
     const updates = {
       mesh: {
@@ -564,7 +636,8 @@ class SmartObjectModal {
         triggerDistance: parseInt(this.modal.querySelector('#smart-mic-distance').value),
         activationMode: this.modal.querySelector('#smart-mic-mode').value
       },
-      visibility: this.modal.querySelector('#smart-visibility').value
+      visibility: this.modal.querySelector('#smart-visibility').value,
+      position: positionUpdates
     };
 
     // Update object
@@ -579,6 +652,51 @@ class SmartObjectModal {
     console.log('[SmartModal] Saved changes for', this.currentObject.uuid);
 
     this.hide();
+  }
+
+  _estimateGroundHeight(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (typeof this.smartObjects?.estimateGroundHeight === 'function') {
+      return this.smartObjects.estimateGroundHeight(lat, lon);
+    }
+    return null;
+  }
+
+  _refreshGroundDisplay() {
+    const groundHint = this.modal?.querySelector('#smart-ground-hint');
+    if (!groundHint) return;
+    const latValue = parseFloat(this.modal.querySelector('#smart-lat')?.value);
+    const lonValue = parseFloat(this.modal.querySelector('#smart-lon')?.value);
+    const altValue = parseFloat(this.modal.querySelector('#smart-alt')?.value);
+    const ground = this._estimateGroundHeight(latValue, lonValue);
+    if (Number.isFinite(ground)) {
+      const parts = [`Ground elevation: ${ground.toFixed(2)}m`];
+      if (Number.isFinite(altValue)) {
+        parts.push(`Δ ${(altValue - ground).toFixed(2)}m`);
+      }
+      groundHint.textContent = parts.join(' • ');
+      groundHint.classList.remove('muted');
+    } else {
+      groundHint.textContent = 'Ground elevation unavailable';
+      groundHint.classList.add('muted');
+    }
+  }
+
+  _applyGroundToAltitude() {
+    const autoAltCheckbox = this.modal?.querySelector('#smart-auto-alt');
+    const altInput = this.modal?.querySelector('#smart-alt');
+    if (!altInput || !autoAltCheckbox) return;
+    const autoEnabled = autoAltCheckbox.checked;
+    altInput.disabled = autoEnabled;
+    if (autoEnabled) {
+      const latValue = parseFloat(this.modal.querySelector('#smart-lat')?.value);
+      const lonValue = parseFloat(this.modal.querySelector('#smart-lon')?.value);
+      const ground = this._estimateGroundHeight(latValue, lonValue);
+      if (Number.isFinite(ground)) {
+        altInput.value = ground.toFixed(2);
+      }
+    }
+    this._refreshGroundDisplay();
   }
 
   updateSessionStatus(obj = null) {
@@ -604,6 +722,31 @@ class SmartObjectModal {
     if (peerText) parts.push(peerText);
     statusEl.textContent = parts.join(' • ');
     statusEl.classList.remove('muted');
+
+    if (target === this.currentObject) {
+      const position = target.config?.position || {};
+      const latField = this.modal.querySelector('#smart-lat');
+      const lonField = this.modal.querySelector('#smart-lon');
+      const altField = this.modal.querySelector('#smart-alt');
+      const autoAltCheckbox = this.modal.querySelector('#smart-auto-alt');
+
+      if (latField && !latField.matches(':focus') && Number.isFinite(position.lat)) {
+        latField.value = position.lat.toFixed(7);
+      }
+      const lonValue = position.lon ?? position.lng;
+      if (lonField && !lonField.matches(':focus') && Number.isFinite(lonValue)) {
+        lonField.value = lonValue.toFixed(7);
+      }
+      if (altField && !altField.matches(':focus') && Number.isFinite(position.alt ?? position.y)) {
+        altField.value = (position.alt ?? position.y).toFixed(2);
+      }
+      if (autoAltCheckbox && !autoAltCheckbox.matches(':focus')) {
+        autoAltCheckbox.checked = position.snapToGround === true;
+      }
+      this._applyGroundToAltitude();
+    } else {
+      this._refreshGroundDisplay();
+    }
   }
 
   isShowingObject(uuid) {
