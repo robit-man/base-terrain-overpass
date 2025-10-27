@@ -549,6 +549,7 @@ export class HybridHub {
       // Update status to connecting
       peer.bridgeStatus = 'handshaking';
       this.renderPeers();
+      this._updateSessionsForHydra(pub, { status: 'handshaking' });
 
       // Send handshake request
       await discovery.dm(pub, {
@@ -566,6 +567,7 @@ export class HybridHub {
         const currentPeer = this.state.hydra.peers.get(pub);
         if (currentPeer && currentPeer.bridgeStatus === 'handshaking') {
           currentPeer.bridgeStatus = 'timeout';
+          this._updateSessionsForHydra(pub, { status: 'timeout' });
           this.renderPeers();
         }
       }, 10000); // 10 second timeout
@@ -574,6 +576,7 @@ export class HybridHub {
       peer.bridgeStatus = 'error';
       pushToast(`Handshake failed: ${err?.message || err}`);
       this.renderPeers();
+      this._updateSessionsForHydra(pub, { status: 'error', errorMessage: err?.message || String(err) });
     }
   }
 
@@ -595,6 +598,10 @@ export class HybridHub {
     // Update bridge status
     peer.bridgeStatus = isAck ? 'connected' : 'handshake-received';
     peer.last = msg.ts || nowSecondsFallback();
+    this._updateSessionsForHydra(pub, {
+      status: isAck ? 'connected' : 'handshake-received',
+      lastHandshakeAt: msg.ts || Date.now()
+    });
 
     // Log to chat
     const key = makeScopedKey(NETWORKS.HYDRA, pub);
@@ -701,6 +708,29 @@ export class HybridHub {
     if (this.state.rawMessageView) {
       this.renderRawMessages();
     }
+  }
+
+  _ensureHydraPeerRecord(pub, session = null) {
+    const normalized = normalizeHex64(pub);
+    if (!normalized) return null;
+    let peer = this.state.hydra.peers.get(normalized);
+    if (!peer) {
+      peer = {
+        nknPub: normalized,
+        addr: session?.hydraAddr || `hydra.${normalized}`,
+        last: nowSecondsFallback(),
+        online: true,
+        meta: { network: 'hydra', ids: ['hydra', 'bridge'] },
+        hasBridge: true,
+        bridgeStatus: 'detected'
+      };
+      this.state.hydra.peers.set(normalized, peer);
+    } else {
+      peer.hasBridge = true;
+      if (!peer.addr) peer.addr = session?.hydraAddr || peer.addr || `hydra.${normalized}`;
+      if (!peer.meta) peer.meta = { network: 'hydra', ids: ['hydra', 'bridge'] };
+    }
+    return peer;
   }
 
   _normalizeSession(raw) {
@@ -814,6 +844,12 @@ export class HybridHub {
     return Array.from(index).map((sessionId) => this.state.sessions.get(sessionId)).filter(Boolean);
   }
 
+  _sessionsForHydra(pub) {
+    const normalized = normalizeHex64(pub);
+    if (!normalized) return [];
+    return Array.from(this.state.sessions.values()).filter((session) => session.hydraPub === normalized);
+  }
+
   _upsertSession(raw) {
     const normalized = this._normalizeSession(raw);
     if (!normalized) return null;
@@ -831,6 +867,18 @@ export class HybridHub {
     return merged;
   }
 
+  _updateSessionsForHydra(pub, updates = {}) {
+    const sessions = this._sessionsForHydra(pub);
+    sessions.forEach((session) => {
+      this._upsertSession({
+        ...session,
+        ...updates,
+        sessionId: session.sessionId
+      });
+    });
+    return sessions.length;
+  }
+
   onSmartObjectCreated(smartObject) {
     if (!smartObject) return;
     const uuid = smartObject.uuid || smartObject.config?.uuid;
@@ -838,6 +886,13 @@ export class HybridHub {
     const sessions = this._sessionsForObject(uuid);
     if (!sessions.length) return;
     sessions.forEach((session) => this._bindSessionToObject(session));
+  }
+
+  onSmartObjectSessionUpdate(smartObject) {
+    if (!smartObject) return;
+    if (this.sceneMgr?.smartModal?.updateSessionStatus) {
+      this.sceneMgr.smartModal.updateSessionStatus(smartObject);
+    }
   }
 
   _handleNoclipChat({ from, payload }) {
@@ -997,6 +1052,21 @@ export class HybridHub {
       meta.textContent = parts.join(' • ');
       row.appendChild(label);
       row.appendChild(meta);
+      if (network === NETWORKS.HYDRA) {
+        const sessions = this._sessionsForHydra(peer.nknPub);
+        if (sessions.length) {
+          const sessionMeta = document.createElement('div');
+          sessionMeta.className = 'hybrid-peer-meta';
+          sessionMeta.textContent = sessions
+            .map((session) => {
+              const labelText = session.objectLabel || session.objectUuid || session.sessionId;
+              const statusText = (session.status || 'pending').replace(/[_-]/g, ' ');
+              return `${labelText}: ${statusText}`;
+            })
+            .join(' • ');
+          row.appendChild(sessionMeta);
+        }
+      }
       frag.appendChild(row);
     });
     ui.hybridPeerList.appendChild(frag);
@@ -1628,21 +1698,21 @@ export class HybridHub {
   _handleSyncAccepted(from, payload) {
     console.log('[Hybrid] Sync accepted by Hydra:', from, payload);
 
-    const bridgeNodeId = payload.bridgeNodeId;
+    const bridgeNodeId = payload.bridgeNodeId || '';
+    const hydraPub = normalizeHex64(from);
     const sessionPayload = payload.session;
     let storedSession = null;
 
     if (sessionPayload) {
       storedSession = this._upsertSession({
         ...sessionPayload,
-        hydraPub: sessionPayload.hydraPub || normalizeHex64(from),
-        status: 'acknowledged'
+        hydraPub: sessionPayload.hydraPub || hydraPub,
+        status: 'handshaking'
       });
     }
 
     if (!storedSession && payload.objectId) {
       const selfPub = normalizeHex64(this.mesh?.selfPub || this.mesh?.selfAddr);
-      const hydraPub = normalizeHex64(from);
       if (selfPub && hydraPub) {
         storedSession = this._upsertSession({
           sessionId: `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1653,14 +1723,39 @@ export class HybridHub {
           hydraBridgeNodeId: bridgeNodeId || '',
           hydraPub,
           hydraAddr: payload.hydraAddr || '',
-          status: 'acknowledged'
+          status: 'handshaking'
         });
+      }
+    }
+
+    if (hydraPub) {
+      this._updateSessionsForHydra(hydraPub, { status: 'handshaking' });
+      const peer = this._ensureHydraPeerRecord(hydraPub, storedSession);
+      if (peer) {
+        peer.hasBridge = true;
+        if (!peer.bridgeStatus || peer.bridgeStatus === 'detected' || peer.bridgeStatus === 'timeout') {
+          peer.bridgeStatus = 'handshaking';
+        }
+      }
+      this.renderPeers();
+      const kickHandshake = () => {
+        const currentPeer = this.state.hydra.peers.get(hydraPub);
+        if (!currentPeer) return;
+        if (currentPeer.bridgeStatus === 'connected') return;
+        this._initiateHandshake(hydraPub);
+      };
+      const discoPromise = this.ensureHydraDiscovery();
+      if (discoPromise && typeof discoPromise.then === 'function') {
+        discoPromise.then(kickHandshake).catch(() => kickHandshake());
+      } else {
+        kickHandshake();
       }
     }
 
     // Notify user via UI
     if (typeof pushToast === 'function') {
-      pushToast(`✓ Connected to Hydra bridge: ${bridgeNodeId}`, { duration: 4000 });
+      const toastLabel = bridgeNodeId ? `✓ Bridge approved by Hydra (${bridgeNodeId})` : '✓ Bridge approved by Hydra';
+      pushToast(toastLabel, { duration: 4000 });
     }
 
     // Log to Smart Object modal if open
@@ -1708,6 +1803,11 @@ export class HybridHub {
           rejectionReason: reason
         });
       });
+    }
+
+    const hydraPub = normalizeHex64(from);
+    if (hydraPub) {
+      this._updateSessionsForHydra(hydraPub, { status: 'rejected', rejectionReason: reason });
     }
 
     // Notify user via UI

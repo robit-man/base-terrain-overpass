@@ -337,6 +337,13 @@ class SmartObjectManager {
     obj.config.updatedAt = now;
     obj.lastUpdate = now;
     this._saveToStorage();
+    if (this.hybrid?.onSmartObjectSessionUpdate) {
+      try {
+        this.hybrid.onSmartObjectSessionUpdate(obj);
+      } catch (err) {
+        console.warn('[SmartObjects] hybrid onSmartObjectSessionUpdate error', err);
+      }
+    }
     return true;
   }
 

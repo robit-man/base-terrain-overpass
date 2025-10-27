@@ -52,6 +52,12 @@ class SmartObjectModal {
             </div>
           </section>
 
+          <!-- Session Status -->
+          <section class="smart-modal-section">
+            <h3>Session Status</h3>
+            <div id="smart-session-status" class="smart-session-status muted">No active Hydra session</div>
+          </section>
+
           <!-- Audio Source -->
           <section class="smart-modal-section">
             <h3>Audio Source (TTS from Hydra)</h3>
@@ -518,6 +524,8 @@ class SmartObjectModal {
 
     // Privacy
     this.modal.querySelector('#smart-visibility').value = config.visibility || 'public';
+
+    this.updateSessionStatus(obj);
   }
 
   /**
@@ -571,6 +579,36 @@ class SmartObjectModal {
     console.log('[SmartModal] Saved changes for', this.currentObject.uuid);
 
     this.hide();
+  }
+
+  updateSessionStatus(obj = null) {
+    const statusEl = this.modal?.querySelector('#smart-session-status');
+    if (!statusEl) return;
+    const target = obj || this.currentObject;
+    if (obj && this.currentObject && obj.uuid !== this.currentObject.uuid) return;
+    if (!target) {
+      statusEl.textContent = 'No active Hydra session';
+      statusEl.classList.add('muted');
+      return;
+    }
+    const session = target.config?.session;
+    if (!session) {
+      statusEl.textContent = 'No active Hydra session';
+      statusEl.classList.add('muted');
+      return;
+    }
+    const statusText = (session.status || 'pending').replace(/[_-]/g, ' ');
+    const label = session.objectLabel || target.config?.mesh?.label?.text || target.uuid;
+    const peerText = session.hydraPub ? `hydra.${session.hydraPub.slice(0, 8)}…` : '';
+    const parts = [`${label}: ${statusText}`];
+    if (peerText) parts.push(peerText);
+    statusEl.textContent = parts.join(' • ');
+    statusEl.classList.remove('muted');
+  }
+
+  isShowingObject(uuid) {
+    if (!uuid) return false;
+    return !!this.currentObject && this.currentObject.uuid === uuid;
   }
 
   /**
