@@ -128,12 +128,12 @@ export class AdaptiveBatchScheduler {
           // ULTRA CONSERVATIVE on mobile - each tile blocks 100-400ms
           interactiveBatch = 1;
           visualBatch = 1;
-          farfieldBatch = 0;
+          farfieldBatch = 1;
           break;
         case 'GOOD':
           // Minimal - good balance
           interactiveBatch = 1;
-          visualBatch = 0;
+          visualBatch = 1;
           farfieldBatch = 0;
           break;
         case 'MODERATE':
@@ -168,18 +168,18 @@ export class AdaptiveBatchScheduler {
           // Moderate batching
           interactiveBatch = 2;
           visualBatch = 1;
-          farfieldBatch = 0;
+          farfieldBatch = 1;
           break;
         case 'MODERATE':
           // Conservative batching
           interactiveBatch = 1;
           visualBatch = 1;
-          farfieldBatch = 0;
+          farfieldBatch = 1;
           break;
         case 'POOR':
           // Minimal batching
           interactiveBatch = 1;
-          visualBatch = 0;
+          visualBatch = 1;
           farfieldBatch = 0;
           break;
         default: // CRITICAL or UNKNOWN

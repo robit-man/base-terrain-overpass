@@ -366,7 +366,7 @@ export class TileManager {
     // CRITICAL: Budget needs to be large enough to actually process tiles
     // Each tile takes ~10-20ms to finalize (BFS + smooth + normals)
     // Too small = queue balloons and tiles stay unfinalized forever
-    this._finalizeBudgetMs = this._isMobile ? 8 : 16;
+    this._finalizeBudgetMs = this._isMobile ? 14 : 32;
 
     // CRITICAL: Texture and grass queues - deferred until AFTER elevation fetch
     // NO TEXTURES until terrain elevation data is fetched
@@ -4683,11 +4683,19 @@ export class TileManager {
       return;
     }
     if (this._fetchPhase === 'visual') {
-      if (this._visualTilesPending(exclude)) return;
+      if (this._visualTilesPending(exclude)) {
+        // Count tiny holes and allow a soft advance
+        let holes = 0;
+        for (const t of this.tiles.values()) if (t.type === 'visual') holes += (t.unreadyCount || 0);
+        if (holes > 0 && holes <= (this.VISUAL_HOLE_TOLERANCE || 24)) {
+          // proceed to farfield despite tiny holes
+        } else {
+          return; // keep waiting
+        }
+      }
       this._fetchPhase = 'farfield';
       this._primePhaseWork('farfield');
       this._scheduleBackfill(0);
-      return;
     }
     if (this._fetchPhase === 'farfield') {
       if (this._farfieldTilesPending(exclude)) return;
@@ -6016,7 +6024,9 @@ export class TileManager {
       this.MAX_CONCURRENT_POPULATES = 18;
       this.RATE_QPS = 36; this.RATE_BPS = 768 * 1024;
     }
-
+ if (this._periodicBackfillPaused && this._relayWasConnected) {
+   this._periodicBackfillPaused = false; // resume periodic backfill
+ }
     // Hard cap for mobile so we never go "full send" on phones or tablets.
     if (this._isMobile) {
       this.MAX_CONCURRENT_POPULATES = Math.min(this.MAX_CONCURRENT_POPULATES, 3);
