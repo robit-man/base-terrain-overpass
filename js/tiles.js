@@ -3742,6 +3742,7 @@ export class TileManager {
       this._pullGeometryToBuffers(tile);
       this._updateGlobalFromArray(data.y);
       this._applyAllColorsGlobal(tile);
+      this._ensureTileOverlay(tile);
 
       return true;
     } catch {
@@ -4072,7 +4073,7 @@ export class TileManager {
     this.tiles.set(id, tile);
     const seededFromNeighbors = this._seedTileFromNeighbors(tile);
     this._ensureRoadMask(tile, { reset: true });
-    if (seededFromNeighbors) this._applyAllColorsGlobal(tile);
+    if (seededFromNeighbors) this._applyAllColorsGlobal(tile); this._ensureTileOverlay(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
     this._ensureTileOverlay(tile);
     for (const [dq, dr] of HEX_DIRS) {
@@ -4094,6 +4095,8 @@ export class TileManager {
       } else {
         return existing;
       }
+      this._ensureTileOverlay(tile);
+
     }
 
     const radius = this.tileRadius * Math.max(1, Math.round(scale));
