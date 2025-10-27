@@ -7,6 +7,7 @@ import { worldToLatLon, latLonToWorld } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { TerrainRelay } from './terrainRelay.js';
 import { GrassManager } from './grass.js';
+import { AdaptiveBatchScheduler } from './adaptiveBatchScheduler.js';
 
 const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
@@ -319,6 +320,23 @@ export class TileManager {
       onStatus: (text, level) => this._onRelayStatus(text, level),
     });
 
+    // CRITICAL: Adaptive Batch Scheduler - prevents crash on NKN connect
+    // Dynamically adjusts batch sizes based on real-time FPS monitoring
+    // Starts with 1 tile (center only), increases when FPS > 50, pauses when FPS < 25
+    this.adaptiveBatchScheduler = new AdaptiveBatchScheduler({
+      isMobile: this._isMobile,
+      tileManager: this,
+      onBatchSizeChange: (sizes) => {
+        console.log('[AdaptiveBatch] Batch sizes:', sizes);
+      },
+      onStatusChange: (status) => {
+        // Optional: could update UI status indicator here
+        if (status.paused) {
+          console.warn('[AdaptiveBatch] Processing paused:', status.pauseReason);
+        }
+      }
+    });
+
     // ---- populate plumbing (PHASED) ----
     this._populateQueue = [];          // entries: { tile, phase, priority }
     this._populateInflight = 0;
@@ -349,6 +367,12 @@ export class TileManager {
     // Each tile takes ~10-20ms to finalize (BFS + smooth + normals)
     // Too small = queue balloons and tiles stay unfinalized forever
     this._finalizeBudgetMs = this._isMobile ? 8 : 16;
+
+    // CRITICAL: Texture and grass queues - deferred until AFTER elevation fetch
+    // NO TEXTURES until terrain elevation data is fetched
+    // NO GRASS until terrain elevation data is fetched
+    this._textureQueue = [];   // Tiles waiting for texture application
+    this._grassQueue = [];     // Tiles waiting for grass injection
 
     // ---- network governor (token bucket) ----
     this._rateTokensQ = this.RATE_QPS;
@@ -1581,6 +1605,13 @@ export class TileManager {
     return THREE.MathUtils.clamp((y - minY) / (maxY - minY), 0, 1);
   }
   _applyAllColorsGlobal(tile) {
+    // CRITICAL: BLOCK ALL TEXTURE APPLICATION UNTIL ELEVATION DATA IS FETCHED
+    // This prevents ARCGIS textures from appearing before terrain geometry
+    if (!tile || !tile._elevationFetched) {
+      // Elevation data not fetched yet - skip texture application
+      return;
+    }
+
     this._ensureColorAttr(tile);
     const roadMask = this._ensureRoadMask(tile);
     const arr = tile.col.array;
@@ -1884,8 +1915,10 @@ export class TileManager {
     let entry = this._overlayCache.get(key);
 
     if (entry && entry.status === 'ready') {
+      // Store entry reference so we can apply it after elevation is fetched
+      tile._overlay = { status: 'ready', cacheKey: key, entry };
+      // Try to apply overlay (will be blocked if elevation not fetched yet)
       this._applyOverlayEntryToTile(tile, entry);
-      tile._overlay = { status: 'ready', cacheKey: key };
       return;
     }
 
@@ -1941,8 +1974,10 @@ export class TileManager {
       entry.waiters?.clear?.();
       for (const t of waiters) {
         if (!t || !this.tiles.has(`${t.q},${t.r}`)) continue;
+        // Store entry reference so we can apply it after elevation is fetched
+        t._overlay = { status: 'ready', cacheKey, entry };
+        // Try to apply overlay (will be blocked if elevation not fetched yet)
         this._applyOverlayEntryToTile(t, entry);
-        t._overlay = { status: 'ready', cacheKey };
       }
     };
 
@@ -2049,6 +2084,13 @@ export class TileManager {
     const bounds = entry.bounds;
     if (!bounds) return;
 
+    // CRITICAL: BLOCK ALL OVERLAY/TEXTURE/GRASS until elevation data is fetched
+    // This prevents ARCGIS imagery and grass from appearing before terrain geometry
+    if (!tile._elevationFetched) {
+      // Elevation not fetched yet - defer this overlay application
+      return;
+    }
+
     // Pass image size for half-texel inset in UVs
     this._ensureTileUv(tile, bounds, entry.imageSize);
 
@@ -2058,9 +2100,9 @@ export class TileManager {
     if (allowTrees && this._treeEnabled) this._applyTreeSeeds(tile, entry);
     else this._clearTileTrees(tile);
 
-    // Apply grass to green areas on interactive and visual tiles
+    // CRITICAL: BLOCK grass injection until elevation fetched AND textures applied
     const allowGrass = tile.type === 'interactive' || tile.type === 'visual';
-    if (allowGrass && this._grassEnabled && entry.samples) {
+    if (allowGrass && this._grassEnabled && entry.samples && tile._texturesApplied) {
       this.grassManager?.generateGrassForTile(tile, entry.samples, bounds);
     } else {
       this.grassManager?.removeGrassForTile(tile);
@@ -5069,19 +5111,99 @@ export class TileManager {
   _drainFinalizeQueue() {
     if (!this._finalizeQueue.length) return;
 
-    const nowPerf = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
-      ? performance.now()
-      : Date.now();
-    const start = nowPerf();
-    const budget = this._finalizeBudgetMs;
+    // CRITICAL: Process ONLY 1 tile per frame to prevent main thread blocking
+    // Each tile takes 100-400ms to finalize (_nearestAnchorFill, _smoothUnknowns, etc.)
+    // Processing multiple tiles = instant crash on mobile
+    const maxTilesPerFrame = 1;
+    let processed = 0;
 
-    while (this._finalizeQueue.length > 0) {
-      if (nowPerf() - start > budget) break;
-
+    while (this._finalizeQueue.length > 0 && processed < maxTilesPerFrame) {
       const entry = this._finalizeQueue.shift();
       if (!entry || !entry.tile) continue;
 
       this._finalizeTile(entry.tile, entry.opts);
+      processed++;
+    }
+  }
+
+  // CRITICAL: Texture application queue - ONLY processes tiles with elevation data
+  _queueTextureApplication(tile) {
+    if (!tile || !tile._elevationFetched) return;
+    if (!this._textureQueue) this._textureQueue = [];
+    if (this._textureQueue.includes(tile)) return;
+    this._textureQueue.push(tile);
+  }
+
+  _drainTextureQueue() {
+    if (!this._textureQueue || !this._textureQueue.length) return;
+
+    // Only apply textures if FPS is healthy
+    const fpsHealth = this.adaptiveBatchScheduler?._fpsHealth;
+    if (fpsHealth === 'POOR' || fpsHealth === 'CRITICAL') {
+      // Skip texture application when FPS is struggling
+      return;
+    }
+
+    const budget = this._isMobile ? 4 : 8; // ms
+    const start = performance.now();
+    let processed = 0;
+    const maxPerFrame = this._isMobile ? 2 : 4;
+
+    while (this._textureQueue.length > 0 && processed < maxPerFrame) {
+      if (performance.now() - start > budget) break;
+
+      const tile = this._textureQueue.shift();
+      if (tile && tile._elevationFetched && tile.grid?.geometry) {
+        // Apply textures now that elevation is fetched
+        this._applyAllColorsGlobal(tile);
+        tile._texturesApplied = true;
+        processed++;
+      }
+    }
+  }
+
+  // CRITICAL: Grass injection queue - ONLY processes tiles with elevation data
+  _queueGrassInjection(tile) {
+    if (!tile || !tile._elevationFetched) return;
+    if (!this.grassManager) return; // No grass on mobile
+    if (!this._grassQueue) this._grassQueue = [];
+    if (this._grassQueue.includes(tile)) return;
+    this._grassQueue.push(tile);
+  }
+
+  _drainGrassQueue() {
+    if (!this._grassQueue || !this._grassQueue.length) return;
+    if (!this.grassManager) return;
+
+    // Only inject grass if FPS is healthy AND textures are mostly done
+    const fpsHealth = this.adaptiveBatchScheduler?._fpsHealth;
+    if (fpsHealth === 'POOR' || fpsHealth === 'CRITICAL') {
+      // Skip grass injection when FPS is struggling
+      return;
+    }
+
+    // Wait for texture queue to be mostly drained
+    if (this._textureQueue && this._textureQueue.length > 5) {
+      return;
+    }
+
+    const budget = this._isMobile ? 3 : 6; // ms
+    const start = performance.now();
+    let processed = 0;
+    const maxPerFrame = this._isMobile ? 1 : 2;
+
+    while (this._grassQueue.length > 0 && processed < maxPerFrame) {
+      if (performance.now() - start > budget) break;
+
+      const tile = this._grassQueue.shift();
+      if (tile && tile._elevationFetched && tile._texturesApplied && !tile._grassInjected) {
+        // Inject grass now that elevation and textures are ready
+        if (this.grassManager.addGrassForTile) {
+          this.grassManager.addGrassForTile(tile);
+        }
+        tile._grassInjected = true;
+        processed++;
+      }
     }
   }
 
@@ -5101,7 +5223,8 @@ export class TileManager {
           this._deferredNormalsTiles.add(tile);
         }
       }
-      this._applyAllColorsGlobal(tile);
+      // CRITICAL: DO NOT apply textures during finalize - defer until after elevation fetch
+      // this._applyAllColorsGlobal(tile);  // REMOVED - moved to deferred queue
     } else {
       // ---- blend / seal with pinned edges acting as anchors ----
       this._nearestAnchorFill(tile);
@@ -5120,13 +5243,33 @@ export class TileManager {
           this._deferredNormalsTiles.add(tile);
         }
       }
-      this._applyAllColorsGlobal(tile);
+      // CRITICAL: DO NOT apply textures during finalize - defer until after elevation fetch
+      // this._applyAllColorsGlobal(tile);  // REMOVED - moved to deferred queue
     }
 
     // Finally, if any side borders a visual/farfield tile, feather to a straight edge line
     // derived from the neighbor's tip heights. This guarantees no cracks at the LOD boundary.
     if (tile.type === 'interactive') {
       this._stitchInteractiveToVisualEdges(tile, { bandRatio: 0.07, sideArc: Math.PI / 10 });
+    }
+
+    // CRITICAL: Mark tile as having elevation data BEFORE queueing textures/grass
+    // This ensures textures and grass are only applied AFTER terrain elevation is fetched
+    tile._elevationFetched = true;
+
+    // CRITICAL: If overlay was loaded while waiting for elevation, apply it now
+    if (tile._overlay && tile._overlay.status === 'ready' && tile._overlay.entry) {
+      this._applyOverlayEntryToTile(tile, tile._overlay.entry);
+    }
+
+    // CRITICAL: Queue texture application AFTER elevation fetch completes
+    // Textures MUST NOT be applied during finalize to reduce GPU sync overhead
+    this._queueTextureApplication(tile);
+
+    // CRITICAL: Queue grass injection AFTER elevation fetch completes
+    // Grass MUST NOT be injected until terrain geometry is stable
+    if (this._grassEnabled && tile.type !== 'farfield') {
+      this._queueGrassInjection(tile);
     }
 
     // ---- mark phase complete & chain next ----
@@ -5396,48 +5539,35 @@ export class TileManager {
     }
     this._lastBackfillTime = now;
 
-    const phase = this._fetchPhase;
-    let entries = [...this.tiles.values()]
-      .filter(t => this._tileNeedsFetch(t) && !t.populating && !this._isPhaseQueued(t, PHASE_SEED) && !this._isPhaseQueued(t, PHASE_EDGE) && !this._isPhaseQueued(t, PHASE_FULL))
-      .map(t => {
-        let priority = 2;
-        if (phase === 'interactive') {
-          if (t.type === 'interactive') priority = 0;
-          else if (t.type === 'visual') priority = 1;
-          else priority = 2;
-        } else if (phase === 'visual') {
-          if (t.type === 'interactive') priority = 0;
-          else if (t.type === 'visual') priority = 1;
-          else priority = 2;
-        } else { // farfield phase
-          if (t.type === 'interactive') priority = 0;
-          else if (t.type === 'visual') priority = 1;
-          else priority = 2;
-        }
-        return { t, priority, d: this._hexDist(t.q, t.r, 0, 0) };
-      })
-      .sort((a, b) => (a.priority - b.priority) || (a.d - b.d));
+    // CRITICAL: Collect tiles that need fetching, but DON'T queue them directly
+    // Instead, pass them to the AdaptiveBatchScheduler which will queue them
+    // progressively based on real-time FPS monitoring
+    const tilesToEnqueue = [...this.tiles.values()]
+      .filter(t =>
+        this._tileNeedsFetch(t) &&
+        !t.populating &&
+        !this._isPhaseQueued(t, PHASE_SEED) &&
+        !this._isPhaseQueued(t, PHASE_EDGE) &&
+        !this._isPhaseQueued(t, PHASE_FULL)
+      );
 
-    // CRITICAL: Limit how many tiles we queue at once to prevent crash
-    // During warmup: extremely conservative (3-5 tiles max)
-    // Mobile: 10 tiles max
-    // Desktop: 20 tiles max
-    let maxEntries;
-    if (this._relayWarmupActive) {
-      maxEntries = this._isMobile ? 3 : 5;
-    } else if (this._isMobile) {
-      maxEntries = 10;
-    } else {
-      maxEntries = 20;
-    }
+    // Pass to adaptive scheduler instead of queuing directly
+    // The scheduler will batch them based on FPS health
+    if (tilesToEnqueue.length > 0 && this.adaptiveBatchScheduler) {
+      this.adaptiveBatchScheduler.enqueueTiles(tilesToEnqueue);
+    } else if (tilesToEnqueue.length > 0) {
+      // Fallback: if adaptive scheduler not available, use conservative fixed batching
+      console.warn('[TileManager] Adaptive scheduler not available, using fallback batching');
+      const maxFallback = this._isMobile ? 3 : 6;
+      const batch = tilesToEnqueue
+        .map(t => ({ t, d: this._hexDist(t.q, t.r, 0, 0) }))
+        .sort((a, b) => a.d - b.d)
+        .slice(0, maxFallback);
 
-    if (entries.length > maxEntries) {
-      entries = entries.slice(0, maxEntries);
-    }
-
-    for (const { t } of entries) {
-      const p = (t.type === 'interactive') || (t.q === 0 && t.r === 0);
-      this._queuePopulateIfNeeded(t, p);
+      for (const { t } of batch) {
+        const p = (t.type === 'interactive') || (t.q === 0 && t.r === 0);
+        this._queuePopulateIfNeeded(t, p);
+      }
     }
   }
 
@@ -5516,12 +5646,26 @@ export class TileManager {
       // CRITICAL: Drain finalize queue FIRST - this processes heavy geometry ops incrementally
       this._drainFinalizeQueue?.();
 
+      // CRITICAL: Drain texture queue AFTER finalize - only when elevation data is fetched
+      // Textures are applied progressively to reduce GPU sync overhead
+      this._drainTextureQueue?.();
+
+      // CRITICAL: Drain grass queue AFTER textures - only when elevation and textures are ready
+      // Grass injection is deferred until terrain is fully stable
+      this._drainGrassQueue?.();
+
       this._ensureRelaxList?.();
       this._drainRelaxQueue?.();
       if (this._globalDirty) {
         const t = (typeof now === 'function' ? now() : Date.now());
         if (!this._lastRecolorAt || (t - this._lastRecolorAt > 100)) {
-          for (const tile of this.tiles.values()) this._applyAllColorsGlobal(tile);
+          // CRITICAL: Only apply colors to tiles that have elevation data fetched
+          // Skip tiles that haven't been finalized yet
+          for (const tile of this.tiles.values()) {
+            if (tile._elevationFetched) {
+              this._applyAllColorsGlobal(tile);
+            }
+          }
           this._globalDirty = false;
           this._lastRecolorAt = t;
         }
@@ -5879,60 +6023,30 @@ export class TileManager {
     if (isConnected && !this._relayWasConnected) {
       this._relayWasConnected = true;
 
-      // CRITICAL: Start with very low concurrency and gradually ramp up
-      // to prevent massive lag spike / crash on NKN connect
-      this._relayWarmupActive = true;
+      console.log('[Terrain] Relay connected - FPS-based adaptive batching enabled');
+      console.log('[Terrain] Starting with 1 tile batch (center only), will scale based on FPS');
 
-      // CRITICAL: Pause periodic backfill during warmup to prevent cascade
-      this._periodicBackfillPaused = true;
+      // CRITICAL: No more warmup timer - FPS monitor handles concurrency dynamically
+      // The AdaptiveBatchScheduler will start with 1 tile and scale up when FPS is healthy
 
-      this.MAX_CONCURRENT_POPULATES = this._isMobile ? 1 : 3;
-      this.RATE_QPS = 6;
-      this.RATE_BPS = 128 * 1024;
-
-      // Clear any existing warmup timer
+      // Clear any existing warmup timer from previous implementation
       if (this._relayWarmupTimer) {
         clearInterval(this._relayWarmupTimer);
+        this._relayWarmupTimer = null;
       }
 
-      // Gradually ramp up concurrency over 30 seconds
-      const targetConcurrent = this._isMobile ? 3 : 18;
-      const targetQPS = this._isMobile ? 6 : 36;
-      const targetBPS = this._isMobile ? (160 * 1024) : (768 * 1024);
-      const steps = 15; // 15 steps over 30 seconds = 2 second intervals
-      let currentStep = 0;
+      // Mark warmup as inactive - adaptive scheduler handles this now
+      this._relayWarmupActive = false;
+      this._periodicBackfillPaused = false;
 
-      this._relayWarmupTimer = setInterval(() => {
-        currentStep++;
+      // Set conservative initial concurrency - adaptive scheduler will override based on FPS
+      this.MAX_CONCURRENT_POPULATES = this._isMobile ? 3 : 6;
+      this.RATE_QPS = 6;
+      this.RATE_BPS = 160 * 1024;
 
-        if (currentStep >= steps) {
-          // Warmup complete - reached target values
-          this.MAX_CONCURRENT_POPULATES = targetConcurrent;
-          this.RATE_QPS = targetQPS;
-          this.RATE_BPS = targetBPS;
-          this._relayWarmupActive = false;
-
-          // CRITICAL: Resume periodic backfill after warmup completes
-          this._periodicBackfillPaused = false;
-
-          // CRITICAL: Process any pending tree resnaps that were deferred during warmup
-          // Gradually process them to avoid sudden RAF spike
-          this._processPendingTreeResnaps();
-
-          clearInterval(this._relayWarmupTimer);
-          this._relayWarmupTimer = null;
-        } else {
-          // Gradually increase (linear ramp)
-          const progress = currentStep / steps;
-          const initialConcurrent = this._isMobile ? 1 : 3;
-          this.MAX_CONCURRENT_POPULATES = Math.floor(initialConcurrent + (targetConcurrent - initialConcurrent) * progress);
-          this.RATE_QPS = Math.floor(6 + (targetQPS - 6) * progress);
-          this.RATE_BPS = Math.floor(128 * 1024 + (targetBPS - 128 * 1024) * progress);
-        }
-      }, 2000);
-
-      // Delay initial backfill by 2 seconds to let connection stabilize
-      this._scheduleBackfill(2000);
+      // Trigger initial backfill after brief delay to let connection stabilize
+      // AdaptiveBatchScheduler will control how many tiles actually get queued
+      this._scheduleBackfill(1000);
     }
   }
 

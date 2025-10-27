@@ -25,6 +25,7 @@ import { SmartObjectManager } from './smartObjects.js';
 import { SpatialAudioManager } from './spatialAudio.js';
 import { SmartObjectModal } from './smartModal.js';
 import { ProgressiveLoader } from './progressiveLoader.js';
+import { FPSMonitor } from './fpsMonitor.js';
 
 const DAY_MS = 86400000;
 const J1970 = 2440588;
@@ -294,6 +295,18 @@ this.radio = new RadioManager({
     // CRITICAL: Unified progressive loader - controls ALL systems
     // Prevents crash by spreading work across frames with conservative budgets
     this.progressiveLoader = new ProgressiveLoader({ isMobile });
+
+    // CRITICAL: FPS Monitor - tracks real-time performance for adaptive batching
+    // Emits health status every 100ms to drive terrain loading throttling
+    this.fpsMonitor = new FPSMonitor({
+      onHealthChange: (health, fps, metadata) => {
+        console.log(`[FPS] ${health} - ${fps.toFixed(1)}fps (trend: ${metadata.trend})`);
+        // Pass FPS health to terrain manager's adaptive scheduler
+        if (this.hexGridMgr?.adaptiveBatchScheduler) {
+          this.hexGridMgr.adaptiveBatchScheduler.updateFPSHealth(health, fps, metadata);
+        }
+      }
+    });
 
     // Terrain + audio
     this.audio = new AudioEngine(this.sceneMgr);
@@ -4312,6 +4325,12 @@ this.radio = new RadioManager({
 
   /* ---------- Main loop ---------- */
   _tick() {
+    // CRITICAL: Record frame FIRST for FPS monitoring
+    // This drives adaptive batch scheduling to prevent crashes
+    if (this.fpsMonitor) {
+      this.fpsMonitor.recordFrame();
+    }
+
     if (performance?.mark) performance.mark('tick-start');
 
     const logger = this._perfLogger;
