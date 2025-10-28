@@ -578,9 +578,11 @@
                     id="envFarfieldBatchCurrent">(engine: 48)</span></label>
                 <input id="envFarfieldBatch" type="range" min="8" max="128" step="4" value="48" />
               </div>
-              <div class="slider-row readonly">
-                <label>Horizon Field Radius <span class="mono" id="envHorizonRadiusValue">—</span> <span
-                    class="tiny env-current" id="envHorizonRadiusCurrent">(engine: —)</span></label>
+              <div class="slider-row">
+                <label for="envHorizonRadius">Horizon Field Radius <span class="mono" id="envHorizonRadiusValue">100
+                    km</span> <span class="tiny env-current"
+                    id="envHorizonRadiusCurrent">(engine: 100 km)</span></label>
+                <input id="envHorizonRadius" type="range" min="20" max="160" step="1" value="100" />
               </div>
               <div class="slider-row">
                 <label for="envTileRadius">Tile Radius <span class="mono" id="envTileRadiusValue">100 m</span> <span

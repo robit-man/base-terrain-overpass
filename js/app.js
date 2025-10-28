@@ -563,7 +563,8 @@ class App {
     this._mobileFPVOn = false;
 
     this._pointerNdc = { x: 0, y: 0, has: false };
-    this._pointerRingRadius = 10;
+    this._pointerRingBaseRadius = 10;
+    this._pointerRingCurrentRadius = this._pointerRingBaseRadius;
     this._pointerInfo = {
       valid: false,
       screenX: 0,
@@ -571,10 +572,9 @@ class App {
       canvasRect: null,
       relX: 0,
       relY: 0,
-      radius: this._pointerRingRadius
+      radius: this._pointerRingCurrentRadius
     };
     this._pointerRingEl = ui.pointerRing || null;
-    this._pointerRingPulseTimer = null;
     this._placeBtnState = null;
     const dom = this.sceneMgr.renderer.domElement;
     window.addEventListener('pointermove', (e) => this._onPointerMove(e, dom), { passive: true });
@@ -1641,6 +1641,7 @@ class App {
       envFarfieldBudgetValue,
       envFarfieldBatch,
       envFarfieldBatchValue,
+      envHorizonRadius,
       envTileRadius,
       envTileRadiusValue,
       envTerrainApply,
@@ -1717,6 +1718,13 @@ class App {
       if (envHorizonRadiusValue) {
         envHorizonRadiusValue.textContent = horizonKm === '—' ? '—' : `${horizonKm} km`;
       }
+      if (envHorizonRadius && Number.isFinite(settings.horizonOuterRadius)) {
+        const kmValue = settings.horizonOuterRadius / 1000;
+        const min = Number(envHorizonRadius.min ?? 0);
+        const max = Number(envHorizonRadius.max ?? kmValue);
+        const clamped = THREE.MathUtils.clamp(Math.round(kmValue), min, max);
+        envHorizonRadius.value = String(clamped);
+      }
     };
     this._updateTerrainCurrentDisplay = updateTerrainCurrent;
 
@@ -1747,13 +1755,17 @@ class App {
         envTileRadius.value = radius;
         setText(envTileRadiusValue, `${radius} m`);
       }
-      if (envHorizonRadiusValue) {
-        if (Number.isFinite(settings.horizonOuterRadius)) {
-          const km = (settings.horizonOuterRadius / 1000).toFixed(1);
-          setText(envHorizonRadiusValue, `${km} km`);
-        } else {
-          setText(envHorizonRadiusValue, '—');
+      if (Number.isFinite(settings.horizonOuterRadius)) {
+        const kmExact = settings.horizonOuterRadius / 1000;
+        if (envHorizonRadiusValue) setText(envHorizonRadiusValue, `${kmExact.toFixed(1)} km`);
+        if (envHorizonRadius) {
+          const min = Number(envHorizonRadius.min ?? 0);
+          const max = Number(envHorizonRadius.max ?? kmExact);
+          const sliderVal = THREE.MathUtils.clamp(Math.round(kmExact), min, max);
+          envHorizonRadius.value = String(sliderVal);
         }
+      } else {
+        if (envHorizonRadiusValue) setText(envHorizonRadiusValue, '—');
       }
       if (envFogNear) {
         const nearPct = Math.round((settings.fogNearPct ?? this.hexGridMgr?.FOG_NEAR_PCT ?? 0) * 100);
@@ -1829,6 +1841,12 @@ class App {
     });
     envFarfieldBatch?.addEventListener('input', () => {
       setText(envFarfieldBatchValue, envFarfieldBatch.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envHorizonRadius?.addEventListener('input', () => {
+      const km = Number(envHorizonRadius.value);
+      if (envHorizonRadiusValue) setText(envHorizonRadiusValue, `${km.toFixed(0)} km`);
       this._disableTerrainAuto();
       this._scheduleTerrainUpdate();
     });
@@ -2176,7 +2194,14 @@ class App {
     const fogNearPct = Math.max(0, Math.min(0.95, Number(ui.envFogNear?.value ?? Math.round((this.hexGridMgr?.FOG_NEAR_PCT ?? 0.12) * 100)) / 100));
     const fogFarRaw = Number(ui.envFogFar?.value ?? Math.round((this.hexGridMgr?.FOG_FAR_PCT ?? 0.98) * 100));
     const fogFarPct = Math.max(fogNearPct + 0.02, Math.min(1, fogFarRaw / 100));
-    return {
+    let horizonOuterRadius = null;
+    if (ui.envHorizonRadius) {
+      const km = Number(ui.envHorizonRadius.value);
+      if (Number.isFinite(km) && km > 0) {
+        horizonOuterRadius = km * 1000;
+      }
+    }
+    const config = {
       interactiveRing: interactive,
       visualRing: visual,
       farfieldExtra: farExtra,
@@ -2187,6 +2212,8 @@ class App {
       fogNearPct,
       fogFarPct,
     };
+    if (Number.isFinite(horizonOuterRadius)) config.horizonOuterRadius = horizonOuterRadius;
+    return config;
   }
 
   _applyTerrainSettingsFromUi({ auto = false } = {}) {
@@ -5132,8 +5159,10 @@ class App {
   }
 
   _onCanvasPointerDown(e) {
-    if (e.button === 0) this._pulsePointerRing('shrink');
-    else if (e.button === 2) this._pulsePointerRing('expand');
+    if (e.button === 0 || e.button === 2) {
+      this._setPointerRingVisible(true);
+      this._setPointerRingHeld(true);
+    }
     const isMouse = !e.pointerType || e.pointerType === 'mouse';
     if (this._pointerLockArmed && !this._pointerLockActive && isMouse && e.button === 0) {
       if (this._pointerLockHoldActive) return;
@@ -5229,10 +5258,7 @@ class App {
     if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
       this._cancelPointerHold();
     }
-    if (this._pointerRingEl) {
-      this._pointerRingEl.classList.remove('shrink');
-      this._pointerRingEl.classList.remove('expand');
-    }
+    if (this._pointerRingEl) this._setPointerRingHeld(false);
 
     // It's only a "real click" if we *didn't* orbit the camera.
     const wasDraggingCamera = this._orbitDragActive && this._orbitDragMoved;
@@ -5259,6 +5285,7 @@ class App {
     }
     this._pointerInfo.valid = false;
     this._setPointerRingVisible(false);
+    this._setPointerRingHeld(false);
   }
 
 
@@ -5306,8 +5333,10 @@ class App {
       ring.hidden = false;
       ring.classList.add('visible');
     } else {
-      ring.classList.remove('visible', 'shrink', 'expand');
+      ring.classList.remove('visible', 'held');
       ring.hidden = true;
+      this._pointerRingCurrentRadius = this._pointerRingBaseRadius;
+      if (this._pointerInfo) this._pointerInfo.radius = this._pointerRingCurrentRadius;
     }
   }
 
@@ -5318,22 +5347,15 @@ class App {
     ring.style.top = `${y}px`;
   }
 
-  _pulsePointerRing(mode) {
+  _setPointerRingHeld(held) {
     const ring = this._pointerRingEl;
     if (!ring) return;
-    ring.hidden = false;
-    ring.classList.add('visible');
-    ring.classList.remove('shrink');
-    ring.classList.remove('expand');
-    if (mode === 'shrink') ring.classList.add('shrink');
-    else if (mode === 'expand') ring.classList.add('expand');
-    if (mode) {
-      if (this._pointerRingPulseTimer) clearTimeout(this._pointerRingPulseTimer);
-      this._pointerRingPulseTimer = setTimeout(() => {
-        ring.classList.remove('shrink');
-        ring.classList.remove('expand');
-      }, mode === 'expand' ? 220 : 160);
-    }
+    const next = !!held;
+    ring.classList.toggle('held', next);
+    this._pointerRingCurrentRadius = next
+      ? this._pointerRingBaseRadius * 0.56
+      : this._pointerRingBaseRadius;
+    if (this._pointerInfo) this._pointerInfo.radius = this._pointerRingCurrentRadius;
   }
 
   _commitPointerLock() {
@@ -5533,7 +5555,7 @@ class App {
       this._pointerInfo.relX = e.clientX - rect.left;
       this._pointerInfo.relY = e.clientY - rect.top;
       this._pointerInfo.valid = inside;
-      this._pointerInfo.radius = this._pointerRingRadius;
+      this._pointerInfo.radius = this._pointerRingCurrentRadius;
     }
   }
 

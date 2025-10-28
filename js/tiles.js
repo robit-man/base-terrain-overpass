@@ -173,7 +173,7 @@ export class TileManager {
     this.HORIZON_FOCUS_STRENGTH = this._isMobile ? HORIZON_FOCUS_STRENGTH_MOBILE : HORIZON_FOCUS_STRENGTH_DESKTOP;
     this.HORIZON_FOCUS_THRESHOLD = HORIZON_FOCUS_SPEED_THRESHOLD;
     this.HORIZON_UPDATE_INTERVAL_MS = HORIZON_UPDATE_INTERVAL_MS;
-    this.HORIZON_INNER_GAP = this.tileRadius * 0.5;
+    this.HORIZON_INNER_GAP = Math.max(8, this.tileRadius * 0.08);
     this.HORIZON_TEXTURE_SCALE = HORIZON_TEXTURE_SCALE;
     this.FOG_NEAR_PCT = 0.12;
     this.FOG_FAR_PCT = 0.98;
@@ -316,6 +316,7 @@ export class TileManager {
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
       fogNearPct: this.FOG_NEAR_PCT,
       fogFarPct: this.FOG_FAR_PCT,
+      horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
     };
     this._defaultTerrainSettings = {
       interactiveRing: this.INTERACTIVE_RING,
@@ -329,6 +330,7 @@ export class TileManager {
       spacing: this.spacing,
       fogNearPct: this.FOG_NEAR_PCT,
       fogFarPct: this.FOG_FAR_PCT,
+      horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
     };
     this._lodQuality = 1;
 
@@ -2179,10 +2181,23 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     const needFocus = velocity > this.HORIZON_FOCUS_THRESHOLD;
     if (!this._horizonDirty && now < this._nextHorizonUpdate && !needFocus) return;
 
-    const innerRadius = Math.max(
-      this._computeFarfieldOuterRadius() + this.HORIZON_INNER_GAP,
-      this.tileRadius * (this.VISUAL_RING + this.FARFIELD_EXTRA * 0.5)
-    );
+    let farEdge = this._computeFarfieldOuterRadius();
+    const mergeMesh = this._farfieldMerge?.mesh;
+    if (mergeMesh?.geometry) {
+      mergeMesh.geometry.computeBoundingSphere?.();
+      const bs = mergeMesh.geometry.boundingSphere;
+      if (bs) {
+        const worldCenter = bs.center.clone();
+        mergeMesh.localToWorld(worldCenter);
+        const radial = Math.hypot(worldCenter.x, worldCenter.z) + bs.radius;
+        if (Number.isFinite(radial)) farEdge = Math.max(farEdge, radial);
+      }
+    }
+    if (Number.isFinite(farEdge) && farEdge > this._lastFarfieldOuterRadius) {
+      this._lastFarfieldOuterRadius = farEdge;
+    }
+    const minInner = this.tileRadius * (this.VISUAL_RING + Math.max(1, this.FARFIELD_EXTRA) * 0.5);
+    const innerRadius = Math.max(farEdge + this.HORIZON_INNER_GAP, minInner);
     const outerRadius = Math.max(
       innerRadius + this.HORIZON_EXTRA_METERS,
       this.HORIZON_TARGET_RADIUS
@@ -2260,7 +2275,10 @@ _planarizeEdgeWhenNeighborMissing(tile, {
 
     posAttr.needsUpdate = true;
     uvAttr.needsUpdate = true;
-    try { hf.geometry.computeVertexNormals(); } catch { }
+    try {
+      hf.geometry.computeVertexNormals();
+      hf.geometry.computeBoundingSphere();
+    } catch { }
 
     hf.innerRadius = innerRadius;
     hf.outerRadius = outerRadius;
@@ -4978,8 +4996,15 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       const wx = base.x + pos.getX(i);
       const wz = base.z + pos.getZ(i);
 
-      const y = this._robustSampleHeight(wx, wz, lowMesh, neighborMeshes, lowPosAttr, this._lastHeight);
-      pos.setY(i, Number.isFinite(y) ? y : 0);
+      const sampled = this._robustSampleHeight(wx, wz, lowMesh, neighborMeshes, lowPosAttr, this._lastHeight);
+      let height = sampled;
+      if (!Number.isFinite(height)) {
+        const fallback = this.getHeightAt(wx, wz);
+        if (Number.isFinite(fallback)) height = fallback;
+      }
+      if (!Number.isFinite(height)) height = this._lastHeight;
+      pos.setY(i, height);
+      this._updateGlobalFromValue(height);
     }
     this._handoffOverlayBetweenTiles(v, t);
     pos.needsUpdate = true;
@@ -7122,6 +7147,7 @@ _applyPendingSamples() {
     spacing,
     fogNearPct,
     fogFarPct,
+    horizonOuterRadius,
   } = {}) {
     let needReset = false;
     if (Number.isFinite(tileRadius) && tileRadius > 10 && tileRadius !== this.tileRadius) {
@@ -7160,6 +7186,16 @@ _applyPendingSamples() {
       const minFar = this.FOG_NEAR_PCT + 0.02;
       this.FOG_FAR_PCT = THREE.MathUtils.clamp(fogFarPct, minFar, 1);
     }
+    if (Number.isFinite(horizonOuterRadius)) {
+      const minOuter = 20000;
+      const maxOuter = 200000;
+      const clampedOuter = THREE.MathUtils.clamp(horizonOuterRadius, minOuter, maxOuter);
+      if (!Number.isFinite(this.HORIZON_TARGET_RADIUS) || Math.abs(clampedOuter - this.HORIZON_TARGET_RADIUS) > 1) {
+        this.HORIZON_TARGET_RADIUS = clampedOuter;
+        this._lastHorizonOuterRadius = clampedOuter;
+        this._markHorizonDirty();
+      }
+    }
 
     this._baseLod = {
       ...this._baseLod,
@@ -7169,6 +7205,7 @@ _applyPendingSamples() {
       farfieldRing: this.FARFIELD_RING,
       farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
       farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
+      horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
     };
 
     if (needReset) {
@@ -7269,8 +7306,9 @@ _applyPendingSamples() {
     this._tmpSampleVec.set(x, 10000, z);
     this.ray.set(this._tmpSampleVec, this.DOWN);
     const hits = this.ray.intersectObjects(meshes, true);
-    if (!hits.length) return null;
-    return hits[0].point.y;
+    if (hits.length) return hits[0].point.y;
+    const fallback = this.getHeightAt(x, z);
+    return Number.isFinite(fallback) ? fallback : null;
   }
 
   _collectMeshesNearByType(x, z, types = []) {

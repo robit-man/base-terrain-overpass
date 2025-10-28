@@ -154,6 +154,7 @@ const envFarfieldBudgetCurrent = document.getElementById('envFarfieldBudgetCurre
 const envFarfieldBatch = document.getElementById('envFarfieldBatch');
 const envFarfieldBatchValue = document.getElementById('envFarfieldBatchValue');
 const envFarfieldBatchCurrent = document.getElementById('envFarfieldBatchCurrent');
+const envHorizonRadius = document.getElementById('envHorizonRadius');
 const envHorizonRadiusValue = document.getElementById('envHorizonRadiusValue');
 const envHorizonRadiusCurrent = document.getElementById('envHorizonRadiusCurrent');
 const envTileRadius = document.getElementById('envTileRadius');
@@ -366,7 +367,7 @@ export const ui = {
   envFarfieldNearPad, envFarfieldNearPadValue, envFarfieldNearPadCurrent,
   envFarfieldBudget, envFarfieldBudgetValue, envFarfieldBudgetCurrent,
   envFarfieldBatch, envFarfieldBatchValue, envFarfieldBatchCurrent,
-  envHorizonRadiusValue, envHorizonRadiusCurrent,
+  envHorizonRadius, envHorizonRadiusValue, envHorizonRadiusCurrent,
   envTileRadius, envTileRadiusValue, envTileRadiusCurrent,
   envFogNear, envFogNearValue, envFogNearCurrent,
   envFogFar, envFogFarValue, envFogFarCurrent,
