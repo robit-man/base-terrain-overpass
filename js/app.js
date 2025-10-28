@@ -563,12 +563,26 @@ class App {
     this._mobileFPVOn = false;
 
     this._pointerNdc = { x: 0, y: 0, has: false };
+    this._pointerRingRadius = 10;
+    this._pointerInfo = {
+      valid: false,
+      screenX: 0,
+      screenY: 0,
+      canvasRect: null,
+      relX: 0,
+      relY: 0,
+      radius: this._pointerRingRadius
+    };
+    this._pointerRingEl = ui.pointerRing || null;
+    this._pointerRingPulseTimer = null;
     this._placeBtnState = null;
     const dom = this.sceneMgr.renderer.domElement;
     window.addEventListener('pointermove', (e) => this._onPointerMove(e, dom), { passive: true });
     window.addEventListener('pointerleave', () => {
       this._pointerNdc.has = false;
       this.buildings?.clearHover();
+      this._pointerInfo.valid = false;
+      this._setPointerRingVisible(false);
     });
     if (dom) {
       dom.addEventListener('pointerdown', (e) => this._onCanvasPointerDown(e), { passive: true });
@@ -1598,6 +1612,7 @@ class App {
     const theme = this.sceneMgr?.setWireframeMode?.(this._wireframeMode) || {};
     this.hexGridMgr?.setWireframe?.(this._wireframeMode, theme);
     this.buildings?.setWireframe?.(this._wireframeMode, theme);
+    document.body?.classList?.toggle('wireframe-mode', this._wireframeMode);
     this._syncWireframeUI();
   }
 
@@ -2549,6 +2564,7 @@ class App {
     document.body.classList.toggle('theme-day', theme === 'day');
     document.body.classList.toggle('theme-night', theme === 'night');
     document.body.classList.toggle('theme-twilight', theme === 'twilight');
+    this.buildings?.refreshHoverOverlayTheme?.();
   }
 
   _initProcessLeaderboard() {
@@ -5116,6 +5132,8 @@ class App {
   }
 
   _onCanvasPointerDown(e) {
+    if (e.button === 0) this._pulsePointerRing('shrink');
+    else if (e.button === 2) this._pulsePointerRing('expand');
     const isMouse = !e.pointerType || e.pointerType === 'mouse';
     if (this._pointerLockArmed && !this._pointerLockActive && isMouse && e.button === 0) {
       if (this._pointerLockHoldActive) return;
@@ -5211,6 +5229,10 @@ class App {
     if (this._pointerLockHoldActive && (e.pointerId == null || e.pointerId === this._pointerLockHoldPointerId)) {
       this._cancelPointerHold();
     }
+    if (this._pointerRingEl) {
+      this._pointerRingEl.classList.remove('shrink');
+      this._pointerRingEl.classList.remove('expand');
+    }
 
     // It's only a "real click" if we *didn't* orbit the camera.
     const wasDraggingCamera = this._orbitDragActive && this._orbitDragMoved;
@@ -5235,6 +5257,8 @@ class App {
     if (this._orbitDragActive && e.pointerId === this._orbitDragPointerId) {
       this._endOrbitDrag(e);
     }
+    this._pointerInfo.valid = false;
+    this._setPointerRingVisible(false);
   }
 
 
@@ -5272,6 +5296,43 @@ class App {
       canvas.classList.add('pointer-lock-arming');
     } else {
       canvas.classList.remove('pointer-lock-arming');
+    }
+  }
+
+  _setPointerRingVisible(visible) {
+    const ring = this._pointerRingEl;
+    if (!ring) return;
+    if (visible) {
+      ring.hidden = false;
+      ring.classList.add('visible');
+    } else {
+      ring.classList.remove('visible', 'shrink', 'expand');
+      ring.hidden = true;
+    }
+  }
+
+  _updatePointerRingPosition(x, y) {
+    const ring = this._pointerRingEl;
+    if (!ring) return;
+    ring.style.left = `${x}px`;
+    ring.style.top = `${y}px`;
+  }
+
+  _pulsePointerRing(mode) {
+    const ring = this._pointerRingEl;
+    if (!ring) return;
+    ring.hidden = false;
+    ring.classList.add('visible');
+    ring.classList.remove('shrink');
+    ring.classList.remove('expand');
+    if (mode === 'shrink') ring.classList.add('shrink');
+    else if (mode === 'expand') ring.classList.add('expand');
+    if (mode) {
+      if (this._pointerRingPulseTimer) clearTimeout(this._pointerRingPulseTimer);
+      this._pointerRingPulseTimer = setTimeout(() => {
+        ring.classList.remove('shrink');
+        ring.classList.remove('expand');
+      }, mode === 'expand' ? 220 : 160);
     }
   }
 
@@ -5343,6 +5404,9 @@ class App {
     this._endOrbitDrag();
     this._togglePointerLockHint(this._pointerLockActive);
     this._syncPointerLockButton(true);
+    if (isLocked) {
+      this._setPointerRingVisible(false);
+    }
   }
 
   _syncPointerLockButton(force = false) {
@@ -5443,11 +5507,34 @@ class App {
     const rect = dom.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
-    this._pointerNdc.x = x * 2 - 1;
-    this._pointerNdc.y = -(y * 2 - 1);
-    this._pointerNdc.has = true;
-    this._pointerLastMoveMs = (performance && performance.now) ? performance.now() : Date.now(); // NEW
-    this._hoverDirty = true;
+    let inside = x >= 0 && x <= 1 && y >= 0 && y <= 1;
+    if (inside && typeof document !== 'undefined' && document.elementFromPoint) {
+      const topEl = document.elementFromPoint(e.clientX, e.clientY);
+      inside = topEl === dom;
+    }
+    if (inside) {
+      this._pointerNdc.x = x * 2 - 1;
+      this._pointerNdc.y = -(y * 2 - 1);
+      this._pointerNdc.has = true;
+      this._pointerLastMoveMs = (performance && performance.now) ? performance.now() : Date.now();
+      this._hoverDirty = true;
+      this._updatePointerRingPosition(e.clientX, e.clientY);
+      this._setPointerRingVisible(true);
+    } else {
+      this._pointerNdc.has = false;
+      this._setPointerRingVisible(false);
+      this.buildings?.clearHover();
+    }
+
+    if (this._pointerInfo) {
+      this._pointerInfo.screenX = e.clientX;
+      this._pointerInfo.screenY = e.clientY;
+      this._pointerInfo.canvasRect = rect;
+      this._pointerInfo.relX = e.clientX - rect.left;
+      this._pointerInfo.relY = e.clientY - rect.top;
+      this._pointerInfo.valid = inside;
+      this._pointerInfo.radius = this._pointerRingRadius;
+    }
   }
 
   // === NEW: throttled hover raycast ===
@@ -5476,7 +5563,7 @@ class App {
     this._hoverNextAllowedMs = now + 80; // ~12.5 Hz
 
     this._raycaster.setFromCamera(this._pointerNdc, this.sceneMgr.camera);
-    this.buildings?.updateHover(this._raycaster, this.sceneMgr.camera);
+    this.buildings?.updateHover(this._raycaster, this.sceneMgr.camera, { pointer: this._pointerInfo });
     this.remotes?.updateHover(this._raycaster);
   }
 

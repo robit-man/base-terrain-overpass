@@ -237,6 +237,15 @@ export class BuildingManager {
     this._hoverLabelCtx = null;
     this._hoverLabelTexture = null;
     this._hoverInfo = null;
+    this._hoverOverlayRoot = null;
+    this._hoverOverlaySvg = null;
+    this._hoverOverlayLine = null;
+    this._hoverCard = null;
+    this._hoverCardName = null;
+    this._hoverCardAddress = null;
+    this._pointerTheme = { lineColor: null };
+    this._wireframeLineColor = new THREE.Color(0xffffff);
+    this._ensureHoverOverlay();
     this.physics = null;
     this._addressToast = null;
     this._addressToastNameEl = null;
@@ -787,6 +796,7 @@ export class BuildingManager {
     this._stemMaterial.dispose();
     this._pickMaterial.dispose();
     this._buildingMaterial.dispose();
+    this._hideHoverOverlay();
 
     // CSS3D teardown
     if (this._cssRenderer) {
@@ -802,7 +812,7 @@ export class BuildingManager {
 
   /* ---------------- hover & CSS3D panel ---------------- */
 
-  updateHover(raycaster, camera) {
+  updateHover(raycaster, camera, opts = {}) {
     if (!this._pickerRoot.children.length) {
       this.clearHover();
       return;
@@ -821,7 +831,7 @@ export class BuildingManager {
       return;
     }
 
-    this._showHover(info, hit.point, camera);
+    this._showHover(info, hit.point, camera, opts);
   }
 
   clearHover() {
@@ -840,13 +850,14 @@ export class BuildingManager {
     }
     if (this._hoverGroup) this._hoverGroup.visible = false;
     this._hoverInfo = null;
+    this._hideHoverOverlay();
 
     // Hide CSS3D panel
     this._hideDuckDuckGoPanel();
     this._hideAddressToast();
   }
 
-  _showHover(info, point, camera) {
+  _showHover(info, point, camera, opts = {}) {
     this._ensureHoverArtifacts();
 
     // Update highlight edges once per target
@@ -878,18 +889,16 @@ export class BuildingManager {
     const offset = dir.multiplyScalar(stemLength);
     const labelPos = anchorTop.clone().add(offset);
     labelPos.y += stemLength;
-
-    // stem
-    const stemGeom = new THREE.BufferGeometry().setFromPoints([anchorTop, labelPos]);
-    this._hoverStem.geometry.dispose();
-    this._hoverStem.geometry = stemGeom;
-    this._hoverStem.visible = true;
-
-    // (hide the old canvas label)
-    if (this._hoverLabel) {
-      this._hoverLabel.position.copy(labelPos);
-      this._hoverLabel.visible = true;
+    if (this._hoverStem) {
+      this._hoverStem.visible = false;
+      if (this._hoverStem.geometry) {
+        this._hoverStem.geometry.dispose();
+        this._hoverStem.geometry = new THREE.BufferGeometry();
+      }
     }
+    if (this._hoverLabel) this._hoverLabel.visible = false;
+
+    this._updateHoverOverlay(info, anchorTop, camera, opts.pointer || {});
 
     this._showAddressToast(info);
   }
@@ -2312,6 +2321,117 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
     this._hoverGroup.add(label);
   }
 
+  _ensureHoverOverlay() {
+    if (this._hoverOverlayRoot || typeof document === 'undefined') {
+      if (this._hoverOverlayRoot && !this._hoverOverlayLine) {
+        this._hoverOverlayLine = this._hoverOverlayRoot.querySelector('line');
+        this._hoverCard = this._hoverOverlayRoot.querySelector('.building-hover-card');
+        this._hoverCardName = this._hoverOverlayRoot.querySelector('.building-hover-card-name');
+        this._hoverCardAddress = this._hoverOverlayRoot.querySelector('.building-hover-card-address');
+        this._hoverOverlaySvg = this._hoverOverlayRoot.querySelector('svg');
+      }
+      return this._hoverOverlayRoot;
+    }
+    const root = document.getElementById('buildingHoverOverlay');
+    if (!root) return null;
+    this._hoverOverlayRoot = root;
+    this._hoverOverlaySvg = root.querySelector('svg');
+    this._hoverOverlayLine = root.querySelector('line');
+    this._hoverCard = root.querySelector('.building-hover-card');
+    this._hoverCardName = root.querySelector('.building-hover-card-name');
+    this._hoverCardAddress = root.querySelector('.building-hover-card-address');
+    return root;
+  }
+
+  _hideHoverOverlay() {
+    const root = this._hoverOverlayRoot || this._ensureHoverOverlay();
+    if (!root) return;
+    root.hidden = true;
+  }
+
+  _syncHoverOverlayTheme(themeColor = null) {
+    const root = this._hoverOverlayRoot || this._ensureHoverOverlay();
+    if (!root) return;
+    const body = (typeof document !== 'undefined') ? document.body : null;
+    const night = body?.classList.contains('theme-night') || body?.classList.contains('theme-twilight');
+    root.classList.toggle('wireframe', !!this._wireframeMode);
+    let line = themeColor instanceof THREE.Color ? themeColor : null;
+    if (!line) {
+      line = this._wireframeMode
+        ? (this._wireframeLineColor instanceof THREE.Color ? this._wireframeLineColor : new THREE.Color(0xffffff))
+        : new THREE.Color(night ? 0xf5f7ff : 0x1a1c20);
+    }
+    if (this._hoverOverlayLine) {
+      this._hoverOverlayLine.setAttribute('stroke', `#${line.getHexString()}`);
+    }
+  }
+
+  _updateHoverOverlay(info, anchorWorld, camera, pointer = {}) {
+    const root = this._hoverOverlayRoot || this._ensureHoverOverlay();
+    if (!root) return;
+    const { valid, screenX, screenY, canvasRect } = pointer || {};
+    if (!valid || !canvasRect || !Number.isFinite(screenX) || !Number.isFinite(screenY)) {
+      root.hidden = true;
+      return;
+    }
+
+    const width = window.innerWidth || canvasRect.right;
+    const height = window.innerHeight || canvasRect.bottom;
+    if (this._hoverOverlaySvg) {
+      this._hoverOverlaySvg.setAttribute('width', String(width));
+      this._hoverOverlaySvg.setAttribute('height', String(height));
+    }
+
+    const projected = this._tmpVec3.copy(anchorWorld).project(camera);
+    if (projected.z > 1 || projected.z < -1) {
+      root.hidden = true;
+      return;
+    }
+    const ax = canvasRect.left + (projected.x * 0.5 + 0.5) * canvasRect.width;
+    const ay = canvasRect.top + (-projected.y * 0.5 + 0.5) * canvasRect.height;
+
+    this._syncHoverOverlayTheme();
+
+    const pointerRadius = Number.isFinite(pointer.radius) ? pointer.radius : 10;
+    const pointerGap = pointerRadius + 8;
+    if (root && typeof pointerGap === 'number') {
+      root.style.setProperty('--hover-card-gap', `${pointerGap}px`);
+    }
+
+    if (this._hoverOverlayLine) {
+      this._hoverOverlayLine.setAttribute('x1', String(ax));
+      this._hoverOverlayLine.setAttribute('y1', String(ay));
+      this._hoverOverlayLine.setAttribute('x2', String(screenX));
+      this._hoverOverlayLine.setAttribute('y2', String(screenY));
+    }
+
+    if (this._hoverCard) {
+      const clampMargin = 18;
+      const clampedX = Math.min(width - clampMargin, Math.max(clampMargin, screenX));
+      const clampedY = Math.min(height - clampMargin, Math.max(clampMargin, screenY));
+      this._hoverCard.style.left = `${clampedX}px`;
+      this._hoverCard.style.top = `${clampedY}px`;
+      const name = this._formatBuildingName(info);
+      if (this._hoverCardName) {
+        if (name) {
+          this._hoverCardName.textContent = name;
+          this._hoverCardName.hidden = false;
+        } else {
+          this._hoverCardName.hidden = true;
+        }
+      }
+      if (this._hoverCardAddress) {
+        this._hoverCardAddress.textContent = info?.address || 'Unknown address';
+      }
+    }
+
+    root.hidden = false;
+  }
+
+  refreshHoverOverlayTheme() {
+    this._syncHoverOverlayTheme();
+  }
+
   _roundRect(ctx, x, y, w, h, r) {
     const rr = Math.min(r, w * 0.5, h * 0.5);
     ctx.beginPath();
@@ -3186,6 +3306,11 @@ _refreshBuildingVisibility(building) {
 
   setWireframe(enabled, theme = {}) {
     this._wireframeMode = !!enabled;
+    if (theme?.lineColor instanceof THREE.Color) {
+      this._wireframeLineColor = theme.lineColor.clone();
+    } else if (!enabled) {
+      this._wireframeLineColor = new THREE.Color(0xffffff);
+    }
     const lineColor = theme?.lineColor instanceof THREE.Color
       ? theme.lineColor.clone()
       : null;
@@ -3215,6 +3340,8 @@ _refreshBuildingVisibility(building) {
         if (state.tileKey) this._updateMergedGroupVisibility(state.tileKey);
       }
     }
+    const themeColor = theme?.lineColor instanceof THREE.Color ? theme.lineColor : null;
+    this._syncHoverOverlayTheme(themeColor);
   }
 
   _verifyFloatingBuildings() {
