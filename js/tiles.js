@@ -4708,14 +4708,14 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     return { group, mesh, geometry: geom, mat };
   }
 
-  // pick stride/scale/sample strategy by distance
-  _farfieldTierForDist(dist) {
-    // tune these bands freely; goal is to cap #tiles & #queries
-    if (dist <= this.VISUAL_RING + 24) return { stride: 3, scale: 3, samples: 'all', minPrec: 5 };
-    if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 6, samples: 'tips', minPrec: 4 };
-    if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 12, samples: 'tips', minPrec: 3 };
-    return { stride: 24, scale: 24, samples: 'center', minPrec: 3 }; // absurd horizon: 1 sample/tile
-  }
+// pick stride/scale/sample strategy by distance
+_farfieldTierForDist(dist) {
+  // To guarantee no overlap, keep farfield tiles at visual size (scale: 1).
+  if (dist <= this.VISUAL_RING + 24)  return { stride: 1,  scale: 1, samples: 'all',   minPrec: 5 };
+  if (dist <= this.VISUAL_RING + 128) return { stride: 6,  scale: 1, samples: 'tips',  minPrec: 4 };
+  if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 1, samples: 'tips',  minPrec: 3 };
+  return { stride: 24, scale: 1, samples: 'center', minPrec: 3 }; // thin sampling, same-size tiles
+}
 
   // normalize modulo for negatives
   _divisible(n, k) { n = Math.round(n); k = Math.max(1, Math.round(k)); return ((n % k) + k) % k === 0; }
