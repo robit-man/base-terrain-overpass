@@ -6596,6 +6596,77 @@ _applyPendingSamples() {
     return { ...this._relayStatus, pipeline };
   }
 
+  // tiles.js — inside TileManager
+setOverlayEnabled(on) {
+  const want = !!on;
+  if (this._overlayEnabled === want) return;
+  this._overlayEnabled = want;
+  // Tear down or ensure for current tiles
+  for (const t of this.tiles.values()) {
+    if (want) this._ensureTileOverlay(t);
+    else this._teardownOverlayForTile(t);
+  }
+}
+
+
+getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
+  // If overlays are disabled, nothing to sample
+  if (!this._overlayEnabled || !this.origin) return null;
+
+  // Find the tile we’re on by rounding axial coords
+  const { q, r } = this._axialRound(this._worldToAxialFloat(x, z));
+  const tile = this.tiles.get(`${q},${r}`);
+  if (!tile) return null;
+
+  // Ensure an overlay request is in-flight for this tile (won’t block)
+  this._ensureTileOverlay(tile);
+
+  // Try to find a ready overlay entry (texture.image is the canvas we drew)
+  const cacheKey = tile._overlay?.cacheKey;
+  const entry = cacheKey ? this._overlayCache.get(cacheKey) : tile._overlay?.entry;
+  const canvas = entry?.texture?.image || entry?.canvas;
+  const bounds = entry?.bounds;
+  const imgSize = entry?.imageSize;
+  if (!canvas || !bounds || !imgSize) return null;
+
+  // World -> lat/lon -> UV in the entry bounds
+  const toUV = (wx, wz) => {
+    const { lat, lon } = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+    const lonSpan = Math.max(1e-12, bounds.lonMax - bounds.lonMin);
+    const latSpan = Math.max(1e-12, bounds.latMax - bounds.latMin);
+    const u = (lon - bounds.lonMin) / lonSpan;
+    const v = (bounds.latMax - lat) / latSpan;  // Mercator tiles are top-origin
+    return { u, v };
+  };
+
+  // Read a single pixel (clamped) from the canvas
+  const readUV = (u, v) => {
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    // Half-texel inset to match your UV padding approach
+    const px = Math.max(0, Math.min(canvas.width  - 1, Math.floor(u * (canvas.width  - 1))));
+    const py = Math.max(0, Math.min(canvas.height - 1, Math.floor(v * (canvas.height - 1))));
+    const d = ctx.getImageData(px, py, 1, 1).data;
+    return { r: d[0] / 255, g: d[1] / 255, b: d[2] / 255 };
+  };
+
+  if (!Number.isFinite(averageRadius) || averageRadius <= 0 || !Number.isFinite(samples) || samples <= 1) {
+    const { u, v } = toUV(x, z);
+    return readUV(u, v);
+  }
+
+  // Average N jittered taps in a disk of averageRadius
+  let acc = { r: 0, g: 0, b: 0 }, hit = 0;
+  for (let i = 0; i < samples; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const rj = Math.random() * averageRadius;
+    const { u, v } = toUV(x + Math.cos(a) * rj, z + Math.sin(a) * rj);
+    const c = readUV(u, v);
+    if (c) { acc.r += c.r; acc.g += c.g; acc.b += c.b; hit++; }
+  }
+  return hit ? { r: acc.r / hit, g: acc.g / hit, b: acc.b / hit } : null;
+}
   refreshTiles() {
     this._invalidateHeightCache();
     for (const tile of this.tiles.values()) {

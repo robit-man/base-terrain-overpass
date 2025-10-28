@@ -98,10 +98,13 @@ function buildOverpassQuery(bbox) {
     [out:json][timeout:25];
     (
       way["building"](${minLat},${minLon},${maxLat},${maxLon});
-      way["highway"] (${minLat},${minLon},${maxLat},${maxLon});
+      relation["building"](${minLat},${minLon},${maxLat},${maxLon});
+      way["building:part"](${minLat},${minLon},${maxLat},${maxLon});
+      relation["building:part"](${minLat},${minLon},${maxLat},${maxLon});
+      way["highway"](${minLat},${minLon},${maxLat},${maxLon});
       way["waterway"](${minLat},${minLon},${maxLat},${maxLon});
       way["leisure"="park"](${minLat},${minLon},${maxLat},${maxLon});
-      way["landuse"] (${minLat},${minLon},${maxLat},${maxLon});
+      way["landuse"](${minLat},${minLon},${maxLat},${maxLon});
     );
     (._;>;);
     out body;
@@ -333,6 +336,8 @@ export class BuildingManager {
     this._wireframeMode = false;
 
     const envTexture = scene?.environment || null;
+
+    // Opaque, matte buildings (vertex colors)
     this._buildingMaterial = new THREE.MeshPhysicalMaterial({
       //color: new THREE.Color(0xaeb6c2),
       transmission: 1,
@@ -345,10 +350,20 @@ export class BuildingManager {
       clearcoatRoughness: 0.05,
       envMap: envTexture,
       envMapIntensity: 0.6,
-      //vertexColors: true,
+      vertexColors: true,        // ← enable per-vertex colors
       //transparent: true,
       //opacity: 0.96,
       side: THREE.BackSide
+    });
+
+
+    // Slightly different roughness for roofs (also vertex-colored)
+    this._roofMaterial = new THREE.MeshStandardMaterial({
+      metalness: 0.0,
+      roughness: 0.8,
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      envMap: envTexture
     });
     this._roadMaterial = new THREE.MeshPhysicalMaterial({
       transmission: 1,
@@ -1593,38 +1608,87 @@ export class BuildingManager {
     state.resnapFrozen = false;
 
     const nodeMap = new Map();
-    for (const el of data?.elements || []) if (el.type === 'node') nodeMap.set(el.id, el);
+    const wayMap = new Map();
+    const rels = [];
+
+    for (const el of (data?.elements || [])) {
+      if (el.type === 'node') nodeMap.set(el.id, el);
+      else if (el.type === 'way') wayMap.set(el.id, el);
+      else if (el.type === 'relation') rels.push(el);
+    }
 
     const features = [];
     let buildingCount = 0;
     let extraCount = 0;
 
-    for (const el of data?.elements || []) {
-      if (el.type !== 'way') continue;
-      const tags = el.tags || {};
+    // Collect way-ids that are used inside building relations to avoid double-adding
+    const wayIdsUsedByBuildingRels = new Set();
+    for (const rel of rels) {
+      const t = rel.tags || {};
+      if ((t.type === 'multipolygon') && (t.building || t['building:part'])) {
+        for (const m of (rel.members || [])) {
+          if (m.type === 'way') wayIdsUsedByBuildingRels.add(m.ref);
+        }
+      }
+    }
+
+    // 1) Buildings from standalone ways (skip ones consumed by relations)
+    for (const way of wayMap.values()) {
+      const tags = way.tags || {};
+      if (!(tags.building || tags['building:part'])) continue;
+      if (wayIdsUsedByBuildingRels.has(way.id)) continue; // will come from the relation
+
       const flat = [];
-      for (const nid of el.nodes || []) {
-        const node = nodeMap.get(nid);
-        if (!node) continue;
-        const { x, z } = this._latLonToWorld(node.lat, node.lon);
+      for (const nid of (way.nodes || [])) {
+        const n = nodeMap.get(nid);
+        if (!n) continue;
+        const { x, z } = this._latLonToWorld(n.lat, n.lon);
+        flat.push(x, z);
+      }
+      if (flat.length < 6) continue;
+      features.push({ kind: 'building', flat, tags, id: way.id });
+      buildingCount++;
+    }
+
+    // 2) Buildings from relations (multipolygons with outers/inners)
+    for (const rel of rels) {
+      const tags = rel.tags || {};
+      if (!((tags.type === 'multipolygon') && (tags.building || tags['building:part']))) continue;
+
+      const rings = this._relationToRings(rel, nodeMap, wayMap);
+      if (!rings || !rings.outer || rings.outer.length < 6) continue;
+
+      const packed = [rings.outer, ...(rings.holes || [])].filter(r => r && r.length >= 6);
+      if (!packed.length) continue;
+
+      features.push({ kind: 'building', rings: packed, tags, id: rel.id });
+      buildingCount++;
+    }
+
+    // 3) Extras (roads/water/areas) -> still from ways
+    for (const way of wayMap.values()) {
+      const tags = way.tags || {};
+      const flat = [];
+      for (const nid of (way.nodes || [])) {
+        const n = nodeMap.get(nid);
+        if (!n) continue;
+        const { x, z } = this._latLonToWorld(n.lat, n.lon);
         flat.push(x, z);
       }
       if (flat.length < 4) continue;
 
-      if (tags.building && FEATURES.BUILDINGS) {
-        features.push({ kind: 'building', flat, tags, id: el.id });
-        buildingCount++;
-      } else if (tags.highway && FEATURES.ROADS) {
-        features.push({ kind: 'road', flat, tags, id: el.id });
+      if (tags.highway && FEATURES.ROADS) {
+        features.push({ kind: 'road', flat, tags, id: way.id });
         extraCount++;
       } else if (tags.waterway && FEATURES.WATERWAYS) {
-        features.push({ kind: 'water', flat, tags, id: el.id });
+        features.push({ kind: 'water', flat, tags, id: way.id });
         extraCount++;
       } else if (FEATURES.AREAS && (tags.leisure === 'park' || tags.landuse)) {
-        features.push({ kind: 'area', flat, tags, id: el.id });
+        features.push({ kind: 'area', flat, tags, id: way.id });
         extraCount++;
       }
     }
+
 
     state.status = features.length ? 'building' : 'ready';
     state.buildings = [];
@@ -2042,78 +2106,146 @@ export class BuildingManager {
 
     return mergedGeom.getAttribute('position').count / 2;
   }
+  // Accepts either: flat (Array<number>) OR rings (Array<flat[]>)
+_buildBuilding(flatOrRings, tags, id) {
+  const levelMeters = 3;
 
-  /* ---------------- building/road/water creation ---------------- */
-
-  _buildBuilding(flat, tags, id) {
-    const rawFootprint = flat.slice();
-    if (rawFootprint.length < 6) return null;
-
-    const h = this._chooseBuildingHeight(tags);
-    const buryBoost = Math.max(0, -this.extraDepth);          // compensate bury
-    const extrusion = h + this.extensionHeight + buryBoost;    // canonical top
-
-    const groundBase = this._lowestGround(rawFootprint);       // no offset
-    const baseline = groundBase + this.extraDepth;             // where solids live
-
-
-    // Wireframe (canonical reference)
-    const wireGeom = this._makeWireGeometry(rawFootprint, groundBase, extrusion);
-    const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
-    edges.position.y = this.extraDepth;
-    edges.castShadow = false;
-    edges.receiveShadow = false;
-    edges.visible = false;
-
-    // Solid + picker: generated directly from same footprint
-    const solidGeo = this._makeSolidGeometry(rawFootprint, extrusion);
-
-    // CRITICAL: Share geometry between meshes instead of cloning
-    // Cloning duplicates memory - 50 buildings × 2 clones = 100 geometry buffers!
-    // Sharing saves 66% memory per building
-    const pickMesh = new THREE.Mesh(solidGeo, this._pickMaterial);
-    pickMesh.position.set(0, baseline, 0);
-    pickMesh.visible = false;
-
-    const solidMesh = new THREE.Mesh(solidGeo, this._buildingMaterial);
-    solidMesh.position.set(0, baseline, 0);
-    solidMesh.renderOrder = 1;
-    solidMesh.castShadow = true;
-    solidMesh.receiveShadow = false;
-    solidMesh.visible = false;
-
-    const centroid = averagePoint(rawFootprint);
-    const address = formatAddress(tags);
-    const info = {
-      id,
-      address,
-      rawFootprint,
-      height: extrusion,
-      baseHeight: groundBase,
-      centroid,
-      tags: { ...tags },
-      tile: null,
-      resnapStableFrames: 0,
-      resnapFrozen: false,
-      resnapLock: false,
-      insideRadius: true,
-      isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z),
-      // Animation state
-      animating: false,
-      animationProgress: 0,
-      animationStartTime: 0,
-      animationDuration: 0.8  // seconds for rise animation
-    };
-
-    edges.userData.buildingInfo = info;
-    pickMesh.userData.buildingInfo = info;
-    solidMesh.userData.buildingInfo = info;
-
-    const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
-    const fillColor = this._elevationColor(groundBase + extrusion * 0.5);
-    this._applyGeometryColor(building.solid.geometry, fillColor);
-    return building;
+  // Normalize input -> rings: [outer, ...holes]
+  let rings;
+  if (Array.isArray(flatOrRings) && typeof flatOrRings[0] === 'number') {
+    rings = [flatOrRings.slice()];
+  } else if (Array.isArray(flatOrRings) && Array.isArray(flatOrRings[0])) {
+    rings = flatOrRings.map(r => r.slice());
+  } else {
+    return null;
   }
+  if (!rings.length || rings[0].length < 6) return null;
+
+  const outer = rings[0];
+  const rawFootprint = outer.slice();
+
+  // --- Parse heights from tags ---
+  const parseNum   = (v) => (v == null ? NaN : parseFloat(v));
+  const parseInt10 = (v) => (v == null ? NaN : parseInt(v, 10));
+
+  const totalH =
+    (Number.isFinite(parseNum(tags.height)) ? parseNum(tags.height) : NaN) ||
+    (Number.isFinite(parseInt10(tags['building:levels'])) ? parseInt10(tags['building:levels']) * levelMeters : NaN) ||
+    this._chooseBuildingHeight(tags);
+
+  const minH =
+    (Number.isFinite(parseNum(tags.min_height)) ? parseNum(tags.min_height) : 0) +
+    (Number.isFinite(parseInt10(tags['building:min_level'])) ? parseInt10(tags['building:min_level']) * levelMeters : 0);
+
+  const roofH =
+    (Number.isFinite(parseNum(tags['roof:height'])) ? parseNum(tags['roof:height']) : 0) ||
+    (Number.isFinite(parseInt10(tags['roof:levels'])) ? parseInt10(tags['roof:levels']) * levelMeters : 0);
+
+  // Visible height ABOVE the baseline (baseline already includes minH)
+  const visibleH = Math.max(0, totalH - minH);
+  const bodyH    = Math.max(0, visibleH - roofH);
+  const roofShape = String(tags['roof:shape'] || '').toLowerCase();
+
+  // Bury/extension
+  const buryBoost = Math.max(0, -this.extraDepth);
+  const visibleTopWithExtras = visibleH + this.extensionHeight + buryBoost;
+
+  // Baseline anchored to terrain under the outer ring
+  const groundBase = this._lowestGround(outer);     // no offsets
+const baseHeight = groundBase + minH;             // OSM min_height applied here
+const baseline   = baseHeight + this.extraDepth;  // solids live at this Y
+
+// Wireframe (match the solids’ baseline semantics)
+const wireGeom = this._makeWireGeometry(outer, baseHeight,
+  totalH + this.extensionHeight + Math.max(0, -this.extraDepth));
+const edges = new THREE.LineSegments(wireGeom, this._edgeMaterial);
+edges.position.y = this.extraDepth;
+edges.castShadow = false;
+edges.receiveShadow = false;
+edges.visible = false;
+
+// BODY + optional ROOF
+const geos = [];
+const bodyHFinal = Math.max(0.01, bodyH);
+const bodyGeo = (rings.length > 1)
+  ? this._makeSolidGeometryFromRings(rings, bodyHFinal)
+  : this._makeSolidGeometry(outer, bodyHFinal);
+geos.push(bodyGeo);
+
+if (roofH > 0.01) {
+  const roofGeo = this._makeRoofGeometry(rings, roofH, roofShape);
+  geos.push(roofGeo.translate(0, bodyHFinal, 0)); // on top of body
+}
+
+const solidGeo = mergeGeometries(geos, false);
+solidGeo.computeBoundingSphere();
+solidGeo.computeBoundingBox();
+
+// PICK + SOLID (share geometry)
+const pickMesh  = new THREE.Mesh(solidGeo, this._pickMaterial);
+pickMesh.position.set(0, baseline, 0);
+pickMesh.visible = false;
+
+const solidMesh = new THREE.Mesh(solidGeo, this._buildingMaterial);
+solidMesh.position.set(0, baseline, 0);
+solidMesh.renderOrder = 1;
+solidMesh.castShadow = true;
+solidMesh.receiveShadow = false;
+solidMesh.visible = false;
+
+// Info payload (use baseHeight that includes minH)
+const centroid = averagePoint(outer);
+const address  = formatAddress(tags);
+const info = {
+  id,
+  address,
+  rawFootprint: outer.slice(),
+  height: totalH + this.extensionHeight + Math.max(0, -this.extraDepth),
+  baseHeight, // <-- groundBase + minH
+  centroid,
+  tags: { ...tags },
+  tile: null,
+  resnapStableFrames: 0,
+  resnapFrozen: false,
+  resnapLock: false,
+  insideRadius: true,
+  isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z),
+  animating: false,
+  animationProgress: 0,
+  animationStartTime: 0,
+  animationDuration: 0.8
+};
+
+edges.userData.buildingInfo = info;
+pickMesh.userData.buildingInfo = info;
+solidMesh.userData.buildingInfo = info;
+
+const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
+
+  // --------- COLORING: sample basemap, else tag colors, else elevation fallback ---------
+  const sampled = this._sampleBaseColorForFootprint(rawFootprint);
+  if (sampled) {
+    this._applyRoofAndWallColors(building.solid.geometry, sampled.wall, sampled.roof);
+  } else {
+    // Prefer tag colors
+    const tryColor = (s) => { try { return s ? new THREE.Color(s) : null; } catch { return null; } };
+    const tagBody = tryColor(tags['building:colour'] || tags['colour']);
+    const tagRoof = tryColor(tags['roof:colour']) || (tagBody ? tagBody.clone().offsetHSL(0, 0, 0.06) : null);
+
+    if (tagBody || tagRoof) {
+      const bodyCol = tagBody || this._elevationColor(baseHeight + visibleH * 0.5);
+      const roofCol = tagRoof || bodyCol.clone().offsetHSL(0, 0, 0.06);
+      this._applyRoofAndWallColors(building.solid.geometry, bodyCol, roofCol);
+    } else {
+      const fillColor = this._elevationColor(baseHeight + visibleH * 0.5);
+      this._applyGeometryColor(building.solid.geometry, fillColor);
+    }
+  }
+
+  return building;
+}
+
+
 
   _makeSolidGeometry(footprint, height) {
     const shape = new THREE.Shape();
@@ -2460,6 +2592,121 @@ export class BuildingManager {
     }
   }
 
+  // ---------- COLOR SAMPLING & APPLICATION HELPERS ----------
+
+  _getRasterColorAt(x, z) {
+    const mgr = this.tileManager;
+    if (!mgr) return null;
+
+    // Try a few common adapter names on your TileManager
+    const fns = ['getRasterColorAt', 'sampleColorAt', 'sampleBaseColorAt', 'getColorAt'];
+    for (const name of fns) {
+      const fn = mgr && typeof mgr[name] === 'function' ? mgr[name] : null;
+      if (!fn) continue;
+      try {
+        const c = fn.call(mgr, x, z);
+        if (!c) continue;
+        // Accept formats: {r,g,b} in 0..1 or 0..255, or THREE.Color
+        if (c.isColor) return c;
+        let r = c.r, g = c.g, b = c.b;
+        if ([r, g, b].every(v => Number.isFinite(v))) {
+          if (r > 1 || g > 1 || b > 1) { r /= 255; g /= 255; b /= 255; }
+          return new THREE.Color(r, g, b);
+        }
+      } catch { }
+    }
+    return null;
+  }
+
+  _pointInPolygon(x, z, flat) {
+    // Ray-casting algorithm on XZ plane
+    let inside = false;
+    for (let i = 0, j = flat.length - 2; i < flat.length; j = i, i += 2) {
+      const xi = flat[i], zi = flat[i + 1];
+      const xj = flat[j], zj = flat[j + 1];
+      const intersect = ((zi > z) !== (zj > z)) &&
+        (x < (xj - xi) * (z - zi) / Math.max(1e-9, (zj - zi)) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  _sampleBaseColorForFootprint(flat) {
+    if (!flat || flat.length < 6) return null;
+
+    // Quick bbox
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < flat.length; i += 2) {
+      const x = flat[i], z = flat[i + 1];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+
+    // Sample density based on footprint area (cheap estimate)
+    const areaEst = Math.max(1, (maxX - minX) * (maxZ - minZ));
+    const target = THREE.MathUtils.clamp(Math.floor(areaEst / 300), 6, 24);
+
+    // Jittered grid rejection-sampling
+    let sumR = 0, sumG = 0, sumB = 0, n = 0;
+    const cols = Math.ceil(Math.sqrt(target));
+    const rows = cols;
+    const dx = (maxX - minX) / Math.max(1, cols);
+    const dz = (maxZ - minZ) / Math.max(1, rows);
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = minX + (c + Math.random() * 0.8) * dx;
+        const z = minZ + (r + Math.random() * 0.8) * dz;
+        if (!this._pointInPolygon(x, z, flat)) continue;
+        const col = this._getRasterColorAt(x, z);
+        if (!col) continue;
+        sumR += col.r; sumG += col.g; sumB += col.b;
+        n++;
+      }
+    }
+
+    if (n === 0) return null;
+    const base = new THREE.Color(sumR / n, sumG / n, sumB / n);
+
+    // Derive wall vs roof tints
+    const roof = base.clone().lerp(new THREE.Color(1, 1, 1), 0.12); // slight brighten
+    const wall = base.clone().lerp(new THREE.Color(0, 0, 0), 0.18); // slight darken
+    return { roof, wall };
+  }
+
+  _applyRoofAndWallColors(geometry, wallColor, roofColor) {
+    if (!geometry?.getAttribute) return;
+    geometry.computeVertexNormals();
+
+    const pos = geometry.getAttribute('position');
+    const nor = geometry.getAttribute('normal');
+    const count = pos?.count | 0;
+    if (!count || !nor) return;
+
+    // Ensure color attribute exists
+    let attr = geometry.getAttribute('color');
+    if (!attr || attr.count !== count) {
+      attr = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
+      geometry.setAttribute('color', attr);
+    }
+
+    // Heuristic: top cap normals point mostly +Y after your rotateX/-Z flip
+    const roofDot = 0.7; // threshold for "is roof"
+    const wr = wallColor.r, wg = wallColor.g, wb = wallColor.b;
+    const rr = roofColor.r, rg = roofColor.g, rb = roofColor.b;
+
+    for (let i = 0; i < count; i++) {
+      const ny = nor.getY(i);
+      const isRoof = ny >= roofDot;      // roof
+      const r = isRoof ? rr : wr;
+      const g = isRoof ? rg : wg;
+      const b = isRoof ? rb : wb;
+      attr.setXYZ(i, r, g, b);
+    }
+    attr.needsUpdate = true;
+  }
+
+
   _resnapTile(tileKey, state) {
     const buildings = state.buildings || [];
     const extras = state.extras || [];
@@ -2497,8 +2744,10 @@ export class BuildingManager {
     const info = building.info;
     info.isVisualEdge = this._isNearVisualEdge(info.centroid.x, info.centroid.z);
     if (info.resnapFrozen) return false;
+
     let baseline = this._lowestGround(info.rawFootprint);
     let groundBase = baseline;
+
     if (info.isVisualEdge && this.tileManager?.getHeightAt) {
       // CRITICAL: Use cached height to avoid expensive raycasts (2-3ms each)
       const cacheKey = `${Math.round(info.centroid.x)},${Math.round(info.centroid.z)}`;
@@ -2531,6 +2780,7 @@ export class BuildingManager {
       baseline += this.extraDepth;
       groundBase = baseline - this.extraDepth;
     }
+
     const prev = info.baseHeight;
     const diff = Number.isFinite(prev) ? Math.abs(prev - groundBase) : Infinity;
     const threshold = info.resnapLock ? RESNAP_LOCK_TOLERANCE : RESNAP_HEIGHT_TOLERANCE;
@@ -2561,19 +2811,45 @@ export class BuildingManager {
       building.render.geometry.dispose();
       building.render.geometry = newGeom;
       building.render.position.set(0, this.extraDepth, 0);
-      // REMOVED: building.render.updateMatrixWorld(true);  // Deferred to renderer
     }
+
     if (building.solid) {
       building.solid.position.y = baseline;
-      // REMOVED: building.solid.updateMatrixWorld(true);  // Deferred to renderer
-      const color = this._elevationColor(groundBase + info.height * 0.5);
-      this._applyGeometryColor(building.solid.geometry, color);
+
+      // === NEW: imagery-first color (instant), fallback to elevation tone ===
+      // Sample a small neighborhood at centroid for stability
+      let sampled = null;
+      if (this.tileManager?.getRasterColorAt) {
+        sampled = this.tileManager.getRasterColorAt(
+          info.centroid.x, info.centroid.z,
+          { averageRadius: 2, samples: 9 } // small area average
+        );
+      }
+
+      let colorPayload;
+      if (sampled) {
+        const base = sampled.isColor
+          ? sampled
+          : new THREE.Color(sampled.r, sampled.g, sampled.b);
+
+        // Derive subtle roof vs wall tints from sampled base
+        const roof = base.clone().lerp(new THREE.Color(1, 1, 1), 0.12); // slight brighten
+        const wall = base.clone().lerp(new THREE.Color(0, 0, 0), 0.18); // slight darken
+        colorPayload = { roof, wall }; // handled in _applyGeometryColor
+      } else {
+        // Fallback: your original elevation-based mid-height color
+        colorPayload = this._elevationColor(groundBase + info.height * 0.5);
+      }
+
+      this._applyGeometryColor(building.solid.geometry, colorPayload);
+
       this.physics?.registerStaticMesh(building.solid, { forceUpdate: true });
     }
+
     if (building.pick) {
       building.pick.position.y = baseline;
-      // REMOVED: building.pick.updateMatrixWorld(true);  // Deferred to renderer
     }
+
     if (this._hoverInfo === info) {
       if (this._hoverEdges) {
         const g = this._buildHighlightGeometry(info);
@@ -2598,64 +2874,107 @@ export class BuildingManager {
       }
       this._hoverGroup.visible = true;
     }
+
     this._refreshBuildingVisibility(building);
     return changed;
   }
 
-  _refreshBuildingVisibility(building) {
-    if (!building || !building.info) return;
-    const info = building.info;
-    const inside = info.insideRadius !== false;
-    const snapped = !!info.resnapFrozen;
-    const wireMode = !!this._wireframeMode;
+_refreshBuildingVisibility(building) {
+  if (!building || !building.info) return;
 
-    const ghostVisible = inside;
-    const solidVisible = inside && snapped && !wireMode;
-    const wireVisible = wireMode ? inside : (inside && !snapped);
+  const info = building.info;
+  const inside   = info.insideRadius !== false;
+  const snapped  = !!info.resnapFrozen;
+  const wireMode = !!this._wireframeMode;
 
-    if (building.render) {
-      building.render.visible = wireVisible;
-    }
+  // Ghost (pick) follows inside-radius only
+  const ghostVisible = inside;
 
-    // ANIMATION: Start animation once the solid first becomes available
-    if (solidVisible && !info.animating && info.animationProgress === 0) {
-      info.animating = true;
-      info.animationProgress = 0;
-      info.animationStartTime = performance.now() / 1000;
-    }
+  // Show solids immediately (no snap gate) unless wire-only mode
+  const solidVisible = inside && !wireMode;
 
-    if (building.solid) {
-      building.solid.visible = solidVisible;
-      if (!solidVisible) {
-        // Ensure hidden solids don't keep stale animation scale
-        if (!info.animating) building.solid.scale.y = 1;
-      }
+  // Wire shows until snapped (or if wire-only mode is on)
+  const wireVisible = wireMode ? inside : (inside && !snapped);
 
-      if (info.animating && solidVisible) {
+  if (building.render) {
+    building.render.visible = wireVisible;
+  }
+
+  // Start rise animation the first time the solid becomes visible
+  if (solidVisible && !info.animating && info.animationProgress === 0) {
+    info.animating = true;
+    info.animationProgress = 0;
+    info.animationStartTime = performance.now() / 1000;
+  }
+
+  // Helper: compute target scale so the solid's top matches the wire height.
+  // We anchor the base at baseline while scaling.
+  const applyAnchoredScaleTo = (mesh, baselineY, progress01) => {
+    if (!mesh) return;
+
+    // Ensure we have a bounding box for height/minY
+    const geo = mesh.geometry;
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+
+    // Actual geometry height in local space
+    const geomH = Math.max(1e-6, bb.max.y - bb.min.y);
+
+    // info.height is the desired world-space height ABOVE the baseline (wireframe uses this)
+    const targetScale = Math.max(1e-6, info.height / geomH);
+
+    // Ease 0..1, then scale to the final target
+    const s = THREE.MathUtils.clamp(progress01, 0, 1) * targetScale;
+
+    // Anchor base: we want (s * minY + posY) == baselineY  => posY = baselineY - s*minY
+    mesh.scale.y = s;
+    mesh.position.y = baselineY - (bb.min.y * s);
+  };
+
+  if (building.solid) {
+    const baseline = info.baseHeight + this.extraDepth;
+
+    // Visibility
+    building.solid.visible = solidVisible;
+
+    if (!solidVisible) {
+      // Reset hidden solids to their final state so they don't carry a partial scale
+      applyAnchoredScaleTo(building.solid, baseline, 1);
+    } else {
+      // Animate rise 0 -> 1 with cubic ease-out
+      let eased = 1;
+      if (info.animating) {
         const elapsed = (performance.now() / 1000) - info.animationStartTime;
         info.animationProgress = Math.min(1, elapsed / info.animationDuration);
-        const eased = 1 - Math.pow(1 - info.animationProgress, 3);
-        building.solid.scale.y = eased;
+        eased = 1 - Math.pow(1 - info.animationProgress, 3);
+
         if (info.animationProgress >= 1) {
           info.animating = false;
-          building.solid.scale.y = 1;
+          eased = 1;
         }
-      } else if (!info.animating && info.animationProgress > 0) {
-        building.solid.scale.y = 1;
       }
+      applyAnchoredScaleTo(building.solid, baseline, eased);
     }
-
-    if (building.pick) {
-      building.pick.visible = ghostVisible;
-      if (info.animating && building.pick && building.solid) {
-        building.pick.scale.y = building.solid.scale.y;
-      } else if (!info.animating && info.animationProgress > 0) {
-        building.pick.scale.y = 1;
-      }
-    }
-
-    this._updateMergedGroupVisibility(info.tile);
   }
+
+  if (building.pick) {
+    building.pick.visible = ghostVisible;
+
+    // Keep ghost in sync with solid (so height perception matches the rise)
+    if (building.solid && solidVisible) {
+      building.pick.scale.y    = building.solid.scale.y;
+      building.pick.position.y = building.solid.position.y;
+    } else if (building.solid) {
+      // Reset when hidden
+      building.pick.scale.y    = 1;
+      building.pick.position.y = building.solid.position.y;
+    }
+  }
+
+  this._updateMergedGroupVisibility(info.tile);
+}
+
+
 
   _refreshRoadVisibility(road) {
     if (!road) return;
@@ -2709,20 +3028,55 @@ export class BuildingManager {
     }
     state.mergedGroup.visible = visible;
   }
-
   _applyGeometryColor(geometry, color) {
     if (!geometry?.getAttribute) return;
+
     const pos = geometry.getAttribute('position');
-    const count = pos?.count;
-    if (!Number.isFinite(count) || count <= 0) return;
+    const count = pos?.count | 0;
+    if (!count) return;
+
+    // Ensure color attribute exists & sized
     let attr = geometry.getAttribute('color');
     if (!attr || attr.count !== count) {
-      const array = new Float32Array(count * 3);
-      attr = new THREE.BufferAttribute(array, 3);
+      attr = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
       geometry.setAttribute('color', attr);
     }
-    const r = color.r, g = color.g, b = color.b;
-    for (let i = 0; i < attr.count; i++) attr.setXYZ(i, r, g, b);
+
+    // If we were asked to split roof vs walls, use normals
+    const wantsSplit = color && typeof color === 'object' && ('roof' in color) && ('wall' in color);
+    const nor = geometry.getAttribute('normal');
+    if (wantsSplit && !nor) geometry.computeVertexNormals();
+
+    if (wantsSplit && geometry.getAttribute('normal')) {
+      // Split by upward-facing normals (roof)
+      const nrm = geometry.getAttribute('normal');
+      const roofDot = 0.7; // >= 0.7 => roof-ish (top cap of the extrude)
+      const wr = color.wall.r, wg = color.wall.g, wb = color.wall.b;
+      const rr = color.roof.r, rg = color.roof.g, rb = color.roof.b;
+
+      for (let i = 0; i < count; i++) {
+        const ny = nrm.getY(i);
+        const isRoof = ny >= roofDot;
+        const r = isRoof ? rr : wr;
+        const g = isRoof ? rg : wg;
+        const b = isRoof ? rb : wb;
+        attr.setXYZ(i, r, g, b);
+      }
+      attr.needsUpdate = true;
+      return;
+    }
+
+    // Fallback: uniform color (accepts THREE.Color or {r,g,b})
+    const base = color?.isColor
+      ? color
+      : new THREE.Color(
+        (color?.r ?? 1),
+        (color?.g ?? 1),
+        (color?.b ?? 1)
+      );
+
+    const r = base.r, g = base.g, b = base.b;
+    for (let i = 0; i < count; i++) attr.setXYZ(i, r, g, b);
     attr.needsUpdate = true;
   }
 
@@ -3093,6 +3447,165 @@ export class BuildingManager {
     geom.computeBoundingSphere();
     return geom;
   }
+
+  // --- Assemble relation multipolygon rings -> { outer: Float32Array-like flat, holes: [flat...] }
+  _relationToRings(rel, nodeMap, wayMap) {
+    const waysById = (ids) => ids.map(id => wayMap.get(id)).filter(Boolean);
+
+    const splitMembers = (role) =>
+      (rel.members || []).filter(m => m.type === 'way' && m.role === role).map(m => m.ref);
+
+    const stitch = (wayRefs) => {
+      const remaining = waysById(wayRefs).map(w => w.nodes.slice());
+      const rings = [];
+
+      while (remaining.length) {
+        let ring = remaining.shift().slice();
+        // grow ring by sewing matching endpoints
+        let extended = true;
+        while (extended) {
+          extended = false;
+          for (let i = 0; i < remaining.length; i++) {
+            const cand = remaining[i];
+            const a0 = ring[0], a1 = ring[ring.length - 1];
+            const b0 = cand[0], b1 = cand[cand.length - 1];
+            if (a1 === b0) { ring = ring.concat(cand.slice(1)); remaining.splice(i, 1); extended = true; break; }
+            if (a1 === b1) { ring = ring.concat(cand.slice(0, -1).reverse()); remaining.splice(i, 1); extended = true; break; }
+            if (a0 === b1) { ring = cand.concat(ring.slice(1)); remaining.splice(i, 1); extended = true; break; }
+            if (a0 === b0) { ring = cand.slice().reverse().concat(ring.slice(1)); remaining.splice(i, 1); extended = true; break; }
+          }
+        }
+        if (ring[0] !== ring[ring.length - 1]) ring.push(ring[0]); // close
+        rings.push(ring);
+      }
+      // convert to flat xz
+      const toFlat = (ids) => {
+        const out = [];
+        for (const nid of ids) {
+          const n = nodeMap.get(nid);
+          if (!n) continue;
+          const { x, z } = this._latLonToWorld(n.lat, n.lon);
+          out.push(x, z);
+        }
+        return out;
+      };
+      return rings.map(toFlat).filter(r => r.length >= 6);
+    };
+
+    const outers = stitch(splitMembers('outer'));
+    const inners = stitch(splitMembers('inner'));
+
+    // Ensure orientation: outer CCW, holes CW for THREE.Shape
+    const orient = (flat, wantCCW) => {
+      const pts = [];
+      for (let i = 0; i < flat.length; i += 2) pts.push(new THREE.Vector2(flat[i], flat[i + 1]));
+      const cw = THREE.ShapeUtils.isClockWise(pts);
+      const ok = wantCCW ? !cw : cw;
+      return ok ? flat : flat.slice().reverse();
+    };
+
+    const outer = outers[0] ? orient(outers[0], /*wantCCW=*/true) : null;
+    const holes = inners.map(h => orient(h, /*wantCCW=*/false));
+    return { outer, holes };
+  }
+
+  // --- Extrude with holes (rings: [outer, ...holes])
+  _makeSolidGeometryFromRings(rings, height) {
+    const [outer, ...holes] = rings;
+    const shape = new THREE.Shape();
+    for (let i = 0; i < outer.length; i += 2) {
+      const x = outer[i], z = outer[i + 1];
+      if (i === 0) shape.moveTo(x, z); else shape.lineTo(x, z);
+    }
+    shape.autoClose = true;
+
+    for (const h of holes) {
+      if (!h || h.length < 6) continue;
+      const path = new THREE.Path();
+      for (let i = 0; i < h.length; i += 2) {
+        const x = h[i], z = h[i + 1];
+        if (i === 0) path.moveTo(x, z); else path.lineTo(x, z);
+      }
+      path.autoClose = true;
+      shape.holes.push(path);
+    }
+
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: Math.max(0.01, height), bevelEnabled: false });
+    geo.rotateX(-Math.PI / 2).scale(1, 1, -1);
+    geo.computeBoundingSphere();
+    geo.computeBoundingBox();
+    return geo;
+  }
+
+  // --- Simple principal axis (for gabled)
+  _principalAxis(flatOuter) {
+    // PCA-ish by covariance of (x,z)
+    let cx = 0, cz = 0, n = flatOuter.length / 2;
+    for (let i = 0; i < flatOuter.length; i += 2) { cx += flatOuter[i]; cz += flatOuter[i + 1]; }
+    cx /= n; cz /= n;
+    let sxx = 0, sxz = 0, szz = 0;
+    for (let i = 0; i < flatOuter.length; i += 2) {
+      const x = flatOuter[i] - cx, z = flatOuter[i + 1] - cz;
+      sxx += x * x; szz += z * z; sxz += x * z;
+    }
+    // eigenvector of [[sxx,sxz],[sxz,szz]] with larger eigenvalue
+    const t = sxx + szz;
+    const d = Math.sqrt(Math.max(0, (sxx - szz) * (sxx - szz) + 4 * sxz * sxz));
+    const l = t + d; // larger eigenvalue (no normalization)
+    let ux = (l - szz);
+    let uz = sxz;
+    const norm = Math.hypot(ux, uz) || 1;
+    return { cx, cz, ux: ux / norm, uz: uz / norm }; // major axis unit vector
+  }
+
+  // --- Build a roof geometry above (rings) with height and shape
+  _makeRoofGeometry(rings, roofH, shapeTag) {
+    const outer = rings[0];
+    const base = this._makeSolidGeometryFromRings(rings, Math.max(0.01, roofH));
+    // Taper top by scaling toward centroid
+    const pos = base.getAttribute('position');
+    const arr = pos.array;
+    let maxY = -Infinity;
+    for (let i = 1; i < arr.length; i += 3) if (arr[i] > maxY) maxY = arr[i];
+    const { cx, cz, ux, uz } = this._principalAxis(outer);
+    // perp to ridge (for gabled)
+    const px = -uz, pz = ux;
+
+    const shrink = 0.22; // taper strength
+    for (let i = 0; i < arr.length; i += 3) {
+      const y = arr[i + 1];
+      const t = Math.max(0, Math.min(1, y / (maxY || 1)));
+      const dx = arr[i] - cx;
+      const dz = arr[i + 2] - cz;
+
+      if (!shapeTag || shapeTag === 'hipped' || shapeTag === 'pyramidal') {
+        // uniform taper toward centroid
+        const s = 1 - t * shrink;
+        arr[i] = cx + dx * s;
+        arr[i + 2] = cz + dz * s;
+      } else if (shapeTag === 'gabled' || shapeTag === 'skillion' || shapeTag === 'mono-pitched') {
+        // taper only across the cross-axis (px,pz), keep ridge direction (ux,uz) length
+        const along = dx * ux + dz * uz;
+        const across = dx * px + dz * pz;
+        const s = 1 - t * shrink;
+        const nx = cx + along * ux + across * px * s;
+        const nz = cz + along * uz + across * pz * s;
+        arr[i] = nx; arr[i + 2] = nz;
+      } else if (shapeTag === 'dome' || shapeTag === 'round') {
+        // spherical-ish bulge
+        const r = Math.hypot(dx, dz) + 1e-6;
+        const s = 1 - Math.pow(t, 1.3) * shrink;
+        arr[i] = cx + (dx / r) * r * s;
+        arr[i + 2] = cz + (dz / r) * r * s;
+      } else {
+        // flat: no change
+      }
+    }
+    pos.needsUpdate = true;
+    base.computeVertexNormals();
+    return base;
+  }
+
 
   _chooseBuildingHeight(tags = {}) {
     if (tags.height) {
