@@ -64,7 +64,9 @@ export class SceneManager {
 
 
     // Camera stays at (0,0,0) in dolly local space; dolly handles eye height
-    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
+    const CAMERA_FAR_DEFAULT = 200000;
+    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, CAMERA_FAR_DEFAULT);
+    this.camera.layers.enable(1); // ensure horizon/farfield overlays (layer 1) render
     this.camera.position.set(0, 0, 0);
     this.camera.up.set(0, 1, 0);
     this.camera.rotation.order = 'YXZ';
@@ -375,6 +377,17 @@ _sampleTileRadius() {
   return 4000;
 }
 
+  _ensureCameraFar(targetRadius) {
+    if (!Number.isFinite(targetRadius) || targetRadius <= 0) return;
+    const desiredFar = Math.min(400000, Math.max(this.camera.near + 100, targetRadius * 1.35));
+    const currentFar = this.camera.far;
+    if (!Number.isFinite(currentFar) || Math.abs(desiredFar - currentFar) > currentFar * 0.05) {
+      this.camera.far = desiredFar;
+      this.camera.updateProjectionMatrix();
+      console.debug('[Scene] camera.far updated', { desiredFar, targetRadius });
+    }
+  }
+
   // Start close for atmospheric perspective; scale far with (possibly inset) radius; tighten at night/haze
   _computeFogDistances(radius, altitude, turbidity, nearPct = this._defaultFogNear, farPct = this._defaultFogFar) {
     radius = Math.max(50, radius);
@@ -417,6 +430,7 @@ _sampleTileRadius() {
 
     // Base world radius of your farfield (tiles)
     const tileRadius = this._sampleTileRadius();
+    this._ensureCameraFar(tileRadius);
     const settings = this.app?.hexGridMgr?.getTerrainSettings?.();
     const fogNearPct = settings?.fogNearPct ?? this._defaultFogNear;
     const fogFarPct = settings?.fogFarPct ?? this._defaultFogFar;

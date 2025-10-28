@@ -24,15 +24,13 @@ const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 f
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
 const EQ_TRI_ALTITUDE_SCALE = Math.sqrt(3) / 2;
 const TAU = Math.PI * 2;
-const HORIZON_SEGMENTS_DESKTOP = 96;
-const HORIZON_SEGMENTS_MOBILE = 48;
+const HORIZON_SEGMENTS_DESKTOP = 6;
+const HORIZON_SEGMENTS_MOBILE = 6;
 const HORIZON_RADIAL_STEPS = 3;
 const HORIZON_FOCUS_STRENGTH_DESKTOP = 2.8;
 const HORIZON_FOCUS_STRENGTH_MOBILE = 1.6;
 const HORIZON_FOCUS_SPEED_THRESHOLD = 12; // m/s before densifying forward tessellation
 const HORIZON_UPDATE_INTERVAL_MS = 750;
-const HORIZON_TEXTURE_SCALE = 1 / 120000;
-const HORIZON_TRI_RATIO = Math.sqrt(3);
 const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
 const WAYBACK_WMTS_CAPABILITIES = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml';
 const DEFAULT_WAYBACK_VERSION = '49849';
@@ -175,13 +173,15 @@ export class TileManager {
     this.HORIZON_FOCUS_THRESHOLD = HORIZON_FOCUS_SPEED_THRESHOLD;
     this.HORIZON_UPDATE_INTERVAL_MS = HORIZON_UPDATE_INTERVAL_MS;
     this.HORIZON_INNER_GAP = Math.max(8, this.tileRadius * 0.08);
-    this.HORIZON_TEXTURE_SCALE = HORIZON_TEXTURE_SCALE;
     this.FOG_NEAR_PCT = 0.12;
     this.FOG_FAR_PCT = 0.98;
     this._wireframeMode = false;
     this._wireframeLineColor = new THREE.Color(0xffffff);
     this._lastHorizonOuterRadius = this.HORIZON_TARGET_RADIUS;
     this._lastFarfieldOuterRadius = this.tileRadius * (this.FARFIELD_RING + 1);
+    this.FARFIELD_UPDATE_THRESHOLD = Math.max(2, (opts?.farfieldUpdateThreshold ?? 3));
+    this._farfieldAnchor = null;
+    this._farfieldPendingUpdate = true;
 
     // ---- interactive (high-res) relaxation ----
     // CRITICAL: Reduce relaxation iterations on mobile to prevent frame stalls
@@ -222,6 +222,7 @@ export class TileManager {
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._tmpHorizonVec = new THREE.Vector3();
     this._lastHeight = 0;
+    this._horizonBaseColor = { r: 0.22, g: 0.24, b: 0.27 };
 
     // Mobile guard: disable heavy trees on phones/tablets by default
     const _tmOnMobile = (typeof navigator !== 'undefined')
@@ -232,6 +233,7 @@ export class TileManager {
     this._playerVelocity = new THREE.Vector3();
     this._velocityHistory = [];
     this._velocityHistorySize = 5;
+    this._movementDir = { q: 0, r: 0 };
     this.PREDICT_TILES_THRESHOLD = 2.0;  // m/s minimum velocity to trigger prediction
     this.PREDICT_LOOKAHEAD_TIME = 2.0;   // seconds to look ahead
     this.TILE_REMOVAL_HYSTERESIS = 2;    // extra rings to keep before removing tiles
@@ -253,8 +255,12 @@ export class TileManager {
     this._horizonField = null;
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
+    this._horizonOverlayKey = null;
+    this._horizonOverlayEntry = null;
+    this._horizonWaiter = null;
+    this._lastHorizonOverlayLogKey = null;
     this._overlayEnabled = _tmOnMobile ? false : true;
-    this._overlayZoom = 16;
+    this._overlayZoom = 12;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
     this._overlayCtx = null;
@@ -452,12 +458,13 @@ export class TileManager {
     this._farfieldAdapterDirty = new Set();
     this._tmpSampleVec = new THREE.Vector3();
     this._treeHeightListener = this.addHeightListener((sample) => this._onTreeHeightSample(sample));
+    this._farfieldPool = new Map();
   }
 
   /* ---------------- small helpers ---------------- */
 
-  _axialWorld(q, r) {
-    const a = this.tileRadius;
+  _axialWorld(q, r, radius = null) {
+    const a = Number.isFinite(radius) ? radius : this.tileRadius;
     return { x: 1.5 * a * q, z: a * ((Math.sqrt(3) / 2) * q + Math.sqrt(3) * r) };
   }
   _hexCorners(a) {
@@ -967,10 +974,14 @@ _planarizeEdgeWhenNeighborMissing(tile, {
   _tileCornerPriority(tile) {
     if (!tile) return Infinity;
     if (tile.type === 'visual') return 0;
-    if (tile.type === 'farfield') return 1;
     if (tile.type === 'interactive') {
       if (!tile._elevationFetched || !tile._phase?.fullDone) return 3;
-      return 2;
+      return 1;
+    }
+    if (tile.type === 'farfield') return 2;
+    if (tile.type === 'interactive') {
+      if (!tile._elevationFetched || !tile._phase?.fullDone) return 3;
+      return 1;
     }
     return 4;
   }
@@ -1025,62 +1036,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     return updated;
   }
 
-  _harmonizeCornerHeights(tile) {
-    if (!tile || !tile.pos || !tile.grid?.group) return;
-    const tips = this._selectCornerTipIndices(tile);
-    if (!tips || tips.length < 6) return;
-    const touched = new Set();
-    const base = tile.grid.group.position;
-    for (let s = 0; s < tips.length; s++) {
-      const idx = tips[s];
-      if (idx == null) continue;
-      const wx = base.x + tile.pos.getX(idx);
-      const wz = base.z + tile.pos.getZ(idx);
-      const neighborA = this._getTile(tile.q + HEX_DIRS[s][0], tile.r + HEX_DIRS[s][1]);
-      const neighborB = this._getTile(tile.q + HEX_DIRS[(s + 5) % 6][0], tile.r + HEX_DIRS[(s + 5) % 6][1]);
-      const candidates = [tile, neighborA, neighborB].filter((t) => t && t.pos && t.grid?.group);
-
-      let bestTile = null;
-      let bestData = null;
-      let bestPriority = Infinity;
-      for (const candidate of candidates) {
-        const vertex = this._findNearestCornerVertex(candidate, wx, wz, 0.28);
-        if (!vertex) continue;
-        const priority = this._tileCornerPriority(candidate);
-        if (priority < bestPriority || (priority === bestPriority && vertex.dist2 < (bestData?.dist2 ?? Infinity))) {
-          bestPriority = priority;
-          bestTile = candidate;
-          bestData = vertex;
-        }
-      }
-
-      let targetHeight = bestData?.height;
-      if (!Number.isFinite(targetHeight)) {
-        targetHeight = this.getHeightAt(wx, wz);
-      }
-      if (!Number.isFinite(targetHeight)) continue;
-
-      for (const candidate of candidates) {
-        const eps = candidate.type === 'visual' ? 0.3 : 0.2;
-        this._setWorldVertexHeight(candidate, wx, wz, targetHeight, eps, null, touched);
-      }
-    }
-    for (const t of touched) {
-      if (!t?.grid?.geometry) continue;
-      try {
-        if (!this._isMobile) t.grid.geometry.computeVertexNormals();
-        else {
-          if (!t._deferredNormalsUpdate) {
-            t._deferredNormalsUpdate = true;
-            if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
-            this._deferredNormalsTiles.add(t);
-          }
-        }
-      } catch { }
-      this._pullGeometryToBuffers?.(t);
-      this._applyAllColorsGlobal?.(t);
-    }
-  }
+  _harmonizeCornerHeights() { /* intentionally disabled */ }
 
   _classifyNeighborDetailForSeam(tile) {
     if (!tile) return 'missing';
@@ -1925,7 +1881,10 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     const segments = adapter.segments || Math.max(3, Math.round(this.FARFIELD_ADAPTER_SEGMENTS || 6));
     const outerCount = adapter.outerCount || segments * 6;
     const base = tile.grid.group.position;
-    const innerRadius = this.tileRadius * FARFIELD_ADAPTER_INNER_RATIO;
+    const tileRadius = Number.isFinite(tile._radiusOverride)
+      ? tile._radiusOverride
+      : this._farfieldRadiusForScale(tile.scale);
+    const innerRadius = tileRadius * FARFIELD_ADAPTER_INNER_RATIO;
 
     const neighborMeshes = [];
     for (const [dq, dr] of HEX_DIRS) {
@@ -1953,7 +1912,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     };
 
     const outerVertices = [];
-    const corners = this._hexCorners(this.tileRadius);
+    const corners = this._hexCorners(tileRadius);
     let idx = 0;
     const outerLum = this.LUM_MAX;
 
@@ -1977,7 +1936,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       }
     }
 
-    const maxShiftFactor = Math.max(1e-3, this.tileRadius - innerRadius);
+    const maxShiftFactor = Math.max(1e-3, tileRadius - innerRadius);
 
     for (let i = 0; i < outerCount; i++) {
       const next = (i + 1) % outerCount;
@@ -2064,10 +2023,11 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     let maxRadius = this.tileRadius * (this.FARFIELD_RING + 1);
     for (const tile of this.tiles.values()) {
       if (!tile || tile.type !== 'farfield') continue;
-      const center = this._axialWorld(tile.q, tile.r);
       const tileRadius = Number.isFinite(tile._radiusOverride)
         ? tile._radiusOverride
-        : this.tileRadius * Math.max(1, tile.scale || 1);
+        : this._farfieldRadiusForScale(tile.scale || 1);
+      const stride = Math.max(1, Math.round(tile._stride || tile.scale || 1));
+      const center = this._axialWorld(tile.q / stride, tile.r / stride, tileRadius);
       const dist = Math.hypot(center.x, center.z) + tileRadius;
       if (dist > maxRadius) maxRadius = dist;
     }
@@ -2076,47 +2036,77 @@ _planarizeEdgeWhenNeighborMissing(tile, {
   }
 
   _sampleHorizonHeight(x, z, fallback = this._lastHeight) {
+    return this._sampleFarfieldSurface(x, z, fallback).height;
+  }
+
+  _extractColorFromHit(hit, fallback = this._horizonBaseColor) {
+    if (!hit || !hit.object?.geometry) return fallback;
+    const geom = hit.object.geometry;
+    const colorAttr = geom.getAttribute?.('color');
+    if (!colorAttr) return fallback;
+    const tmp = { r: 0, g: 0, b: 0 };
+    const accumulate = (idx) => {
+      if (idx == null) return;
+      tmp.r += colorAttr.getX(idx);
+      tmp.g += colorAttr.getY(idx);
+      tmp.b += colorAttr.getZ(idx);
+    };
+    const indexAttr = geom.getIndex?.();
+    if (indexAttr) {
+      const triIndex = (hit.faceIndex ?? 0) * 3;
+      const a = indexAttr.getX(triIndex);
+      const b = indexAttr.getY(triIndex + 1);
+      const c = indexAttr.getZ(triIndex + 2);
+      accumulate(a);
+      accumulate(b);
+      accumulate(c);
+      const inv3 = 1 / 3;
+      tmp.r *= inv3; tmp.g *= inv3; tmp.b *= inv3;
+    } else if (hit.face) {
+      accumulate(hit.face.a);
+      accumulate(hit.face.b);
+      accumulate(hit.face.c);
+      const inv3 = 1 / 3;
+      tmp.r *= inv3; tmp.g *= inv3; tmp.b *= inv3;
+    } else if (Number.isInteger(hit.faceIndex)) {
+      const idx = hit.faceIndex;
+      accumulate(idx);
+    } else {
+      return fallback;
+    }
+    if (!Number.isFinite(tmp.r) || !Number.isFinite(tmp.g) || !Number.isFinite(tmp.b)) {
+      return fallback;
+    }
+    return tmp;
+  }
+
+  _sampleFarfieldSurface(x, z, fallbackHeight = this._lastHeight, fallbackColor = this._horizonBaseColor) {
     const mergeMesh = this._farfieldMerge?.mesh;
+    let height = Number.NaN;
+    let color = fallbackColor;
     if (mergeMesh) {
       const origin = this._tmpHorizonVec.set(x, 100000, z);
       this.ray.set(origin, this.DOWN);
       const hits = this.ray.intersectObject(mergeMesh, true);
       if (hits && hits.length) {
-        const y = hits[0]?.point?.y;
-        if (Number.isFinite(y)) return y;
+        const hit = hits[0];
+        if (hit?.point) height = hit.point.y;
+        const sampled = this._extractColorFromHit(hit, fallbackColor);
+        if (sampled) color = sampled;
       }
     }
-    const h = this.getHeightAt(x, z);
-    if (Number.isFinite(h)) return h;
-    return fallback;
+    if (!Number.isFinite(height)) {
+      const fallback = this.getHeightAt(x, z);
+      if (Number.isFinite(fallback)) height = fallback;
+      else height = fallbackHeight;
+    }
+    return { height, color };
   }
 
   _initHorizonField() {
     if (this._horizonField || !this.scene) return;
-    const segments = Math.max(12, Math.round(this.HORIZON_SEGMENTS || 48));
-    const radialSteps = Math.max(2, Math.round(this.HORIZON_RADIAL_STEPS || 3));
-    const vertCount = segments * radialSteps;
-
+    const segments = Math.max(6, Math.round(this.HORIZON_SEGMENTS || 6));
     const geom = new THREE.BufferGeometry();
-    const posAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
-    const uvAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 2), 2).setUsage(THREE.DynamicDrawUsage);
-    const colAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
-    geom.setAttribute('position', posAttr);
-    geom.setAttribute('uv', uvAttr);
-    geom.setAttribute('color', colAttr);
-
-    const indices = [];
-    for (let r = 0; r < radialSteps - 1; r++) {
-      const ringStart = r * segments;
-      const nextRingStart = (r + 1) * segments;
-      for (let s = 0; s < segments; s++) {
-        const next = (s + 1) % segments;
-        indices.push(ringStart + s, nextRingStart + s, nextRingStart + next);
-        indices.push(ringStart + s, nextRingStart + next, ringStart + next);
-      }
-    }
-    geom.setIndex(indices);
-
     const baseMat = this._getFarfieldMaterial();
     const material = baseMat.clone();
     material.name = 'HorizonFieldMaterial';
@@ -2132,33 +2122,305 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     mesh.receiveShadow = false;
     mesh.castShadow = false;
     mesh.layers.set(1);
+    material.wireframe = false;
+    material.needsUpdate = true;
+    mesh.visible = false;
     this.scene.add(mesh);
-
-    const colArr = colAttr.array;
-    for (let i = 0; i < colArr.length; i += 3) {
-      colArr[i] = 0.22;
-      colArr[i + 1] = 0.24;
-      colArr[i + 2] = 0.27;
-    }
-    colAttr.needsUpdate = true;
+    console.debug('[TileManager] Horizon field initialized', { segments });
 
     this._horizonField = {
       mesh,
       geometry: geom,
-      posAttr,
-      uvAttr,
-      colAttr,
-      segments,
-      radialSteps,
-      angles: new Float32Array(segments),
-      weights: new Float32Array(segments),
-      focusGain: new Float32Array(segments),
-      innerHeights: new Float32Array(segments),
+      posAttr: null,
+      uvAttr: null,
+      colAttr: null,
+      vertexCount: 0,
+      uvBounds: null,
       innerRadius: 0,
       outerRadius: 0,
     };
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
+    this._horizonOverlayKey = null;
+    this._horizonOverlayEntry = null;
+  }
+
+  _computeBoundsFromPositions(positions) {
+    if (!positions || positions.length < 3 || !this.origin) return null;
+    let latMin = Infinity;
+    let latMax = -Infinity;
+    let lonMin = Infinity;
+    let lonMax = -Infinity;
+    for (let i = 0; i < positions.length; i += 3) {
+      const wx = positions[i];
+      const wz = positions[i + 2];
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      if (!ll) continue;
+      if (ll.lat < latMin) latMin = ll.lat;
+      if (ll.lat > latMax) latMax = ll.lat;
+      if (ll.lon < lonMin) lonMin = ll.lon;
+      if (ll.lon > lonMax) lonMax = ll.lon;
+    }
+    if (!Number.isFinite(latMin) || !Number.isFinite(latMax) || !Number.isFinite(lonMin) || !Number.isFinite(lonMax)) {
+      return null;
+    }
+    const padLat = Math.max(1e-4, (latMax - latMin) * 0.05);
+    const padLon = Math.max(1e-4, (lonMax - lonMin) * 0.05);
+    return {
+      latMin: latMin - padLat,
+      latMax: latMax + padLat,
+      lonMin: lonMin - padLon,
+      lonMax: lonMax + padLon,
+    };
+  }
+
+  _pickHorizonZoom(bounds) {
+    if (!bounds) return 6;
+    const lonSpan = Math.max(1e-6, bounds.lonMax - bounds.lonMin);
+    const latSpan = Math.max(1e-6, bounds.latMax - bounds.latMin);
+    const span = Math.max(lonSpan, latSpan);
+    let zoom = Math.floor(Math.log2(360 / span)) - 1;
+    if (!Number.isFinite(zoom)) zoom = 6;
+    zoom = THREE.MathUtils.clamp(zoom, 5, 11);
+    return zoom;
+  }
+
+  _ensureHorizonUv(bounds) {
+    if (!this._horizonField || !bounds || !this.origin) return;
+    const hf = this._horizonField;
+    const posAttr = hf.posAttr;
+    const uvAttr = hf.uvAttr;
+    if (!posAttr || !uvAttr) return;
+    const prev = hf.uvBounds;
+    if (prev &&
+      Math.abs(prev.latMin - bounds.latMin) < 1e-6 &&
+      Math.abs(prev.latMax - bounds.latMax) < 1e-6 &&
+      Math.abs(prev.lonMin - bounds.lonMin) < 1e-6 &&
+      Math.abs(prev.lonMax - bounds.lonMax) < 1e-6) {
+      return;
+    }
+    const lonMin = bounds.lonMin;
+    const lonMax = bounds.lonMax;
+    const lonSpan = Math.max(1e-12, lonMax - lonMin);
+    const mercY = (latDeg) => {
+      const lat = THREE.MathUtils.clamp(latDeg, -85.05112878, 85.05112878);
+      const phi = THREE.MathUtils.degToRad(lat);
+      return Math.log(Math.tan(Math.PI * 0.25 + phi * 0.5));
+    };
+    const mMax = mercY(bounds.latMax);
+    const mMin = mercY(bounds.latMin);
+    const mSpan = Math.max(1e-12, mMax - mMin);
+    const epsU = 1 / 4096;
+    const epsV = 1 / 4096;
+    for (let i = 0; i < posAttr.count; i++) {
+      const wx = posAttr.getX(i);
+      const wz = posAttr.getZ(i);
+      const ll = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+      const lon = Number.isFinite(ll?.lon) ? ll.lon : (lonMin + lonMax) * 0.5;
+      const lat = Number.isFinite(ll?.lat) ? ll.lat : (bounds.latMin + bounds.latMax) * 0.5;
+      const u = (lon - lonMin) / lonSpan;
+      const v = (mMax - mercY(lat)) / mSpan;
+      uvAttr.setXY(
+        i,
+        THREE.MathUtils.clamp(u, epsU, 1 - epsU),
+        THREE.MathUtils.clamp(v, epsV, 1 - epsV)
+      );
+    }
+    uvAttr.needsUpdate = true;
+    hf.uvBounds = bounds;
+  }
+
+  _ensureHorizonOverlay(bounds) {
+    if (!bounds || !this._horizonField || !this._overlayEnabled) return;
+    const version = this._overlayVersion || DEFAULT_WAYBACK_VERSION;
+    if (!version) return;
+    let zoom = this._pickHorizonZoom(bounds);
+    const computeTileBounds = (z) => {
+      const tl = this._slippyLonLatToTile(bounds.lonMin, bounds.latMax, z);
+      const tr = this._slippyLonLatToTile(bounds.lonMax, bounds.latMax, z);
+      const bl = this._slippyLonLatToTile(bounds.lonMin, bounds.latMin, z);
+      const br = this._slippyLonLatToTile(bounds.lonMax, bounds.latMin, z);
+      return {
+        minX: Math.min(tl.x, tr.x, bl.x, br.x),
+        maxX: Math.max(tl.x, tr.x, bl.x, br.x),
+        minY: Math.min(tl.y, tr.y, bl.y, br.y),
+        maxY: Math.max(tl.y, tr.y, bl.y, br.y),
+      };
+    };
+
+    let { minX, maxX, minY, maxY } = computeTileBounds(zoom);
+    while (Math.max(maxX - minX, maxY - minY) > 6 && zoom < 11) {
+      zoom += 1;
+      const updated = computeTileBounds(zoom);
+      minX = updated.minX;
+      maxX = updated.maxX;
+      minY = updated.minY;
+      maxY = updated.maxY;
+    }
+    const composite = (minX !== maxX) || (minY !== maxY);
+    const key = composite
+      ? `horizon/${version}/${zoom}/${minX}-${maxX}/${minY}-${maxY}`
+      : `horizon/${version}/${zoom}/${minX}/${minY}`;
+
+    this._horizonOverlayKey = key;
+    if (this._lastHorizonOverlayLogKey !== key) {
+      console.debug('[TileManager] Horizon overlay request', { key, zoom, composite, bounds });
+      this._lastHorizonOverlayLogKey = key;
+    }
+    let entry = this._overlayCache.get(key);
+    if (!entry) {
+      const coverage = bounds;
+      const unionBounds = composite
+        ? this._unionTileBounds(minX, maxX, minY, maxY, zoom)
+        : this._slippyTileBounds(minX, minY, zoom);
+      entry = {
+        status: 'loading',
+        waiters: new Set(),
+        version,
+        zoom,
+        x: minX,
+        y: minY,
+        x0: minX,
+        x1: maxX,
+        y0: minY,
+        y1: maxY,
+        composite,
+        bounds: unionBounds,
+        coverage,
+        isHorizon: true,
+      };
+      this._overlayCache.set(key, entry);
+      this._fetchOverlayTile(key, entry);
+    }
+
+    if (!this._horizonWaiter) this._horizonWaiter = { isHorizon: true };
+    if (entry.status === 'ready') {
+      if (this._horizonOverlayEntry !== entry) this._applyHorizonOverlay(entry);
+    } else if (entry.waiters) {
+      entry.waiters.add(this._horizonWaiter);
+    }
+  }
+
+  _applyHorizonOverlay(entry) {
+    if (!entry || entry.status !== 'ready' || !this._horizonField) return;
+    if (!entry.bounds) return;
+    this._ensureHorizonUv(entry.bounds);
+    const hf = this._horizonField;
+    this._horizonOverlayEntry = entry;
+    const mat = hf.mesh.material;
+    mat.wireframe = false;
+    mat.map = entry.texture;
+    mat.vertexColors = true;
+    mat.needsUpdate = true;
+    hf.mesh.visible = true;
+    console.debug('[TileManager] Horizon overlay applied', {
+      zoom: entry.zoom,
+      composite: !!entry.composite,
+      bounds: entry.bounds,
+    });
+  }
+
+  _swapFarfieldResource(tile, scale) {
+    if (!tile || tile.type !== 'farfield') return 0;
+    const targetScale = Math.max(1, Math.round(scale || 1));
+    const currentScale = Math.max(1, Math.round(tile.scale || 1));
+    if (tile.grid?.group && targetScale === currentScale) return 0;
+
+    const parent = tile.grid?.group?.parent || this.scene;
+    const name = tile.grid?.group?.name || `tile-far-${tile.q},${tile.r}`;
+    const visible = tile.grid?.group?.visible ?? true;
+    const renderOrder = tile.grid?.mesh?.renderOrder ?? -10;
+
+    this._releaseFarfieldResource(tile);
+
+    const resource = this._acquireFarfieldResource(targetScale);
+    const radius = this._farfieldRadiusForScale(targetScale);
+    const stride = targetScale;
+    this._resetFarfieldGeometryAttributes(resource.geometry, radius);
+    resource.group.name = name;
+    const wp = this._axialWorld(tile.q / stride, tile.r / stride, radius);
+    resource.group.position.set(wp.x, 0, wp.z);
+    resource.group.visible = visible;
+    resource.group.layers.set(1);
+    if (resource.group.parent) resource.group.parent.remove(resource.group);
+    parent.add(resource.group);
+
+    if (resource.mesh) {
+      resource.mesh.material = this._getFarfieldMaterial();
+      resource.mesh.renderOrder = renderOrder;
+      resource.mesh.layers.set(1);
+      resource.mesh.raycast = THREE.Mesh.prototype.raycast;
+    }
+
+    const posAttr = resource.geometry.attributes.position;
+    const colAttr = resource.geometry.attributes.color;
+    if (colAttr) colAttr.setUsage(THREE.DynamicDrawUsage);
+
+    tile.grid = { group: resource.group, mesh: resource.mesh, geometry: resource.geometry, mat: resource.mat };
+    tile.pos = posAttr;
+    tile.neighbors = this._buildAdjacency(resource.geometry.getIndex(), posAttr.count);
+    tile.ready = new Uint8Array(posAttr.count);
+    tile.col = colAttr;
+    tile.unreadyCount = posAttr.count;
+    tile.scale = targetScale;
+    tile._stride = stride;
+    tile._radiusOverride = radius;
+    tile._adapter = null;
+    tile._adapterDirty = true;
+    tile._fetchedEver = false;
+    tile._retryCounts = { full: 0 };
+    tile._queuedPhases = new Set();
+    tile.fetched = new Set();
+    tile.populating = false;
+    tile._phase = { fullDone: false };
+
+    this._initColorsNearBlack(tile);
+    this._seedTileFromNeighbors(tile);
+    this._applyAllColorsGlobal(tile);
+    this._ensureFarfieldAdapter(tile);
+    this._invalidateHeightCache();
+    this._queuePopulate(tile, false);
+    this._ensureTileOverlay(tile);
+    return 1;
+  }
+
+  _refreshFarfieldTile(tile, tier = {}) {
+    if (!tile || tile.type !== 'farfield') return 0;
+    let changes = 0;
+    const targetScale = Math.max(1, Math.round(tier.scale || 1));
+    const targetSamples = tier.samples || 'all';
+    if ((tile.scale || 1) !== targetScale) {
+      changes += this._swapFarfieldResource(tile, targetScale);
+    } else {
+      const radius = this._farfieldRadiusForScale(targetScale);
+      const stride = Math.max(1, Math.round(tile._stride || targetScale));
+      const wp = this._axialWorld(tile.q / stride, tile.r / stride, radius);
+      if (tile.grid?.group) tile.grid.group.position.set(wp.x, 0, wp.z);
+      tile._radiusOverride = radius;
+      tile._stride = stride;
+    }
+
+    if ((tile._farSampleMode || 'all') !== targetSamples) {
+      tile._farSampleMode = targetSamples;
+      tile._adapterDirty = true;
+      tile._fetchedEver = false;
+      if (tile.ready) tile.ready.fill(0);
+      tile.unreadyCount = tile.pos?.count ?? 0;
+      this._queuePopulate(tile, false);
+      changes++;
+    }
+
+    if (tier.minPrec != null) tile._farMinPrec = tier.minPrec;
+    if (tier.subdivideEdges) {
+      tile._subdivideEdges = true;
+      this._subdivideInterfaceEdges(tile);
+    } else {
+      tile._subdivideEdges = false;
+    }
+
+    if (tile._adapterDirty) this._markFarfieldAdapterDirty(tile);
+    this._queuePopulateIfNeeded?.(tile, false);
+    return changes;
   }
 
   _disposeHorizonField() {
@@ -2169,6 +2431,10 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       this._horizonField.mesh.material?.dispose?.();
     } catch { /* noop */ }
     this._horizonField = null;
+    this._horizonOverlayEntry = null;
+    this._horizonOverlayKey = null;
+    this._horizonWaiter = null;
+    this._lastHorizonOverlayLogKey = null;
   }
 
   _updateHorizonField(playerPos, deltaTime = 0) {
@@ -2198,92 +2464,167 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       this._lastFarfieldOuterRadius = farEdge;
     }
     const minInner = this.tileRadius * (this.VISUAL_RING + Math.max(1, this.FARFIELD_EXTRA) * 0.5);
-    const innerRadius = Math.max(farEdge + this.HORIZON_INNER_GAP, minInner);
+    const seamPadMeters = Math.max(0, this.FARFIELD_NEAR_PAD * this.tileRadius * 0.25);
+    const innerRadius = Math.max(farEdge + this.HORIZON_INNER_GAP + seamPadMeters, minInner);
     const outerRadius = Math.max(
       innerRadius + this.HORIZON_EXTRA_METERS,
       this.HORIZON_TARGET_RADIUS
     );
 
-    const segments = hf.segments;
-    const radialSteps = hf.radialSteps;
-    const weights = hf.weights;
-    const focusGain = hf.focusGain;
-    const angles = hf.angles;
-    const innerHeights = hf.innerHeights;
-
-    const focusDir = needFocus ? Math.atan2(this._playerVelocity.z, this._playerVelocity.x) : null;
-    let totalWeight = 0;
-    for (let i = 0; i < segments; i++) {
-      const baseAngle = (i / segments) * TAU;
-      let weight = 1;
-      let gain = 0;
-      if (focusDir !== null) {
-        const diff = Math.atan2(Math.sin(baseAngle - focusDir), Math.cos(baseAngle - focusDir));
-        gain = Math.max(0, Math.cos(diff));
-        weight += this.HORIZON_FOCUS_STRENGTH * gain * gain;
-      }
-      weights[i] = weight;
-      focusGain[i] = gain;
-      totalWeight += weight;
+    const levels = [];
+    const baseSide = Math.max(25, this.tileRadius * 0.5);
+    const levelScale = 1.6;
+    const maxLevels = 8;
+    let side = baseSide;
+    let levelInner = innerRadius;
+    let levelGuard = 0;
+    while (levelInner < outerRadius - 1 && levelGuard++ < maxLevels) {
+      const thickness = Math.max(side * Math.sqrt(3) * 0.85, side * 1.35);
+      const levelOuter = Math.min(outerRadius, levelInner + thickness);
+      levels.push({ side, inner: levelInner, outer: levelOuter });
+      levelInner = levelOuter;
+      side *= levelScale;
     }
-    if (!Number.isFinite(totalWeight) || totalWeight <= 0) totalWeight = segments;
-
-    let cumulative = 0;
-    for (let i = 0; i < segments; i++) {
-      const w = weights[i];
-      const start = cumulative / totalWeight;
-      cumulative += w;
-      const end = cumulative / totalWeight;
-      angles[i] = ((start + end) * 0.5) * TAU;
+    if (!levels.length) {
+      levels.push({ side: baseSide, inner: innerRadius, outer: outerRadius });
     }
 
-    const posAttr = hf.posAttr;
-    const uvAttr = hf.uvAttr;
+    const positions = [];
+    const colors = [];
+    const indices = [];
+    const fallbackColor = this._horizonBaseColor;
 
-    const baseHeight = this._lastHeight;
-    for (let i = 0; i < segments; i++) {
-      const angle = angles[i];
-      const cosA = Math.cos(angle);
-      const sinA = Math.sin(angle);
-      const x = innerRadius * cosA;
-      const z = innerRadius * sinA;
-      const y = this._sampleHorizonHeight(x, z, baseHeight);
-      innerHeights[i] = y;
-      posAttr.setXYZ(i, x, y, z);
-      uvAttr.setXY(i, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
-    }
+    levels.forEach((level, levelIdx) => {
+      const horizontalStep = level.side;
+      const verticalStep = Math.sqrt(3) * 0.5 * level.side;
+      const margin = level.side * 0.25;
+      const outerHexLimit = Math.ceil((level.outer + margin) / horizontalStep) + 3;
+      const step = Math.max(1, Math.round(level.side / baseSide));
 
-    for (let band = 1; band < radialSteps; band++) {
-      const bandT = band / (radialSteps - 1);
-      const radius = THREE.MathUtils.lerp(innerRadius, outerRadius, Math.pow(bandT, 1.15));
-      const heightBlend = Math.pow(bandT, 1.6);
-      for (let i = 0; i < segments; i++) {
-        const angle = angles[i];
-        let radial = radius;
-        if (focusDir !== null && band === radialSteps - 1) {
-          radial += radius * 0.12 * focusGain[i];
+      const vertexMap = new Map();
+      const coordMap = new Map();
+      const coordKey = (i, j) => `${levelIdx}:${i}:${j}`;
+      const getCoord = (i, j) => {
+        const key = coordKey(i, j);
+        let coord = coordMap.get(key);
+        if (!coord) {
+          const hx = i;
+          const hy = j;
+          const x = (hx + hy * 0.5) * horizontalStep;
+          const z = hy * verticalStep;
+          const q = hx;
+          const r = hy;
+          const hexDist = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
+          coord = { x, z, radius: Math.hypot(x, z), hexDist };
+          coordMap.set(key, coord);
         }
-        const x = radial * Math.cos(angle);
-        const z = radial * Math.sin(angle);
-        const innerY = innerHeights[i];
-        const farY = innerY * 0.25;
-        const y = THREE.MathUtils.lerp(innerY, farY, heightBlend);
-        const idx = band * segments + i;
-        posAttr.setXYZ(idx, x, y, z);
-        uvAttr.setXY(idx, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
+        return coord;
+      };
+      const ensureVertex = (i, j) => {
+        const key = coordKey(i, j);
+        if (vertexMap.has(key)) return vertexMap.get(key);
+        const coord = getCoord(i, j);
+        const sample = this._sampleFarfieldSurface(coord.x, coord.z, this._lastHeight, fallbackColor);
+        const idx = positions.length / 3;
+        positions.push(coord.x, sample.height, coord.z);
+        const col = sample.color || fallbackColor;
+        colors.push(col.r, col.g, col.b);
+        vertexMap.set(key, idx);
+        return idx;
+      };
+      const includeTriangle = (verts) => {
+        let minRadius = Infinity;
+        let maxRadius = -Infinity;
+        let minHex = Infinity;
+        let maxHex = -Infinity;
+        for (const [ii, jj] of verts) {
+          const coord = getCoord(ii, jj);
+          if (coord.radius < minRadius) minRadius = coord.radius;
+          if (coord.radius > maxRadius) maxRadius = coord.radius;
+          if (coord.hexDist < minHex) minHex = coord.hexDist;
+          if (coord.hexDist > maxHex) maxHex = coord.hexDist;
+        }
+        if (maxRadius < level.inner - margin) return false;
+        if (minRadius > level.outer + margin) return false;
+        const innerHex = (level.inner - margin) / horizontalStep;
+        const outerHex = (level.outer + margin) / horizontalStep;
+        if (maxHex < innerHex) return false;
+        if (minHex > outerHex) return false;
+        return true;
+      };
+
+      for (let j = -outerHexLimit; j <= outerHexLimit - step; j += step) {
+        for (let i = -outerHexLimit; i <= outerHexLimit - step; i += step) {
+          const triUp = [[i, j], [i + step, j], [i, j + step]];
+          if (includeTriangle(triUp)) {
+            const a = ensureVertex(i, j);
+            const b = ensureVertex(i + step, j);
+            const c = ensureVertex(i, j + step);
+            indices.push(a, b, c);
+          }
+          const triDown = [[i + step, j], [i + step, j + step], [i, j + step]];
+          if (includeTriangle(triDown)) {
+            const a = ensureVertex(i + step, j);
+            const b = ensureVertex(i + step, j + step);
+            const c = ensureVertex(i, j + step);
+            indices.push(a, b, c);
+          }
+        }
       }
+    });
+
+    if (!positions.length || !indices.length) {
+      console.warn('[TileManager] Horizon mesh skipped (no triangles built)');
+      this._horizonDirty = false;
+      this._nextHorizonUpdate = now + this.HORIZON_UPDATE_INTERVAL_MS;
+      return;
     }
 
-    posAttr.needsUpdate = true;
-    uvAttr.needsUpdate = true;
-    try {
-      hf.geometry.computeVertexNormals();
-      hf.geometry.computeBoundingSphere();
-    } catch { }
+    const positionAttr = new THREE.BufferAttribute(new Float32Array(positions), 3).setUsage(THREE.DynamicDrawUsage);
+    const colorAttr = new THREE.BufferAttribute(new Float32Array(colors), 3).setUsage(THREE.DynamicDrawUsage);
+    let uvAttr = hf.geometry.getAttribute('uv');
+    if (!uvAttr || uvAttr.count !== positionAttr.count || uvAttr.array.length !== positionAttr.count * 2) {
+      uvAttr = new THREE.BufferAttribute(new Float32Array(positionAttr.count * 2), 2).setUsage(THREE.DynamicDrawUsage);
+    }
+    const indexArray = indices.length > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
+    const indexAttr = new THREE.BufferAttribute(indexArray, 1).setUsage(THREE.DynamicDrawUsage);
 
+    hf.geometry.setAttribute('position', positionAttr);
+    hf.geometry.setAttribute('color', colorAttr);
+    hf.geometry.setAttribute('uv', uvAttr);
+    hf.geometry.setIndex(indexAttr);
+
+    hf.geometry.computeVertexNormals();
+    hf.geometry.computeBoundingSphere();
+
+    hf.posAttr = positionAttr;
+    hf.colAttr = colorAttr;
+    hf.uvAttr = uvAttr;
+    hf.vertexCount = positionAttr.count;
     hf.innerRadius = innerRadius;
     hf.outerRadius = outerRadius;
+
+    const bounds = this._computeBoundsFromPositions(positions);
+    if (bounds) {
+      this._ensureHorizonUv(bounds);
+      this._ensureHorizonOverlay(bounds);
+    } else {
+      console.warn('[TileManager] Horizon UV bounds unavailable');
+    }
+
     hf.mesh.visible = true;
+    const mat = hf.mesh.material;
+    if (mat) {
+      mat.wireframe = false;
+      mat.needsUpdate = true;
+    }
+    console.debug('[TileManager] Horizon mesh rebuilt', {
+      vertices: positionAttr.count,
+      triangles: indexArray.length / 3,
+      levels: levels.length,
+      innerRadius,
+      outerRadius,
+    });
     this._lastHorizonOuterRadius = outerRadius;
     this._horizonDirty = false;
     this._nextHorizonUpdate = now + this.HORIZON_UPDATE_INTERVAL_MS;
@@ -2565,6 +2906,12 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     }
     this._overlayCache.clear();
     for (const tile of tiles) this._ensureTileOverlay(tile);
+    this._horizonOverlayEntry = null;
+    this._horizonOverlayKey = null;
+    this._horizonWaiter = null;
+    this._lastHorizonOverlayLogKey = null;
+    this._horizonDirty = true;
+    this._nextHorizonUpdate = 0;
   }
   _teardownOverlayForTile(tile) {
     if (!tile) return;
@@ -2751,7 +3098,12 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       const waiters = entry.waiters ? Array.from(entry.waiters) : [];
       entry.waiters?.clear?.();
       for (const t of waiters) {
-        if (!t || !this.tiles.has(`${t.q},${t.r}`)) continue;
+        if (!t) continue;
+        if (t.isHorizon) {
+          this._applyHorizonOverlay(entry);
+          continue;
+        }
+        if (!this.tiles.has(`${t.q},${t.r}`)) continue;
         // Store entry reference so we can apply it after elevation is fetched
         t._overlay = { status: 'ready', cacheKey, entry };
         // Try to apply overlay (will be blocked if elevation not fetched yet)
@@ -2763,7 +3115,24 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       entry.status = 'error';
       const waiters = entry.waiters ? Array.from(entry.waiters) : [];
       entry.waiters?.clear?.();
-      for (const t of waiters) { if (t) t._overlay = null; }
+      for (const t of waiters) {
+        if (!t) continue;
+        if (t.isHorizon) {
+          this._horizonOverlayEntry = null;
+          this._horizonOverlayKey = null;
+          if (this._horizonField?.mesh?.material) {
+            const mat = this._horizonField.mesh.material;
+            if (mat.map) {
+              mat.map = null;
+            }
+            mat.wireframe = false;
+            mat.needsUpdate = true;
+          }
+          console.warn('[TileManager] Horizon overlay failed', { cacheKey, zoom: entry.zoom });
+          continue;
+        }
+        t._overlay = null;
+      }
     };
 
     // ---- SINGLE TILE path ----------------------------------------------------
@@ -4708,6 +5077,102 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     return { group, mesh, geometry: geom, mat };
   }
 
+  _farfieldPoolKey(scale = 1) {
+    return `${Math.max(1, Math.round(scale || 1))}`;
+  }
+
+  _farfieldRadiusForScale(scale = 1) {
+    return this.tileRadius * Math.max(1, Math.round(scale || 1));
+  }
+
+  _resetFarfieldGeometryAttributes(geometry, radius) {
+    if (!geometry) return;
+    const posAttr = geometry.getAttribute?.('position');
+    if (posAttr?.count >= 7) {
+      posAttr.setXYZ(0, 0, 0, 0);
+      const corners = this._hexCorners(radius);
+      for (let i = 0; i < 6; i++) {
+        const corner = corners[i];
+        posAttr.setXYZ(i + 1, corner.x, 0, corner.z);
+      }
+      posAttr.needsUpdate = true;
+    }
+    const colAttr = geometry.getAttribute?.('color');
+    if (colAttr) {
+      const lum = this.LUM_MIN;
+      for (let i = 0; i < colAttr.count; i++) {
+        colAttr.setX(i, lum);
+        colAttr.setY(i, lum);
+        colAttr.setZ(i, lum);
+      }
+      colAttr.needsUpdate = true;
+    }
+  }
+
+  _acquireFarfieldResource(scale = 1) {
+    const key = this._farfieldPoolKey(scale);
+    const pool = this._farfieldPool.get(key);
+    if (pool && pool.length) {
+      return pool.pop();
+    }
+    const radius = this._farfieldRadiusForScale(scale);
+    const resource = this._makeLowResHexMeshForRadius(radius);
+    resource._poolKey = key;
+    resource._radius = radius;
+    return resource;
+  }
+
+  _releaseFarfieldResource(tile) {
+    if (!tile || tile.type !== 'farfield' || !tile.grid?.group) return;
+    const scale = Math.max(1, Math.round(tile.scale || 1));
+    const key = this._farfieldPoolKey(scale);
+    let pool = this._farfieldPool.get(key);
+    if (!pool) {
+      pool = [];
+      this._farfieldPool.set(key, pool);
+    }
+
+    const group = tile.grid.group;
+    const mesh = tile.grid.mesh;
+    const geometry = tile.grid.geometry;
+
+    if (group.parent) group.parent.remove(group);
+    group.visible = false;
+    group.position.set(0, 0, 0);
+    group.rotation.set(0, 0, 0);
+    group.scale.set(1, 1, 1);
+
+    if (mesh?.material && mesh.material !== this._farfieldMat && mesh.material !== this._terrainMat && mesh.material.map) {
+      try {
+        mesh.material.map = null;
+        mesh.material.needsUpdate = true;
+      } catch {}
+    }
+
+    if (geometry) {
+      const radius = this._farfieldRadiusForScale(scale);
+      this._resetFarfieldGeometryAttributes(geometry, radius);
+    }
+
+    if (tile._adapter?.mesh) {
+      try {
+        tile._adapter.mesh.parent?.remove(tile._adapter.mesh);
+        tile._adapter.mesh.geometry?.dispose?.();
+        tile._adapter.mesh.material?.dispose?.();
+      } catch {}
+    }
+    tile._adapter = null;
+
+    pool.push({
+      group,
+      mesh,
+      geometry,
+      mat: tile.grid.mat,
+      _poolKey: key,
+      _radius: this.tileRadius * scale,
+    });
+  }
+
   // pick stride/scale/sample strategy by distance
   _farfieldTierForDist(dist) {
     // tune these bands freely; goal is to cap #tiles & #queries
@@ -4859,30 +5324,36 @@ _planarizeEdgeWhenNeighborMissing(tile, {
   }
   _addFarfieldTile(q, r, scale = 1, sampleMode = 'all') {
     const id = `${q},${r}`;
+    const normalizedScale = Math.max(1, Math.round(scale || 1));
     const existing = this.tiles.get(id);
     if (existing) {
-      if (existing.type === 'farfield' && ((existing.scale || 1) !== scale || (existing._farSampleMode || 'all') !== sampleMode)) {
+      if (existing.type === 'farfield' && ((existing.scale || 1) !== normalizedScale || (existing._farSampleMode || 'all') !== sampleMode)) {
         this._discardTile(id);
       } else {
         return existing;
       }
-      this._ensureTileOverlay(tile);
-
     }
 
-    const radius = this.tileRadius * Math.max(1, Math.round(scale));
-    const low = this._makeLowResHexMeshForRadius(radius);
+    const radius = this._farfieldRadiusForScale(normalizedScale);
+    const stride = normalizedScale;
+    const low = this._acquireFarfieldResource(normalizedScale);
+    this._resetFarfieldGeometryAttributes(low.geometry, radius);
     low.group.name = `tile-far-${id}`;
     const farfieldMat = this._getFarfieldMaterial();
     if (low.mesh) {
       low.mesh.material = farfieldMat;
       low.mesh.renderOrder = -10;
+      low.mesh.layers.set(1);
     }
-    const wp = this._axialWorld(q, r);
-    low.group.position.set(wp.x, 0, wp.z);
-    this.scene.add(low.group);
     low.group.layers.set(1);
-    low.mesh.layers.set(1);
+   low.group.visible = true;
+    const wp = this._axialWorld(q / stride, r / stride, radius);
+    low.group.position.set(wp.x, 0, wp.z);
+    if (!low.group.parent) this.scene.add(low.group); else {
+      // ensure the group is attached to the scene root
+      low.group.parent.remove(low.group);
+      this.scene.add(low.group);
+    }
 
     // allow farfield meshes to answer height queries when no interactive terrain is nearby
     if (low.mesh) low.mesh.raycast = THREE.Mesh.prototype.raycast;
@@ -4907,7 +5378,8 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       _phase: { fullDone: false },
       _queuedPhases: new Set(),
       _retryCounts: { full: 0 },
-      scale,
+      scale: normalizedScale,
+      _stride: stride,
       _radiusOverride: radius,
       _farSampleMode: sampleMode,
       _adapter: null,
@@ -6491,6 +6963,19 @@ _kickFarfieldIfIdle() {
       this._pendingHeavySweep = true; // 🔁 ensure we continue filling ring next frames
     }
 
+    if (!this._farfieldAnchor) this._farfieldAnchor = { q: q0, r: r0 };
+    let farfieldNeedsUpdate = this._farfieldPendingUpdate;
+    if (!farfieldNeedsUpdate && tileChanged) {
+      if (this._shouldUpdateFarfield(q0, r0)) {
+        this._farfieldPendingUpdate = true;
+        farfieldNeedsUpdate = true;
+      }
+    }
+    if (!farfieldNeedsUpdate) {
+      // still allow external triggers to set pending flag
+      farfieldNeedsUpdate = this._farfieldPendingUpdate;
+    }
+
     // Predictive preloading based on movement direction
     this._predictivePreloadTiles(playerPos, q0, r0);
 
@@ -6548,8 +7033,8 @@ _kickFarfieldIfIdle() {
         }
       }
 
-      this._updateFarfieldMergedMesh();
-      this._updateHorizonField(playerPos, deltaTime);
+      //this._updateFarfieldMergedMesh();
+      //this._updateHorizonField(playerPos, deltaTime);
       const treeRefreshPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 3, this._treeComplexity ?? 0.35)));
       this._serviceTreeRefresh(treeRefreshPerFrame);
 
@@ -6654,51 +7139,56 @@ _kickFarfieldIfIdle() {
 
     // 3) farfield (strided + sparse) (respect budget)
     // CRITICAL: Skip farfield creation entirely during warmup
-    if (!budgetHit && !this._relayWarmupActive) {
-      let farCreated = 0;
-      farOuter:
-      for (let dq = -this.FARFIELD_RING; dq <= this.FARFIELD_RING; dq++) {
-        if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break; }
-        const rMin = Math.max(-this.FARFIELD_RING, -dq - this.FARFIELD_RING);
-        const rMax = Math.min(this.FARFIELD_RING, -dq + this.FARFIELD_RING);
-        for (let dr = rMin; dr <= rMax; dr++) {
-          if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; break farOuter; }
-          const q = q0 + dq, r = r0 + dr;
-          const dist = this._hexDist(q, r, q0, r0);
-          if (dist <= this.VISUAL_RING) continue;
+    if (!budgetHit && !this._relayWarmupActive && farfieldNeedsUpdate) {
+    const movementDir = this._movementDir || { q: 0, r: 0 };
+    const cardinal = this._dominantAxialAxis?.(movementDir.q, movementDir.r) ?? { q: 1, r: 0 };
+    const { q: dirQ, r: dirR } = cardinal;
+    const axialDist = (dq, dr) => dq * dirQ + dr * dirR;
+    const shellDist = (q, r) => this._hexDist(q, r, q0, r0);
+    const reuseMap = new Map();
+    const farTiles = [];
+    for (const [id, tile] of this.tiles) {
+      if (tile.type === 'farfield') farTiles.push(tile);
+    }
+    const frontThreshold = this.FARFIELD_RING - Math.max(1, Math.floor(cardinal.maxStride || 1));
+    const backThreshold = -(this.FARFIELD_RING + this.TILE_REMOVAL_HYSTERESIS + 1);
 
-          const tier = this._farfieldTierForDist?.(dist) || { stride: 3, scale: 2, samples: 'sparse', minPrec: 6 };
-          const { stride, scale, samples, minPrec, subdivideEdges } = tier;
-          if (!this._divisible?.(q - q0, stride) || !this._divisible?.(r - r0, stride)) continue;
+    const frontSlots = new Set();
+    this._forEachAxialRing(q0, r0, this.FARFIELD_RING, Math.max(1, Math.round(cardinal.maxStride || 1)), (q, r) => {
+      if (axialDist(q - q0, r - r0) >= frontThreshold) frontSlots.add(`${q},${r}`);
+    });
 
-          const id = `${q},${r}`;
-          const existing = this.tiles.get(id);
+    const backSlots = new Set();
+    this._forEachAxialRing(q0, r0, this.FARFIELD_RING + this.TILE_REMOVAL_HYSTERESIS, Math.max(1, Math.round(cardinal.maxStride || 1)), (q, r) => {
+      if (axialDist(q - q0, r - r0) <= backThreshold) backSlots.add(`${q},${r}`);
+    });
 
-          if (!existing) {
-            const t = this._addFarfieldTile(q, r, scale, samples);
-            t._farMinPrec = minPrec;
-            t._subdivideEdges = subdivideEdges || false;
-            if (subdivideEdges) this._subdivideInterfaceEdges(t);
-            workDone++;
-            if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
-          } else if (existing.type !== 'farfield' ||
-            (existing.scale || 1) !== scale ||
-            (existing._farSampleMode || 'all') !== samples) {
-            this._discardTile(id);
-            const t = this._addFarfieldTile(q, r, scale, samples);
-            t._farMinPrec = minPrec;
-            t._subdivideEdges = subdivideEdges || false;
-            if (subdivideEdges) this._subdivideInterfaceEdges(t);
-            workDone++;
-            if (++farCreated >= (this.FARFIELD_CREATE_BUDGET || 16)) break farOuter;
-          } else {
-            existing._farMinPrec = minPrec;
-            existing._subdivideEdges = subdivideEdges || false;
-            if (subdivideEdges) this._subdivideInterfaceEdges(existing);
-            this._queuePopulateIfNeeded?.(existing, false);
-          }
-        }
+    let farCreated = 0;
+    for (const tile of farTiles) {
+      const id = `${tile.q},${tile.r}`;
+      if (frontSlots.has(id)) {
+        reuseMap.set(id, tile);
+      } else if (backSlots.has(id)) {
+        this._discardTile(id);
       }
+    }
+
+    for (const slot of frontSlots) {
+      if (reuseMap.has(slot)) continue;
+      if (nowMs() - startMs > HARD_BUDGET_MS) { budgetHit = true; farfieldNeedsUpdate = true; break; }
+      const [sq, sr] = slot.split(',').map(Number);
+      const dist = shellDist(sq, sr);
+      const tier = this._farfieldTierForDist?.(dist) || { stride: 3, scale: 2, samples: 'sparse', minPrec: 6 };
+      const { stride, scale, samples, minPrec, subdivideEdges } = tier;
+      if (!this._divisible?.(sq - q0, stride) || !this._divisible?.(sr - r0, stride)) continue;
+      const t = this._addFarfieldTile(sq, sr, scale, samples);
+      t._farMinPrec = minPrec;
+      t._subdivideEdges = subdivideEdges || false;
+      if (subdivideEdges) this._subdivideInterfaceEdges(t);
+      workDone++;
+      farCreated++;
+    }
+    this._farfieldPendingUpdate = false;
     }
 
     // 4) prune/downgrade (respect budget, with hysteresis to prevent thrashing)
@@ -6713,7 +7203,10 @@ _kickFarfieldIfIdle() {
         const dist = this._hexDist(t.q, t.r, q0, r0);
 
         // Only remove tiles beyond farfield ring + hysteresis buffer
-        if (dist > removalThreshold) { toRemove.push(id); continue; }
+        if (dist > removalThreshold) {
+          if (t.type === 'farfield' && !farfieldNeedsUpdate) continue;
+          toRemove.push(id); continue;
+        }
 
         // Only downgrade visual->farfield beyond visual ring + hysteresis buffer
         if (dist > downgradeThreshold) {
@@ -7368,6 +7861,55 @@ _applyPendingSamples() {
     this._heightMeshesFallback.length = 0;
   }
 
+  _sampleHeightRay(x, z) {
+    const result = { height: Number.NaN, source: null, hitCount: 0, meshesCount: 0 };
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return result;
+
+    const tmp = this._tmpSampleVec;
+    tmp.set(x, 10000, z);
+
+    const attempt = (meshes, label) => {
+      if (!meshes || meshes.length === 0) return null;
+      this.ray.set(tmp, this.DOWN);
+      const hits = this.ray.intersectObjects(meshes, true);
+      if (hits && hits.length) {
+        return {
+          height: hits[0].point.y,
+          source: label,
+          hitCount: hits.length,
+          meshesCount: meshes.length,
+        };
+      }
+      return null;
+    };
+
+    const interactive = this._collectHeightMeshesNear(x, z);
+    let sample = attempt(interactive, 'interactive');
+    if (sample) return sample;
+
+    const visual = this._collectMeshesNearByType(x, z, ['visual']);
+    sample = attempt(visual, 'visual');
+    if (sample) return sample;
+
+    const farfieldMeshes = [];
+    const mergedMesh = this._farfieldMerge?.mesh;
+    if (mergedMesh && mergedMesh.visible !== false) farfieldMeshes.push(mergedMesh);
+    const nearbyFarfield = this._collectMeshesNearByType(x, z, ['farfield']);
+    if (nearbyFarfield.length) {
+      for (const mesh of nearbyFarfield) {
+        if (!mesh || mesh.visible === false) continue;
+        farfieldMeshes.push(mesh);
+      }
+    }
+    sample = attempt(
+      farfieldMeshes,
+      farfieldMeshes.length === 1 && farfieldMeshes[0] === mergedMesh ? 'farfield-merged' : 'farfield'
+    );
+    if (sample) return sample;
+
+    return result;
+  }
+
   getHeightAt(x, z) {
     const perfNow = performance?.now ? performance.now.bind(performance) : null;
     const start = perfNow ? perfNow() : Date.now();
@@ -7378,53 +7920,17 @@ _applyPendingSamples() {
       return cached.h;
     }
 
-    const tmp = new THREE.Vector3(x, 10000, z);
-    let source = 'interactive';
-    let meshes = this._collectHeightMeshesNear(x, z) || [];
-    this.ray.set(tmp, this.DOWN);
-    let hit = meshes.length ? this.ray.intersectObjects(meshes, true) : [];
-
-    if (!hit.length) {
-      const visualMeshes = this._collectMeshesNearByType(x, z, ['visual']);
-      if (visualMeshes.length) {
-        source = 'visual';
-        meshes = visualMeshes;
-        hit = this.ray.intersectObjects(visualMeshes, true);
-      }
-    }
-
-    if (!hit.length) {
-      const farfieldMeshes = [];
-      const mergedMesh = (this._farfieldMerge?.mesh && this._farfieldMerge.mesh.visible !== false)
-        ? this._farfieldMerge.mesh
-        : null;
-      if (mergedMesh) farfieldMeshes.push(mergedMesh);
-      const nearbyFarfield = this._collectMeshesNearByType(x, z, ['farfield']);
-      if (nearbyFarfield.length) {
-        for (const mesh of nearbyFarfield) {
-          if (!mesh || mesh.visible === false) continue;
-          farfieldMeshes.push(mesh);
-        }
-      }
-      if (farfieldMeshes.length) {
-        source = mergedMesh && farfieldMeshes.length === 1 ? 'farfield-merged' : 'farfield';
-        meshes = farfieldMeshes;
-        hit = this.ray.intersectObjects(farfieldMeshes, true);
-      }
-    }
-
-    let result = this._lastHeight;
-    if (hit.length) {
-      result = hit[0].point.y;
-      this._lastHeight = result;
-    }
+    const sample = this._sampleHeightRay(x, z);
+    let result = Number.isFinite(sample.height) ? sample.height : this._lastHeight;
+    if (Number.isFinite(sample.height)) this._lastHeight = sample.height;
     this._heightCache.set(key, { h: result, t: now });
     if (this._heightCache.size > 4096) this._heightCache.clear();
 
     const duration = (perfNow ? perfNow() : Date.now()) - start;
     const logNow = perfNow ? perfNow() : Date.now();
     if ((!this._perfLogNext || logNow >= this._perfLogNext) && duration > 2) {
-      console.log(`[tiles.getHeightAt] source=${source} meshes=${meshes.length} hit=${hit.length > 0} duration=${duration.toFixed(2)}ms`);
+      const src = sample.source || 'fallback';
+      console.log(`[tiles.getHeightAt] source=${src} meshes=${sample.meshesCount} hit=${sample.hitCount > 0} duration=${duration.toFixed(2)}ms`);
       this._perfLogNext = logNow + 2000;
     }
     return result;
@@ -7477,6 +7983,23 @@ setOverlayEnabled(on) {
   for (const t of this.tiles.values()) {
     if (want) this._ensureTileOverlay(t);
     else this._teardownOverlayForTile(t);
+  }
+  if (want) {
+    this._horizonDirty = true;
+    this._nextHorizonUpdate = 0;
+  } else {
+    if (this._horizonField?.mesh?.material) {
+      const mat = this._horizonField.mesh.material;
+      if (mat.map) {
+        mat.map = null;
+        mat.needsUpdate = true;
+      }
+      mat.wireframe = true;
+      mat.needsUpdate = true;
+    }
+    this._horizonOverlayEntry = null;
+    this._horizonOverlayKey = null;
+    this._lastHorizonOverlayLogKey = null;
   }
 }
 
@@ -7591,24 +8114,30 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     }
     this._teardownOverlayForTile(t);
     if (t._overlay) t._overlay = null;
-    if (t.type === 'farfield') {
+    const isFarfield = t.type === 'farfield';
+    if (isFarfield) {
       const key = this._farfieldAdapterKey(t);
       if (key) this._farfieldAdapterDirty.delete(key);
       this._markFarfieldMergeDirty(t);
+      this._releaseFarfieldResource(t);
+      this._farfieldPendingUpdate = true;
+    } else {
+      this.scene.remove(t.grid.group);
     }
-    this.scene.remove(t.grid.group);
     try {
-      if (t._adapter?.mesh) {
-        t._adapter.mesh.geometry?.dispose?.();
-      }
-      t.grid.geometry?.dispose?.();
-      t.grid.mat?.dispose?.();
-      const mesh = t.grid?.mesh;
-      if (mesh?.material) {
-        const mat = mesh.material;
-        if (mat !== this._terrainMat && mat !== this._farfieldMat) {
-          try { mat.map = null; } catch { /* noop */ }
-          mat.dispose?.();
+      if (!isFarfield) {
+        if (t._adapter?.mesh) {
+          t._adapter.mesh.geometry?.dispose?.();
+        }
+        t.grid.geometry?.dispose?.();
+        t.grid.mat?.dispose?.();
+        const mesh = t.grid?.mesh;
+        if (mesh?.material) {
+          const mat = mesh.material;
+          if (mat !== this._terrainMat && mat !== this._farfieldMat) {
+            try { mat.map = null; } catch { /* noop */ }
+            mat.dispose?.();
+          }
         }
       }
       t.wire?.material?.dispose?.();
@@ -7643,6 +8172,8 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     this._deferredInteractive.clear();
     this._interactiveSecondPass = false;
     this._farfieldAdapterDirty.clear();
+    this._farfieldAnchor = null;
+    this._farfieldPendingUpdate = true;
   }
 
   /* ---------------- Public cache management API ---------------- */
@@ -7716,6 +8247,20 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     } catch (err) {
       console.warn('[tiles] Error cleaning up old cache:', err);
     }
+  }
+
+  _shouldUpdateFarfield(q, r) {
+    if (!Number.isFinite(q) || !Number.isFinite(r)) return false;
+    if (!this._farfieldAnchor) {
+      this._farfieldAnchor = { q, r };
+      return true;
+    }
+    const dist = this._hexDist(q, r, this._farfieldAnchor.q, this._farfieldAnchor.r);
+    if (dist >= this.FARFIELD_UPDATE_THRESHOLD) {
+      this._farfieldAnchor = { q, r };
+      return true;
+    }
+    return false;
   }
 
   dispose() {
