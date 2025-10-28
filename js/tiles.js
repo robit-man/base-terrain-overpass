@@ -195,6 +195,10 @@ export class TileManager {
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._lastHeight = 0;
 
+    // Mobile guard: disable heavy trees on phones/tablets by default
+    const _tmOnMobile = (typeof navigator !== 'undefined')
+      && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
+
     // ---- Movement prediction for tile preloading ----
     this._lastPlayerPos = null;
     this._playerVelocity = new THREE.Vector3();
@@ -218,7 +222,7 @@ export class TileManager {
       lastBuildCount: 0,
       lastBuildTime: 0,
     };
-    this._overlayEnabled = true;
+    this._overlayEnabled = _tmOnMobile ? false : true;
     this._overlayZoom = 16;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
@@ -227,10 +231,6 @@ export class TileManager {
     this._overlayVersions = [];
     this._overlayVersionPromise = null;
     this._overlayVersionLastFetch = 0;
-
-    // Mobile guard: disable heavy trees on phones/tablets by default
-    const _tmOnMobile = (typeof navigator !== 'undefined')
-      && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobi/i.test(navigator.userAgent);
 
     // Persist this so other systems (populate/relay throttling, finalize budget) can branch on mobile
     this._isMobile = _tmOnMobile;
@@ -242,7 +242,7 @@ export class TileManager {
     this._treeLibWarned = false;
 
     // Dial back complexity on mobile to reduce instance counts and leaf density
-    this._treeComplexity = _tmOnMobile ? 0.22 : 0.35;        // min is clamped at 0.20 internally
+    this._treeComplexity = _tmOnMobile ? 0.12 : 0.55;        // min is clamped at 0.20 internally
     this._treeTargetComplexity = this._treeComplexity;
 
     this._treePerfSamples = [];

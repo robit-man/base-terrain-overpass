@@ -39,7 +39,6 @@ export class SceneManager {
     this.renderer.setPixelRatio(safePR);
 
     this.renderer.outputEncoding = THREE.sRGBEncoding;
-    //this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = DAY_EXPOSURE;
     this.renderer.physicallyCorrectLights = true;
 
@@ -84,8 +83,8 @@ export class SceneManager {
     skyUniforms['mieCoefficient'].value = 0.004;
     skyUniforms['mieDirectionalG'].value = 0.95;
 
-    this._farfieldSampleInsetFrac = 0.05; // sample ~8% inside the farfield edge
-    this._farFogInsetFrac        = 0.03;  // fog.far ~5% inside the farfield edge
+    this._farfieldSampleInsetFrac = 0.08; // sample ~8% inside the farfield edge
+    this._farFogInsetFrac        = 0.05;  // fog.far ~5% inside the farfield edge
 
     // OPTIMIZED: Enhanced directional sun light with realistic intensity
     this.sunLight = new THREE.DirectionalLight(0xffffff, 3.5);  // Slightly reduced for more realistic contrast
