@@ -27,7 +27,8 @@ export class SceneManager {
     this.renderer = new THREE.WebGLRenderer({
       antialias: !isMobile,
       alpha: true,
-      powerPreference: isMobile ? 'low-power' : 'high-performance'
+      powerPreference: isMobile ? 'low-power' : 'high-performance',
+      logarithmicDepthBuffer: true
     });
 
     this.renderer.setSize(innerWidth, innerHeight);

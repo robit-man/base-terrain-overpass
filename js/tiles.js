@@ -22,6 +22,16 @@ const TERRAIN_FETCH_BOOST = IS_MOBILE ? 1 : 2;          // don't accelerate fetc
 
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
+const EQ_TRI_ALTITUDE_SCALE = Math.sqrt(3) / 2;
+const TAU = Math.PI * 2;
+const HORIZON_SEGMENTS_DESKTOP = 96;
+const HORIZON_SEGMENTS_MOBILE = 48;
+const HORIZON_RADIAL_STEPS = 3;
+const HORIZON_FOCUS_STRENGTH_DESKTOP = 2.8;
+const HORIZON_FOCUS_STRENGTH_MOBILE = 1.6;
+const HORIZON_FOCUS_SPEED_THRESHOLD = 12; // m/s before densifying forward tessellation
+const HORIZON_UPDATE_INTERVAL_MS = 750;
+const HORIZON_TEXTURE_SCALE = 1 / 120000;
 const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
 const WAYBACK_WMTS_CAPABILITIES = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml';
 const DEFAULT_WAYBACK_VERSION = '49849';
@@ -155,6 +165,16 @@ export class TileManager {
     this.FARFIELD_CREATE_BUDGET = 360;
     this.FARFIELD_BATCH_SIZE = 360;
     this.FARFIELD_NEAR_PAD = 3;
+    this.FARFIELD_ADAPTER_SEGMENTS = this._isMobile ? 4 : 8;
+    this.HORIZON_EXTRA_METERS = 60000;
+    this.HORIZON_TARGET_RADIUS = 100000;
+    this.HORIZON_SEGMENTS = this._isMobile ? HORIZON_SEGMENTS_MOBILE : HORIZON_SEGMENTS_DESKTOP;
+    this.HORIZON_RADIAL_STEPS = HORIZON_RADIAL_STEPS;
+    this.HORIZON_FOCUS_STRENGTH = this._isMobile ? HORIZON_FOCUS_STRENGTH_MOBILE : HORIZON_FOCUS_STRENGTH_DESKTOP;
+    this.HORIZON_FOCUS_THRESHOLD = HORIZON_FOCUS_SPEED_THRESHOLD;
+    this.HORIZON_UPDATE_INTERVAL_MS = HORIZON_UPDATE_INTERVAL_MS;
+    this.HORIZON_INNER_GAP = this.tileRadius * 0.5;
+    this.HORIZON_TEXTURE_SCALE = HORIZON_TEXTURE_SCALE;
 
     // ---- interactive (high-res) relaxation ----
     // CRITICAL: Reduce relaxation iterations on mobile to prevent frame stalls
@@ -193,6 +213,7 @@ export class TileManager {
     this.ray = new THREE.Raycaster();
     this.ray.layers.enable(1);
     this.DOWN = new THREE.Vector3(0, -1, 0);
+    this._tmpHorizonVec = new THREE.Vector3();
     this._lastHeight = 0;
 
     // Mobile guard: disable heavy trees on phones/tablets by default
@@ -222,6 +243,9 @@ export class TileManager {
       lastBuildCount: 0,
       lastBuildTime: 0,
     };
+    this._horizonField = null;
+    this._horizonDirty = true;
+    this._nextHorizonUpdate = 0;
     this._overlayEnabled = _tmOnMobile ? false : true;
     this._overlayZoom = 16;
     this._overlayCache = new Map();
@@ -262,6 +286,8 @@ export class TileManager {
 
     // Toggle for generation + per-frame updates (used elsewhere in the file)
     this._grassEnabled = !_tmOnMobile;
+
+    this._initHorizonField();
 
 
     if (!scene.userData._tmLightsAdded) {
@@ -603,12 +629,15 @@ _stitchInteractiveToVisualEdges(tile, {
   const BAND_INNER = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio)));  // inner edge of blend band
 
   const newLocks = new Set();
+  if (!tile.locked) tile.locked = new Uint8Array(pos.count);
+  const lockArray = tile.locked;
 
   for (let s = 0; s < 6; s++) {
     // neighbor across side s
     const nq = tile.q + HEX_DIRS[s][0];
     const nr = tile.r + HEX_DIRS[s][1];
     const nTile = this._getTile(nq, nr);
+    const neighborQuality = this._classifyNeighborDetailForSeam(nTile);
 
     // the two corner tips that bound side s
     const iA = tips[s];
@@ -631,6 +660,26 @@ _stitchInteractiveToVisualEdges(tile, {
       const bHit = this._robustSampleHeight(Bx, Bz, primaryMesh, neighborMeshes, nearestAttr, By0);
       if (Number.isFinite(aHit)) Ay = aHit;
       if (Number.isFinite(bHit)) By = bHit;
+    }
+
+    if (neighborQuality !== 'high') {
+      const weight = neighborQuality === 'missing' ? 1.0 : 0.7;
+      if (Number.isFinite(Ay)) {
+        const curr = pos.getY(iA);
+        const blended = curr + (Ay - curr) * weight;
+        pos.setY(iA, blended);
+        this._updateGlobalFromValue?.(blended);
+        lockArray[iA] = 1;
+        Ay = blended;
+      }
+      if (Number.isFinite(By)) {
+        const curr = pos.getY(iB);
+        const blended = curr + (By - curr) * weight;
+        pos.setY(iB, blended);
+        this._updateGlobalFromValue?.(blended);
+        lockArray[iB] = 1;
+        By = blended;
+      }
     }
 
     // AB for projecting t along the edge segment
@@ -662,7 +711,7 @@ _stitchInteractiveToVisualEdges(tile, {
       if (r >= RIM_STRICT) {
         // true rim: snap exactly to straight line and keep it pinned
         pos.setY(i, yLine);
-        if (tile.locked) tile.locked[i] = 1;     // lock ONLY the rim
+        lockArray[i] = 1;     // lock ONLY the rim
         newLocks.add(i);
       } else {
         // inside the rim: we’ll feather (do NOT lock inner band)
@@ -679,11 +728,13 @@ _stitchInteractiveToVisualEdges(tile, {
         if (w < 0) w = 0; else if (w > 1) w = 1;
         w = w * w * (3 - 2 * w);                  // smoothstep
         pos.setY(i, y0 + (yLine - y0) * w);
+        lockArray[i] = 1;
       }
     }
   }
 
   pos.needsUpdate = true;
+  this._harmonizeCornerHeights(tile);
 
   // normals: compute fast on desktop; defer on mobile like elsewhere
   try {
@@ -761,6 +812,8 @@ _planarizeEdgeWhenNeighborMissing(tile, {
 
   const tips = this._selectCornerTipIndices?.(tile);
   if (!tips || tips.length < 6) return;
+  if (!tile.locked) tile.locked = new Uint8Array(pos.count);
+  const lockArray = tile.locked;
 
   for (let s = 0; s < 6; s++) {
     // neighbor across side s
@@ -803,7 +856,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
 
       if (r >= RIM_STRICT) {
         pos.setY(i, yLine);
-        if (tile.locked) tile.locked[i] = 1;  // keep edge flat until neighbor shows
+        lockArray[i] = 1;  // keep edge flat until neighbor shows
       } else {
         bandIdx.push({ i, r, yLine });
       }
@@ -817,12 +870,13 @@ _planarizeEdgeWhenNeighborMissing(tile, {
         w = Math.max(0, Math.min(1, w));
         w = w * w * (3 - 2 * w); // smoothstep
         pos.setY(i, y0 + (yLine - y0) * w);
-        if (tile.locked) tile.locked[i] = 1;
+        lockArray[i] = 1;
       }
     }
   }
 
   pos.needsUpdate = true;
+  this._harmonizeCornerHeights(tile);
 
   // Defer normals on mobile like elsewhere
   if (!this._isMobile) {
@@ -847,7 +901,139 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       if (!neighbor || neighbor.type !== 'interactive') continue;
       this._stitchInteractiveToVisualEdges(neighbor);
       this._planarizeEdgeWhenNeighborMissing(neighbor);
+      this._harmonizeCornerHeights(neighbor);
     }
+  }
+
+  _markHorizonDirty() {
+    this._horizonDirty = true;
+    this._nextHorizonUpdate = 0;
+  }
+
+  _tileCornerPriority(tile) {
+    if (!tile) return Infinity;
+    if (tile.type === 'visual') return 0;
+    if (tile.type === 'farfield') return 1;
+    if (tile.type === 'interactive') {
+      if (!tile._elevationFetched || !tile._phase?.fullDone) return 3;
+      return 2;
+    }
+    return 4;
+  }
+
+  _findNearestCornerVertex(tile, wx, wz, epsilon = 0.25) {
+    if (!tile || !tile.pos || !tile.grid?.group) return null;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const eps2 = epsilon * epsilon;
+    let best = null;
+    const tips = this._selectCornerTipIndices(tile);
+    const indices = tips && tips.length ? tips : Array.from({ length: pos.count }, (_, i) => i);
+    for (const idx of indices) {
+      if (idx == null || idx < 0 || idx >= pos.count) continue;
+      const vx = base.x + pos.getX(idx);
+      const vz = base.z + pos.getZ(idx);
+      const dx = vx - wx;
+      const dz = vz - wz;
+      const dist2 = dx * dx + dz * dz;
+      if (dist2 <= eps2 && (!best || dist2 < best.dist2)) {
+        best = { idx, height: pos.getY(idx), dist2 };
+      }
+    }
+    return best;
+  }
+
+  _setWorldVertexHeight(tile, wx, wz, targetY, epsilon = 0.18, indices = null, touched = null) {
+    if (!tile || !tile.pos || !tile.grid?.group) return false;
+    const pos = tile.pos;
+    const base = tile.grid.group.position;
+    const eps2 = epsilon * epsilon;
+    let updated = false;
+    const iterator = Array.isArray(indices) && indices.length
+      ? indices
+      : Array.from({ length: pos.count }, (_, i) => i);
+    for (const idx of iterator) {
+      const vx = base.x + pos.getX(idx);
+      const vz = base.z + pos.getZ(idx);
+      const dx = vx - wx;
+      const dz = vz - wz;
+      if (dx * dx + dz * dz <= eps2) {
+        pos.setY(idx, targetY);
+        if (!tile.locked) tile.locked = new Uint8Array(pos.count);
+        tile.locked[idx] = 1;
+        updated = true;
+      }
+    }
+    if (updated) {
+      pos.needsUpdate = true;
+      if (touched) touched.add(tile);
+    }
+    return updated;
+  }
+
+  _harmonizeCornerHeights(tile) {
+    if (!tile || !tile.pos || !tile.grid?.group) return;
+    const tips = this._selectCornerTipIndices(tile);
+    if (!tips || tips.length < 6) return;
+    const touched = new Set();
+    const base = tile.grid.group.position;
+    for (let s = 0; s < tips.length; s++) {
+      const idx = tips[s];
+      if (idx == null) continue;
+      const wx = base.x + tile.pos.getX(idx);
+      const wz = base.z + tile.pos.getZ(idx);
+      const neighborA = this._getTile(tile.q + HEX_DIRS[s][0], tile.r + HEX_DIRS[s][1]);
+      const neighborB = this._getTile(tile.q + HEX_DIRS[(s + 5) % 6][0], tile.r + HEX_DIRS[(s + 5) % 6][1]);
+      const candidates = [tile, neighborA, neighborB].filter((t) => t && t.pos && t.grid?.group);
+
+      let bestTile = null;
+      let bestData = null;
+      let bestPriority = Infinity;
+      for (const candidate of candidates) {
+        const vertex = this._findNearestCornerVertex(candidate, wx, wz, 0.28);
+        if (!vertex) continue;
+        const priority = this._tileCornerPriority(candidate);
+        if (priority < bestPriority || (priority === bestPriority && vertex.dist2 < (bestData?.dist2 ?? Infinity))) {
+          bestPriority = priority;
+          bestTile = candidate;
+          bestData = vertex;
+        }
+      }
+
+      let targetHeight = bestData?.height;
+      if (!Number.isFinite(targetHeight)) {
+        targetHeight = this.getHeightAt(wx, wz);
+      }
+      if (!Number.isFinite(targetHeight)) continue;
+
+      for (const candidate of candidates) {
+        const eps = candidate.type === 'visual' ? 0.3 : 0.2;
+        this._setWorldVertexHeight(candidate, wx, wz, targetHeight, eps, null, touched);
+      }
+    }
+    for (const t of touched) {
+      if (!t?.grid?.geometry) continue;
+      try {
+        if (!this._isMobile) t.grid.geometry.computeVertexNormals();
+        else {
+          if (!t._deferredNormalsUpdate) {
+            t._deferredNormalsUpdate = true;
+            if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+            this._deferredNormalsTiles.add(t);
+          }
+        }
+      } catch { }
+      this._pullGeometryToBuffers?.(t);
+      this._applyAllColorsGlobal?.(t);
+    }
+  }
+
+  _classifyNeighborDetailForSeam(tile) {
+    if (!tile) return 'missing';
+    if (tile.type !== 'interactive') return 'low';
+    if (!tile._elevationFetched) return 'low';
+    if (!tile._phase?.fullDone) return 'low';
+    return 'high';
   }
 
   // tighter rim: only the true outermost ring
@@ -1392,6 +1578,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     this._farfieldMerge.dirty = true;
     this._farfieldMerge.nextBuild = t + debounce;
     if (tile) tile._mergedDirty = true;
+    this._markHorizonDirty();
   }
 
   _disposeFarfieldMergedMesh() {
@@ -1405,6 +1592,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     this._farfieldMerge.nextBuild = 0;
     this._farfieldMerge.lastBuildCount = 0;
     this._restoreFarfieldTileVisibility();
+    this._markHorizonDirty();
   }
 
   _updateFarfieldMergedMesh({ force = false } = {}) {
@@ -1568,6 +1756,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     state.dirty = false;
     state.lastBuildTime = tNow;
     state.lastBuildCount = farTiles.length;
+    this._markHorizonDirty();
   }
 
   _restoreFarfieldTileVisibility() {
@@ -1612,34 +1801,57 @@ _planarizeEdgeWhenNeighborMissing(tile, {
   }
   _ensureFarfieldAdapter(tile) {
     if (!tile || tile.type !== 'farfield') return;
-    if (!tile._adapter) {
+    const segments = Math.max(3, Math.round(this.FARFIELD_ADAPTER_SEGMENTS || 6));
+    const outerCount = segments * 6;
+    const vertexCount = outerCount * 2;
+
+    const needRebuild =
+      !tile._adapter ||
+      tile._adapter.segments !== segments ||
+      !tile._adapter.posAttr ||
+      tile._adapter.posAttr.count !== vertexCount;
+
+    if (needRebuild) {
+      if (tile._adapter?.mesh) {
+        try {
+          tile.grid.group.remove(tile._adapter.mesh);
+          tile._adapter.mesh.geometry?.dispose?.();
+        } catch { /* noop */ }
+      }
+
       const geom = new THREE.BufferGeometry();
-      const posAttr = new THREE.BufferAttribute(new Float32Array(12 * 3), 3).setUsage(THREE.DynamicDrawUsage);
-      const colAttr = new THREE.BufferAttribute(new Float32Array(12 * 3), 3).setUsage(THREE.DynamicDrawUsage);
+      const posAttr = new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
+      const colAttr = new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
       geom.setAttribute('position', posAttr);
       geom.setAttribute('color', colAttr);
+
       const idx = [];
-      for (let i = 0; i < 6; i++) {
-        const next = (i + 1) % 6;
-        idx.push(i, next, 6 + next);
-        idx.push(i, 6 + next, 6 + i);
+      for (let i = 0; i < outerCount; i++) {
+        const next = (i + 1) % outerCount;
+        const apex = outerCount + i;
+        const apexNext = outerCount + next;
+        idx.push(i, next, apex);
+        idx.push(next, apexNext, apex);
       }
       geom.setIndex(idx);
+
       const mesh = new THREE.Mesh(geom, this._getFarfieldMaterial());
       mesh.frustumCulled = false;
       mesh.renderOrder = tile.grid.mesh ? tile.grid.mesh.renderOrder - 1 : -5;
       mesh.receiveShadow = true;
       mesh.castShadow = false;
       tile.grid.group.add(mesh);
-      const arr = colAttr.array;
-      for (let i = 0; i < arr.length; i += 3) {
-        arr[i] = arr[i + 1] = arr[i + 2] = 0.2;
+
+      const cArr = colAttr.array;
+      for (let i = 0; i < cArr.length; i += 3) {
+        cArr[i] = cArr[i + 1] = cArr[i + 2] = 0.22;
       }
       colAttr.needsUpdate = true;
-      tile._adapter = { mesh, geometry: geom, posAttr, colAttr };
-      this._markFarfieldAdapterDirty(tile);
+
+      tile._adapter = { mesh, geometry: geom, posAttr, colAttr, segments, outerCount };
     }
-    if (!tile._adapterDirty) return;
+
+    tile._adapterDirty = true;
     this._updateFarfieldAdapter(tile);
     tile._adapterDirty = false;
     const key = this._farfieldAdapterKey(tile);
@@ -1649,36 +1861,115 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     const adapter = tile?._adapter;
     if (!adapter) return;
     const posAttr = adapter.posAttr;
-    const pos = tile.pos;
+    const colAttr = adapter.colAttr;
+    const segments = adapter.segments || Math.max(3, Math.round(this.FARFIELD_ADAPTER_SEGMENTS || 6));
+    const outerCount = adapter.outerCount || segments * 6;
     const base = tile.grid.group.position;
     const innerRadius = this.tileRadius * FARFIELD_ADAPTER_INNER_RATIO;
-    const neighbors = this._gatherNeighborMeshes(tile.q, tile.r);
 
-    for (let i = 0; i < 6; i++) {
-      const angle = (Math.PI / 3) * i;
-      const ix = innerRadius * Math.cos(angle);
-      const iz = innerRadius * Math.sin(angle);
-      const wx = base.x + ix;
-      const wz = base.z + iz;
-      let iy = null;
-      if (neighbors.length) {
+    const neighborMeshes = [];
+    for (const [dq, dr] of HEX_DIRS) {
+      const n = this._getTile(tile.q + dq, tile.r + dr);
+      if (!n || n.type === 'farfield') continue;
+      const mesh = this._getMeshForTile(n);
+      if (mesh) neighborMeshes.push(mesh);
+    }
+
+    const sampleNeighborHeight = (wx, wz, fallback) => {
+      if (neighborMeshes.length) {
         this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
-        const hits = this.ray.intersectObjects(neighbors, true);
+        const hits = this.ray.intersectObjects(neighborMeshes, true);
         if (hits && hits.length) {
-          const hit = hits[0];
-          if (Number.isFinite(hit.point.y)) iy = hit.point.y;
+          const y = hits[0]?.point?.y;
+          if (Number.isFinite(y)) return y;
         }
       }
-      if (!Number.isFinite(iy)) {
-        iy = this._approxTileHeight(tile, ix, iz);
+      return fallback;
+    };
+
+    const setColor = (idx, lum) => {
+      const o = idx * 3;
+      colAttr.array[o] = colAttr.array[o + 1] = colAttr.array[o + 2] = lum;
+    };
+
+    const outerVertices = [];
+    const corners = this._hexCorners(this.tileRadius);
+    let idx = 0;
+    const outerLum = this.LUM_MAX;
+
+    for (let s = 0; s < 6; s++) {
+      const a = corners[s];
+      const b = corners[(s + 1) % 6];
+      for (let k = 0; k <= segments; k++) {
+        if (s > 0 && k === 0) continue; // skip duplicate corner
+        if (s === 5 && k === segments) continue; // avoid wrapping duplicate
+        const t = k / segments;
+        const lx = a.x + (b.x - a.x) * t;
+        const lz = a.z + (b.z - a.z) * t;
+        const wx = base.x + lx;
+        const wz = base.z + lz;
+        let height = sampleNeighborHeight(wx, wz, this._approxTileHeight(tile, lx, lz));
+        if (!Number.isFinite(height)) height = this._approxTileHeight(tile, lx, lz);
+        posAttr.setXYZ(idx, lx, height, lz);
+        setColor(idx, outerLum);
+        outerVertices[idx] = { x: lx, z: lz, y: height };
+        idx++;
       }
-      posAttr.setXYZ(i, ix, iy, iz);
     }
-    for (let i = 0; i < 6; i++) {
-      const idx = 6 + i;
-      posAttr.setXYZ(idx, pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1));
+
+    const maxShiftFactor = Math.max(1e-3, this.tileRadius - innerRadius);
+
+    for (let i = 0; i < outerCount; i++) {
+      const next = (i + 1) % outerCount;
+      const curr = outerVertices[i];
+      const nxt = outerVertices[next];
+      const edgeX = nxt.x - curr.x;
+      const edgeZ = nxt.z - curr.z;
+      const baseLen = Math.hypot(edgeX, edgeZ);
+      if (baseLen < 1e-6) {
+        posAttr.setXYZ(outerCount + i, curr.x, curr.y, curr.z);
+        setColor(outerCount + i, this.LUM_MIN);
+        continue;
+      }
+
+      const midX = (curr.x + nxt.x) * 0.5;
+      const midZ = (curr.z + nxt.z) * 0.5;
+
+      let normalX = -edgeZ / baseLen;
+      let normalZ = edgeX / baseLen;
+      const toCenterDot = midX * normalX + midZ * normalZ;
+      if (toCenterDot < 0) {
+        normalX *= -1;
+        normalZ *= -1;
+      }
+
+      let desiredShift = baseLen * EQ_TRI_ALTITUDE_SCALE;
+      const midRadius = Math.hypot(midX, midZ);
+      const maxShift = Math.max(0, midRadius - innerRadius);
+      if (maxShift <= 1e-4) {
+        desiredShift = Math.min(desiredShift, maxShiftFactor * 0.25);
+      } else {
+        desiredShift = Math.min(desiredShift, maxShift);
+      }
+
+      const innerX = midX - normalX * desiredShift;
+      const innerZ = midZ - normalZ * desiredShift;
+      const wx = base.x + innerX;
+      const wz = base.z + innerZ;
+
+      const farfieldHeight = this._approxTileHeight(tile, innerX, innerZ);
+      const neighborHeight = sampleNeighborHeight(wx, wz, farfieldHeight);
+      const blend = maxShift > 1e-4 ? THREE.MathUtils.clamp(desiredShift / maxShift, 0, 1) : 1;
+      const smoothBlend = THREE.MathUtils.smoothstep(0, 1, blend);
+      const innerY = THREE.MathUtils.lerp(neighborHeight, farfieldHeight, smoothBlend);
+
+      posAttr.setXYZ(outerCount + i, innerX, innerY, innerZ);
+      const innerLum = THREE.MathUtils.lerp(outerLum, this.LUM_MIN, smoothBlend);
+      setColor(outerCount + i, innerLum);
     }
+
     posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
     try { adapter.geometry.computeVertexNormals(); } catch { }
   }
   _refreshFarfieldAdapters(q0, r0) {
@@ -1708,6 +1999,218 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       processed++;
     }
   }
+
+  _computeFarfieldOuterRadius() {
+    let maxRadius = this.tileRadius * (this.FARFIELD_RING + 1);
+    for (const tile of this.tiles.values()) {
+      if (!tile || tile.type !== 'farfield') continue;
+      const center = this._axialWorld(tile.q, tile.r);
+      const tileRadius = Number.isFinite(tile._radiusOverride)
+        ? tile._radiusOverride
+        : this.tileRadius * Math.max(1, tile.scale || 1);
+      const dist = Math.hypot(center.x, center.z) + tileRadius;
+      if (dist > maxRadius) maxRadius = dist;
+    }
+    return maxRadius;
+  }
+
+  _sampleHorizonHeight(x, z, fallback = this._lastHeight) {
+    const mergeMesh = this._farfieldMerge?.mesh;
+    if (mergeMesh) {
+      const origin = this._tmpHorizonVec.set(x, 100000, z);
+      this.ray.set(origin, this.DOWN);
+      const hits = this.ray.intersectObject(mergeMesh, true);
+      if (hits && hits.length) {
+        const y = hits[0]?.point?.y;
+        if (Number.isFinite(y)) return y;
+      }
+    }
+    const h = this.getHeightAt(x, z);
+    if (Number.isFinite(h)) return h;
+    return fallback;
+  }
+
+  _initHorizonField() {
+    if (this._horizonField || !this.scene) return;
+    const segments = Math.max(12, Math.round(this.HORIZON_SEGMENTS || 48));
+    const radialSteps = Math.max(2, Math.round(this.HORIZON_RADIAL_STEPS || 3));
+    const vertCount = segments * radialSteps;
+
+    const geom = new THREE.BufferGeometry();
+    const posAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    const uvAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 2), 2).setUsage(THREE.DynamicDrawUsage);
+    const colAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    geom.setAttribute('position', posAttr);
+    geom.setAttribute('uv', uvAttr);
+    geom.setAttribute('color', colAttr);
+
+    const indices = [];
+    for (let r = 0; r < radialSteps - 1; r++) {
+      const ringStart = r * segments;
+      const nextRingStart = (r + 1) * segments;
+      for (let s = 0; s < segments; s++) {
+        const next = (s + 1) % segments;
+        indices.push(ringStart + s, nextRingStart + s, nextRingStart + next);
+        indices.push(ringStart + s, nextRingStart + next, ringStart + next);
+      }
+    }
+    geom.setIndex(indices);
+
+    const baseMat = this._getFarfieldMaterial();
+    const material = baseMat.clone();
+    material.name = 'HorizonFieldMaterial';
+    material.vertexColors = true;
+    material.transparent = false;
+    material.depthWrite = true;
+    material.side = THREE.FrontSide;
+    material.toneMapped = true;
+
+    const mesh = new THREE.Mesh(geom, material);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = -20;
+    mesh.receiveShadow = false;
+    mesh.castShadow = false;
+    mesh.layers.set(1);
+    this.scene.add(mesh);
+
+    const colArr = colAttr.array;
+    for (let i = 0; i < colArr.length; i += 3) {
+      colArr[i] = 0.22;
+      colArr[i + 1] = 0.24;
+      colArr[i + 2] = 0.27;
+    }
+    colAttr.needsUpdate = true;
+
+    this._horizonField = {
+      mesh,
+      geometry: geom,
+      posAttr,
+      uvAttr,
+      colAttr,
+      segments,
+      radialSteps,
+      angles: new Float32Array(segments),
+      weights: new Float32Array(segments),
+      focusGain: new Float32Array(segments),
+      innerHeights: new Float32Array(segments),
+      innerRadius: 0,
+      outerRadius: 0,
+    };
+    this._horizonDirty = true;
+    this._nextHorizonUpdate = 0;
+  }
+
+  _disposeHorizonField() {
+    if (!this._horizonField) return;
+    try {
+      this.scene.remove(this._horizonField.mesh);
+      this._horizonField.geometry?.dispose?.();
+      this._horizonField.mesh.material?.dispose?.();
+    } catch { /* noop */ }
+    this._horizonField = null;
+  }
+
+  _updateHorizonField(playerPos, deltaTime = 0) {
+    if (!this._horizonField) {
+      this._initHorizonField();
+      if (!this._horizonField) return;
+    }
+    const hf = this._horizonField;
+    const now = performance?.now ? performance.now() : Date.now();
+    const velocity = this._playerVelocity.length();
+    const needFocus = velocity > this.HORIZON_FOCUS_THRESHOLD;
+    if (!this._horizonDirty && now < this._nextHorizonUpdate && !needFocus) return;
+
+    const innerRadius = Math.max(
+      this._computeFarfieldOuterRadius() + this.HORIZON_INNER_GAP,
+      this.tileRadius * (this.VISUAL_RING + this.FARFIELD_EXTRA * 0.5)
+    );
+    const outerRadius = Math.max(
+      innerRadius + this.HORIZON_EXTRA_METERS,
+      this.HORIZON_TARGET_RADIUS
+    );
+
+    const segments = hf.segments;
+    const radialSteps = hf.radialSteps;
+    const weights = hf.weights;
+    const focusGain = hf.focusGain;
+    const angles = hf.angles;
+    const innerHeights = hf.innerHeights;
+
+    const focusDir = needFocus ? Math.atan2(this._playerVelocity.z, this._playerVelocity.x) : null;
+    let totalWeight = 0;
+    for (let i = 0; i < segments; i++) {
+      const baseAngle = (i / segments) * TAU;
+      let weight = 1;
+      let gain = 0;
+      if (focusDir !== null) {
+        const diff = Math.atan2(Math.sin(baseAngle - focusDir), Math.cos(baseAngle - focusDir));
+        gain = Math.max(0, Math.cos(diff));
+        weight += this.HORIZON_FOCUS_STRENGTH * gain * gain;
+      }
+      weights[i] = weight;
+      focusGain[i] = gain;
+      totalWeight += weight;
+    }
+    if (!Number.isFinite(totalWeight) || totalWeight <= 0) totalWeight = segments;
+
+    let cumulative = 0;
+    for (let i = 0; i < segments; i++) {
+      const w = weights[i];
+      const start = cumulative / totalWeight;
+      cumulative += w;
+      const end = cumulative / totalWeight;
+      angles[i] = ((start + end) * 0.5) * TAU;
+    }
+
+    const posAttr = hf.posAttr;
+    const uvAttr = hf.uvAttr;
+
+    const baseHeight = this._lastHeight;
+    for (let i = 0; i < segments; i++) {
+      const angle = angles[i];
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+      const x = innerRadius * cosA;
+      const z = innerRadius * sinA;
+      const y = this._sampleHorizonHeight(x, z, baseHeight);
+      innerHeights[i] = y;
+      posAttr.setXYZ(i, x, y, z);
+      uvAttr.setXY(i, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
+    }
+
+    for (let band = 1; band < radialSteps; band++) {
+      const bandT = band / (radialSteps - 1);
+      const radius = THREE.MathUtils.lerp(innerRadius, outerRadius, Math.pow(bandT, 1.15));
+      const heightBlend = Math.pow(bandT, 1.6);
+      for (let i = 0; i < segments; i++) {
+        const angle = angles[i];
+        let radial = radius;
+        if (focusDir !== null && band === radialSteps - 1) {
+          radial += radius * 0.12 * focusGain[i];
+        }
+        const x = radial * Math.cos(angle);
+        const z = radial * Math.sin(angle);
+        const innerY = innerHeights[i];
+        const farY = innerY * 0.25;
+        const y = THREE.MathUtils.lerp(innerY, farY, heightBlend);
+        const idx = band * segments + i;
+        posAttr.setXYZ(idx, x, y, z);
+        uvAttr.setXY(idx, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
+      }
+    }
+
+    posAttr.needsUpdate = true;
+    uvAttr.needsUpdate = true;
+    try { hf.geometry.computeVertexNormals(); } catch { }
+
+    hf.innerRadius = innerRadius;
+    hf.outerRadius = outerRadius;
+    hf.mesh.visible = true;
+    this._horizonDirty = false;
+    this._nextHorizonUpdate = now + this.HORIZON_UPDATE_INTERVAL_MS;
+  }
+
   _forEachAxialRing(q0, r0, radius, step, cb) {
     step = Math.max(1, Math.floor(step));
     if (radius <= 0) { cb(q0, r0); return; }
@@ -4356,6 +4859,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       this._queuePopulate(tile, false);
     }
     this._markFarfieldMergeDirty(tile);
+    this._markHorizonDirty();
     return tile;
   }
 
@@ -5959,6 +6463,7 @@ _kickFarfieldIfIdle() {
       }
 
       this._updateFarfieldMergedMesh();
+      this._updateHorizonField(playerPos, deltaTime);
       const treeRefreshPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 3, this._treeComplexity ?? 0.35)));
       this._serviceTreeRefresh(treeRefreshPerFrame);
 
@@ -6602,6 +7107,7 @@ _applyPendingSamples() {
         this._prewarmFarfieldRing(0, 0);
       }
     }
+    this._markHorizonDirty();
     this._scheduleBackfill(0);
   }
 
@@ -6998,12 +7504,14 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     if (Number.isFinite(q) && Number.isFinite(r)) {
       this._restitchInteractiveNeighbors(q, r);
     }
+    this._markHorizonDirty();
   }
 
   _resetAllTiles() {
     for (const id of Array.from(this.tiles.keys())) this._discardTile(id);
     this.tiles.clear();
     this._disposeFarfieldMergedMesh();
+    this._disposeHorizonField();
     this._populateQueue.length = 0;
     this._populateBusy = false;
     this.GLOBAL_MIN_Y = +Infinity;
