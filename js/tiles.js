@@ -165,8 +165,8 @@ export class TileManager {
     this.RELAX_FRAME_BUDGET_MS = this._isMobile ? 0.5 : 1;  // Mobile: tighter budget
 
     // ---- GLOBAL grayscale controls (altitude => luminance) ----
-    this.LUM_MIN = 0.20;
-    this.LUM_MAX = 0.26;
+    this.LUM_MIN = 0.20;   
+    this.LUM_MAX = 0.26; 
     this.GLOBAL_MIN_Y = +Infinity;
     this.GLOBAL_MAX_Y = -Infinity;
     this._globalDirty = false;
@@ -495,349 +495,359 @@ export class TileManager {
     return out;
   }
 
-  /* =======================
-     Overlay handoff helpers
-     ======================= */
+/* =======================
+   Overlay handoff helpers
+   ======================= */
 
-  // Keeps a short-lived cache of overlay entries by tile id ("q,r")
-  _initOverlayHandoffMap() {
-    if (!this._overlayHandoff) this._overlayHandoff = new Map();
+// Keeps a short-lived cache of overlay entries by tile id ("q,r")
+_initOverlayHandoffMap() {
+  if (!this._overlayHandoff) this._overlayHandoff = new Map();
+}
+
+// Capture the overlay from an existing tile before it is discarded
+_stashOverlayForId(id, tile) {
+  this._initOverlayHandoffMap();
+  if (!tile || !tile._overlay) return;
+  const cacheKey = tile._overlay.cacheKey;
+  const entry = cacheKey ? this._overlayCache?.get(cacheKey) : tile._overlay.entry;
+  const texture = entry?.texture || tile.grid?.mesh?.material?.map;
+  if (!texture) return;
+
+  this._overlayHandoff.set(id, {
+    cacheKey: cacheKey || null,
+    entry: entry || null,
+    texture
+  });
+
+  // Auto-expire to avoid leaks if a new tile isn't created immediately
+  if (this._overlayHandoffTimer) clearTimeout(this._overlayHandoffTimer);
+  this._overlayHandoffTimer = setTimeout(() => this._overlayHandoff.clear(), 1500);
+}
+
+// Apply (and consume) a previously stashed overlay to a newly created tile
+_applyOverlayHandoff(id, tile) {
+  this._initOverlayHandoffMap();
+  const hand = this._overlayHandoff.get(id);
+  if (!hand || !tile || !tile.grid?.mesh) return false;
+
+  // Mark overlay as "ready" on the new tile so _ensureTileOverlay() is a no-op
+  tile._overlay = tile._overlay || {};
+  tile._overlay.status = 'ready';
+  tile._overlay.cacheKey = hand.cacheKey || tile._overlay.cacheKey || null;
+  tile._overlay.entry = hand.entry || tile._overlay.entry || null;
+
+  // Reuse the exact same texture object to avoid a visible change
+  try {
+    this._applyOverlayTexture(tile, hand.texture);
+  } catch (e) {
+    // Fallback: nothing fatal; let normal ensure path run later
+    console.warn('[Tiles] overlay handoff failed, will re-ensure:', e);
+    tile._overlay.status = 'pending';
   }
 
-  // Capture the overlay from an existing tile before it is discarded
-  _stashOverlayForId(id, tile) {
-    this._initOverlayHandoffMap();
-    if (!tile || !tile._overlay) return;
-    const cacheKey = tile._overlay.cacheKey;
-    const entry = cacheKey ? this._overlayCache?.get(cacheKey) : tile._overlay.entry;
-    const texture = entry?.texture || tile.grid?.mesh?.material?.map;
-    if (!texture) return;
+  this._overlayHandoff.delete(id);
+  return true;
+}
 
-    this._overlayHandoff.set(id, {
-      cacheKey: cacheKey || null,
-      entry: entry || null,
-      texture
-    });
+// Direct tile→tile handoff (used during promote where both tiles exist briefly)
+_handoffOverlayBetweenTiles(fromTile, toTile) {
+  if (!fromTile || !toTile) return false;
+  const id = `${toTile.q},${toTile.r}`;
+  // Prefer explicit cache entry; fall back to live material.map
+  const cacheKey = fromTile._overlay?.cacheKey || null;
+  const entry = cacheKey ? this._overlayCache?.get(cacheKey) : (fromTile._overlay?.entry || null);
+  const texture = entry?.texture || fromTile.grid?.mesh?.material?.map;
+  if (!texture) return false;
 
-    // Auto-expire to avoid leaks if a new tile isn't created immediately
-    if (this._overlayHandoffTimer) clearTimeout(this._overlayHandoffTimer);
-    this._overlayHandoffTimer = setTimeout(() => this._overlayHandoff.clear(), 1500);
+  toTile._overlay = toTile._overlay || {};
+  toTile._overlay.status = 'ready';
+  toTile._overlay.cacheKey = cacheKey;
+  toTile._overlay.entry = entry || null;
+
+  try {
+    this._applyOverlayTexture(toTile, texture);
+  } catch (e) {
+    console.warn('[Tiles] direct overlay handoff failed:', e);
+    toTile._overlay.status = 'pending';
+    return false;
   }
-
-  // Apply (and consume) a previously stashed overlay to a newly created tile
-  _applyOverlayHandoff(id, tile) {
-    this._initOverlayHandoffMap();
-    const hand = this._overlayHandoff.get(id);
-    if (!hand || !tile || !tile.grid?.mesh) return false;
-
-    // Mark overlay as "ready" on the new tile so _ensureTileOverlay() is a no-op
-    tile._overlay = tile._overlay || {};
-    tile._overlay.status = 'ready';
-    tile._overlay.cacheKey = hand.cacheKey || tile._overlay.cacheKey || null;
-    tile._overlay.entry = hand.entry || tile._overlay.entry || null;
-
-    // Reuse the exact same texture object to avoid a visible change
-    try {
-      this._applyOverlayTexture(tile, hand.texture);
-    } catch (e) {
-      // Fallback: nothing fatal; let normal ensure path run later
-      console.warn('[Tiles] overlay handoff failed, will re-ensure:', e);
-      tile._overlay.status = 'pending';
-    }
-
-    this._overlayHandoff.delete(id);
-    return true;
-  }
-
-  // Direct tile→tile handoff (used during promote where both tiles exist briefly)
-  _handoffOverlayBetweenTiles(fromTile, toTile) {
-    if (!fromTile || !toTile) return false;
-    const id = `${toTile.q},${toTile.r}`;
-    // Prefer explicit cache entry; fall back to live material.map
-    const cacheKey = fromTile._overlay?.cacheKey || null;
-    const entry = cacheKey ? this._overlayCache?.get(cacheKey) : (fromTile._overlay?.entry || null);
-    const texture = entry?.texture || fromTile.grid?.mesh?.material?.map;
-    if (!texture) return false;
-
-    toTile._overlay = toTile._overlay || {};
-    toTile._overlay.status = 'ready';
-    toTile._overlay.cacheKey = cacheKey;
-    toTile._overlay.entry = entry || null;
-
-    try {
-      this._applyOverlayTexture(toTile, texture);
-    } catch (e) {
-      console.warn('[Tiles] direct overlay handoff failed:', e);
-      toTile._overlay.status = 'pending';
-      return false;
-    }
-    // Also stash for safety in case code later discards/creates again this tick
-    this._stashOverlayForId(id, { _overlay: { cacheKey }, grid: { mesh: { material: { map: texture } } } });
-    return true;
-  }
+  // Also stash for safety in case code later discards/creates again this tick
+  this._stashOverlayForId(id, { _overlay: { cacheKey }, grid: { mesh: { material: { map: texture } } } });
+  return true;
+}
 
 
 
   // only locks the true rim (not the inner band), and uses a robust height sampler.
-  //
-  // - If the neighbor tile is visual/farfield: sample its mesh to define the straight edge.
-  // - If the neighbor is missing/unfetched: planarize to the straight line between OUR two corner tips.
-  // - Feather a short band inward so there are no kinks.
-  // - Lock ONLY the rim vertices so the relaxer won’t open cracks, but inner band can still smooth.
+//
+// - If the neighbor tile is visual/farfield: sample its mesh to define the straight edge.
+// - If the neighbor is missing/unfetched: planarize to the straight line between OUR two corner tips.
+// - Feather a short band inward so there are no kinks.
+// - Lock ONLY the rim vertices so the relaxer won’t open cracks, but inner band can still smooth.
 
-  _stitchInteractiveToVisualEdges(tile, {
-    bandRatio = 0.07,              // ~7% of radius inward is blended
-    sideArc = Math.PI / 10       // angular width considered "this side"
-  } = {}) {
-    if (!tile || tile.type !== 'interactive') return;
+_stitchInteractiveToVisualEdges(tile, {
+  bandRatio = 0.07,              // ~7% of radius inward is blended
+  sideArc   = Math.PI / 10       // angular width considered "this side"
+} = {}) {
+  if (!tile || tile.type !== 'interactive') return;
 
-    const pos = tile.pos;
-    const aR = this.tileRadius;
-    const base = tile.grid.group.position;
-    const tips = this._selectCornerTipIndices(tile);
-    if (!tips || tips.length < 6) return;
+  const pos  = tile.pos;
+  const aR   = this.tileRadius;
+  const base = tile.grid.group.position;
+  const tips = this._selectCornerTipIndices(tile);
+  if (!tips || tips.length < 6) return;
 
-    // angular centers for the 6 sides (halfway between corners)
-    const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
-    const RIM_STRICT = aR * 0.985;                                           // true outer rim
-    const BAND_INNER = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio)));  // inner edge of blend band
+  // angular centers for the 6 sides (halfway between corners)
+  const sideAng    = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+  const RIM_STRICT = aR * 0.985;                                           // true outer rim
+  const BAND_INNER = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio)));  // inner edge of blend band
 
-    const newLocks = new Set();
+  const newLocks = new Set();
 
-    for (let s = 0; s < 6; s++) {
-      // neighbor across side s
-      const nq = tile.q + HEX_DIRS[s][0];
-      const nr = tile.r + HEX_DIRS[s][1];
-      const nTile = this._getTile(nq, nr);
+  for (let s = 0; s < 6; s++) {
+    // neighbor across side s
+    const nq = tile.q + HEX_DIRS[s][0];
+    const nr = tile.r + HEX_DIRS[s][1];
+    const nTile = this._getTile(nq, nr);
 
-      // the two corner tips that bound side s
-      const iA = tips[s];
-      const iB = tips[(s + 1) % 6];
-      if (iA == null || iB == null) continue;
+    // the two corner tips that bound side s
+    const iA = tips[s];
+    const iB = tips[(s + 1) % 6];
+    if (iA == null || iB == null) continue;
 
-      // world positions of those corner tips on THIS tile
-      const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA), Ay0 = pos.getY(iA);
-      const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB), By0 = pos.getY(iB);
+    // world positions of those corner tips on THIS tile
+    const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA), Ay0 = pos.getY(iA);
+    const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB), By0 = pos.getY(iB);
 
-      // Determine authoritative heights along the shared edge:
-      // - If neighbor exists and is non-interactive, sample it robustly.
-      // - Otherwise (missing neighbor), fall back to our own corner heights (planarize).
-      let Ay = Ay0, By = By0;
-      if (nTile && nTile.type !== 'interactive') {
-        const primaryMesh = this._getMeshForTile(nTile);
-        const neighborMeshes = []; // (hook for merged/adapter meshes if you have them)
-        const nearestAttr = nTile.grid?.geometry?.getAttribute?.('position');
-        const aHit = this._robustSampleHeight(Ax, Az, primaryMesh, neighborMeshes, nearestAttr, Ay0);
-        const bHit = this._robustSampleHeight(Bx, Bz, primaryMesh, neighborMeshes, nearestAttr, By0);
-        if (Number.isFinite(aHit)) Ay = aHit;
-        if (Number.isFinite(bHit)) By = bHit;
-      }
+    // Determine authoritative heights along the shared edge:
+    // - If neighbor exists and is non-interactive, sample it robustly.
+    // - Otherwise (missing neighbor), fall back to our own corner heights (planarize).
+    let Ay = Ay0, By = By0;
+    if (nTile && nTile.type !== 'interactive') {
+      const primaryMesh   = this._getMeshForTile(nTile);
+      const neighborMeshes = []; // (hook for merged/adapter meshes if you have them)
+      const nearestAttr    = nTile.grid?.geometry?.getAttribute?.('position');
+      const aHit = this._robustSampleHeight(Ax, Az, primaryMesh, neighborMeshes, nearestAttr, Ay0);
+      const bHit = this._robustSampleHeight(Bx, Bz, primaryMesh, neighborMeshes, nearestAttr, By0);
+      if (Number.isFinite(aHit)) Ay = aHit;
+      if (Number.isFinite(bHit)) By = bHit;
+    }
 
-      // AB for projecting t along the edge segment
-      const ABx = (Bx - Ax), ABz = (Bz - Az);
-      const denom = ABx * ABx + ABz * ABz;
-      if (denom < 1e-8) continue;
+    // AB for projecting t along the edge segment
+    const ABx = (Bx - Ax), ABz = (Bz - Az);
+    const denom = ABx * ABx + ABz * ABz;
+    if (denom < 1e-8) continue;
 
-      // pass 1: snap the *rim* exactly to the straight line; collect inner-band verts to feather
-      const bandIdx = [];
-      for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i), z = pos.getZ(i);
-        const r = Math.hypot(x, z);
-        if (r < BAND_INNER) continue; // only edge band and rim
+    // pass 1: snap the *rim* exactly to the straight line; collect inner-band verts to feather
+    const bandIdx = [];
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+      if (r < BAND_INNER) continue; // only edge band and rim
 
-        // Is this vertex aligned with side s by angle?
-        const a = this._angleOf(x, z);
-        const d = this._angDiff(a, sideAng[s]);
-        if (d > sideArc) continue;
+      // Is this vertex aligned with side s by angle?
+      const a = this._angleOf(x, z);
+      const d = this._angDiff(a, sideAng[s]);
+      if (d > sideArc) continue;
 
-        const wx = base.x + x, wz = base.z + z;
-        // param t along AB (0 at A, 1 at B)
-        let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
-        if (!Number.isFinite(t)) t = 0;
-        if (t < 0) t = 0; else if (t > 1) t = 1;
+      const wx = base.x + x, wz = base.z + z;
+      // param t along AB (0 at A, 1 at B)
+      let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
+      if (!Number.isFinite(t)) t = 0;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
 
-        // straight-line height at this edge point
-        const yLine = Ay + t * (By - Ay);
+      // straight-line height at this edge point
+      const yLine = Ay + t * (By - Ay);
 
-        if (r >= RIM_STRICT) {
-          // true rim: snap exactly to straight line and keep it pinned
-          pos.setY(i, yLine);
-          if (tile.locked) tile.locked[i] = 1;     // lock ONLY the rim
-          newLocks.add(i);
-        } else {
-          // inside the rim: we’ll feather (do NOT lock inner band)
-          bandIdx.push({ i, r, yLine });
-        }
-      }
-
-      // pass 2: feather the inner band (smoothly blend original -> line as we approach the rim)
-      if (bandIdx.length) {
-        const span = Math.max(1e-4, aR - BAND_INNER);
-        for (const { i, r, yLine } of bandIdx) {
-          const y0 = pos.getY(i);
-          let w = (r - BAND_INNER) / span;          // 0 at BAND_INNER, 1 at rim
-          if (w < 0) w = 0; else if (w > 1) w = 1;
-          w = w * w * (3 - 2 * w);                  // smoothstep
-          pos.setY(i, y0 + (yLine - y0) * w);
-        }
+      if (r >= RIM_STRICT) {
+        // true rim: snap exactly to straight line and keep it pinned
+        pos.setY(i, yLine);
+        if (tile.locked) tile.locked[i] = 1;     // lock ONLY the rim
+        newLocks.add(i);
+      } else {
+        // inside the rim: we’ll feather (do NOT lock inner band)
+        bandIdx.push({ i, r, yLine });
       }
     }
 
-    pos.needsUpdate = true;
-
-    // normals: compute fast on desktop; defer on mobile like elsewhere
-    try {
-      if (!this._isMobile) {
-        tile.grid.geometry.computeVertexNormals();
-      } else if (tile.grid?.geometry) {
-        if (!tile._deferredNormalsUpdate) {
-          tile._deferredNormalsUpdate = true;
-          if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
-          this._deferredNormalsTiles.add(tile);
-        }
+    // pass 2: feather the inner band (smoothly blend original -> line as we approach the rim)
+    if (bandIdx.length) {
+      const span = Math.max(1e-4, aR - BAND_INNER);
+      for (const { i, r, yLine } of bandIdx) {
+        const y0 = pos.getY(i);
+        let w = (r - BAND_INNER) / span;          // 0 at BAND_INNER, 1 at rim
+        if (w < 0) w = 0; else if (w > 1) w = 1;
+        w = w * w * (3 - 2 * w);                  // smoothstep
+        pos.setY(i, y0 + (yLine - y0) * w);
       }
-    } catch { }
-
-    // keep CPU buffers & color in sync for relax/coloring:
-    this._pullGeometryToBuffers?.(tile);
-    this._applyAllColorsGlobal?.(tile);
-
-    // Update lock set: unlock any previous rim verts that are no longer part of this pass.
-    if (!tile._visualEdgeLocks) tile._visualEdgeLocks = new Set();
-    for (const idx of tile._visualEdgeLocks) {
-      if (!newLocks.has(idx) && tile.locked) tile.locked[idx] = 0;
     }
-    tile._visualEdgeLocks = newLocks;
   }
 
-  // Robust sampler used above: unchanged in signature, but safe for missing meshes and provides
-  // a nearest-vertex fallback when raycasts miss (e.g., merged farfield or adapter quads).
-  _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
-    this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+  pos.needsUpdate = true;
 
-    if (primaryMesh) {
-      const hit = this.ray.intersectObject(primaryMesh, true);
-      if (hit && hit.length) return hit[0].point.y;
-    }
-    if (neighborMeshes && neighborMeshes.length) {
-      for (let i = 0; i < neighborMeshes.length; i++) {
-        const hit = this.ray.intersectObject(neighborMeshes[i], true);
-        if (hit && hit.length) return hit[0].point.y;
-      }
-    }
-
-    if (nearestGeomAttr?.isBufferAttribute) {
-      let best = Infinity, bestY = approx;
-      const arr = nearestGeomAttr.array;
-      const px = (primaryMesh?.parent?.position.x || 0);
-      const pz = (primaryMesh?.parent?.position.z || 0);
-      for (let i = 0; i < arr.length; i += 3) {
-        const dx = (arr[i] + px) - wx;
-        const dz = (arr[i + 2] + pz) - wz;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < best) { best = d2; bestY = arr[i + 1]; }
-      }
-      return bestY;
-    }
-
-    return approx;
-  }
-
-  // When a neighbor is missing (not yet fetched), keep our shared side planar
-  // so there’s never a crack when the neighbor arrives later.
-  _planarizeEdgeWhenNeighborMissing(tile, {
-    bandRatio = 0.06,        // ~6% of radius inward
-    sideArc = Math.PI / 10   // angular width considered "this side"
-  } = {}) {
-    if (!tile || !tile.pos) return;
-    const pos = tile.pos;
-    const aR = this.tileRadius;
-    const base = tile.grid.group.position;
-
-    // same side centers as in _stitchInteractiveToVisualEdges
-    const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
-    const RIM_STRICT = aR * 0.985;
-    const BAND_INNER = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio)));
-
-    const tips = this._selectCornerTipIndices?.(tile);
-    if (!tips || tips.length < 6) return;
-
-    for (let s = 0; s < 6; s++) {
-      // neighbor across side s
-      const nq = tile.q + (HEX_DIRS[s]?.[0] ?? 0);
-      const nr = tile.r + (HEX_DIRS[s]?.[1] ?? 0);
-      const nTile = this._getTile(nq, nr);
-
-      // Only run this when neighbor doesn't exist yet
-      if (nTile) continue;
-
-      const iA = tips[s];
-      const iB = tips[(s + 1) % 6];
-      if (iA == null || iB == null) continue;
-
-      // Use our own corner heights to define the straight edge
-      const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA), Ay = pos.getY(iA);
-      const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB), By = pos.getY(iB);
-
-      const ABx = (Bx - Ax), ABz = (Bz - Az);
-      const denom = ABx * ABx + ABz * ABz; if (denom < 1e-8) continue;
-
-      const bandIdx = [];
-
-      for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i), z = pos.getZ(i);
-        const r = Math.hypot(x, z);
-        if (r < BAND_INNER) continue;
-
-        // Is this vertex aligned with side s by angle?
-        const a = this._angleOf(x, z);     // existing helper
-        const d = this._angDiff(a, sideAng[s]);  // existing helper
-        if (d > sideArc) continue;
-
-        const wx = base.x + x, wz = base.z + z;
-        let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
-        if (!Number.isFinite(t)) t = 0;
-        if (t < 0) t = 0; else if (t > 1) t = 1;
-
-        const yLine = Ay + t * (By - Ay);
-
-        if (r >= RIM_STRICT) {
-          pos.setY(i, yLine);
-          if (tile.locked) tile.locked[i] = 1;  // keep edge flat until neighbor shows
-        } else {
-          bandIdx.push({ i, r, yLine });
-        }
-      }
-
-      if (bandIdx.length) {
-        const span = Math.max(1e-4, aR - BAND_INNER);
-        for (const { i, r, yLine } of bandIdx) {
-          const y0 = pos.getY(i);
-          let w = (r - BAND_INNER) / span; // 0..1
-          w = Math.max(0, Math.min(1, w));
-          w = w * w * (3 - 2 * w); // smoothstep
-          pos.setY(i, y0 + (yLine - y0) * w);
-          if (tile.locked) tile.locked[i] = 1;
-        }
-      }
-    }
-
-    pos.needsUpdate = true;
-
-    // Defer normals on mobile like elsewhere
+  // normals: compute fast on desktop; defer on mobile like elsewhere
+  try {
     if (!this._isMobile) {
-      try { tile.grid.geometry.computeVertexNormals(); } catch { }
-    } else {
+      tile.grid.geometry.computeVertexNormals();
+    } else if (tile.grid?.geometry) {
       if (!tile._deferredNormalsUpdate) {
         tile._deferredNormalsUpdate = true;
         if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
         this._deferredNormalsTiles.add(tile);
       }
     }
+  } catch {}
 
-    // Keep CPU buffers & color in sync
-    this._pullGeometryToBuffers?.(tile);
-    this._applyAllColorsGlobal?.(tile);
+  // keep CPU buffers & color in sync for relax/coloring:
+  this._pullGeometryToBuffers?.(tile);
+  this._applyAllColorsGlobal?.(tile);
+
+  // Update lock set: unlock any previous rim verts that are no longer part of this pass.
+  if (!tile._visualEdgeLocks) tile._visualEdgeLocks = new Set();
+  for (const idx of tile._visualEdgeLocks) {
+    if (!newLocks.has(idx) && tile.locked) tile.locked[idx] = 0;
+  }
+  tile._visualEdgeLocks = newLocks;
+}
+
+// Robust sampler used above: unchanged in signature, but safe for missing meshes and provides
+// a nearest-vertex fallback when raycasts miss (e.g., merged farfield or adapter quads).
+_robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
+  this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+
+  if (primaryMesh) {
+    const hit = this.ray.intersectObject(primaryMesh, true);
+    if (hit && hit.length) return hit[0].point.y;
+  }
+  if (neighborMeshes && neighborMeshes.length) {
+    for (let i = 0; i < neighborMeshes.length; i++) {
+      const hit = this.ray.intersectObject(neighborMeshes[i], true);
+      if (hit && hit.length) return hit[0].point.y;
+    }
+  }
+
+  if (nearestGeomAttr?.isBufferAttribute) {
+    let best = Infinity, bestY = approx;
+    const arr = nearestGeomAttr.array;
+    const px = (primaryMesh?.parent?.position.x || 0);
+    const pz = (primaryMesh?.parent?.position.z || 0);
+    for (let i = 0; i < arr.length; i += 3) {
+      const dx = (arr[i]     + px) - wx;
+      const dz = (arr[i + 2] + pz) - wz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < best) { best = d2; bestY = arr[i + 1]; }
+    }
+    return bestY;
+  }
+
+  return approx;
+}
+
+// When a neighbor is missing (not yet fetched), keep our shared side planar
+// so there’s never a crack when the neighbor arrives later.
+_planarizeEdgeWhenNeighborMissing(tile, {
+  bandRatio = 0.06,        // ~6% of radius inward
+  sideArc = Math.PI / 10   // angular width considered "this side"
+} = {}) {
+  if (!tile || !tile.pos) return;
+  const pos = tile.pos;
+  const aR = this.tileRadius;
+  const base = tile.grid.group.position;
+
+  // same side centers as in _stitchInteractiveToVisualEdges
+  const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+  const RIM_STRICT = aR * 0.985;
+  const BAND_INNER = aR * (1 - Math.max(0.02, Math.min(0.2, bandRatio)));
+
+  const tips = this._selectCornerTipIndices?.(tile);
+  if (!tips || tips.length < 6) return;
+
+  for (let s = 0; s < 6; s++) {
+    // neighbor across side s
+    const nq = tile.q + (HEX_DIRS[s]?.[0] ?? 0);
+    const nr = tile.r + (HEX_DIRS[s]?.[1] ?? 0);
+    const nTile = this._getTile(nq, nr);
+
+    // Only run this when neighbor doesn't exist yet
+    if (nTile) continue;
+
+    const iA = tips[s];
+    const iB = tips[(s + 1) % 6];
+    if (iA == null || iB == null) continue;
+
+    // Use our own corner heights to define the straight edge
+    const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA), Ay = pos.getY(iA);
+    const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB), By = pos.getY(iB);
+
+    const ABx = (Bx - Ax), ABz = (Bz - Az);
+    const denom = ABx * ABx + ABz * ABz; if (denom < 1e-8) continue;
+
+    const bandIdx = [];
+
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+      if (r < BAND_INNER) continue;
+
+      // Is this vertex aligned with side s by angle?
+      const a = this._angleOf(x, z);     // existing helper
+      const d = this._angDiff(a, sideAng[s]);  // existing helper
+      if (d > sideArc) continue;
+
+      const wx = base.x + x, wz = base.z + z;
+      let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
+      if (!Number.isFinite(t)) t = 0;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+
+      const yLine = Ay + t * (By - Ay);
+
+      if (r >= RIM_STRICT) {
+        pos.setY(i, yLine);
+        if (tile.locked) tile.locked[i] = 1;  // keep edge flat until neighbor shows
+      } else {
+        bandIdx.push({ i, r, yLine });
+      }
+    }
+
+    if (bandIdx.length) {
+      const span = Math.max(1e-4, aR - BAND_INNER);
+      for (const { i, r, yLine } of bandIdx) {
+        const y0 = pos.getY(i);
+        let w = (r - BAND_INNER) / span; // 0..1
+        w = Math.max(0, Math.min(1, w));
+        w = w * w * (3 - 2 * w); // smoothstep
+        pos.setY(i, y0 + (yLine - y0) * w);
+        if (tile.locked) tile.locked[i] = 1;
+      }
+    }
+  }
+
+  pos.needsUpdate = true;
+
+  // Defer normals on mobile like elsewhere
+  if (!this._isMobile) {
+    try { tile.grid.geometry.computeVertexNormals(); } catch {}
+  } else {
+    if (!tile._deferredNormalsUpdate) {
+      tile._deferredNormalsUpdate = true;
+      if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+      this._deferredNormalsTiles.add(tile);
+    }
+  }
+
+  // Keep CPU buffers & color in sync
+  this._pullGeometryToBuffers?.(tile);
+  this._applyAllColorsGlobal?.(tile);
+}
+
+  _restitchInteractiveNeighbors(q, r) {
+    if (!Number.isFinite(q) || !Number.isFinite(r)) return;
+    for (const [dq, dr] of HEX_DIRS) {
+      const neighbor = this._getTile(q + dq, r + dr);
+      if (!neighbor || neighbor.type !== 'interactive') continue;
+      this._stitchInteractiveToVisualEdges(neighbor);
+      this._planarizeEdgeWhenNeighborMissing(neighbor);
+    }
   }
 
   // tighter rim: only the true outermost ring
@@ -4062,10 +4072,6 @@ export class TileManager {
     this._initColorsNearBlack(tile);
     if (seededFromNeighbors) this._applyAllColorsGlobal(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
-    if (!this._applyOverlayHandoff(id, tile)) {
-      // If nothing to handoff, fall back to normal ensure
-      this._ensureTileOverlay?.(tile);
-    }
     this._ensureTileOverlay(tile);
     this._markRelaxListDirty();
     this._invalidateHeightCache();
@@ -4257,12 +4263,8 @@ export class TileManager {
     this._ensureRoadMask(tile, { reset: true });
     if (seededFromNeighbors) this._applyAllColorsGlobal(tile); this._ensureTileOverlay(tile);
     if (this._roadStamps.length) this._applyExistingRoadStampsToTile(tile);
-
-    if (!this._applyOverlayHandoff(id, tile)) {
-      // If nothing to handoff, fall back to normal ensure
-      this._ensureTileOverlay?.(tile);
-    }
     this._ensureTileOverlay(tile);
+    this._restitchInteractiveNeighbors(q, r);
     for (const [dq, dr] of HEX_DIRS) {
       const n = this._getTile(q + dq, r + dr);
       if (n && n.type === 'farfield') this._markFarfieldAdapterDirty(n);
@@ -4282,10 +4284,6 @@ export class TileManager {
       } else {
         return existing;
       }
-      if (!this._applyOverlayHandoff(id, tile)) {
-        // If nothing to handoff, fall back to normal ensure
-        this._ensureTileOverlay?.(tile);
-      }
       this._ensureTileOverlay(tile);
 
     }
@@ -4304,8 +4302,8 @@ export class TileManager {
     low.group.layers.set(1);
     low.mesh.layers.set(1);
 
-    // keep farfield out of height raycasts so near queries stay fast
-    if (low.mesh) low.mesh.raycast = function () { };
+    // allow farfield meshes to answer height queries when no interactive terrain is nearby
+    if (low.mesh) low.mesh.raycast = THREE.Mesh.prototype.raycast;
 
     const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
@@ -4343,6 +4341,7 @@ export class TileManager {
     this._ensureTileOverlay(tile);
     this._invalidateHeightCache();
     this._ensureFarfieldAdapter(tile);
+    this._restitchInteractiveNeighbors(q, r);
     for (const [dq, dr] of HEX_DIRS) {
       const neighbor = this._getTile(q + dq, r + dr);
       if (neighbor && neighbor.type === 'farfield') this._markFarfieldAdapterDirty(neighbor);
@@ -5463,6 +5462,8 @@ export class TileManager {
     if (tile.type === 'interactive') {
       this._stitchInteractiveToVisualEdges(tile, { bandRatio: 0.07, sideArc: Math.PI / 10 });
       this._planarizeEdgeWhenNeighborMissing(tile); // when any neighbor is absent
+    } else if (tile.type === 'visual' || tile.type === 'farfield') {
+      this._restitchInteractiveNeighbors(tile.q, tile.r);
     }
 
     // CRITICAL: Mark tile as having elevation data BEFORE queueing textures/grass
@@ -5685,18 +5686,18 @@ export class TileManager {
           _handleBatch(b)
             .finally(() => {
               active--;
-              // Push any landed vertices right away so users see terrain “fill in”
-              this._applyPendingSamples?.();                 // stream updates mid-batch
-              // If we still have headroom, keep ticking in a microtask to reduce idle gaps.
-              if (active < CONC && cursor < batches.length) {
-                Promise.resolve().then(tick);
-              } else {
-                requestAnimationFrame(tick);
-              }
-              if (active === 0 && cursor >= batches.length) {
-                this._applyPendingSamples();
-                resolve();
-              }
+                // Push any landed vertices right away so users see terrain “fill in”
+                this._applyPendingSamples?.();                 // stream updates mid-batch
+                // If we still have headroom, keep ticking in a microtask to reduce idle gaps.
+                if (active < CONC && cursor < batches.length) {
+                  Promise.resolve().then(tick);
+                } else {
+                  requestAnimationFrame(tick);
+                }
+                if (active === 0 && cursor >= batches.length) {
+                  this._applyPendingSamples();
+                  resolve();
+                }
             });
         }
         if (active === 0 && cursor >= batches.length) {
@@ -5763,27 +5764,27 @@ export class TileManager {
   }
 
   // Nudge farfield fetch if everything looks idle
-  _kickFarfieldIfIdle() {
-    // Only kick if nothing is currently being populated
-    const idle =
-      (this._populateInflight === 0) &&
-      (this._populateQueue.length === 0);
+_kickFarfieldIfIdle() {
+  // Only kick if nothing is currently being populated
+  const idle =
+    (this._populateInflight === 0) &&
+    (this._populateQueue.length === 0);
 
-    if (!idle) return;
+  if (!idle) return;
 
-    // Make sure we’re actually in farfield fetch phase
-    if (this._fetchPhase !== 'farfield') {
-      this._fetchPhase = 'farfield';
-    }
-
-    // Ensure farfield tiles are prewarmed for the current center
-    const q = this._lastQR?.q ?? 0;
-    const r = this._lastQR?.r ?? 0;
-    this._prewarmFarfieldRing?.(q, r);
-
-    // Immediately schedule a backfill pass
-    this._scheduleBackfill(0);
+  // Make sure we’re actually in farfield fetch phase
+  if (this._fetchPhase !== 'farfield') {
+    this._fetchPhase = 'farfield';
   }
+
+  // Ensure farfield tiles are prewarmed for the current center
+  const q = this._lastQR?.q ?? 0;
+  const r = this._lastQR?.r ?? 0;
+  this._prewarmFarfieldRing?.(q, r);
+
+  // Immediately schedule a backfill pass
+  this._scheduleBackfill(0);
+}
 
 
   _backfillMissing({ onlyIfRelayReady = false } = {}) {
@@ -6351,34 +6352,34 @@ export class TileManager {
   }
 
 
-  // tiles.js
-  _applyPendingSamples() {
-    if (!this.tiles) return;
-    for (const tile of this.tiles.values()) {
-      if (!tile?.pos) continue;
+// tiles.js
+_applyPendingSamples() {
+  if (!this.tiles) return;
+  for (const tile of this.tiles.values()) {
+    if (!tile?.pos) continue;
 
-      // If this batch actually wrote vertices, push them once
-      if (tile.fetched && tile.fetched.size > 0) {
-        this._pushBuffersToGeometry?.(tile);
+    // If this batch actually wrote vertices, push them once
+    if (tile.fetched && tile.fetched.size > 0) {
+      this._pushBuffersToGeometry?.(tile);
 
-        // When all verts are ready, flip the elevation gate
-        if ((tile.unreadyCount | 0) === 0) {
-          tile._elevationFetched = true;
-        }
-
-        if (tile.unreadyCount === 0) {
-          tile._queuedPhases?.clear?.();
-          tile._phase = tile._phase || {};
-          tile._phase.fullDone = true;
-          tile.populating = false;
-        }
-
-        tile.fetched?.clear?.();
+      // When all verts are ready, flip the elevation gate
+      if ((tile.unreadyCount | 0) === 0) {
+        tile._elevationFetched = true;
       }
+
+      if (tile.unreadyCount === 0) {
+        tile._queuedPhases?.clear?.();
+        tile._phase = tile._phase || {};
+        tile._phase.fullDone = true;
+        tile.populating = false;
+      }
+
+      tile.fetched?.clear?.();
     }
-    // Let global color/texture passes run
-    this._globalDirty = true;
   }
+  // Let global color/texture passes run
+  this._globalDirty = true;
+}
 
   /* ---------------- LOD / perf ---------------- */
 
@@ -6688,6 +6689,25 @@ export class TileManager {
     return hits[0].point.y;
   }
 
+  _collectMeshesNearByType(x, z, types = []) {
+    if (!Array.isArray(types) || !types.length) return [];
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return [];
+    const axialFloat = this._worldToAxialFloat(x, z);
+    if (!axialFloat) return [];
+    const center = this._axialRound(axialFloat.q, axialFloat.r);
+    if (!center) return [];
+    const coords = [center, ...this._axialNeighbors(center.q, center.r)];
+    const out = [];
+    for (const { q, r } of coords) {
+      const tile = this.tiles.get(`${q},${r}`);
+      if (!tile || !types.includes(tile.type)) continue;
+      const mesh = tile.grid?.mesh;
+      if (!mesh || mesh.visible === false) continue;
+      out.push(mesh);
+    }
+    return out;
+  }
+
   _seedTileFromNeighbors(tile) {
     if (!tile || !this.origin || !tile.pos || !tile.grid?.group) return false;
     const pos = tile.pos;
@@ -6736,10 +6756,40 @@ export class TileManager {
     }
 
     const tmp = new THREE.Vector3(x, 10000, z);
-    const meshes = this._collectHeightMeshesNear(x, z);
-    if (!meshes || meshes.length === 0) return this._lastHeight;
+    let source = 'interactive';
+    let meshes = this._collectHeightMeshesNear(x, z) || [];
     this.ray.set(tmp, this.DOWN);
-    const hit = this.ray.intersectObjects(meshes, true);
+    let hit = meshes.length ? this.ray.intersectObjects(meshes, true) : [];
+
+    if (!hit.length) {
+      const visualMeshes = this._collectMeshesNearByType(x, z, ['visual']);
+      if (visualMeshes.length) {
+        source = 'visual';
+        meshes = visualMeshes;
+        hit = this.ray.intersectObjects(visualMeshes, true);
+      }
+    }
+
+    if (!hit.length) {
+      const farfieldMeshes = [];
+      const mergedMesh = (this._farfieldMerge?.mesh && this._farfieldMerge.mesh.visible !== false)
+        ? this._farfieldMerge.mesh
+        : null;
+      if (mergedMesh) farfieldMeshes.push(mergedMesh);
+      const nearbyFarfield = this._collectMeshesNearByType(x, z, ['farfield']);
+      if (nearbyFarfield.length) {
+        for (const mesh of nearbyFarfield) {
+          if (!mesh || mesh.visible === false) continue;
+          farfieldMeshes.push(mesh);
+        }
+      }
+      if (farfieldMeshes.length) {
+        source = mergedMesh && farfieldMeshes.length === 1 ? 'farfield-merged' : 'farfield';
+        meshes = farfieldMeshes;
+        hit = this.ray.intersectObjects(farfieldMeshes, true);
+      }
+    }
+
     let result = this._lastHeight;
     if (hit.length) {
       result = hit[0].point.y;
@@ -6751,7 +6801,7 @@ export class TileManager {
     const duration = (perfNow ? perfNow() : Date.now()) - start;
     const logNow = perfNow ? perfNow() : Date.now();
     if ((!this._perfLogNext || logNow >= this._perfLogNext) && duration > 2) {
-      console.log(`[tiles.getHeightAt] meshes=${meshes.length} hit=${hit.length > 0} duration=${duration.toFixed(2)}ms`);
+      console.log(`[tiles.getHeightAt] source=${source} meshes=${meshes.length} hit=${hit.length > 0} duration=${duration.toFixed(2)}ms`);
       this._perfLogNext = logNow + 2000;
     }
     return result;
@@ -6796,76 +6846,76 @@ export class TileManager {
   }
 
   // tiles.js — inside TileManager
-  setOverlayEnabled(on) {
-    const want = !!on;
-    if (this._overlayEnabled === want) return;
-    this._overlayEnabled = want;
-    // Tear down or ensure for current tiles
-    for (const t of this.tiles.values()) {
-      if (want) this._ensureTileOverlay(t);
-      else this._teardownOverlayForTile(t);
-    }
+setOverlayEnabled(on) {
+  const want = !!on;
+  if (this._overlayEnabled === want) return;
+  this._overlayEnabled = want;
+  // Tear down or ensure for current tiles
+  for (const t of this.tiles.values()) {
+    if (want) this._ensureTileOverlay(t);
+    else this._teardownOverlayForTile(t);
+  }
+}
+
+
+getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
+  // If overlays are disabled, nothing to sample
+  if (!this._overlayEnabled || !this.origin) return null;
+
+  // Find the tile we’re on by rounding axial coords
+  const { q, r } = this._axialRound(this._worldToAxialFloat(x, z));
+  const tile = this.tiles.get(`${q},${r}`);
+  if (!tile) return null;
+
+  // Ensure an overlay request is in-flight for this tile (won’t block)
+  this._ensureTileOverlay(tile);
+
+  // Try to find a ready overlay entry (texture.image is the canvas we drew)
+  const cacheKey = tile._overlay?.cacheKey;
+  const entry = cacheKey ? this._overlayCache.get(cacheKey) : tile._overlay?.entry;
+  const canvas = entry?.texture?.image || entry?.canvas;
+  const bounds = entry?.bounds;
+  const imgSize = entry?.imageSize;
+  if (!canvas || !bounds || !imgSize) return null;
+
+  // World -> lat/lon -> UV in the entry bounds
+  const toUV = (wx, wz) => {
+    const { lat, lon } = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
+    const lonSpan = Math.max(1e-12, bounds.lonMax - bounds.lonMin);
+    const latSpan = Math.max(1e-12, bounds.latMax - bounds.latMin);
+    const u = (lon - bounds.lonMin) / lonSpan;
+    const v = (bounds.latMax - lat) / latSpan;  // Mercator tiles are top-origin
+    return { u, v };
+  };
+
+  // Read a single pixel (clamped) from the canvas
+  const readUV = (u, v) => {
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    // Half-texel inset to match your UV padding approach
+    const px = Math.max(0, Math.min(canvas.width  - 1, Math.floor(u * (canvas.width  - 1))));
+    const py = Math.max(0, Math.min(canvas.height - 1, Math.floor(v * (canvas.height - 1))));
+    const d = ctx.getImageData(px, py, 1, 1).data;
+    return { r: d[0] / 255, g: d[1] / 255, b: d[2] / 255 };
+  };
+
+  if (!Number.isFinite(averageRadius) || averageRadius <= 0 || !Number.isFinite(samples) || samples <= 1) {
+    const { u, v } = toUV(x, z);
+    return readUV(u, v);
   }
 
-
-  getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
-    // If overlays are disabled, nothing to sample
-    if (!this._overlayEnabled || !this.origin) return null;
-
-    // Find the tile we’re on by rounding axial coords
-    const { q, r } = this._axialRound(this._worldToAxialFloat(x, z));
-    const tile = this.tiles.get(`${q},${r}`);
-    if (!tile) return null;
-
-    // Ensure an overlay request is in-flight for this tile (won’t block)
-    this._ensureTileOverlay(tile);
-
-    // Try to find a ready overlay entry (texture.image is the canvas we drew)
-    const cacheKey = tile._overlay?.cacheKey;
-    const entry = cacheKey ? this._overlayCache.get(cacheKey) : tile._overlay?.entry;
-    const canvas = entry?.texture?.image || entry?.canvas;
-    const bounds = entry?.bounds;
-    const imgSize = entry?.imageSize;
-    if (!canvas || !bounds || !imgSize) return null;
-
-    // World -> lat/lon -> UV in the entry bounds
-    const toUV = (wx, wz) => {
-      const { lat, lon } = worldToLatLon(wx, wz, this.origin.lat, this.origin.lon);
-      const lonSpan = Math.max(1e-12, bounds.lonMax - bounds.lonMin);
-      const latSpan = Math.max(1e-12, bounds.latMax - bounds.latMin);
-      const u = (lon - bounds.lonMin) / lonSpan;
-      const v = (bounds.latMax - lat) / latSpan;  // Mercator tiles are top-origin
-      return { u, v };
-    };
-
-    // Read a single pixel (clamped) from the canvas
-    const readUV = (u, v) => {
-      if (u < 0 || u > 1 || v < 0 || v > 1) return null;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return null;
-      // Half-texel inset to match your UV padding approach
-      const px = Math.max(0, Math.min(canvas.width - 1, Math.floor(u * (canvas.width - 1))));
-      const py = Math.max(0, Math.min(canvas.height - 1, Math.floor(v * (canvas.height - 1))));
-      const d = ctx.getImageData(px, py, 1, 1).data;
-      return { r: d[0] / 255, g: d[1] / 255, b: d[2] / 255 };
-    };
-
-    if (!Number.isFinite(averageRadius) || averageRadius <= 0 || !Number.isFinite(samples) || samples <= 1) {
-      const { u, v } = toUV(x, z);
-      return readUV(u, v);
-    }
-
-    // Average N jittered taps in a disk of averageRadius
-    let acc = { r: 0, g: 0, b: 0 }, hit = 0;
-    for (let i = 0; i < samples; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const rj = Math.random() * averageRadius;
-      const { u, v } = toUV(x + Math.cos(a) * rj, z + Math.sin(a) * rj);
-      const c = readUV(u, v);
-      if (c) { acc.r += c.r; acc.g += c.g; acc.b += c.b; hit++; }
-    }
-    return hit ? { r: acc.r / hit, g: acc.g / hit, b: acc.b / hit } : null;
+  // Average N jittered taps in a disk of averageRadius
+  let acc = { r: 0, g: 0, b: 0 }, hit = 0;
+  for (let i = 0; i < samples; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const rj = Math.random() * averageRadius;
+    const { u, v } = toUV(x + Math.cos(a) * rj, z + Math.sin(a) * rj);
+    const c = readUV(u, v);
+    if (c) { acc.r += c.r; acc.g += c.g; acc.b += c.b; hit++; }
   }
+  return hit ? { r: acc.r / hit, g: acc.g / hit, b: acc.b / hit } : null;
+}
   refreshTiles() {
     this._invalidateHeightCache();
     for (const tile of this.tiles.values()) {
@@ -6907,6 +6957,8 @@ export class TileManager {
 
   _discardTile(id) {
     const t = this.tiles.get(id);
+    const q = Number.isFinite(t?.q) ? t.q : null;
+    const r = Number.isFinite(t?.r) ? t.r : null;
     if (t) this._stashOverlayForId(id, t);
     if (!t) return;
     if (t._treeGroup) this._clearTileTrees(t);
@@ -6943,6 +6995,9 @@ export class TileManager {
     this._deferredInteractive.delete(t);
     this.tiles.delete(id);
     this._markRelaxListDirty();
+    if (Number.isFinite(q) && Number.isFinite(r)) {
+      this._restitchInteractiveNeighbors(q, r);
+    }
   }
 
   _resetAllTiles() {

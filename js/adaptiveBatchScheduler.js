@@ -54,9 +54,10 @@ export class AdaptiveBatchScheduler {
     this._farfieldQueue = [];
 
     // Queue size limits (prevent memory issues)
-    this._maxInteractiveQueueSize = this._isMobile ? 50 : 150;
-    this._maxVisualQueueSize = this._isMobile ? 30 : 100;
-    this._maxFarfieldQueueSize = this._isMobile ? 20 : 80;
+    // Queue caps must accommodate full rings; keep them high enough to avoid drops.
+    this._maxInteractiveQueueSize = this._isMobile ? 240 : 1200;
+    this._maxVisualQueueSize = this._isMobile ? 180 : 800;
+    this._maxFarfieldQueueSize = this._isMobile ? 120 : 600;
 
     // Processing state
     this._processing = false;
