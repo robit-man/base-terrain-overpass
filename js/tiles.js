@@ -32,6 +32,7 @@ const HORIZON_FOCUS_STRENGTH_MOBILE = 1.6;
 const HORIZON_FOCUS_SPEED_THRESHOLD = 12; // m/s before densifying forward tessellation
 const HORIZON_UPDATE_INTERVAL_MS = 750;
 const HORIZON_TEXTURE_SCALE = 1 / 120000;
+const HORIZON_TRI_RATIO = Math.sqrt(3);
 const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer';
 const WAYBACK_WMTS_CAPABILITIES = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml';
 const DEFAULT_WAYBACK_VERSION = '49849';
