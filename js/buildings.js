@@ -3184,10 +3184,37 @@ _refreshBuildingVisibility(building) {
     }
   }
 
-  setWireframe(enabled) {
-    // DISABLED: Buildings are now always solid (no wireframe mode)
-    // Keeping this method for backward compatibility but making it a no-op
-    return;
+  setWireframe(enabled, theme = {}) {
+    this._wireframeMode = !!enabled;
+    const lineColor = theme?.lineColor instanceof THREE.Color
+      ? theme.lineColor.clone()
+      : null;
+
+    const applyColor = (mesh) => {
+      if (!mesh?.material || !lineColor) return;
+      if (mesh.material.color) mesh.material.color.set(lineColor);
+      mesh.material.needsUpdate = true;
+    };
+
+    if (this._tileStates && this._tileStates.size) {
+      for (const state of this._tileStates.values()) {
+        if (!state) continue;
+        const buildings = state.buildings || [];
+        for (const building of buildings) {
+          if (!building) continue;
+          if (building.render) applyColor(building.render);
+          this._refreshBuildingVisibility(building);
+        }
+        if (state.extras && state.extras.length) {
+          for (const extra of state.extras) {
+            if (!extra) continue;
+            if (extra.userData?.type === 'road') this._refreshRoadVisibility(extra);
+            else if (extra.userData?.type === 'water' || extra.userData?.type === 'area') extra.visible = !this._wireframeMode;
+          }
+        }
+        if (state.tileKey) this._updateMergedGroupVisibility(state.tileKey);
+      }
+    }
   }
 
   _verifyFloatingBuildings() {

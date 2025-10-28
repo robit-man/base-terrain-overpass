@@ -175,6 +175,12 @@ export class TileManager {
     this.HORIZON_UPDATE_INTERVAL_MS = HORIZON_UPDATE_INTERVAL_MS;
     this.HORIZON_INNER_GAP = this.tileRadius * 0.5;
     this.HORIZON_TEXTURE_SCALE = HORIZON_TEXTURE_SCALE;
+    this.FOG_NEAR_PCT = 0.12;
+    this.FOG_FAR_PCT = 0.98;
+    this._wireframeMode = false;
+    this._wireframeLineColor = new THREE.Color(0xffffff);
+    this._lastHorizonOuterRadius = this.HORIZON_TARGET_RADIUS;
+    this._lastFarfieldOuterRadius = this.tileRadius * (this.FARFIELD_RING + 1);
 
     // ---- interactive (high-res) relaxation ----
     // CRITICAL: Reduce relaxation iterations on mobile to prevent frame stalls
@@ -308,6 +314,8 @@ export class TileManager {
       farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       relaxIters: this.RELAX_ITERS_PER_FRAME,
       relaxBudget: this.RELAX_FRAME_BUDGET_MS,
+      fogNearPct: this.FOG_NEAR_PCT,
+      fogFarPct: this.FOG_FAR_PCT,
     };
     this._defaultTerrainSettings = {
       interactiveRing: this.INTERACTIVE_RING,
@@ -319,6 +327,8 @@ export class TileManager {
       farfieldNearPad: this.FARFIELD_NEAR_PAD,
       tileRadius: this.tileRadius,
       spacing: this.spacing,
+      fogNearPct: this.FOG_NEAR_PCT,
+      fogFarPct: this.FOG_FAR_PCT,
     };
     this._lodQuality = 1;
 
@@ -910,6 +920,47 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     this._nextHorizonUpdate = 0;
   }
 
+  _applyMaterialWireframeState(material, enabled, color) {
+    if (!material) return;
+    material.wireframe = !!enabled;
+    if (enabled) {
+      if (material.color && color) material.color.set(color);
+      if (Object.prototype.hasOwnProperty.call(material, 'vertexColors')) material.vertexColors = false;
+      if (Object.prototype.hasOwnProperty.call(material, 'opacity')) {
+        material.opacity = 1;
+        material.transparent = false;
+      }
+    } else {
+      if (material.color) material.color.set(0xffffff);
+      if (Object.prototype.hasOwnProperty.call(material, 'vertexColors')) material.vertexColors = true;
+    }
+    material.needsUpdate = true;
+  }
+
+  setWireframe(enabled, theme = {}) {
+    const lineColor = theme?.lineColor instanceof THREE.Color
+      ? theme.lineColor.clone()
+      : new THREE.Color(enabled ? 0xffffff : 0xffffff);
+    this._wireframeMode = !!enabled;
+    this._wireframeLineColor = lineColor.clone();
+
+    if (this._terrainMat) this._applyMaterialWireframeState(this._terrainMat, enabled, lineColor);
+    if (this._farfieldMat) this._applyMaterialWireframeState(this._farfieldMat, enabled, lineColor);
+    if (this._horizonField?.mesh?.material) this._applyMaterialWireframeState(this._horizonField.mesh.material, enabled, lineColor);
+
+    for (const tile of this.tiles.values()) {
+      const mesh = tile?.grid?.mesh;
+      if (mesh?.material) this._applyMaterialWireframeState(mesh.material, enabled, lineColor);
+      const adapterMat = tile?._adapter?.mesh?.material;
+      if (adapterMat) this._applyMaterialWireframeState(adapterMat, enabled, lineColor);
+      if (tile?._treeGroup) tile._treeGroup.visible = !enabled;
+    }
+
+    if (this.grassManager?.setWireframeMode) {
+      this.grassManager.setWireframeMode(enabled, { lineColor });
+    }
+  }
+
   _tileCornerPriority(tile) {
     if (!tile) return Infinity;
     if (tile.type === 'visual') return 0;
@@ -1158,6 +1209,9 @@ _planarizeEdgeWhenNeighborMissing(tile, {
         roughness: 0.85,
         receiveShadow: true,
       });
+      if (this._wireframeMode) {
+        this._applyMaterialWireframeState(this._terrainMat, true, this._wireframeLineColor);
+      }
     }
     return this._terrainMat;
   }
@@ -1212,6 +1266,9 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       this._farfieldMat.polygonOffsetUnits = 2;
       this._farfieldMat.name = 'TileFarfieldMaterial';
       this._farfieldMat.needsUpdate = true;
+      if (this._wireframeMode) {
+        this._applyMaterialWireframeState(this._farfieldMat, true, this._wireframeLineColor);
+      }
     }
     return this._farfieldMat;
   }
@@ -2011,6 +2068,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
       const dist = Math.hypot(center.x, center.z) + tileRadius;
       if (dist > maxRadius) maxRadius = dist;
     }
+    this._lastFarfieldOuterRadius = maxRadius;
     return maxRadius;
   }
 
@@ -2207,6 +2265,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     hf.innerRadius = innerRadius;
     hf.outerRadius = outerRadius;
     hf.mesh.visible = true;
+    this._lastHorizonOuterRadius = outerRadius;
     this._horizonDirty = false;
     this._nextHorizonUpdate = now + this.HORIZON_UPDATE_INTERVAL_MS;
   }
@@ -3598,6 +3657,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
 
       tile.grid.group.add(group);
       tile._treeGroup = group;
+      if (this._wireframeMode) group.visible = false;
       this._resnapTreesForTile(tile);
     } catch (err) {
       console.warn('[tiles] tree generation aborted', err);
@@ -7025,6 +7085,11 @@ _applyPendingSamples() {
   }
 
   getTerrainSettings() {
+    const horizonOuter = this._horizonField?.outerRadius
+      ?? this._lastHorizonOuterRadius
+      ?? this._lastFarfieldOuterRadius
+      ?? this._computeFarfieldOuterRadius();
+    const horizonInner = this._horizonField?.innerRadius ?? Math.max(0, horizonOuter - this.HORIZON_EXTRA_METERS);
     return {
       interactiveRing: this.INTERACTIVE_RING,
       visualRing: this.VISUAL_RING,
@@ -7035,6 +7100,10 @@ _applyPendingSamples() {
       farfieldNearPad: this.FARFIELD_NEAR_PAD,
       tileRadius: this.tileRadius,
       spacing: this.spacing,
+      fogNearPct: this.FOG_NEAR_PCT,
+      fogFarPct: this.FOG_FAR_PCT,
+      horizonInnerRadius: horizonInner,
+      horizonOuterRadius: horizonOuter,
     };
   }
 
@@ -7051,6 +7120,8 @@ _applyPendingSamples() {
     farfieldNearPad,
     tileRadius,
     spacing,
+    fogNearPct,
+    fogFarPct,
   } = {}) {
     let needReset = false;
     if (Number.isFinite(tileRadius) && tileRadius > 10 && tileRadius !== this.tileRadius) {
@@ -7081,6 +7152,13 @@ _applyPendingSamples() {
     }
     if (Number.isFinite(farfieldNearPad)) {
       this.FARFIELD_NEAR_PAD = Math.max(0, Math.round(farfieldNearPad));
+    }
+    if (Number.isFinite(fogNearPct)) {
+      this.FOG_NEAR_PCT = THREE.MathUtils.clamp(fogNearPct, 0, 0.95);
+    }
+    if (Number.isFinite(fogFarPct)) {
+      const minFar = this.FOG_NEAR_PCT + 0.02;
+      this.FOG_FAR_PCT = THREE.MathUtils.clamp(fogFarPct, minFar, 1);
     }
 
     this._baseLod = {

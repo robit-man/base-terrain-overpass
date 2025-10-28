@@ -255,6 +255,7 @@ export class GrassManager {
     this.enabled = typeof window !== 'undefined';
     this.instancesPerSample = 6;
     this.maxBladesPerTile = 7000;
+    this._wireframeMode = false;
 
     this.tileGrass = new Map();
 
@@ -382,6 +383,13 @@ export class GrassManager {
     }
   }
 
+  setWireframeMode(enabled) {
+    this._wireframeMode = !!enabled;
+    for (const entry of this.tileGrass.values()) {
+      if (entry?.mesh) entry.mesh.visible = !enabled;
+    }
+  }
+
   generateGrassForTile(tile, samples, bounds) {
     if (!this.enabled || !this.material || !this._bladeGeometry) return;
     if (!tile || !samples || !samples.length || !bounds) {
@@ -480,6 +488,7 @@ export class GrassManager {
     mesh.name = `grass-${tile.q},${tile.r}`;
 
     group.add(mesh);
+    if (this._wireframeMode) mesh.visible = false;
     this.tileGrass.set(this._tileKey(tile), { mesh, tile });
   }
 

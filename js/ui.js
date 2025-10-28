@@ -153,9 +153,17 @@ const envFarfieldBudgetCurrent = document.getElementById('envFarfieldBudgetCurre
 const envFarfieldBatch = document.getElementById('envFarfieldBatch');
 const envFarfieldBatchValue = document.getElementById('envFarfieldBatchValue');
 const envFarfieldBatchCurrent = document.getElementById('envFarfieldBatchCurrent');
+const envHorizonRadiusValue = document.getElementById('envHorizonRadiusValue');
+const envHorizonRadiusCurrent = document.getElementById('envHorizonRadiusCurrent');
 const envTileRadius = document.getElementById('envTileRadius');
 const envTileRadiusValue = document.getElementById('envTileRadiusValue');
 const envTileRadiusCurrent = document.getElementById('envTileRadiusCurrent');
+const envFogNear = document.getElementById('envFogNear');
+const envFogNearValue = document.getElementById('envFogNearValue');
+const envFogNearCurrent = document.getElementById('envFogNearCurrent');
+const envFogFar = document.getElementById('envFogFar');
+const envFogFarValue = document.getElementById('envFogFarValue');
+const envFogFarCurrent = document.getElementById('envFogFarCurrent');
 const envTerrainApply = document.getElementById('envTerrainApply');
 const envTerrainAuto = document.getElementById('envTerrainAuto');
 const envTerrainTargetFps = document.getElementById('envTerrainTargetFps');
@@ -357,7 +365,10 @@ export const ui = {
   envFarfieldNearPad, envFarfieldNearPadValue, envFarfieldNearPadCurrent,
   envFarfieldBudget, envFarfieldBudgetValue, envFarfieldBudgetCurrent,
   envFarfieldBatch, envFarfieldBatchValue, envFarfieldBatchCurrent,
+  envHorizonRadiusValue, envHorizonRadiusCurrent,
   envTileRadius, envTileRadiusValue, envTileRadiusCurrent,
+  envFogNear, envFogNearValue, envFogNearCurrent,
+  envFogFar, envFogFarValue, envFogFarCurrent,
   envTerrainApply, envTerrainAuto,
   envTerrainTargetFps, envTerrainTargetFpsValue,
   envBuildingRadius, envBuildingRadiusValue, envBuildingRadiusCurrent,

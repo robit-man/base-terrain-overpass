@@ -568,10 +568,24 @@
                     id="envFarfieldBatchCurrent">(engine: 48)</span></label>
                 <input id="envFarfieldBatch" type="range" min="8" max="128" step="4" value="48" />
               </div>
+              <div class="slider-row readonly">
+                <label>Horizon Field Radius <span class="mono" id="envHorizonRadiusValue">—</span> <span
+                    class="tiny env-current" id="envHorizonRadiusCurrent">(engine: —)</span></label>
+              </div>
               <div class="slider-row">
                 <label for="envTileRadius">Tile Radius <span class="mono" id="envTileRadiusValue">100 m</span> <span
                     class="tiny env-current" id="envTileRadiusCurrent">(engine: 100 m)</span></label>
                 <input id="envTileRadius" type="range" min="60" max="180" step="5" value="100" />
+              </div>
+              <div class="slider-row">
+                <label for="envFogNear">Fog Near <span class="mono" id="envFogNearValue">12%</span> <span
+                    class="tiny env-current" id="envFogNearCurrent">(engine: 12%)</span></label>
+                <input id="envFogNear" type="range" min="0" max="60" step="1" value="12" />
+              </div>
+              <div class="slider-row">
+                <label for="envFogFar">Fog Far <span class="mono" id="envFogFarValue">98%</span> <span
+                    class="tiny env-current" id="envFogFarCurrent">(engine: 98%)</span></label>
+                <input id="envFogFar" type="range" min="65" max="100" step="1" value="98" />
               </div>
               <div class="button-row">
                 <button id="envTerrainApply" class="secondary" type="button">Update Terrain</button>

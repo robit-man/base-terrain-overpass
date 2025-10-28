@@ -87,6 +87,10 @@ export class SceneManager {
 
     this._farfieldSampleInsetFrac = 0.08; // sample ~8% inside the farfield edge
     this._farFogInsetFrac = 0.05;  // fog.far ~5% inside the farfield edge
+    this._wireframeMode = false;
+    this._wireframeThemeBg = null;
+    this._defaultFogNear = 0.12;
+    this._defaultFogFar = 0.98;
 
     // OPTIMIZED: Enhanced directional sun light with realistic intensity
     this.sunLight = new THREE.DirectionalLight(0xffffff, 3.5);  // Slightly reduced for more realistic contrast
@@ -349,6 +353,9 @@ _sampleTileRadius() {
   const tm = this.app?.hexGridMgr;
   if (tm?.getTerrainSettings) {
     const s = tm.getTerrainSettings();
+    if (Number.isFinite(s.horizonOuterRadius) && s.horizonOuterRadius > 0) {
+      return Math.max(300, s.horizonOuterRadius);
+    }
     // Use the same notion of "world radius" used elsewhere: tileRadius * farfieldRing
     if (Number.isFinite(s.tileRadius) && Number.isFinite(s.farfieldRing)) {
       return Math.max(300, s.tileRadius * s.farfieldRing);
@@ -369,21 +376,24 @@ _sampleTileRadius() {
 }
 
   // Start close for atmospheric perspective; scale far with (possibly inset) radius; tighten at night/haze
-  _computeFogDistances(tileRadius, altitude, turbidity) {
-    const radius = Math.max(50, tileRadius);
+  _computeFogDistances(radius, altitude, turbidity, nearPct = this._defaultFogNear, farPct = this._defaultFogFar) {
+    radius = Math.max(50, radius);
     const nightMix = this.currentNightMix ?? 0;
     const dayFactor = 1 - nightMix;
 
-    let far = Math.min(radius, this.camera.far - 25);
+    const clampedNearPct = THREE.MathUtils.clamp(nearPct, 0, 0.95);
+    const clampedFarPct = THREE.MathUtils.clamp(farPct, clampedNearPct + 0.02, 1);
+
+    let far = THREE.MathUtils.clamp(radius * clampedFarPct, this.camera.near + 30, this.camera.far - 25);
     if (nightMix > 0) {
       const duskClamp = THREE.MathUtils.lerp(far * 0.5, far, Math.pow(dayFactor, 0.65));
       far = Math.min(far, duskClamp);
     }
-    far = Math.max(this.camera.near + 30, Math.min(radius, far));
+    far = Math.max(this.camera.near + 40, far);
 
-    let near = Math.max(this.camera.near + 10, radius * 0.12);
+    let near = THREE.MathUtils.clamp(radius * clampedNearPct, this.camera.near + 10, far - 10);
     if (nightMix > 0) {
-      const nightNear = Math.min(far - 12, radius * 0.18 + 20 * nightMix);
+      const nightNear = Math.min(far - 12, radius * Math.min(0.3, clampedNearPct + 0.12) + 20 * nightMix);
       near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
     }
     near = Math.min(near, far - 10);
@@ -392,10 +402,24 @@ _sampleTileRadius() {
   }
 
   _syncFogToSky() {
+    if (this._wireframeMode) {
+      const bg = this._wireframeThemeBg instanceof THREE.Color ? this._wireframeThemeBg : new THREE.Color(0x000000);
+      if (!this.scene.fog) {
+        this.scene.fog = new THREE.Fog(bg.clone(), this.camera.near + 5, Math.max(this.camera.near + 50, this.camera.far - 25));
+      }
+      this.scene.fog.color.copy(bg);
+      this.scene.fog.near = this.camera.near + 5;
+      this.scene.fog.far = Math.max(this.camera.near + 50, this.camera.far - 25);
+      this.renderer.setClearColor(bg, 1);
+      return;
+    }
     const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
 
     // Base world radius of your farfield (tiles)
     const tileRadius = this._sampleTileRadius();
+    const settings = this.app?.hexGridMgr?.getTerrainSettings?.();
+    const fogNearPct = settings?.fogNearPct ?? this._defaultFogNear;
+    const fogFarPct = settings?.fogFarPct ?? this._defaultFogFar;
 
     // Inset distances (fractions of tile radius)
     const sampleInsetFrac = this._farfieldSampleInsetFrac ?? 0.08;
@@ -424,8 +448,7 @@ _sampleTileRadius() {
     }
 
     // --- 2) Fog distances: also pull fog.far slightly INSIDE the farfield edge ---
-    const fogRadius = Math.max(3000, tileRadius * (1 - fogInsetFrac));
-    const { near, far } = this._computeFogDistances(fogRadius, this.currentSunAltitude ?? 0, turbidity);
+    const { near, far } = this._computeFogDistances(tileRadius, this.currentSunAltitude ?? 0, turbidity, fogNearPct, fogFarPct);
 
     if (!this.scene.fog) {
       this.scene.fog = new THREE.Fog(fogColor.clone(), near, far);
@@ -442,6 +465,62 @@ _sampleTileRadius() {
     if (this.scene.background && this.scene.background.isColor) {
       this.scene.background = null;
     }
+  }
+
+  setWireframeMode(enabled) {
+    const next = !!enabled;
+    if (this._wireframeMode === next) {
+      const night = (this.currentNightMix ?? 0) >= 0.5;
+      if (next) {
+        const desiredBg = new THREE.Color(night ? 0x000000 : 0xffffff);
+        if (!this._wireframeThemeBg || !this._wireframeThemeBg.equals(desiredBg)) {
+          this._wireframeThemeBg = desiredBg.clone();
+          this.renderer.setClearColor(desiredBg, 1);
+          if (!this.scene.fog) {
+            this.scene.fog = new THREE.Fog(desiredBg.clone(), this.camera.near + 5, Math.max(this.camera.near + 50, this.camera.far - 25));
+          } else {
+            this.scene.fog.color.copy(desiredBg);
+            this.scene.fog.near = this.camera.near + 5;
+            this.scene.fog.far = Math.max(this.camera.near + 50, this.camera.far - 25);
+          }
+          this.scene.background = desiredBg.clone();
+        }
+      } else if (this.scene.fog) {
+        this.scene.fog.near = this.camera.near + 5;
+        this.scene.fog.far = Math.max(this.camera.near + 50, this.camera.far - 25);
+      }
+      const line = next
+        ? new THREE.Color(night ? 0xffffff : 0x000000)
+        : new THREE.Color(0xffffff);
+      return { lineColor: line, background: this._wireframeThemeBg || null, night };
+    }
+
+    const nightMix = this.currentNightMix ?? 0;
+    const isNight = nightMix >= 0.5;
+    if (next) {
+      this._wireframeMode = true;
+      const bg = new THREE.Color(isNight ? 0x000000 : 0xffffff);
+      const line = new THREE.Color(isNight ? 0xffffff : 0x000000);
+      this._wireframeThemeBg = bg.clone();
+      this.renderer.setClearColor(bg, 1);
+      this.scene.background = bg.clone();
+      if (this.sky) this.sky.visible = false;
+      if (this.scene.environment) this.scene.environment = null;
+      if (!this.scene.fog) {
+        this.scene.fog = new THREE.Fog(bg.clone(), this.camera.near + 5, Math.max(this.camera.near + 50, this.camera.far - 25));
+      } else {
+        this.scene.fog.color.copy(bg);
+        this.scene.fog.near = this.camera.near + 5;
+        this.scene.fog.far = Math.max(this.camera.near + 50, this.camera.far - 25);
+      }
+      return { lineColor: line, background: bg, night: isNight };
+    }
+
+    this._wireframeMode = false;
+    this._wireframeThemeBg = null;
+    if (this.sky) this.sky.visible = true;
+    this._syncFogToSky();
+    return { lineColor: new THREE.Color(0xffffff), background: null, night: isNight };
   }
   updateSun({
     lat = 0,

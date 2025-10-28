@@ -1595,7 +1595,9 @@ class App {
 
   _toggleWireframe() {
     this._wireframeMode = !this._wireframeMode;
-    this.buildings?.setWireframe?.(this._wireframeMode);
+    const theme = this.sceneMgr?.setWireframeMode?.(this._wireframeMode) || {};
+    this.hexGridMgr?.setWireframe?.(this._wireframeMode, theme);
+    this.buildings?.setWireframe?.(this._wireframeMode, theme);
     this._syncWireframeUI();
   }
 
@@ -1646,6 +1648,24 @@ class App {
       envNormalApply,
     } = ui;
 
+    const {
+      envInteractiveRingCurrent,
+      envVisualRingCurrent,
+      envFarfieldExtraCurrent,
+      envFarfieldNearPadCurrent,
+      envFarfieldBudgetCurrent,
+      envFarfieldBatchCurrent,
+      envTileRadiusCurrent,
+      envFogNear,
+      envFogNearValue,
+      envFogNearCurrent,
+      envFogFar,
+      envFogFarValue,
+      envFogFarCurrent,
+      envHorizonRadiusValue,
+      envHorizonRadiusCurrent,
+    } = ui;
+
     if (!envInteractiveRing || !envVisualRing) {
       this._syncTerrainControls = null;
       this._syncBuildingControls = null;
@@ -1669,6 +1689,19 @@ class App {
       setCurrent(envFarfieldBudgetCurrent, settings.farfieldCreateBudget);
       setCurrent(envFarfieldBatchCurrent, settings.farfieldBatchSize);
       setCurrent(envTileRadiusCurrent, settings.tileRadius, ' m');
+      const fogNearPct = Math.round((settings.fogNearPct ?? this.hexGridMgr?.FOG_NEAR_PCT ?? 0) * 100);
+      const fogFarPct = Math.round((settings.fogFarPct ?? this.hexGridMgr?.FOG_FAR_PCT ?? 0) * 100);
+      setCurrent(envFogNearCurrent, `${fogNearPct}%`);
+      setCurrent(envFogFarCurrent, `${fogFarPct}%`);
+      if (envFogNearValue) envFogNearValue.textContent = `${fogNearPct}%`;
+      if (envFogFarValue) envFogFarValue.textContent = `${fogFarPct}%`;
+      const horizonKm = Number.isFinite(settings.horizonOuterRadius)
+        ? (settings.horizonOuterRadius / 1000).toFixed(1)
+        : '—';
+      setCurrent(envHorizonRadiusCurrent, horizonKm, horizonKm === '—' ? '' : ' km');
+      if (envHorizonRadiusValue) {
+        envHorizonRadiusValue.textContent = horizonKm === '—' ? '—' : `${horizonKm} km`;
+      }
     };
     this._updateTerrainCurrentDisplay = updateTerrainCurrent;
 
@@ -1698,6 +1731,24 @@ class App {
         const radius = Math.round(settings.tileRadius ?? this.hexGridMgr?.tileRadius ?? 100);
         envTileRadius.value = radius;
         setText(envTileRadiusValue, `${radius} m`);
+      }
+      if (envHorizonRadiusValue) {
+        if (Number.isFinite(settings.horizonOuterRadius)) {
+          const km = (settings.horizonOuterRadius / 1000).toFixed(1);
+          setText(envHorizonRadiusValue, `${km} km`);
+        } else {
+          setText(envHorizonRadiusValue, '—');
+        }
+      }
+      if (envFogNear) {
+        const nearPct = Math.round((settings.fogNearPct ?? this.hexGridMgr?.FOG_NEAR_PCT ?? 0) * 100);
+        envFogNear.value = nearPct;
+        setText(envFogNearValue, `${nearPct}%`);
+      }
+      if (envFogFar) {
+        const farPct = Math.round((settings.fogFarPct ?? this.hexGridMgr?.FOG_FAR_PCT ?? 0) * 100);
+        envFogFar.value = farPct;
+        setText(envFogFarValue, `${farPct}%`);
       }
       updateTerrainCurrent(settings);
     };
@@ -1768,6 +1819,31 @@ class App {
     });
     envTileRadius?.addEventListener('input', () => {
       setText(envTileRadiusValue, `${envTileRadius.value} m`);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFogNear?.addEventListener('input', () => {
+      const nearVal = Number(envFogNear.value);
+      if (envFogFar) {
+        let farVal = Number(envFogFar.value);
+        if (farVal <= nearVal + 2) {
+          farVal = Math.min(100, nearVal + 3);
+          envFogFar.value = farVal;
+          setText(envFogFarValue, `${farVal}%`);
+        }
+      }
+      setText(envFogNearValue, `${nearVal}%`);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFogFar?.addEventListener('input', () => {
+      const nearVal = Number(envFogNear?.value ?? 0);
+      let farVal = Number(envFogFar.value);
+      if (farVal <= nearVal + 2) {
+        farVal = Math.min(100, nearVal + 3);
+        envFogFar.value = farVal;
+      }
+      setText(envFogFarValue, `${farVal}%`);
       this._disableTerrainAuto();
       this._scheduleTerrainUpdate();
     });
@@ -1956,6 +2032,7 @@ class App {
   _summarizeTerrain() {
     const tm = this.hexGridMgr;
     if (!tm) return null;
+    const settings = tm.getTerrainSettings?.() || {};
     return {
       interactiveRing: tm.INTERACTIVE_RING,
       visualRing: tm.VISUAL_RING,
@@ -1967,6 +2044,9 @@ class App {
         ? Number(tm.RELAX_FRAME_BUDGET_MS.toFixed?.(2) ?? tm.RELAX_FRAME_BUDGET_MS)
         : null,
       visualCreateBudget: tm.VISUAL_CREATE_BUDGET,
+      horizonOuterRadius: settings.horizonOuterRadius ?? tm._lastHorizonOuterRadius ?? null,
+      fogNearPct: settings.fogNearPct ?? tm.FOG_NEAR_PCT,
+      fogFarPct: settings.fogFarPct ?? tm.FOG_FAR_PCT,
     };
   }
 
@@ -2078,6 +2158,9 @@ class App {
     const budget = Math.max(1, Number(ui.envFarfieldBudget?.value ?? this.hexGridMgr?.FARFIELD_CREATE_BUDGET ?? 60));
     const batch = Math.max(1, Number(ui.envFarfieldBatch?.value ?? this.hexGridMgr?.FARFIELD_BATCH_SIZE ?? 48));
     const tileRadius = Math.max(10, Number(ui.envTileRadius?.value ?? this.hexGridMgr?.tileRadius ?? 100));
+    const fogNearPct = Math.max(0, Math.min(0.95, Number(ui.envFogNear?.value ?? Math.round((this.hexGridMgr?.FOG_NEAR_PCT ?? 0.12) * 100)) / 100));
+    const fogFarRaw = Number(ui.envFogFar?.value ?? Math.round((this.hexGridMgr?.FOG_FAR_PCT ?? 0.98) * 100));
+    const fogFarPct = Math.max(fogNearPct + 0.02, Math.min(1, fogFarRaw / 100));
     return {
       interactiveRing: interactive,
       visualRing: visual,
@@ -2086,6 +2169,8 @@ class App {
       farfieldCreateBudget: budget,
       farfieldBatchSize: batch,
       tileRadius,
+      fogNearPct,
+      fogFarPct,
     };
   }
 
