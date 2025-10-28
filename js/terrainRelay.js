@@ -394,7 +394,7 @@ export class TerrainRelay {
     const mc = new window.nkn.MultiClient({
       seed,
       identifier: 'terrain',
-      numSubClients: IS_MOBILE ? 1 : 2,   // was 4
+      numSubClients: IS_MOBILE ? 1 : 4,   // was 4
       originalClient: false,
     });
 

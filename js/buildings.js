@@ -1312,13 +1312,25 @@ export class BuildingManager {
 
   /* ---------------- origin, tiles, fetching ---------------- */
 
-  _updateTiles(force = false) {
-    const anchor = this._resolveTrackingNode();
-    anchor.getWorldPosition(this._tmpVec);
-    const key = this._tileKeyForWorld(this._tmpVec.x, this._tmpVec.z);
-    const hasPendingWait = (this._pendingTerrainTiles?.size ?? 0) > 0;
-    if (!force && key === this._currentCenter && !hasPendingWait) return;
-    this._currentCenter = key;
+_updateTiles(force = false) {
+  const anchor = this._resolveTrackingNode();
+  anchor.getWorldPosition(this._tmpVec);
+  const key = this._tileKeyForWorld(this._tmpVec.x, this._tmpVec.z);
+
+  const hasPendingWait = (this._pendingTerrainTiles?.size ?? 0) > 0;
+
+  // NEW: if there is any outstanding building work, don't early-return
+  const hasPendingWork =
+    (this._pendingFetchTiles?.size ?? 0) > 0 ||           // OSM fetches queued
+    (this._pendingMergeTiles?.size ?? 0) > 0 ||           // geometry merges queued
+    (this._buildQueue?.length ?? 0) > 0 ||                // build jobs queued
+    !!this._activeBuildJob ||                             // build in progress
+    (this._resnapDirtyQueue?.length ?? 0) > 0;            // snapping work queued
+
+  if (!force && key === this._currentCenter && !hasPendingWait && !hasPendingWork) {
+    return;
+  }
+  this._currentCenter = key;
 
     const [tx, tz] = key.split(',').map(Number);
     const span = this._tileSpanForRadius();
@@ -1915,7 +1927,7 @@ export class BuildingManager {
 
         // CRITICAL: Skip immediate resnap during instantiation to prevent cascading lag
         // The building will be resnapped by the dirty resnap queue in a controlled manner
-        // this._resnapBuilding(building);  // REMOVED - causes 5-9ms raycast per building!
+        this._resnapBuilding(building);  // REMOVED - causes 5-9ms raycast per building!
 
         this._refreshBuildingVisibility(building);
         if (solid && this.physics) this.physics.registerStaticMesh(solid, { forceUpdate: true });
@@ -2748,7 +2760,7 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
     let baseline = this._lowestGround(info.rawFootprint);
     let groundBase = baseline;
 
-    if (info.isVisualEdge && this.tileManager?.getHeightAt) {
+if (this.tileManager?.getHeightAt) {
       // CRITICAL: Use cached height to avoid expensive raycasts (2-3ms each)
       const cacheKey = `${Math.round(info.centroid.x)},${Math.round(info.centroid.z)}`;
       const now = this._nowMs();

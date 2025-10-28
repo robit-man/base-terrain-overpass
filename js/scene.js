@@ -4,10 +4,10 @@ import { Sky } from 'Sky';
 
 const TWILIGHT_ALTITUDE = THREE.MathUtils.degToRad(-0.5);
 const NIGHT_ALTITUDE = THREE.MathUtils.degToRad(-12);
-const DAY_EXPOSURE = 1;
-const NIGHT_EXPOSURE = 0.18;
+const DAY_EXPOSURE = 0.8;
+const NIGHT_EXPOSURE = 0.018;
 const NIGHT_FOG_COLOR = new THREE.Color(0x05070d);
-const NIGHT_AMBIENT_COLOR = new THREE.Color(0x05060a);
+const NIGHT_AMBIENT_COLOR = new THREE.Color(0x000000);
 const DAY_AMBIENT_COLOR = new THREE.Color(0x1e212b);
 const DUSK_SUN_COLOR = new THREE.Color(0xffa864);
 const DAY_SUN_COLOR = new THREE.Color(0xffffff);
@@ -37,10 +37,11 @@ export class SceneManager {
       ? Math.min(window.devicePixelRatio * 0.5, 1.0) // ~half res, never above 1.0
       : window.devicePixelRatio;
     this.renderer.setPixelRatio(safePR);
-
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.outputEncoding = THREE.sRGBEncoding;
     this.renderer.toneMappingExposure = DAY_EXPOSURE;
-    this.renderer.physicallyCorrectLights = true;
+    this.renderer.physicallyCorrectLights = !isMobile;
 
     this.renderer.xr.enabled = true;
     try {
@@ -84,7 +85,7 @@ export class SceneManager {
     skyUniforms['mieDirectionalG'].value = 0.95;
 
     this._farfieldSampleInsetFrac = 0.08; // sample ~8% inside the farfield edge
-    this._farFogInsetFrac        = 0.05;  // fog.far ~5% inside the farfield edge
+    this._farFogInsetFrac = 0.05;  // fog.far ~5% inside the farfield edge
 
     // OPTIMIZED: Enhanced directional sun light with realistic intensity
     this.sunLight = new THREE.DirectionalLight(0xffffff, 3.5);  // Slightly reduced for more realistic contrast
@@ -230,7 +231,7 @@ export class SceneManager {
       this.renderer.outputEncoding = THREE.LinearEncoding;
     } else if ('outputColorSpace' in this.renderer) {
       // @ts-ignore legacy/modern compat
-      this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // linear
+      this.renderer.outputColorSpace = THREE.SRGBColorSpace; // linear
     }
 
     // Render sky-only to offscreen
@@ -341,89 +342,106 @@ export class SceneManager {
     this._lastFogColor.copy(c);
     return c;
   }
-// ---------- Tile radius helpers & fog distances ----------
+  // ---------- Tile radius helpers & fog distances ----------
 _sampleTileRadius() {
+  // Prefer farfield world radius from the TileManager (via App → hexGridMgr)
+  const tm = this.app?.hexGridMgr;
+  if (tm?.getTerrainSettings) {
+    const s = tm.getTerrainSettings();
+    // Use the same notion of "world radius" used elsewhere: tileRadius * farfieldRing
+    if (Number.isFinite(s.tileRadius) && Number.isFinite(s.farfieldRing)) {
+      return Math.max(300, s.tileRadius * s.farfieldRing);
+    }
+    // Fallback: if tileRadius isn’t available, derive from spacing * farfieldRing
+    if (Number.isFinite(s.spacing) && Number.isFinite(s.farfieldRing)) {
+      return Math.max(300, s.spacing * s.farfieldRing);
+    }
+  }
+
+  // Secondary fallback: honor any previously-set source (if present)
   const src = this._tileRadiusSource;
-  let r = (typeof src === 'function') ? src() : src;
-  if (!isFinite(r) || r <= 0) r = 4000;
-  return r;
+  const r = (typeof src === 'function') ? src() : src;
+  if (Number.isFinite(r) && r > 0) return r;
+
+  // Last resort: hard default
+  return 4000;
 }
 
-// Start close for atmospheric perspective; scale far with (possibly inset) radius; tighten at night/haze
-_computeFogDistances(tileRadius, altitude, turbidity) {
-  const radius = Math.max(50, tileRadius);
-  const nightMix = this.currentNightMix ?? 0;
-  const dayFactor = 1 - nightMix;
+  // Start close for atmospheric perspective; scale far with (possibly inset) radius; tighten at night/haze
+  _computeFogDistances(tileRadius, altitude, turbidity) {
+    const radius = Math.max(50, tileRadius);
+    const nightMix = this.currentNightMix ?? 0;
+    const dayFactor = 1 - nightMix;
 
-  let far = Math.min(radius, this.camera.far - 25);
-  if (nightMix > 0) {
-    const duskClamp = THREE.MathUtils.lerp(far * 0.5, far, Math.pow(dayFactor, 0.65));
-    far = Math.min(far, duskClamp);
-  }
-  far = Math.max(this.camera.near + 30, Math.min(radius, far));
+    let far = Math.min(radius, this.camera.far - 25);
+    if (nightMix > 0) {
+      const duskClamp = THREE.MathUtils.lerp(far * 0.5, far, Math.pow(dayFactor, 0.65));
+      far = Math.min(far, duskClamp);
+    }
+    far = Math.max(this.camera.near + 30, Math.min(radius, far));
 
-  let near = Math.max(this.camera.near + 10, radius * 0.12);
-  if (nightMix > 0) {
-    const nightNear = Math.min(far - 12, radius * 0.18 + 20 * nightMix);
-    near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
-  }
-  near = Math.min(near, far - 10);
+    let near = Math.max(this.camera.near + 10, radius * 0.12);
+    if (nightMix > 0) {
+      const nightNear = Math.min(far - 12, radius * 0.18 + 20 * nightMix);
+      near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
+    }
+    near = Math.min(near, far - 10);
 
-  return { near, far };
-}
-
-_syncFogToSky() {
-  const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
-
-  // Base world radius of your farfield (tiles)
-  const tileRadius = this._sampleTileRadius();
-
-  // Inset distances (fractions of tile radius)
-  const sampleInsetFrac = this._farfieldSampleInsetFrac ?? 0.08;
-  const fogInsetFrac    = this._farFogInsetFrac ?? 0.05;
-
-  // --- 1) Sampling angle: aim a little INSIDE the farfield edge ---
-  // Use a reduced target distance so the “below-horizon” row corresponds
-  // to the ring at (tileRadius * (1 - sampleInsetFrac)).
-  const targetD = Math.max(10, tileRadius * (1 - sampleInsetFrac));
-  const cameraHeight = Math.abs(this.camera?.position?.y ?? 0);
-  const edgeAngleRad = Math.atan2(cameraHeight, targetD); // angle below horizon to hit that ring
-  this._horizonOffsetDeg = THREE.MathUtils.clamp(
-    THREE.MathUtils.radToDeg(edgeAngleRad),
-    0.75, 12
-  );
-
-  // 🔍 Sample the true color just BELOW the horizon from the Sky shader
-  const fogColor = this._sampleSkyHorizonColor();
-
-  // Optional night tinting
-  const nightMix = this.currentNightMix ?? 0;
-  if (nightMix > 0) {
-    const t = THREE.MathUtils.clamp((nightMix - 0.08) / 0.92, 0, 1);
-    const blend = Math.pow(t, 1.25);
-    if (blend > 0) fogColor.lerp(NIGHT_FOG_COLOR, blend);
+    return { near, far };
   }
 
-  // --- 2) Fog distances: also pull fog.far slightly INSIDE the farfield edge ---
-  const fogRadius = Math.max(50, tileRadius * (1 - fogInsetFrac));
-  const { near, far } = this._computeFogDistances(fogRadius, this.currentSunAltitude ?? 0, turbidity);
+  _syncFogToSky() {
+    const turbidity = this.sky?.material?.uniforms?.turbidity?.value ?? 2.5;
 
-  if (!this.scene.fog) {
-    this.scene.fog = new THREE.Fog(fogColor.clone(), near, far);
-  } else {
-    this.scene.fog.color.copy(fogColor);
-    this.scene.fog.near = near;
-    this.scene.fog.far  = far;
+    // Base world radius of your farfield (tiles)
+    const tileRadius = this._sampleTileRadius();
+
+    // Inset distances (fractions of tile radius)
+    const sampleInsetFrac = this._farfieldSampleInsetFrac ?? 0.08;
+    const fogInsetFrac = this._farFogInsetFrac ?? 0.05;
+
+    // --- 1) Sampling angle: aim a little INSIDE the farfield edge ---
+    // Use a reduced target distance so the “below-horizon” row corresponds
+    // to the ring at (tileRadius * (1 - sampleInsetFrac)).
+    const targetD = Math.max(10, tileRadius * (1 - sampleInsetFrac));
+    const cameraHeight = Math.abs(this.camera?.position?.y ?? 0);
+    const edgeAngleRad = Math.atan2(cameraHeight, targetD); // angle below horizon to hit that ring
+    this._horizonOffsetDeg = THREE.MathUtils.clamp(
+      THREE.MathUtils.radToDeg(edgeAngleRad),
+      0.75, 12
+    );
+
+    // 🔍 Sample the true color just BELOW the horizon from the Sky shader
+    const fogColor = this._sampleSkyHorizonColor();
+
+    // Optional night tinting
+    const nightMix = this.currentNightMix ?? 0;
+    if (nightMix > 0) {
+      const t = THREE.MathUtils.clamp((nightMix - 0.08) / 0.92, 0, 1);
+      const blend = Math.pow(t, 1.25);
+      if (blend > 0) fogColor.lerp(NIGHT_FOG_COLOR, blend);
+    }
+
+    // --- 2) Fog distances: also pull fog.far slightly INSIDE the farfield edge ---
+    const fogRadius = Math.max(3000, tileRadius * (1 - fogInsetFrac));
+    const { near, far } = this._computeFogDistances(fogRadius, this.currentSunAltitude ?? 0, turbidity);
+
+    if (!this.scene.fog) {
+      this.scene.fog = new THREE.Fog(fogColor.clone(), near, far);
+    } else {
+      this.scene.fog.color.copy(fogColor);
+      this.scene.fog.near = near;
+      this.scene.fog.far = far;
+    }
+
+    // Match clear color so sky/fog blend seamlessly at edges
+    this.renderer.setClearColor(fogColor, 1);
+
+    // Ensure Sky is visible (not a solid color background)
+    if (this.scene.background && this.scene.background.isColor) {
+      this.scene.background = null;
+    }
   }
-
-  // Match clear color so sky/fog blend seamlessly at edges
-  this.renderer.setClearColor(fogColor, 1);
-
-  // Ensure Sky is visible (not a solid color background)
-  if (this.scene.background && this.scene.background.isColor) {
-    this.scene.background = null;
-  }
-}
   updateSun({
     lat = 0,
     lon = 0,
@@ -465,17 +483,50 @@ _syncFogToSky() {
     this.sunLight.color.copy(DUSK_SUN_COLOR).lerp(DAY_SUN_COLOR, Math.pow(dayFactor, 1.6));
 
     const uniforms = this.sky.material.uniforms;
-    const turbidityNight = THREE.MathUtils.lerp(turbidity, 0.25, nightMix);
-    const rayleighNight = THREE.MathUtils.lerp(rayleigh, 0.08, nightMix);
-    const mieNight = THREE.MathUtils.lerp(mieCoefficient, 0.00005, nightMix);
-    const mieDirectionalNight = THREE.MathUtils.lerp(mieDirectionalG, 0.92, nightMix);
+
+    // Push the sky darker earlier at night (no tone mapping involved)
+    const deep = THREE.MathUtils.smoothstep(nightMix, 0.65, 1.0);   // 0→1 into deep night
+    this.sky.material.transparent = true;
+    this.sky.material.depthWrite = false;                           // don’t affect depth
+    this.sky.material.opacity = THREE.MathUtils.lerp(0.0, 0.95, deep);  // 0..85% darkening
+
+    // --- Kill the dome & env in deep night so clear/fog shows through ---
+    const deepNight = nightMix >= 0.90;
+    this.sky.visible = !deepNight;
+
+    // Stop feeding a bright environment when it’s basically night
+    if (deepNight) {
+      if (this._skyEnvTarget) { this._skyEnvTarget.dispose(); this._skyEnvTarget = null; }
+      this.scene.environment = null;
+    } else {
+      if (this._skyEnvTarget) this._skyEnvTarget.dispose();
+      this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
+      this.scene.environment = this._skyEnvTarget.texture;
+    } const dim = 1.0 - deep;                                       // 1 by day → 0 in deep night
+
+    // Dim scattering terms and luminance by 'dim'
+    const turbidityNight = turbidity * dim;
+    const rayleighNight = rayleigh * dim;
+    const mieNight = mieCoefficient * dim;
+    // Also collapse directional Mie toward 0 so there's no residual forward glow
+    const mieDirectionalNight = THREE.MathUtils.lerp(mieDirectionalG, 0.0, deep);
+
     uniforms['turbidity'].value = turbidityNight;
     uniforms['rayleigh'].value = rayleighNight;
     uniforms['mieCoefficient'].value = mieNight;
     uniforms['mieDirectionalG'].value = mieDirectionalNight;
+
+    // Let luminance really fall off (stronger curve than linear)
+    // If you see banding, clamp the floor to ~0.003 instead of 0.0
     if (uniforms['luminance']) {
-      uniforms['luminance'].value = THREE.MathUtils.lerp(1, 0.06, nightMix);
+      uniforms['luminance'].value = THREE.MathUtils.lerp(1.0, 0.0, Math.pow(nightMix, 0.8)) * dim;
     }
+
+    // (Optional but very effective, still “no tone mapping”):
+    // blend the sky into the (already dark) clear/fog color at deep night
+    this.sky.material.transparent = true;
+    this.sky.material.opacity = THREE.MathUtils.lerp(1.0, 0.20, deep);
+
     uniforms['sunPosition'].value.copy(direction.clone().multiplyScalar(45000));
 
     this.currentSunAltitude = altitude;
