@@ -372,6 +372,12 @@ class App {
 
     this._friends = new Set(this._loadFriendList());
     this._teleportToasts = new Map();
+    this._syncRequestQueue = [];
+    this._syncRequestById = new Map();
+    this._activeSyncRequest = null;
+    this._syncModalBusy = false;
+    this._syncModalBound = false;
+    this._initSyncRequestModal();
     this._hudUserListVisible = false;
     this._lastHudUsers = [];
     this._terrainAuto = true;
@@ -2492,6 +2498,180 @@ class App {
       ui.hudUserList.appendChild(row);
     }
     this._syncHudUserListVisibility();
+  }
+
+  _initSyncRequestModal() {
+    if (this._syncModalBound) return;
+    this._syncModalBound = true;
+    const modal = ui.syncRequestModal;
+    if (!modal) return;
+    const acceptBtn = ui.syncRequestAccept;
+    const declineBtn = ui.syncRequestDecline;
+    const closeBtn = ui.syncRequestClose;
+    const backdrop = ui.syncRequestBackdrop;
+    const handleDecline = (reason = 'dismissed') => {
+      if (this._syncModalBusy) return;
+      this._dismissSyncRequest(reason);
+    };
+    acceptBtn?.addEventListener('click', () => {
+      if (this._syncModalBusy) return;
+      this._resolveSyncRequest(true);
+    });
+    declineBtn?.addEventListener('click', () => handleDecline('declined'));
+    closeBtn?.addEventListener('click', (evt) => {
+      evt?.preventDefault?.();
+      handleDecline('dismissed');
+    });
+    backdrop?.addEventListener('click', (evt) => {
+      evt?.preventDefault?.();
+      handleDecline('dismissed');
+    });
+  }
+
+  notifyBridgeSyncRequest(request) {
+    if (!request || !request.id) return;
+    this._syncRequestById.set(request.id, request);
+    if (this._activeSyncRequest?.id === request.id) {
+      this._activeSyncRequest = request;
+      this._renderSyncRequestMessage(request);
+      return;
+    }
+    const existingIdx = this._syncRequestQueue.findIndex((entry) => entry?.id === request.id);
+    if (existingIdx >= 0) this._syncRequestQueue[existingIdx] = request;
+    else this._syncRequestQueue.push(request);
+    if (!this._activeSyncRequest) {
+      this._processNextSyncRequest();
+    }
+  }
+
+  _processNextSyncRequest() {
+    if (this._activeSyncRequest) return;
+    while (this._syncRequestQueue.length) {
+      const next = this._syncRequestQueue.shift();
+      if (!next) continue;
+      const request = this._syncRequestById.get(next.id) || next;
+      this._activeSyncRequest = request;
+      this._presentSyncRequest(request);
+      return;
+    }
+    this._hideSyncRequestModal();
+  }
+
+  _presentSyncRequest(request) {
+    const modal = ui.syncRequestModal;
+    if (!modal) return;
+    this._renderSyncRequestMessage(request);
+    modal.classList.remove('hidden');
+    modal.setAttribute('aria-hidden', 'false');
+    document.body?.classList?.add('modal-open');
+    this._setSyncModalBusy(false);
+  }
+
+  _renderSyncRequestMessage(request) {
+    const container = ui.syncRequestMessage;
+    if (!container) return;
+    container.innerHTML = '';
+    const alias = request.hydraLabel || shortHex(request.hydraPub || request.hydraAddr || '', 6, 4);
+    const intro = document.createElement('p');
+    intro.textContent = `Incoming bridge sync request from ${alias}`;
+    container.appendChild(intro);
+
+    if (request.hydraAddr) {
+      const addrRow = document.createElement('p');
+      addrRow.textContent = 'Hydra address: ';
+      const code = document.createElement('code');
+      code.textContent = request.hydraAddr;
+      addrRow.appendChild(code);
+      container.appendChild(addrRow);
+    }
+
+    if (request.objectLabel || request.objectUuid) {
+      const labelRow = document.createElement('p');
+      const labelText = request.objectLabel || request.objectUuid;
+      labelRow.textContent = `Smart object: ${labelText}`;
+      container.appendChild(labelRow);
+    }
+
+    if (request.discoveryRoom) {
+      const roomRow = document.createElement('p');
+      roomRow.textContent = `Discovery room: ${request.discoveryRoom}`;
+      container.appendChild(roomRow);
+    }
+
+    const pos = request.position || request.geo;
+    const latNum = pos ? Number(pos.lat) : NaN;
+    const lonNum = pos ? Number(pos.lon) : NaN;
+    if (Number.isFinite(latNum) && Number.isFinite(lonNum)) {
+      const posRow = document.createElement('p');
+      const lat = latNum.toFixed(5);
+      const lon = lonNum.toFixed(5);
+      posRow.textContent = `Proposed location: ${lat}, ${lon}`;
+      container.appendChild(posRow);
+    }
+
+    const prompt = document.createElement('p');
+    prompt.textContent = 'Accept to establish a bridge session?';
+    container.appendChild(prompt);
+  }
+
+  _setSyncModalBusy(busy) {
+    this._syncModalBusy = !!busy;
+    if (ui.syncRequestAccept) ui.syncRequestAccept.disabled = !!busy;
+    if (ui.syncRequestDecline) ui.syncRequestDecline.disabled = !!busy;
+    const panel = ui.syncRequestModal?.querySelector('.bridge-modal-panel');
+    if (panel) panel.dataset.busy = busy ? 'true' : 'false';
+  }
+
+  async _resolveSyncRequest(accept, declineReason = 'User declined') {
+    const request = this._activeSyncRequest;
+    if (!request) {
+      this._hideSyncRequestModal();
+      return;
+    }
+    if (this._syncModalBusy) return;
+    if (!this.hybrid) {
+      pushToast('Bridge system unavailable', { duration: 4000 });
+      return;
+    }
+    this._setSyncModalBusy(true);
+    try {
+      if (accept) {
+        if (typeof this.hybrid.acceptSyncRequest !== 'function') {
+          throw new Error('acceptSyncRequest unavailable');
+        }
+        await this.hybrid.acceptSyncRequest(request.id);
+      } else {
+        if (typeof this.hybrid.declineSyncRequest !== 'function') {
+          throw new Error('declineSyncRequest unavailable');
+        }
+        await this.hybrid.declineSyncRequest(request.id, declineReason);
+      }
+      this._syncRequestById.delete(request.id);
+      this._activeSyncRequest = null;
+      this._hideSyncRequestModal();
+      this._setSyncModalBusy(false);
+      this._processNextSyncRequest();
+    } catch (err) {
+      console.error('[App] Failed to resolve sync request:', err);
+      this._setSyncModalBusy(false);
+      pushToast(`Sync ${accept ? 'accept' : 'decline'} failed: ${err?.message || err}`, { duration: 5000 });
+    }
+  }
+
+  _dismissSyncRequest(reason = 'dismissed') {
+    if (!this._activeSyncRequest) {
+      this._hideSyncRequestModal();
+      return;
+    }
+    this._resolveSyncRequest(false, reason);
+  }
+
+  _hideSyncRequestModal() {
+    const modal = ui.syncRequestModal;
+    if (!modal) return;
+    modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    document.body?.classList?.remove('modal-open');
   }
 
   notifyTeleportToast(pub, entry) {

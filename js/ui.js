@@ -87,6 +87,12 @@ const hudClockLocal = document.getElementById('hudClockLocal');
 const hudClockUtc = document.getElementById('hudClockUtc');
 const hudSunInfo = document.getElementById('hudSunInfo');
 const hudMoonInfo = document.getElementById('hudMoonInfo');
+const syncRequestModal = document.getElementById('syncRequestModal');
+const syncRequestBackdrop = document.getElementById('syncRequestBackdrop');
+const syncRequestClose = document.getElementById('syncRequestClose');
+const syncRequestMessage = document.getElementById('syncRequestMessage');
+const syncRequestAccept = document.getElementById('syncRequestAccept');
+const syncRequestDecline = document.getElementById('syncRequestDecline');
 const hudWeather = document.getElementById('hudWeather');
 const hudWeatherIcon = document.getElementById('hudWeatherIcon');
 const hudWeatherTemp = document.getElementById('hudWeatherTemp');
@@ -357,6 +363,8 @@ export const ui = {
   terrainModeGeohash, terrainModeLatLng,
   pointerLockHint,
   teleportToastHost,
+  syncRequestModal, syncRequestBackdrop, syncRequestClose,
+  syncRequestMessage, syncRequestAccept, syncRequestDecline,
   hudUsersToggle, hudUserPanel, hudUserList,
   overviewBrowser, overviewPlatform, overviewResolution, overviewUserAgent,
   charAnimState, charSpeedValue, charElevationValue, charEyeHeightValue, charCrouchState, charJumpState,

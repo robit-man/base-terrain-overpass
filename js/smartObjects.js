@@ -1045,9 +1045,40 @@ class SmartObjectManager {
     });
   }
 
-  /**
-   * Cleanup
-   */
+  markSyncPending(uuid, hydraPub, extras = {}) {
+    const obj = this.objects.get(uuid);
+    if (!obj?.config) return false;
+    const normalized = this._normalizeHydraPub(hydraPub);
+    if (!normalized) return false;
+    if (!Array.isArray(obj.config._pendingSyncs)) obj.config._pendingSyncs = [];
+    const list = obj.config._pendingSyncs;
+    const now = Date.now();
+    let entry = list.find((item) => this._normalizeHydraPub(item?.hydraPub) === normalized);
+    if (!entry) {
+      entry = { hydraPub: normalized, status: 'pending', requestedAt: now };
+      list.push(entry);
+    }
+    entry.hydraPub = normalized;
+    entry.status = extras.status || 'pending';
+    entry.requestedAt = extras.requestedAt || entry.requestedAt || now;
+    if (entry.status === 'pending') {
+      delete entry.respondedAt;
+    } else {
+      entry.respondedAt = now;
+    }
+    if (extras.reason !== undefined) entry.reason = extras.reason;
+    if (extras.sessionId) entry.sessionId = extras.sessionId;
+    if (extras.hydraBridgeNodeId) entry.hydraBridgeNodeId = extras.hydraBridgeNodeId;
+    if (extras.discoveryRoom) entry.discoveryRoom = extras.discoveryRoom;
+    if (extras.direction) entry.direction = extras.direction;
+    obj.config._pendingSyncs = list;
+    obj.config.updatedAt = now;
+    obj.lastUpdate = now;
+    this._saveToStorage();
+    this._broadcastObjectSync('update', obj);
+    return true;
+  }
+
   markSyncRejected(uuid, hydraPub, reason = 'User rejected') {
     const obj = this.objects.get(uuid);
     if (!obj) return false;

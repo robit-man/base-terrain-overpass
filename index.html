@@ -72,6 +72,22 @@
 <body>
   <div id="toastHost" aria-live="polite" aria-atomic="false"></div>
   <div id="teleportToastHost" aria-live="polite" aria-atomic="true"></div>
+  <div id="syncRequestModal" class="bridge-modal hidden" aria-hidden="true">
+    <div class="bridge-modal-backdrop" id="syncRequestBackdrop"></div>
+    <div class="bridge-modal-panel" role="dialog" aria-modal="true" aria-labelledby="syncRequestTitle">
+      <div class="bridge-modal-head">
+        <h2 id="syncRequestTitle">Bridge Sync Request</h2>
+        <button id="syncRequestClose" class="bridge-modal-close" aria-label="Close sync request">✕</button>
+      </div>
+      <div class="bridge-modal-body">
+        <p id="syncRequestMessage">—</p>
+      </div>
+      <div class="bridge-modal-actions">
+        <button id="syncRequestAccept" class="bridge-modal-accept">Accept</button>
+        <button id="syncRequestDecline" class="bridge-modal-decline">Decline</button>
+      </div>
+    </div>
+  </div>
   <div id="buildingHoverToast" class="building-toast" aria-live="polite" aria-atomic="true" role="status" hidden>
     <div class="building-toast-name" data-role="toast-name"></div>
     <div class="building-toast-address" data-role="toast-address">—</div>

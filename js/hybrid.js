@@ -72,6 +72,7 @@ export class HybridHub {
   this._sessionIndexByObject = new Map();
   this._pendingSessionBindings = new Set();
   this._sessionBindTimer = null;
+  this._incomingSyncRequests = new Map();
   this._loadSessions();
 }
 
@@ -1207,6 +1208,10 @@ export class HybridHub {
     const peerRecord = this.state.hydra.peers.get(from);
     if (peerRecord) peerRecord.last = payload.ts || nowSecondsFallback();
     if (this.state.network === NETWORKS.HYDRA) this.renderPeers();
+    if (type === 'noclip-bridge-sync-request') {
+      this._handleIncomingSyncRequest(from, payload);
+      return;
+    }
     if (type === 'smart-object-state') {
       const result = this._handleSmartObjectStateMessage(from, payload);
       if (payload.messageId) {
@@ -1308,6 +1313,85 @@ export class HybridHub {
       this._handlePing(from, payload);
       return;
     }
+  }
+
+  /**
+   * Handle incoming sync request from Hydra peers
+   */
+  _handleIncomingSyncRequest(from, payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const fallbackKey = (from || '').toLowerCase();
+    const normalizedHydra = normalizeHex64(payload.hydraPub || payload.from || from) || fallbackKey;
+    const hydraAddr = typeof payload.hydraAddr === 'string' && payload.hydraAddr
+      ? payload.hydraAddr
+      : (normalizedHydra ? `hydra.${normalizedHydra}` : fallbackKey);
+    const objectUuid = typeof payload.objectId === 'string'
+      ? payload.objectId
+      : (typeof payload.objectUuid === 'string' ? payload.objectUuid : '');
+    const objectLabel = typeof payload.objectLabel === 'string'
+      ? payload.objectLabel
+      : (payload.objectConfig && typeof payload.objectConfig === 'object' && typeof payload.objectConfig.label === 'string'
+        ? payload.objectConfig.label
+        : 'Hydra Bridge');
+    const discoveryRoom = typeof payload.discoveryRoom === 'string' && payload.discoveryRoom
+      ? payload.discoveryRoom
+      : sanitizeRoom();
+    const positionSource = payload.objectConfig && typeof payload.objectConfig === 'object'
+      ? payload.objectConfig.position
+      : payload.position;
+    const position = positionSource && typeof positionSource === 'object' ? { ...positionSource } : null;
+    const geoSource = payload.geo;
+    const geo = geoSource && typeof geoSource === 'object' ? { ...geoSource } : null;
+    const bridgeNodeId = payload.bridgeNodeId || payload.hydraBridgeNodeId || '';
+    const requestId = typeof payload.requestId === 'string' && payload.requestId
+      ? payload.requestId
+      : generateBridgeId();
+    const request = {
+      id: requestId,
+      hydraPub: normalizedHydra,
+      hydraAddr,
+      hydraGraphId: typeof payload.hydraGraphId === 'string' ? payload.hydraGraphId : '',
+      bridgeNodeId,
+      objectUuid,
+      objectLabel,
+      discoveryRoom,
+      position,
+      geo,
+      receivedAt: Date.now(),
+      raw: { ...payload }
+    };
+    this._incomingSyncRequests.set(requestId, request);
+
+    const peer = normalizedHydra ? this._ensureHydraPeerRecord(normalizedHydra, {
+      hydraAddr,
+      hydraPub: normalizedHydra,
+      hydraBridgeNodeId: bridgeNodeId
+    }) : null;
+    if (peer) {
+      peer.hasBridge = true;
+      peer.bridgeStatus = 'handshake-received';
+      this.renderPeers();
+    }
+
+    if (objectUuid && this.sceneMgr?.smartObjects?.markSyncPending) {
+      this.sceneMgr.smartObjects.markSyncPending(objectUuid, normalizedHydra || fallbackKey, {
+        hydraBridgeNodeId: bridgeNodeId,
+        discoveryRoom,
+        direction: 'incoming',
+        requestedAt: request.receivedAt
+      });
+    }
+
+    if (objectUuid && this.sceneMgr?.smartModal?.currentObject?.uuid === objectUuid) {
+      this.sceneMgr.smartModal._log(`↺ Sync request from ${shortPub(normalizedHydra || fallbackKey)}`, 'info');
+    }
+
+    const alias = this.mesh?._aliasFor?.(normalizedHydra || fallbackKey) || shortPub(normalizedHydra || fallbackKey || 'hydra');
+    pushToast(`Sync request from ${alias}`, { duration: 3600 });
+    this.app?.notifyBridgeSyncRequest?.({
+      ...request,
+      hydraLabel: alias
+    });
   }
 
   /**
@@ -2012,6 +2096,88 @@ export class HybridHub {
     }
   }
 
+  async acceptSyncRequest(requestId) {
+    const request = this._incomingSyncRequests.get(requestId);
+    if (!request) throw new Error('Sync request not found');
+    const discovery = await this.ensureHydraDiscovery();
+    if (!discovery) throw new Error('Hydra discovery unavailable');
+    const hydraTarget = normalizeHex64(request.hydraPub || request.raw?.hydraPub || request.raw?.from || '');
+    if (!hydraTarget) throw new Error('Hydra peer unknown');
+    const selfPub = normalizeHex64(this.mesh?.selfPub || this.mesh?.selfAddr || '');
+    if (!selfPub) throw new Error('NoClip identity unavailable');
+    const sessionId = request.raw?.session?.sessionId || generateSessionId();
+    const baseSession = {
+      sessionId,
+      objectUuid: request.objectUuid || '',
+      objectLabel: request.objectLabel || '',
+      noclipPub: selfPub,
+      noclipAddr: this.mesh?.selfAddr || `noclip.${selfPub}`,
+      hydraBridgeNodeId: request.bridgeNodeId || '',
+      hydraGraphId: request.hydraGraphId || '',
+      hydraPub: hydraTarget,
+      hydraAddr: request.hydraAddr || '',
+      discoveryRoom: request.discoveryRoom || sanitizeRoom(),
+      status: 'pending-handshake',
+      position: request.position || null,
+      geo: request.geo || null
+    };
+    await discovery.dm(hydraTarget, {
+      type: 'noclip-bridge-sync-accepted',
+      bridgeNodeId: request.bridgeNodeId || '',
+      objectId: baseSession.objectUuid,
+      objectLabel: baseSession.objectLabel,
+      session: baseSession,
+      timestamp: Date.now()
+    });
+    const session = this._upsertSession(baseSession);
+    if (session.objectUuid && this.sceneMgr?.smartObjects?.attachSession) {
+      this.sceneMgr.smartObjects.attachSession(session.objectUuid, session);
+    }
+    this._incomingSyncRequests.delete(requestId);
+    const peer = this._ensureHydraPeerRecord(hydraTarget, session);
+    if (peer) {
+      peer.hasBridge = true;
+      peer.bridgeStatus = 'handshaking';
+      this.renderPeers();
+    }
+    if (session.objectUuid && this.sceneMgr?.smartModal?.currentObject?.uuid === session.objectUuid) {
+      this.sceneMgr.smartModal._log(`✓ Sync accepted for ${session.objectLabel || session.objectUuid}`, 'success');
+    }
+    const alias = this.mesh?._aliasFor?.(hydraTarget) || shortPub(hydraTarget);
+    pushToast(`Sync accepted with ${alias}`, { duration: 3400 });
+    return session;
+  }
+
+  async declineSyncRequest(requestId, reason = 'User declined') {
+    const request = this._incomingSyncRequests.get(requestId);
+    if (!request) throw new Error('Sync request not found');
+    const discovery = await this.ensureHydraDiscovery();
+    if (!discovery) throw new Error('Hydra discovery unavailable');
+    const hydraTarget = normalizeHex64(request.hydraPub || request.raw?.hydraPub || request.raw?.from || '');
+    if (!hydraTarget) throw new Error('Hydra peer unknown');
+    await discovery.dm(hydraTarget, {
+      type: 'noclip-bridge-sync-rejected',
+      objectId: request.objectUuid || '',
+      objectLabel: request.objectLabel || '',
+      reason,
+      timestamp: Date.now()
+    });
+    this._incomingSyncRequests.delete(requestId);
+    if (request.objectUuid && this.sceneMgr?.smartObjects?.markSyncRejected) {
+      this.sceneMgr.smartObjects.markSyncRejected(request.objectUuid, hydraTarget, reason);
+    }
+    const peer = this.state.hydra.peers.get(hydraTarget);
+    if (peer && peer.bridgeStatus === 'handshake-received') {
+      peer.bridgeStatus = 'detected';
+      this.renderPeers();
+    }
+    if (request.objectUuid && this.sceneMgr?.smartModal?.currentObject?.uuid === request.objectUuid) {
+      this.sceneMgr.smartModal._log(`✗ Sync declined: ${reason}`, 'error');
+    }
+    const alias = this.mesh?._aliasFor?.(hydraTarget) || shortPub(hydraTarget);
+    pushToast(`Sync rejected: ${reason} (${alias})`, { duration: 3400 });
+  }
+
   /**
    * Handle ping request from Hydra
    */
@@ -2148,6 +2314,10 @@ function metaIdentity(mesh) {
 function generateBridgeId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function generateSessionId() {
+  return `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 class HydraDiscoveryShim {
