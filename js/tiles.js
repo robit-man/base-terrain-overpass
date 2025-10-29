@@ -63,6 +63,12 @@ const COLOR_STOPS = {
   snow: { r: 0.94, g: 0.95, b: 0.97 }
 };
 
+const OVERLAY_MAX_DIMENSIONS = {
+  interactive: 512,
+  visual: 320,
+  farfield: 192
+};
+
 /**
  * Normal map generation utilities (ported from normals-tiles.html)
  */
@@ -264,7 +270,7 @@ export class TileManager {
     this._horizonField = null;
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
-    this._overlayEnabled = _tmOnMobile ? false : false;
+    this._overlayEnabled = _tmOnMobile ? false : true;
     this._overlayZoom = 18;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
@@ -2614,6 +2620,10 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (!version) return null;
     return `${WAYBACK_WMTS_ROOT}/tile/${version}/${zoom}/${y}/${x}`;
   }
+  _overlayMaxDimensionForType(type) {
+    if (!type) return OVERLAY_MAX_DIMENSIONS.interactive;
+    return OVERLAY_MAX_DIMENSIONS[type] || OVERLAY_MAX_DIMENSIONS.interactive;
+  }
   _ensureTileOverlay(tile) {
     if (!this._overlayEnabled || !tile || !this.origin) return;
     const eligible = ['interactive', 'visual', 'farfield'];
@@ -2621,6 +2631,20 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
     // already loading/ready? bail
     if (tile._overlay && (tile._overlay.status === 'loading' || tile._overlay.status === 'ready')) return;
+
+    if (tile.type === 'farfield') {
+      let pendingNear = 0;
+      for (const candidate of this.tiles.values()) {
+        if (!candidate) continue;
+        if (candidate === tile) continue;
+        if (candidate.type !== 'interactive' && candidate.type !== 'visual') continue;
+        const status = candidate._overlay?.status;
+        if (status !== 'ready') {
+          pendingNear++;
+          if (pendingNear >= 8) return;
+        }
+      }
+    }
 
     // Version & zoom selection (no more zoom step-down fallback)
     this._primeWaybackVersions();
@@ -2676,7 +2700,8 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         y0: minY, y1: maxY,
         composite: multi,
         bounds: unionBounds,
-        coverage
+        coverage,
+        maxDim: this._overlayMaxDimensionForType(tile.type)
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);          // (replaced) now supports composite
@@ -2684,6 +2709,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       entry.bounds = multi
         ? this._unionTileBounds(minX, maxX, minY, maxY, zoom)
         : this._slippyTileBounds(entry.x, entry.y, zoom);
+    }
+
+    const targetDim = this._overlayMaxDimensionForType(tile.type);
+    if (Number.isFinite(targetDim)) {
+      entry.maxDim = Math.max(entry.maxDim || targetDim, targetDim);
     }
 
     // normal waiter bookkeeping
@@ -2717,9 +2747,15 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         version,
         bounds,
         coverage,
+        maxDim: this._overlayMaxDimensionForType(tile.type)
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);
+    }
+
+    const targetDim = this._overlayMaxDimensionForType(tile.type);
+    if (Number.isFinite(targetDim)) {
+      entry.maxDim = Math.max(entry.maxDim || targetDim, targetDim);
     }
 
     entry.waiters.add(tile);
@@ -2732,18 +2768,21 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
     // helper to finish & notify waiters
     const finalizeReady = (canvas, bounds) => {
+      const preparedCanvas = this._prepareOverlayCanvas(canvas, entry);
+      const sourceCanvas = preparedCanvas || canvas;
+      const applyBounds = bounds;
       // Reuse your existing processing so samples/etc keep working
-      const overlayData = this._processOverlayImage(canvas, bounds);
-      const texCanvas = overlayData.canvas || canvas;
+      const overlayData = this._processOverlayImage(sourceCanvas, applyBounds);
+      const texCanvas = overlayData.canvas || sourceCanvas;
 
       // Create texture from canvas (works for <img> or <canvas>)
       const texture = new THREE.CanvasTexture(texCanvas);
       texture.wrapS = THREE.ClampToEdgeWrapping;
       texture.wrapT = THREE.ClampToEdgeWrapping;
-      texture.minFilter = THREE.LinearMipmapLinearFilter;
+      texture.minFilter = THREE.LinearFilter;
       texture.magFilter = THREE.LinearFilter;
-      texture.generateMipmaps = true;
-      texture.anisotropy = (this.renderer?.capabilities?.getMaxAnisotropy?.() || 1);
+      texture.generateMipmaps = false;
+      texture.anisotropy = 1;
       texture.encoding = THREE.sRGBEncoding;
 
       texture.flipY = false;               // ★ IMPORTANT: keep Mercator v “top-origin”
@@ -3021,11 +3060,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     texture.offset.set(padU, padV);                    // inset from each edge
     texture.repeat.set(1 - 2 * padU, 1 - 2 * padV);    // shrink sampling window
     // Improve mip sampling stability
-    if (texture.generateMipmaps !== false) texture.generateMipmaps = true;
-    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.generateMipmaps = false;
+    texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
     // Optional but helpful on oblique views
-    texture.anisotropy = Math.max(texture.anisotropy || 1, 8);
+    texture.anisotropy = 1;
     texture.needsUpdate = true;
     // ---------------------------------------------------------------------------
 
@@ -3086,6 +3125,47 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
 
 
+  _prepareOverlayCanvas(source, entry) {
+    if (!source) return null;
+    if (typeof document === 'undefined') return source;
+
+    let baseCanvas = source;
+    if (!(source instanceof HTMLCanvasElement)) {
+      const w = source?.naturalWidth || source?.width || 0;
+      const h = source?.naturalHeight || source?.height || 0;
+      if (!w || !h) return source;
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d', { willReadFrequently: false });
+      ctx?.drawImage(source, 0, 0, w, h);
+      baseCanvas = canvas;
+    }
+
+    const maxDim = Math.max(baseCanvas.width, baseCanvas.height);
+    const target = Math.max(64, entry?.maxDim || OVERLAY_MAX_DIMENSIONS.interactive);
+    if (!(maxDim > target)) return baseCanvas;
+
+    const scale = target / maxDim;
+    const width = Math.max(64, Math.round(baseCanvas.width * scale));
+    const height = Math.max(64, Math.round(baseCanvas.height * scale));
+    if (width === baseCanvas.width && height === baseCanvas.height) return baseCanvas;
+
+    const down = document.createElement('canvas');
+    down.width = width;
+    down.height = height;
+    const ctx = down.getContext('2d', { willReadFrequently: false });
+    if (ctx) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'medium';
+      ctx.drawImage(baseCanvas, 0, 0, width, height);
+      return down;
+    }
+    return baseCanvas;
+  }
+
+
+
   _processOverlayImage(image, bounds) {
     if (typeof document === 'undefined') {
       const w = image.naturalWidth || image.width || 256;
@@ -3127,7 +3207,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     return { samples, imageSize: { width: w, height: h }, bounds, canvas: textureCanvas };
   }
   _extractGreenSamples(data, width, height) {
-    const step = Math.max(2, Math.floor(Math.min(width, height) / 64));
+    const step = Math.max(3, Math.floor(Math.min(width, height) / 48));
     const complexity = THREE.MathUtils.clamp(this._treeComplexity ?? 0.35, 0.2, 1);
     const maxSamples = Math.round(120 + complexity * 120);
     const spawnBias = THREE.MathUtils.lerp(0.22, 0.48, complexity);
@@ -5947,13 +6027,40 @@ _farfieldTierForDist(dist) {
     if (!this._textureQueueSet) this._textureQueueSet = new Set();
     if (this._textureQueueSet.has(tile)) return;
     if (!force && tile._texturesApplied && !tile._overlay?.dirty) return;
-    this._textureQueue.push(tile);
+    const priority = this._texturePriorityValue(tile);
+    tile._texturePriority = priority;
+
+    // Avoid flooding with farfield when many nearer tiles are pending
+    if (!force && priority === 2 && this._textureQueue.length > 32) {
+      tile._textureDeferredUntil = (typeof performance !== 'undefined' && performance.now)
+        ? performance.now() + 800
+        : Date.now() + 800;
+    }
+
+    let inserted = false;
+    for (let i = 0; i < this._textureQueue.length; i++) {
+      const next = this._textureQueue[i];
+      if (!next) continue;
+      const nextPriority = next._texturePriority ?? this._texturePriorityValue(next);
+      if (nextPriority > priority) {
+        this._textureQueue.splice(i, 0, tile);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) this._textureQueue.push(tile);
     this._textureQueueSet.add(tile);
     tile._textureDeferredUntil = 0;
   }
 
   _drainTextureQueue() {
     if (!this._textureQueue || !this._textureQueue.length) return;
+
+    this._textureQueue.sort((a, b) => {
+      const pa = a?._texturePriority ?? this._texturePriorityValue(a);
+      const pb = b?._texturePriority ?? this._texturePriorityValue(b);
+      return pa - pb;
+    });
 
     // Apply textures even under poor FPS, but throttle aggressively when needed
     const fpsHealth = this.adaptiveBatchScheduler?._fpsHealth;
@@ -6018,6 +6125,14 @@ _farfieldTierForDist(dist) {
     if (!this._grassQueue) this._grassQueue = [];
     if (this._grassQueue.includes(tile)) return;
     this._grassQueue.push(tile);
+  }
+
+  _texturePriorityValue(tile) {
+    if (!tile) return 3;
+    if (tile.type === 'interactive') return 0;
+    if (tile.type === 'visual') return 1;
+    if (tile.type === 'farfield') return 2;
+    return 3;
   }
 
   _drainGrassQueue() {
