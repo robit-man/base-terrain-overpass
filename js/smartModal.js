@@ -469,6 +469,7 @@ class SmartObjectModal {
         type: 'noclip-bridge-sync-request',
         from: noclipPub,
         noclipAddr,
+        discoveryRoom: this._resolvedDiscoveryRoom(),
         objectId: this.currentObject.uuid,
         objectConfig: {
           position: { ...this.currentObject.config.position },
@@ -720,6 +721,10 @@ class SmartObjectModal {
       }
     }
     this._refreshGroundDisplay();
+  }
+
+  _resolvedDiscoveryRoom() {
+    return 'nexus';
   }
 
   updateSessionStatus(obj = null) {

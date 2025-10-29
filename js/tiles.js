@@ -274,7 +274,7 @@ export class TileManager {
     this._treeLibWarned = false;
 
     // Dial back complexity on mobile to reduce instance counts and leaf density
-    this._treeComplexity = _tmOnMobile ? 0.12 : 0.75;        // min is clamped at 0.20 internally
+    this._treeComplexity = _tmOnMobile ? 0.12 : 0.5;        // min is clamped at 0.20 internally
     this._treeTargetComplexity = this._treeComplexity;
 
     this._treePerfSamples = [];
