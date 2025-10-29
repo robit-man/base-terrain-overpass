@@ -3104,6 +3104,7 @@ body.theme-day .building-hover-overlay {
   transition: all 0.2s;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  color:var(--muted);
 }
 
 .smart-btn-save {
