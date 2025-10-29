@@ -195,6 +195,36 @@ class SmartObjectManager {
     return result;
   }
 
+  _normalizeHydraPub(pub) {
+    if (typeof pub !== 'string') return '';
+    const match = pub.match(/([0-9a-f]{64})$/i);
+    return match ? match[1].toLowerCase() : '';
+  }
+
+  _updatePendingSync(obj, hydraPub, updates = {}) {
+    if (!obj?.config) return false;
+    const list = Array.isArray(obj.config._pendingSyncs) ? obj.config._pendingSyncs : null;
+    if (!list || !list.length) return false;
+    const targetPub = this._normalizeHydraPub(hydraPub);
+    let touched = false;
+    const nowStamp = Date.now();
+    list.forEach((entry) => {
+      if (!entry) return;
+      const entryPub = this._normalizeHydraPub(entry.hydraPub);
+      if (targetPub && entryPub !== targetPub) return;
+      Object.assign(entry, updates);
+      entry.hydraPub = entryPub || targetPub || entry.hydraPub;
+      if (updates.status && updates.status !== 'pending') {
+        entry.respondedAt = nowStamp;
+        if (updates.status !== 'rejected') delete entry.reason;
+      }
+      if (updates.sessionId) entry.sessionId = updates.sessionId;
+      touched = true;
+    });
+    if (touched) obj.config._pendingSyncs = list;
+    return touched;
+  }
+
   estimateGroundHeight(lat, lon) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
     const world = this._geoToWorld(lat, lon);
@@ -490,6 +520,15 @@ class SmartObjectManager {
       ...session,
       updatedAt: now
     };
+
+    const normalizedHydra = this._normalizeHydraPub(session.hydraPub || session.hydraAddr || session.from);
+    if (normalizedHydra) {
+      obj.config.session.hydraPub = normalizedHydra;
+      this._updatePendingSync(obj, normalizedHydra, {
+        status: 'accepted',
+        sessionId: session.sessionId
+      });
+    }
 
     if (session.position && typeof session.position === 'object') {
       const normalized = this._normalizePosition(session.position, obj.config.position);
@@ -1009,6 +1048,35 @@ class SmartObjectManager {
   /**
    * Cleanup
    */
+  markSyncRejected(uuid, hydraPub, reason = 'User rejected') {
+    const obj = this.objects.get(uuid);
+    if (!obj) return false;
+    const normalized = this._normalizeHydraPub(hydraPub);
+    const updated = this._updatePendingSync(obj, normalized, {
+      status: 'rejected',
+      reason
+    });
+    if (!updated) return false;
+    const now = Date.now();
+    obj.config.updatedAt = now;
+    obj.lastUpdate = now;
+    if (obj.config.session && this._normalizeHydraPub(obj.config.session.hydraPub) === normalized) {
+      obj.config.session.status = 'rejected';
+      obj.config.session.rejectionReason = reason;
+      obj.config.session.updatedAt = now;
+    }
+    this._saveToStorage();
+    this._broadcastObjectSync('update', obj);
+    if (this.hybrid?.onSmartObjectSessionUpdate) {
+      try {
+        this.hybrid.onSmartObjectSessionUpdate(obj);
+      } catch (err) {
+        console.warn('[SmartObjects] hybrid onSmartObjectSessionUpdate error', err);
+      }
+    }
+    return true;
+  }
+
   dispose() {
     // Remove all objects
     this.objects.forEach((obj) => {

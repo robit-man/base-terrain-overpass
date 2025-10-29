@@ -68,6 +68,13 @@ export class Mesh {
     this._pendingMessages = [];
     this._pendingMessagesLimit = 128;
 
+    // connection resilience
+    this._connectFailures = 0;
+    this._connectInFlight = false;
+    this._reconnectTimer = null;
+    this._heartbeatTimer = null;
+    this._peerRequestTimer = null;
+
     this.geoShare = new Map(); // pub -> { matchPrec, sharePrec, remotePrec, remoteGh, remoteRadius, ... }
     this.GEOHASH_MAX_PREC = 10;
     this.GEOHASH_BASE_SHARE = 4;
@@ -1214,7 +1221,7 @@ export class Mesh {
     if (type.startsWith('chat-')) {
       this._emit('noclip-chat', { from, payload });
     }
-    if (type.startsWith('hybrid-')) {
+    if (type.startsWith('hybrid-') || type.startsWith('noclip-bridge-')) {
       this._emit('noclip-bridge', { from, payload });
     }
   }
@@ -1264,64 +1271,182 @@ export class Mesh {
 
   /* ───────── Connect & plumbing ───────── */
 
-  async _connect() {
+  async _connect(reason = 'initial') {
+    if (this._connectInFlight) return;
+    this._connectInFlight = true;
+
     try {
-      setNkn('NKN: connecting…', 'warn');
+      this._clearReconnectTimer();
+      const label = reason === 'initial' ? 'connecting…' : 'reconnecting…';
+      const suffix = reason === 'initial' || reason === 'retry' ? '' : ` (${reason})`;
+      setNkn(`NKN: ${label}${suffix}`, 'warn');
+
       let hex = localStorage.getItem('NKN_SEED_HEX_V1');
       const makeSeed = () => { const u = new Uint8Array(32); crypto.getRandomValues(u); return Array.from(u).map(b => b.toString(16).padStart(2, '0')).join(''); };
       if (!isHex64(hex)) { hex = makeSeed(); localStorage.setItem('NKN_SEED_HEX_V1', hex); }
+
+      if (this.client) {
+        try { this.client.close?.(); } catch { }
+        this.client = null;
+      }
+
       // Use noclip. prefix for NoClip peers (changed from web.)
-      this.client = new window.nkn.MultiClient({ seed: hex, identifier: 'noclip', numSubClients: 8, originalClient: true });
+      const client = new window.nkn.MultiClient({ seed: hex, identifier: 'noclip', numSubClients: 8, originalClient: true });
+      this.client = client;
 
-      // Session support (ncp-js)
-      try {
-        if (typeof this.client.listen === 'function' && typeof this.client.onSession === 'function') {
-          this.client.listen();
-          this.client.onSession((session) => this._acceptSession(session));
-        } else {
-          console.warn('[NKN] Session API not available on this sdk build.');
-        }
-      } catch (e) { console.warn('[NKN] session init error', e); }
+      this._setupSessionSupport(client);
+      this._registerClientEvents(client);
+      this._ensureTimers();
+    } catch (err) {
+      console.warn(err);
+      setNkn('NKN: init failed', 'err');
+      this._handleClientDisconnect('init-error', err);
+    } finally {
+      this._connectInFlight = false;
+    }
+  }
 
-      this.client.onConnect(() => {
-        this.selfAddr = this.client.addr || null;
-        this.selfPub = (this.client.getPublicKey() || '').toLowerCase();
-        if (ui.myAddr) ui.myAddr.textContent = this.selfAddr || '—';
-        if (ui.myPub) ui.myPub.textContent = this.selfPub || '—';
-        setNkn('NKN: connected', 'ok');
+  _setupSessionSupport(client) {
+    if (!client) return;
+    try {
+      if (typeof client.listen === 'function' && typeof client.onSession === 'function') {
+        client.listen();
+        client.onSession((session) => this._acceptSession(session));
+      } else {
+        console.warn('[NKN] Session API not available on this sdk build.');
+      }
+    } catch (e) {
+      console.warn('[NKN] session init error', e);
+    }
+  }
 
-        this._applyAlias(this.selfPub, this.displayName);
+  _registerClientEvents(client) {
+    if (!client) return;
 
-        this._initDiscovery();
+    client.onConnect(() => {
+      if (this.client !== client) return;
 
-        // Announce & request peers to *all known targets* (includes bootstrapped addrs)
-        this._blast(this._helloEnvelope(now()));
+      this._connectFailures = 0;
+      this._clearReconnectTimer();
+
+      this.selfAddr = client.addr || null;
+      const pub = typeof client.getPublicKey === 'function' ? client.getPublicKey() : '';
+      this.selfPub = (pub || '').toLowerCase() || null;
+
+      if (ui.myAddr) ui.myAddr.textContent = this.selfAddr || '—';
+      if (ui.myPub) ui.myPub.textContent = this.selfPub || '—';
+      setNkn('NKN: connected', 'ok');
+
+      if (this.selfPub) this._applyAlias(this.selfPub, this.displayName);
+
+      this._initDiscovery();
+
+      if (this.selfPub) {
+        const stamp = now();
+        this._blast(this._helloEnvelope(stamp));
+        this._blast({ type: 'peers_req', from: this.selfPub, ts: stamp });
+      }
+      this._broadcastAlias();
+      this._probeBookIfNeeded();
+      this._flushPendingMessages();
+    });
+
+    client.onMessage(({ src, payload }) => {
+      if (this.client !== client) return;
+      let text = payload;
+      if (payload instanceof Uint8Array) {
+        try { text = new TextDecoder().decode(payload); } catch { return; }
+      }
+      if (typeof text !== 'string') return;
+      this._handleIncomingMessage(src, text);
+    });
+
+    client.on('willreconnect', () => {
+      if (this.client !== client) return;
+      setNkn('NKN: reconnecting…', 'warn');
+    });
+
+    client.on('connectFailed', () => {
+      if (this.client !== client) {
+        try { client.close?.(); } catch { }
+        return;
+      }
+      setNkn('NKN: connect failed', 'err');
+      this._handleClientDisconnect('connectFailed', null, client);
+    });
+
+    client.on('close', () => {
+      if (this.client !== client) {
+        try { client.close?.(); } catch { }
+        return;
+      }
+      setNkn('NKN: disconnected', 'err');
+      this._handleClientDisconnect('close', null, client);
+    });
+  }
+
+  _ensureTimers() {
+    if (!this._heartbeatTimer) {
+      this._heartbeatTimer = setInterval(() => this._heartbeat(), 6000);
+    }
+    if (!this._peerRequestTimer) {
+      this._peerRequestTimer = setInterval(() => {
+        if (!this.selfPub) return;
         this._blast({ type: 'peers_req', from: this.selfPub, ts: now() });
-        this._broadcastAlias();
+      }, 20000);
+    }
+  }
 
-        // Also proactively probe book once
-        this._probeBookIfNeeded();
+  _clearReconnectTimer() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+  }
 
-        this._flushPendingMessages();
-      });
+  _scheduleReconnect(reason = 'retry', delayOverride = null) {
+    const attempt = Math.min(this._connectFailures + 1, 10);
+    const delay = delayOverride ?? Math.min(1000 * Math.pow(1.7, attempt), 30000);
+    this._clearReconnectTimer();
+    console.log(`[NKN] scheduling reconnect in ${Math.round(delay)}ms (${reason})`);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      this._connect('retry');
+    }, delay);
+  }
 
-      this.client.onMessage(({ src, payload }) => {
-        let text = payload;
-        if (payload instanceof Uint8Array) {
-          try { text = new TextDecoder().decode(payload); } catch { return; }
-        }
-        if (typeof text !== 'string') return;
-        this._handleIncomingMessage(src, text);
-      });
+  _handleClientDisconnect(reason = 'disconnect', err = null, clientRef = null) {
+    if (clientRef && clientRef !== this.client) {
+      try { clientRef.close?.(); } catch { }
+      return;
+    }
 
-      this.client.on('willreconnect', () => setNkn('NKN: reconnecting…', 'warn'));
-      this.client.on('connectFailed', () => setNkn('NKN: connect failed', 'err'));
-      this.client.on('close', () => setNkn('NKN: disconnected', 'err'));
+    if (err) console.warn('[NKN] disconnect', reason, err);
+    this._connectFailures = Math.min(this._connectFailures + 1, 50);
 
-      setInterval(() => this._heartbeat(), 6000);
-      setInterval(() => this._blast({ type: 'peers_req', from: this.selfPub, ts: now() }), 20000);
+    const activeClient = clientRef || this.client;
+    if (activeClient) {
+      if (this.client === activeClient) this.client = null;
+      try { activeClient.close?.(); } catch { }
+    } else {
+      this.client = null;
+    }
 
-    } catch (err) { console.warn(err); setNkn('NKN: init failed', 'err'); }
+    this.selfAddr = null;
+    this.selfPub = null;
+    if (ui.myAddr) ui.myAddr.textContent = '—';
+    if (ui.myPub) ui.myPub.textContent = '—';
+
+    if (this.discovery) {
+      try { this.discovery.close?.(); } catch { }
+      this.discovery = null;
+    }
+    this._discoveryHello?.clear?.();
+    this.discoveryInitInFlight = false;
+    this.discoveryStatus = { state: 'idle', detail: '' };
+    this._updateDiscoveryUi();
+
+    this._scheduleReconnect(reason);
   }
 
   /* ───────── Session helpers (ncp-js) ───────── */

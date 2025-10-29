@@ -1957,27 +1957,48 @@ export class HybridHub {
     console.log('[Hybrid] Sync rejected by Hydra:', from, payload);
 
     const reason = payload.reason || 'Unknown reason';
+    const targetSessions = [];
     if (payload?.session?.sessionId) {
-      this._upsertSession({
+      const stored = this._upsertSession({
         ...payload.session,
         hydraPub: payload.session.hydraPub || normalizeHex64(from),
         status: 'rejected',
         rejectionReason: reason
       });
+      if (stored) targetSessions.push(stored);
     } else if (payload?.objectId) {
       const sessions = this._sessionsForObject(payload.objectId);
       sessions.forEach((session) => {
-        this._upsertSession({
+        const merged = this._upsertSession({
           ...session,
           status: 'rejected',
           rejectionReason: reason
         });
+        if (merged) targetSessions.push(merged);
       });
     }
 
     const hydraPub = normalizeHex64(from);
     if (hydraPub) {
       this._updateSessionsForHydra(hydraPub, { status: 'rejected', rejectionReason: reason });
+    }
+
+    const smartManager = this.sceneMgr?.smartObjects;
+    if (smartManager?.markSyncRejected) {
+      const seen = new Set();
+      const attemptMark = (objectUuid, pub) => {
+        if (!objectUuid) return;
+        const normalizedPub = pub || hydraPub || from;
+        const key = `${objectUuid}:${normalizedPub || ''}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        smartManager.markSyncRejected(objectUuid, normalizedPub, reason);
+      };
+      if (targetSessions.length) {
+        targetSessions.forEach((session) => attemptMark(session.objectUuid, session.hydraPub));
+      } else if (payload?.objectId) {
+        attemptMark(payload.objectId, hydraPub);
+      }
     }
 
     // Notify user via UI

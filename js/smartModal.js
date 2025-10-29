@@ -443,23 +443,38 @@ class SmartObjectModal {
         return;
       }
 
-      const noclipPub = this.mesh?.selfPub || this.mesh?.selfAddr || '';
+      const mesh = this.mesh || {};
+      let noclipPub = (mesh.selfPub || '').toLowerCase();
+      let noclipAddr = mesh.selfAddr || '';
+
+      if (!/^[0-9a-f]{64}$/i.test(noclipPub)) {
+        const match = /^noclip\.([0-9a-f]{64})$/i.exec(noclipAddr || '');
+        noclipPub = match ? match[1].toLowerCase() : '';
+      }
+
       if (!noclipPub) {
-        this._log('Error: NoClip address not available', 'error');
+        this._log('Error: NoClip public key not available', 'error');
         return;
       }
+
+      if (!noclipAddr) {
+        noclipAddr = `noclip.${noclipPub}`;
+      }
+
+      const hydraPub = (peer.nknPub || '').toLowerCase();
+      const nowStamp = Date.now();
 
       // Send sync request
       const syncRequest = {
         type: 'noclip-bridge-sync-request',
         from: noclipPub,
-        noclipAddr: `noclip.${noclipPub}`,
+        noclipAddr,
         objectId: this.currentObject.uuid,
         objectConfig: {
           position: { ...this.currentObject.config.position },
           label: this.currentObject.config.mesh?.label?.text || 'Smart Object'
         },
-        timestamp: Date.now()
+        timestamp: nowStamp
       };
 
       await hybridState.discovery.dm(peer.nknPub, syncRequest);
@@ -468,14 +483,22 @@ class SmartObjectModal {
       this._log(`Waiting for approval from Hydra user...`, 'info');
 
       // Store pending sync
-      if (!this.currentObject.config._pendingSyncs) {
-        this.currentObject.config._pendingSyncs = [];
-      }
-      this.currentObject.config._pendingSyncs.push({
-        hydraPub: peer.nknPub,
-        requestedAt: Date.now(),
-        status: 'pending'
-      });
+      const pendingList = Array.isArray(this.currentObject.config._pendingSyncs)
+        ? this.currentObject.config._pendingSyncs
+        : (this.currentObject.config._pendingSyncs = []);
+
+      const existing = pendingList.find((entry) => (entry.hydraPub || '').toLowerCase() === hydraPub);
+      const entry = existing || {};
+      entry.hydraPub = hydraPub;
+      entry.objectId = this.currentObject.uuid;
+      entry.status = 'pending';
+      entry.requestedAt = nowStamp;
+      delete entry.reason;
+      delete entry.respondedAt;
+      if (!existing) pendingList.push(entry);
+
+      this.smartObjects?._saveToStorage?.();
+      this.updateSessionStatus(this.currentObject);
 
     } catch (err) {
       this._log(`✗ Sync request failed: ${err.message}`, 'error');
@@ -710,7 +733,43 @@ class SmartObjectModal {
       return;
     }
     const session = target.config?.session;
+    const pendingSyncs = Array.isArray(target.config?._pendingSyncs) ? target.config._pendingSyncs : [];
+    const activePending = pendingSyncs.find((entry) => entry && entry.status === 'pending');
+    const rejectedHistory = pendingSyncs
+      .filter((entry) => entry && entry.status === 'rejected' && Number.isFinite(entry.respondedAt))
+      .sort((a, b) => b.respondedAt - a.respondedAt);
+
     if (!session) {
+      if (activePending) {
+        const hydraLabel = activePending.hydraPub
+          ? `hydra.${activePending.hydraPub.slice(0, 8)}…`
+          : 'Hydra peer';
+        let age = '';
+        if (Number.isFinite(activePending.requestedAt)) {
+          const deltaSec = Math.max(0, Math.floor((Date.now() - activePending.requestedAt) / 1000));
+          if (deltaSec < 60) age = `${deltaSec}s ago`;
+          else if (deltaSec < 3600) age = `${Math.round(deltaSec / 60)}m ago`;
+          else age = `${Math.round(deltaSec / 3600)}h ago`;
+        }
+        statusEl.textContent = `Sync request pending • ${hydraLabel}${age ? ` • ${age}` : ''}`;
+        statusEl.classList.remove('muted');
+        return;
+      }
+      if (rejectedHistory.length) {
+        const lastRejected = rejectedHistory[0];
+        const hydr = lastRejected.hydraPub ? `hydra.${lastRejected.hydraPub.slice(0, 8)}…` : 'Hydra';
+        const reason = lastRejected.reason || 'Rejected';
+        let when = '';
+        if (Number.isFinite(lastRejected.respondedAt)) {
+          const deltaSec = Math.max(0, Math.floor((Date.now() - lastRejected.respondedAt) / 1000));
+          if (deltaSec < 60) when = `${deltaSec}s ago`;
+          else if (deltaSec < 3600) when = `${Math.round(deltaSec / 60)}m ago`;
+          else when = `${Math.round(deltaSec / 3600)}h ago`;
+        }
+        statusEl.textContent = `Sync rejected • ${hydr}${when ? ` • ${when}` : ''} • ${reason}`;
+        statusEl.classList.remove('muted');
+        return;
+      }
       statusEl.textContent = 'No active Hydra session';
       statusEl.classList.add('muted');
       return;
