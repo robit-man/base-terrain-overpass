@@ -965,6 +965,7 @@ class App {
     if (!skipOrigin) {
       this.hexGridMgr?.setOrigin(lat, lon, { immediate: isManualRequest });
       this.buildings?.setOrigin(lat, lon, { forceRefresh: isManualRequest });
+      this.sceneMgr?.smartObjects?.setOrigin?.(lat, lon);
     }
     if (isManualRequest && !skipOrigin) {
       this.physics?.resetTerrain?.();

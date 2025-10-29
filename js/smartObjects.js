@@ -22,6 +22,9 @@ class SmartObjectManager {
       ? onPlacementModeChange
       : null;
 
+    this._lastOriginKey = null;
+    this._hasOrigin = false;
+
     // Object storage
     this.objects = new Map(); // uuid -> SmartObject
     this.selectedObject = null;
@@ -43,6 +46,7 @@ class SmartObjectManager {
     this._loadFromStorage();
     this._createPlacementPreview();
     this._notifyPlacementModeChange();
+    this.refreshWorldPositions({ force: true });
   }
 
   _notifyPlacementModeChange() {
@@ -104,6 +108,9 @@ class SmartObjectManager {
     let alt = base.alt ?? base.altitude;
     let ground = base.ground;
     const snapToGround = base.snapToGround;
+    const altModeRaw = base.altitudeMode ?? base.altMode ?? base.heightMode;
+    let altMode = typeof altModeRaw === 'string' ? altModeRaw.toLowerCase() : null;
+    let relativeAlt = base.altAboveGround ?? base.relativeAltitude ?? base.relativeAlt ?? base.altitudeRelative;
 
     if (x !== undefined) x = Number(x);
     if (y !== undefined) y = Number(y);
@@ -112,6 +119,7 @@ class SmartObjectManager {
     if (lon !== undefined) lon = Number(lon);
     if (alt !== undefined) alt = Number(alt);
     if (ground !== undefined) ground = Number(ground);
+    if (relativeAlt !== undefined) relativeAlt = Number(relativeAlt);
 
     if (!Number.isFinite(lat) && Number.isFinite(latitude)) lat = latitude;
     if (!Number.isFinite(lon) && Number.isFinite(longitude)) lon = longitude;
@@ -144,7 +152,16 @@ class SmartObjectManager {
       else y = 0;
     }
 
-    if (snapToGround === true && Number.isFinite(ground)) {
+    if (altMode === 'relative' && Number.isFinite(ground)) {
+      if (!Number.isFinite(relativeAlt)) {
+        if (Number.isFinite(alt)) relativeAlt = alt - ground;
+        else if (Number.isFinite(fallback?.altAboveGround)) relativeAlt = fallback.altAboveGround;
+        else relativeAlt = 0;
+      }
+      relativeAlt = Number.isFinite(relativeAlt) ? relativeAlt : 0;
+      y = ground + relativeAlt;
+      alt = ground + relativeAlt;
+    } else if (snapToGround === true && Number.isFinite(ground)) {
       y = ground;
       alt = ground;
     } else if (!Number.isFinite(alt)) {
@@ -176,7 +193,21 @@ class SmartObjectManager {
     if (Number.isFinite(result.y) && Number.isFinite(result.ground)) {
       result.altAboveGround = +(result.y - result.ground).toFixed(3);
     }
-    if (snapToGround == null && Number.isFinite(result.alt) && Number.isFinite(result.ground)) {
+    if (altMode === 'relative') {
+      if (!Number.isFinite(result.altAboveGround) && Number.isFinite(relativeAlt)) {
+        result.altAboveGround = +relativeAlt.toFixed(3);
+      }
+      result.altitudeMode = 'relative';
+    } else if (snapToGround === true) {
+      result.altitudeMode = 'ground';
+      if (Number.isFinite(result.altAboveGround)) result.altAboveGround = 0;
+    } else if (altMode) {
+      result.altitudeMode = altMode;
+    } else {
+      result.altitudeMode = 'absolute';
+    }
+
+    if (snapToGround == null && result.altitudeMode !== 'relative' && Number.isFinite(result.alt) && Number.isFinite(result.ground)) {
       const delta = Math.abs(result.alt - result.ground);
       if (delta < 0.05) result.snapToGround = true;
     } else if (snapToGround != null) {
@@ -192,7 +223,45 @@ class SmartObjectManager {
       }
     }
 
+    if (result.altitudeMode === 'relative' && Number.isFinite(result.altAboveGround) && Number.isFinite(result.ground)) {
+      result.alt = +(result.ground + result.altAboveGround).toFixed(3);
+    }
+    if (Number.isFinite(result.altAboveGround)) {
+      result.relativeAltitude = result.altAboveGround;
+      result.altRelative = result.altAboveGround;
+    }
+
     return result;
+  }
+
+  _refreshObjectPosition(obj, { force = false } = {}) {
+    if (!obj || !obj.config) return;
+    const base = obj.config.position || {};
+    const normalized = this._normalizePosition(base, base);
+    if (!force && base.x === normalized.x && base.y === normalized.y && base.z === normalized.z) return;
+    obj.config.position = normalized;
+    obj.mesh.position.set(normalized.x || 0, normalized.y || 0, normalized.z || 0);
+    obj.mesh.updateWorldMatrix(true, true);
+    obj.wireframeHelper?.update();
+    if (this.spatialAudio?.updateSourcePosition) {
+      this.spatialAudio.updateSourcePosition(obj.uuid, obj.mesh.position);
+    }
+  }
+
+  refreshWorldPositions({ force = false } = {}) {
+    if (!this.objects?.size) return;
+    for (const obj of this.objects.values()) {
+      this._refreshObjectPosition(obj, { force });
+    }
+  }
+
+  setOrigin(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+    if (this._lastOriginKey === key && this._hasOrigin) return;
+    this._lastOriginKey = key;
+    this._hasOrigin = true;
+    this.refreshWorldPositions({ force: true });
   }
 
   _normalizeHydraPub(pub) {
@@ -498,6 +567,8 @@ class SmartObjectManager {
     if (!options.skipSave) {
       this._saveToStorage();
     }
+
+    this._refreshObjectPosition(smartObject, { force: true });
 
     // 9. Broadcast to peers (unless loading from storage or peer sync)
     if (!options.skipBroadcast) {

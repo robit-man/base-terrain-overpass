@@ -53,6 +53,16 @@ const NORMAL_MAP_PROMINENCE = 0.8;  // Reduced from 2.0
 const NORMAL_MAP_GAMMA = 1.0;
 const NORMAL_MAP_HIGHPASS = 2;
 
+const COLOR_STOPS = {
+  waterDeep: { r: 0.07, g: 0.12, b: 0.21 },
+  waterShallow: { r: 0.18, g: 0.27, b: 0.35 },
+  sand: { r: 0.84, g: 0.76, b: 0.58 },
+  grassLow: { r: 0.28, g: 0.45, b: 0.25 },
+  grassHigh: { r: 0.42, g: 0.58, b: 0.33 },
+  rock: { r: 0.51, g: 0.5, b: 0.47 },
+  snow: { r: 0.94, g: 0.95, b: 0.97 }
+};
+
 /**
  * Normal map generation utilities (ported from normals-tiles.html)
  */
@@ -254,7 +264,7 @@ export class TileManager {
     this._horizonField = null;
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
-    this._overlayEnabled = _tmOnMobile ? false : true;
+    this._overlayEnabled = _tmOnMobile ? false : false;
     this._overlayZoom = 18;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
@@ -420,6 +430,7 @@ export class TileManager {
     // NO TEXTURES until terrain elevation data is fetched
     // NO GRASS until terrain elevation data is fetched
     this._textureQueue = [];   // Tiles waiting for texture application
+    this._textureQueueSet = new Set();
     this._grassQueue = [];     // Tiles waiting for grass injection
 
     // ---- network governor (token bucket) ----
@@ -2309,24 +2320,14 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     return tile._roadMask;
   }
   _initColorsNearBlack(tile) {
-    const col = this._ensureColorAttr(tile);
+    this._ensureColorAttr(tile);
     this._ensureRoadMask(tile, { reset: true });
-    const arr = col.array;
-    for (let i = 0; i < tile.pos.count; i++) {
-      const o = 3 * i;
-      arr[o] = arr[o + 1] = arr[o + 2] = 0.1;
-    }
-    col.needsUpdate = true;
+    this._applyAllColorsGlobal(tile, { force: true });
   }
   _initFarfieldColors(tile) {
-    const col = this._ensureColorAttr(tile);
+    this._ensureColorAttr(tile);
     this._ensureRoadMask(tile, { reset: true });
-    const arr = col.array;
-    for (let i = 0; i < tile.pos.count; i++) {
-      const o = 3 * i;
-      arr[o] = arr[o + 1] = arr[o + 2] = 0.2;
-    }
-    col.needsUpdate = true;
+    this._applyAllColorsGlobal(tile, { force: true });
     if (tile.grid?.mat) tile.grid.mat.color?.set?.(0xffffff);
   }
   _updateGlobalFromValue(y) {
@@ -2342,14 +2343,35 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     const t = THREE.MathUtils.clamp((y - minY) / (maxY - minY), 0, 1);
     return this.LUM_MIN + t * (this.LUM_MAX - this.LUM_MIN);
   }
-  _colorFromNormalized(t) {
-    const low = { r: 0.18, g: 0.2, b: 0.24 };
-    const high = { r: 0.82, g: 0.86, b: 0.9 };
+  _lerpColor(a, b, t) {
     return {
-      r: low.r + (high.r - low.r) * t,
-      g: low.g + (high.g - low.g) * t,
-      b: low.b + (high.b - low.b) * t,
+      r: a.r + (b.r - a.r) * t,
+      g: a.g + (b.g - a.g) * t,
+      b: a.b + (b.b - a.b) * t
     };
+  }
+  _colorFromHeight(y, normalized) {
+    if (!Number.isFinite(y)) {
+      return this._lerpColor(COLOR_STOPS.grassLow, COLOR_STOPS.grassHigh, normalized);
+    }
+    if (y <= -2) {
+      const depth = THREE.MathUtils.clamp((-y) / 30, 0, 1);
+      return this._lerpColor(COLOR_STOPS.waterShallow, COLOR_STOPS.waterDeep, depth);
+    }
+    if (y <= 4) {
+      const blend = THREE.MathUtils.clamp((y + 2) / 6, 0, 1);
+      return this._lerpColor(COLOR_STOPS.sand, COLOR_STOPS.grassLow, blend);
+    }
+    if (y < 200) {
+      const blend = THREE.MathUtils.clamp((y - 4) / 196, 0, 1);
+      return this._lerpColor(COLOR_STOPS.grassLow, COLOR_STOPS.grassHigh, blend);
+    }
+    if (y < 800) {
+      const blend = THREE.MathUtils.clamp((y - 200) / 600, 0, 1);
+      return this._lerpColor(COLOR_STOPS.grassHigh, COLOR_STOPS.rock, blend);
+    }
+    const blend = THREE.MathUtils.clamp((y - 800) / 600, 0, 1);
+    return this._lerpColor(COLOR_STOPS.rock, COLOR_STOPS.snow, blend);
   }
   _normalizedHeight(y) {
     const minY = this.GLOBAL_MIN_Y;
@@ -2357,37 +2379,47 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (!Number.isFinite(minY) || !Number.isFinite(maxY) || maxY - minY < 1e-6) return 0;
     return THREE.MathUtils.clamp((y - minY) / (maxY - minY), 0, 1);
   }
-  _applyAllColorsGlobal(tile) {
-    // CRITICAL: BLOCK ALL TEXTURE APPLICATION UNTIL ELEVATION DATA IS FETCHED
-    // This prevents ARCGIS textures from appearing before terrain geometry
-    if (!tile || !tile._elevationFetched) {
-      // Elevation data not fetched yet - skip texture application
-      return;
-    }
+  _applyAllColorsGlobal(tile, { force = false } = {}) {
+    if (!tile) return;
+    if (!force && !tile._elevationFetched) return;
 
     this._ensureColorAttr(tile);
     const roadMask = this._ensureRoadMask(tile);
-    const arr = tile.col.array;
+    const attr = tile.col;
     const pos = tile.pos;
-    for (let i = 0; i < pos.count; i++) {
+    if (!attr || !attr.array || !pos) return;
+
+    const arr = attr.array;
+    const count = pos.count || 0;
+    if (!count) return;
+
+    for (let i = 0; i < count; i++) {
+      const y = pos.getY(i);
+      if (Number.isFinite(y)) this._updateGlobalFromValue?.(y);
+    }
+
+    for (let i = 0; i < count; i++) {
       const y = pos.getY(i);
       const t = this._normalizedHeight(y);
-      const color = this._colorFromNormalized(t);
+      const base = this._colorFromHeight(y, t);
+      const light = THREE.MathUtils.lerp(0.92, 1.06, t);
       const o = 3 * i;
-      let r = color.r;
-      let g = color.g;
-      let b = color.b;
+      let r = THREE.MathUtils.clamp(base.r * light, 0, 1);
+      let g = THREE.MathUtils.clamp(base.g * light, 0, 1);
+      let b = THREE.MathUtils.clamp(base.b * light, 0, 1);
+
       if (roadMask) {
         const mask = THREE.MathUtils.clamp(roadMask[i] ?? 1, 0, 1);
-        r *= mask;
-        g *= mask;
-        b *= mask;
+        r = r * mask + (1 - mask) * r * 0.85;
+        g = g * mask + (1 - mask) * g * 0.85;
+        b = b * mask + (1 - mask) * b * 0.85;
       }
+
       arr[o] = r;
       arr[o + 1] = g;
       arr[o + 2] = b;
     }
-    tile.col.needsUpdate = true;
+    attr.needsUpdate = true;
     if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
   }
   _slippyLonLatToTile(lon, lat, zoom) {
@@ -2837,6 +2869,10 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     const bounds = entry.bounds;
     if (!bounds) return;
 
+    const cacheKey = `${entry.version}/${entry.zoom}/${entry.x}/${entry.y}`;
+    const wasReady = tile._overlay?.status === 'ready';
+    const prevKey = tile._overlay?.cacheKey;
+
     // Pass image size for half-texel inset in UVs
     this._ensureTileUv(tile, bounds, entry.imageSize);
 
@@ -2853,10 +2889,17 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     } else {
       this.grassManager?.removeGrassForTile(tile);
     }
+    const needsRefresh = !wasReady || prevKey !== cacheKey || tile._overlay?.dirty;
     tile._overlay = {
       status: 'ready',
-      cacheKey: `${entry.version}/${entry.zoom}/${entry.x}/${entry.y}`,
+      cacheKey,
+      entry,
+      dirty: needsRefresh
     };
+    if (needsRefresh) {
+      tile._texturesApplied = false;
+      this._queueTextureApplication(tile, { force: true });
+    }
   }
   // DROP-IN REPLACEMENT
   _ensureTileUv(tile, bounds) {
@@ -4199,10 +4242,12 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
       // Update color
       const o = 3 * idx;
-      const color = this._colorFromNormalized(this._normalizedHeight(height));
-      tile.col.array[o] = color.r;
-      tile.col.array[o + 1] = color.g;
-      tile.col.array[o + 2] = color.b;
+      const norm = this._normalizedHeight(height);
+      const color = this._colorFromHeight(height, norm);
+      const light = THREE.MathUtils.lerp(0.92, 1.06, norm);
+      tile.col.array[o] = THREE.MathUtils.clamp(color.r * light, 0, 1);
+      tile.col.array[o + 1] = THREE.MathUtils.clamp(color.g * light, 0, 1);
+      tile.col.array[o + 2] = THREE.MathUtils.clamp(color.b * light, 0, 1);
 
       // Collect samples for batch notification (don't fire per-sample)
       if (this._heightListeners?.size) {
@@ -5895,11 +5940,16 @@ _farfieldTierForDist(dist) {
   }
 
   // CRITICAL: Texture application queue - ONLY processes tiles with elevation data
-  _queueTextureApplication(tile) {
-    //if (!tile || !tile._elevationFetched) return;
-    //if (!this._textureQueue) this._textureQueue = [];
-    //if (this._textureQueue.includes(tile)) return;
+  _queueTextureApplication(tile, { force = false } = {}) {
+    if (!tile) return;
+    if (!force && !tile._elevationFetched) return;
+    if (!this._textureQueue) this._textureQueue = [];
+    if (!this._textureQueueSet) this._textureQueueSet = new Set();
+    if (this._textureQueueSet.has(tile)) return;
+    if (!force && tile._texturesApplied && !tile._overlay?.dirty) return;
     this._textureQueue.push(tile);
+    this._textureQueueSet.add(tile);
+    tile._textureDeferredUntil = 0;
   }
 
   _drainTextureQueue() {
@@ -5917,19 +5967,47 @@ _farfieldTierForDist(dist) {
       maxPerFrame = 1;
     }
 
-    const start = performance.now();
+    const nowFn = (typeof performance !== 'undefined' && performance.now)
+      ? () => performance.now()
+      : () => Date.now();
+    const start = nowFn();
     let processed = 0;
 
     while (this._textureQueue.length > 0 && processed < maxPerFrame) {
-      if (performance.now() - start > budget) break;
+      if (nowFn() - start > budget) break;
 
       const tile = this._textureQueue.shift();
-      if (tile && tile._elevationFetched && tile.grid?.geometry) {
-        // Apply textures now that elevation is fetched
-        this._applyAllColorsGlobal(tile);
-        tile._texturesApplied = true;
-        processed++;
+      if (tile) this._textureQueueSet?.delete(tile);
+      if (!tile) continue;
+      if (!tile._elevationFetched || !tile.grid?.geometry) continue;
+      if (tile._texturesApplied && !tile._overlay?.dirty) continue;
+
+      const nowTime = nowFn();
+      if (tile._textureDeferredUntil && tile._textureDeferredUntil > nowTime) {
+        this._textureQueue.push(tile);
+        this._textureQueueSet.add(tile);
+        break;
       }
+
+      if (this.camera?.position && tile.grid?.group?.position) {
+        const dist = this.camera.position.distanceTo(tile.grid.group.position);
+        const maxDist = this.tileRadius * Math.max(6, this.INTERACTIVE_RING + 3);
+        if (dist > maxDist) {
+          // Defer distant tiles; requeue towards end but avoid thrashing this frame
+          if (!tile._textureDeferredUntil || tile._textureDeferredUntil < nowTime) {
+            tile._textureDeferredUntil = nowTime + 500;
+            this._textureQueue.push(tile);
+            this._textureQueueSet.add(tile);
+          }
+          continue;
+        }
+      }
+
+      this._applyAllColorsGlobal(tile);
+      tile._texturesApplied = true;
+      if (tile._overlay) tile._overlay.dirty = false;
+      tile._textureDeferredUntil = null;
+      processed++;
     }
   }
 
