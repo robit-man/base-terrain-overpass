@@ -45,6 +45,12 @@ body {
     letter-spacing: 0.04em;
 }
 
+html,
+body,
+body * {
+    cursor: none !important;
+}
+
 body.modal-open {
     overflow: hidden;
 }
@@ -793,6 +799,10 @@ input[type=text] {
 
 .slider-row input[type=range] {
     width: 100%;
+}
+
+.slider-row input[type=checkbox] {
+    margin-right: 8px;
 }
 
 .leaflet-div-icon.minimap-player-icon {
@@ -2289,11 +2299,14 @@ canvas {
     border: 2.4px solid rgba(255, 255, 255, 0.94);
     border-radius: 50%;
     pointer-events: none;
-    z-index: 1400;
+    z-index: 9999;
     opacity: 0;
     transform: translate(-50%, -50%) scale(1);
     transition: opacity 0.18s ease, transform 0.14s ease;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.22);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+    mix-blend-mode: difference;
+    background: rgba(255, 255, 255, 0.18);
+    will-change: transform, opacity, left, top;
 }
 
 .pointer-ring.visible {

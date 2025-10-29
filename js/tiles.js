@@ -270,7 +270,7 @@ export class TileManager {
     this._horizonField = null;
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
-    this._overlayEnabled = _tmOnMobile ? false : true;
+    this._overlayEnabled = false;
     this._overlayZoom = 18;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
@@ -2578,6 +2578,33 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     }
     this._overlayCache.clear();
     for (const tile of tiles) this._ensureTileOverlay(tile);
+  }
+
+  setOverlayEnabled(enabled) {
+    const next = !!enabled;
+    if (this._overlayEnabled === next) return;
+    this._overlayEnabled = next;
+    console.log('[tiles] overlay enabled =', next);
+    this._textureQueue = [];
+    this._textureQueueSet?.clear?.();
+    if (!next) {
+      this._overlayCache.clear();
+      this._clearAllOverlays();
+      return;
+    }
+    this._overlayCache.clear();
+    this._primeWaybackVersions();
+    for (const tile of this.tiles.values()) {
+      if (!tile) continue;
+      tile._texturesApplied = false;
+      this._ensureTileOverlay(tile);
+    }
+  }
+
+  _clearAllOverlays() {
+    for (const tile of this.tiles.values()) {
+      this._teardownOverlayForTile(tile);
+    }
   }
   _teardownOverlayForTile(tile) {
     if (!tile) return;
@@ -6023,6 +6050,7 @@ _farfieldTierForDist(dist) {
   _queueTextureApplication(tile, { force = false } = {}) {
     if (!tile) return;
     if (!force && !tile._elevationFetched) return;
+    if (!this._overlayEnabled && !force) return;
     if (!this._textureQueue) this._textureQueue = [];
     if (!this._textureQueueSet) this._textureQueueSet = new Set();
     if (this._textureQueueSet.has(tile)) return;

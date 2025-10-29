@@ -2213,6 +2213,7 @@ solidMesh.renderOrder = 1;
 solidMesh.castShadow = true;
 solidMesh.receiveShadow = false;
 solidMesh.visible = false;
+solidMesh.castShadow = true;
 
 // Info payload (use baseHeight that includes minH)
 const centroid = averagePoint(outer);

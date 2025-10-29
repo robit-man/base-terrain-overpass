@@ -1953,7 +1953,7 @@ class App {
     });
 
     // Imagery vintage controls
-    const { envImageryVintage, envImageryTimeline, envImageryTimelineLabel } = ui;
+    const { envImageryVintage, envImageryTimeline, envImageryTimelineLabel, envOverlayToggle } = ui;
     if (envImageryVintage && envImageryTimeline) {
       // Populate versions when available from tile manager
       const populateImageryVersions = () => {
@@ -1998,6 +1998,19 @@ class App {
         if (idx >= 0) {
           envImageryTimeline.value = String(idx);
           if (envImageryTimelineLabel) envImageryTimelineLabel.textContent = versions[idx].label;
+        }
+      });
+    }
+
+    if (envOverlayToggle) {
+      envOverlayToggle.checked = !!this.hexGridMgr?._overlayEnabled;
+      envOverlayToggle.addEventListener('change', () => {
+        const enabled = !!envOverlayToggle.checked;
+        if (this.hexGridMgr?.setOverlayEnabled) {
+          this.hexGridMgr.setOverlayEnabled(enabled);
+        } else if (this.hexGridMgr) {
+          this.hexGridMgr._overlayEnabled = enabled;
+          this.hexGridMgr._applyOverlayEnabledChange?.();
         }
       });
     }
@@ -5710,22 +5723,24 @@ class App {
     const rect = dom.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
-    let inside = x >= 0 && x <= 1 && y >= 0 && y <= 1;
-    if (inside && typeof document !== 'undefined' && document.elementFromPoint) {
+    const withinBounds = x >= 0 && x <= 1 && y >= 0 && y <= 1;
+    let insideCanvas = withinBounds;
+    if (insideCanvas && typeof document !== 'undefined' && document.elementFromPoint) {
       const topEl = document.elementFromPoint(e.clientX, e.clientY);
-      inside = topEl === dom;
+      insideCanvas = topEl === dom || dom.contains(topEl);
     }
-    if (inside) {
+
+    this._updatePointerRingPosition(e.clientX, e.clientY);
+    this._setPointerRingVisible(true);
+
+    if (insideCanvas) {
       this._pointerNdc.x = x * 2 - 1;
       this._pointerNdc.y = -(y * 2 - 1);
       this._pointerNdc.has = true;
       this._pointerLastMoveMs = (performance && performance.now) ? performance.now() : Date.now();
       this._hoverDirty = true;
-      this._updatePointerRingPosition(e.clientX, e.clientY);
-      this._setPointerRingVisible(true);
     } else {
       this._pointerNdc.has = false;
-      this._setPointerRingVisible(false);
       this.buildings?.clearHover();
     }
 
