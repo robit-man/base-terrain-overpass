@@ -161,7 +161,7 @@ export class BuildingManager {
     progressiveLoader = null,
     radius = 300,
     tileSize,
-    color = 0x333333,
+    color = 0xaaaaaa,
     roadWidth = 3,
     roadOffset = 0.05,
     roadStep = 14,

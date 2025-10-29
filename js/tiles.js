@@ -18,7 +18,7 @@ const IS_MOBILE =
 // Smaller per-message budget + far fewer items per batch → lower parse/mem spikes
 const DM_BUDGET_BYTES = 12000;
 const MAX_LOCATIONS_PER_BATCH = IS_MOBILE ? 96 : 384;   // was 1800 (!)
-const TERRAIN_FETCH_BOOST = IS_MOBILE ? 1 : 2;          // don't accelerate fetch on mobile
+const TERRAIN_FETCH_BOOST = IS_MOBILE ? 1 : 4;          // don't accelerate fetch on mobile
 
 const PIN_SIDE_INNER_RATIO = 0.501; // 0.94 ≈ outer 6% of the tile; try 0.92 for thicker band
 const FARFIELD_ADAPTER_INNER_RATIO = 0.985;
@@ -165,7 +165,7 @@ export class TileManager {
     this.VISUAL_CREATE_BUDGET = 120;
     this.FARFIELD_CREATE_BUDGET = 360;
     this.FARFIELD_BATCH_SIZE = 360;
-    this.FARFIELD_NEAR_PAD = 3;
+    this.FARFIELD_NEAR_PAD = 2;
     this.FARFIELD_ADAPTER_SEGMENTS = this._isMobile ? 4 : 8;
     this.HORIZON_EXTRA_METERS = 60000;
     this.HORIZON_TARGET_RADIUS = 100000;
@@ -185,7 +185,7 @@ export class TileManager {
 
     // ---- interactive (high-res) relaxation ----
     // CRITICAL: Reduce relaxation iterations on mobile to prevent frame stalls
-    this.RELAX_ITERS_PER_FRAME = this._isMobile ? 10 : 80;  // Mobile: 10 iters, Desktop: 20 iters
+    this.RELAX_ITERS_PER_FRAME = this._isMobile ? 10 : 20;  // Mobile: 10 iters, Desktop: 20 iters
     this.RELAX_ALPHA = 0.1;
     this.NORMALS_EVERY = this._isMobile ? 20 : 5;  // Mobile: compute normals less frequently
     // keep relax cheap so fetching dominates
@@ -222,6 +222,7 @@ export class TileManager {
     this.DOWN = new THREE.Vector3(0, -1, 0);
     this._tmpHorizonVec = new THREE.Vector3();
     this._lastHeight = 0;
+    this._disableRaycasts = true;
 
     // Mobile guard: disable heavy trees on phones/tablets by default
     const _tmOnMobile = (typeof navigator !== 'undefined')
@@ -254,7 +255,7 @@ export class TileManager {
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
     this._overlayEnabled = _tmOnMobile ? false : true;
-    this._overlayZoom = 16;
+    this._overlayZoom = 18;
     this._overlayCache = new Map();
     this._overlayCanvas = null;
     this._overlayCtx = null;
@@ -273,7 +274,7 @@ export class TileManager {
     this._treeLibWarned = false;
 
     // Dial back complexity on mobile to reduce instance counts and leaf density
-    this._treeComplexity = _tmOnMobile ? 0.12 : 0.55;        // min is clamped at 0.20 internally
+    this._treeComplexity = _tmOnMobile ? 0.12 : 0.75;        // min is clamped at 0.20 internally
     this._treeTargetComplexity = this._treeComplexity;
 
     this._treePerfSamples = [];
@@ -680,7 +681,7 @@ _stitchInteractiveToVisualEdges(tile, {
       if (Number.isFinite(Ay)) {
         const curr = pos.getY(iA);
         const blended = curr + (Ay - curr) * weight;
-        pos.setY(iA, blended);
+        // pos.setY(iA, blended);   // ← disable corner write
         this._updateGlobalFromValue?.(blended);
         lockArray[iA] = 1;
         Ay = blended;
@@ -688,7 +689,7 @@ _stitchInteractiveToVisualEdges(tile, {
       if (Number.isFinite(By)) {
         const curr = pos.getY(iB);
         const blended = curr + (By - curr) * weight;
-        pos.setY(iB, blended);
+        // pos.setY(iB, blended);   // ← disable corner write
         this._updateGlobalFromValue?.(blended);
         lockArray[iB] = 1;
         By = blended;
@@ -777,8 +778,8 @@ _stitchInteractiveToVisualEdges(tile, {
 // Robust sampler used above: unchanged in signature, but safe for missing meshes and provides
 // a nearest-vertex fallback when raycasts miss (e.g., merged farfield or adapter quads).
 _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx = this._lastHeight) {
+  if (this._disableRaycasts) return approx;
   this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
-
   if (primaryMesh) {
     const hit = this.ray.intersectObject(primaryMesh, true);
     if (hit && hit.length) return hit[0].point.y;
@@ -789,23 +790,10 @@ _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx
       if (hit && hit.length) return hit[0].point.y;
     }
   }
-
-  if (nearestGeomAttr?.isBufferAttribute) {
-    let best = Infinity, bestY = approx;
-    const arr = nearestGeomAttr.array;
-    const px = (primaryMesh?.parent?.position.x || 0);
-    const pz = (primaryMesh?.parent?.position.z || 0);
-    for (let i = 0; i < arr.length; i += 3) {
-      const dx = (arr[i]     + px) - wx;
-      const dz = (arr[i + 2] + pz) - wz;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < best) { best = d2; bestY = arr[i + 1]; }
-    }
-    return bestY;
-  }
-
+  if (nearestGeomAttr?.isBufferAttribute) { /* nearest-vertex fallback... */ }
   return approx;
-}
+} 
+
 
 // When a neighbor is missing (not yet fetched), keep our shared side planar
 // so there’s never a crack when the neighbor arrives later.
@@ -1443,7 +1431,7 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     // OPTIMIZED: Removed padding rings (was +6 rings at full res)
     // Now use edge subdivision for seamless transition
     if (dist <= this.VISUAL_RING + 1) return { stride: 1, scale: 2, samples: 'all', minPrec: 6, subdivideEdges: true };
-    if (dist <= this.VISUAL_RING + 24) return { stride: 2, scale: 2, samples: 'tips', minPrec: 5 };
+    if (dist <= this.VISUAL_RING + 24) return { stride: 2, scale: 2, samples: 'all', minPrec: 5 };
     if (dist <= this.VISUAL_RING + 128) return { stride: 6, scale: 4, samples: 'tips', minPrec: 4 };
     if (dist <= this.VISUAL_RING + 384) return { stride: 12, scale: 8, samples: 'tips', minPrec: 3 };
     return { stride: 24, scale: 12, samples: 'center', minPrec: 3 }; // keep corners so seams match
@@ -1507,82 +1495,69 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     }
   }
 
-  _refineEdgeBand(tile, side, neighbor, { bandRatio = 0.25 }) {
-    const pos = tile.pos;
-    const base = tile.grid.group.position;
-    const aR = this.tileRadius;
-    const innerBand = aR * (1 - bandRatio);
-    const nMesh = this._getMeshForTile(neighbor);
+_refineEdgeBand(tile, side, neighbor, { bandRatio = 0.25 }) {
+  const pos = tile.pos;
+  const base = tile.grid.group.position;
+  const aR = this.tileRadius;
+  const innerBand = aR * (1 - bandRatio);
+  const nMesh = this._getMeshForTile(neighbor);
 
-    if (!nMesh) return;
+  if (!nMesh) return;
 
-    // Get the two corner vertices for this side
-    const cornerA = side + 1;
-    const cornerB = ((side + 1) % 6) + 1;
+  // Corner vertex indices for this side (left as-is)
+  const cornerA = side + 1;
+  const cornerB = ((side + 1) % 6) + 1;
 
-    const Ax = pos.getX(cornerA), Az = pos.getZ(cornerA);
-    const Bx = pos.getX(cornerB), Bz = pos.getZ(cornerB);
+  // NOTE: do NOT modify corner heights anymore
 
-    // Sample heights from neighbor at corners
-    let Ay = this._robustSampleHeightFromMesh(nMesh, base.x + Ax, base.z + Az);
-    let By = this._robustSampleHeightFromMesh(nMesh, base.x + Bx, base.z + Bz);
+  // Find all vertices in the edge band for this side and blend their heights
+  const sideAngle = (side + 0.5) * (Math.PI / 3);
+  const sideArc = Math.PI / 10;
 
-    if (!Number.isFinite(Ay)) Ay = pos.getY(cornerA);
-    if (!Number.isFinite(By)) By = pos.getY(cornerB);
+  for (let i = 0; i < pos.count; i++) {
+    // Skip center and the two corners so we don't change their heights
+    if (i === 0 || i === cornerA || i === cornerB) continue;
 
-    // Update corner heights to match neighbor
-    pos.setY(cornerA, Ay);
-    pos.setY(cornerB, By);
+    const x = pos.getX(i);
+    const z = pos.getZ(i);
+    const r = Math.hypot(x, z);
 
-    // Find all vertices in the edge band for this side and blend their heights
-    const sideAngle = (side + 0.5) * (Math.PI / 3);
-    const sideArc = Math.PI / 10;
+    if (r < innerBand) continue; // Only process edge band
 
-    for (let i = 0; i < pos.count; i++) {
-      if (i === 0 || i === cornerA || i === cornerB) continue; // Skip center and corners
+    // Check if this vertex lies on the given side
+    const angle = this._angleOf(x, z);
+    const angleDiff = this._angDiff(angle, sideAngle);
+    if (angleDiff > sideArc) continue;
 
-      const x = pos.getX(i);
-      const z = pos.getZ(i);
-      const r = Math.hypot(x, z);
+    // Sample neighbor height at this position and blend
+    const wx = base.x + x;
+    const wz = base.z + z;
+    const neighborHeight = this._robustSampleHeightFromMesh(nMesh, wx, wz);
 
-      if (r < innerBand) continue; // Only process edge band
-
-      // Check if this vertex is on this side
-      const angle = this._angleOf(x, z);
-      const angleDiff = this._angDiff(angle, sideAngle);
-      if (angleDiff > sideArc) continue;
-
-      // Sample height from neighbor at this position
-      const wx = base.x + x;
-      const wz = base.z + z;
-      let neighborHeight = this._robustSampleHeightFromMesh(nMesh, wx, wz);
-
-      if (Number.isFinite(neighborHeight)) {
-        // Blend between tile's original height and neighbor's height
-        const blendWeight = (r - innerBand) / (aR - innerBand);
-        const smoothWeight = blendWeight * blendWeight * (3 - 2 * blendWeight); // Smoothstep
-        const originalHeight = pos.getY(i);
-        const blendedHeight = originalHeight + (neighborHeight - originalHeight) * smoothWeight;
-        pos.setY(i, blendedHeight);
-      }
-    }
-
-    pos.needsUpdate = true;
-    // CRITICAL: Skip expensive normal computation on mobile
-    if (!this._isMobile) {
-      try { tile.grid.geometry.computeVertexNormals(); } catch { }
+    if (Number.isFinite(neighborHeight)) {
+      const blendWeight = (r - innerBand) / (aR - innerBand);
+      const smoothWeight = blendWeight * blendWeight * (3 - 2 * blendWeight); // smoothstep
+      const originalHeight = pos.getY(i);
+      const blendedHeight = originalHeight + (neighborHeight - originalHeight) * smoothWeight;
+      pos.setY(i, blendedHeight);
     }
   }
 
-  _robustSampleHeightFromMesh(mesh, wx, wz) {
-    if (!mesh) return null;
-    this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
-    const hits = this.ray.intersectObject(mesh, true);
-    if (hits && hits.length > 0) {
-      return hits[0].point.y;
-    }
-    return null;
+  pos.needsUpdate = true;
+  // CRITICAL: Skip expensive normal computation on mobile
+  if (!this._isMobile) {
+    try { tile.grid.geometry.computeVertexNormals(); } catch {}
   }
+}
+
+_robustSampleHeightFromMesh(mesh, wx, wz) {
+  if (this._disableRaycasts) return null;
+  this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+  const hits = this.ray.intersectObject(mesh, true);
+  if (hits && hits.length > 0) return hits[0].point.y;
+  return null;
+} // :contentReference[oaicite:0]{index=0}
+
 
   // JS % is weird for negatives; normalize
   _divisible(n, k) { n = Math.round(n); k = Math.max(1, Math.round(k)); return ((n % k) + k) % k === 0; }
@@ -7297,20 +7272,25 @@ _applyPendingSamples() {
     return this._heightMeshesFallback;
   }
 
-  _sampleHeightFromNeighbors(x, z, excludeTile = null) {
-    const meshes = this._collectHeightMeshesNear(x, z).slice();
-    if (excludeTile?.grid?.mesh) {
-      const idx = meshes.indexOf(excludeTile.grid.mesh);
-      if (idx !== -1) meshes.splice(idx, 1);
-    }
-    if (!meshes.length) return null;
-    this._tmpSampleVec.set(x, 10000, z);
-    this.ray.set(this._tmpSampleVec, this.DOWN);
-    const hits = this.ray.intersectObjects(meshes, true);
-    if (hits.length) return hits[0].point.y;
+_sampleHeightFromNeighbors(x, z, excludeTile = null) {
+  if (this._disableRaycasts) {
     const fallback = this.getHeightAt(x, z);
     return Number.isFinite(fallback) ? fallback : null;
   }
+  const meshes = this._collectHeightMeshesNear(x, z).slice();
+  if (excludeTile?.grid?.mesh) {
+    const idx = meshes.indexOf(excludeTile.grid.mesh);
+    if (idx !== -1) meshes.splice(idx, 1);
+  }
+  if (!meshes.length) return null;
+  this._tmpSampleVec.set(x, 10000, z);
+  this.ray.set(this._tmpSampleVec, this.DOWN);
+  const hits = this.ray.intersectObjects(meshes, true);
+  if (hits.length) return hits[0].point.y;
+  const fb = this.getHeightAt(x, z);
+  return Number.isFinite(fb) ? fb : null;
+} 
+
 
   _collectMeshesNearByType(x, z, types = []) {
     if (!Array.isArray(types) || !types.length) return [];
