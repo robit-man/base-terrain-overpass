@@ -5750,7 +5750,7 @@ class App {
       this._pointerInfo.canvasRect = rect;
       this._pointerInfo.relX = e.clientX - rect.left;
       this._pointerInfo.relY = e.clientY - rect.top;
-      this._pointerInfo.valid = inside;
+      this._pointerInfo.valid = insideCanvas;
       this._pointerInfo.radius = this._pointerRingCurrentRadius;
     }
   }

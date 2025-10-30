@@ -408,7 +408,10 @@ export class BuildingManager {
     this._tmpVec3 = new THREE.Vector3();
 
     this._edgeMaterial = new THREE.LineBasicMaterial({ color: 0xa7adb7, transparent: true, opacity: 0.05 });
+    this._edgeMaterialDefaultColor = this._edgeMaterial.color.clone();
+    this._edgeMaterialDefaultOpacity = this._edgeMaterial.opacity;
     this._highlightEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 1, transparent: true, opacity: 1 });
+    this._highlightEdgeDefaultColor = this._highlightEdgeMaterial.color.clone();
     this._stemMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 1, transparent: true, opacity: 0.9 });
     this._pickMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
     this._pickMaterial.depthWrite = false;
@@ -3315,6 +3318,28 @@ _refreshBuildingVisibility(building) {
     const lineColor = theme?.lineColor instanceof THREE.Color
       ? theme.lineColor.clone()
       : null;
+
+    if (this._wireframeMode && lineColor) {
+      this._edgeMaterial.color.copy(lineColor);
+      this._edgeMaterial.opacity = 1;
+      this._edgeMaterial.needsUpdate = true;
+    } else {
+      if (this._edgeMaterialDefaultColor) {
+        this._edgeMaterial.color.copy(this._edgeMaterialDefaultColor);
+      }
+      if (Number.isFinite(this._edgeMaterialDefaultOpacity)) {
+        this._edgeMaterial.opacity = this._edgeMaterialDefaultOpacity;
+      }
+      this._edgeMaterial.needsUpdate = true;
+    }
+    if (this._highlightEdgeMaterial) {
+      if (this._wireframeMode && lineColor) {
+        this._highlightEdgeMaterial.color.copy(lineColor);
+      } else if (this._highlightEdgeDefaultColor) {
+        this._highlightEdgeMaterial.color.copy(this._highlightEdgeDefaultColor);
+      }
+      this._highlightEdgeMaterial.needsUpdate = true;
+    }
 
     const applyColor = (mesh) => {
       if (!mesh?.material || !lineColor) return;

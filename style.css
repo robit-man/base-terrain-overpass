@@ -2299,7 +2299,7 @@ canvas {
     border: 2.4px solid rgba(255, 255, 255, 0.94);
     border-radius: 50%;
     pointer-events: none;
-    z-index: 9999;
+    z-index: 99999;
     opacity: 0;
     transform: translate(-50%, -50%) scale(1);
     transition: opacity 0.18s ease, transform 0.14s ease;

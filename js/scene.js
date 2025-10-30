@@ -572,17 +572,10 @@ _sampleTileRadius() {
 
     // --- Kill the dome & env in deep night so clear/fog shows through ---
     const deepNight = nightMix >= 0.90;
-    this.sky.visible = !deepNight;
+    const forceWireframe = !!this._wireframeMode;
+    this.sky.visible = !deepNight && !forceWireframe;
 
-    // Stop feeding a bright environment when it’s basically night
-    if (deepNight) {
-      if (this._skyEnvTarget) { this._skyEnvTarget.dispose(); this._skyEnvTarget = null; }
-      this.scene.environment = null;
-    } else {
-      if (this._skyEnvTarget) this._skyEnvTarget.dispose();
-      this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
-      this.scene.environment = this._skyEnvTarget.texture;
-    } const dim = 1.0 - deep;                                       // 1 by day → 0 in deep night
+    const dim = 1.0 - deep;                                       // 1 by day → 0 in deep night
 
     // Dim scattering terms and luminance by 'dim'
     const turbidityNight = turbidity * dim;
@@ -616,9 +609,14 @@ _sampleTileRadius() {
     const targetExposure = THREE.MathUtils.lerp(NIGHT_EXPOSURE, DAY_EXPOSURE, Math.pow(dayFactor, 1.1));
     this.renderer.toneMappingExposure = targetExposure;
 
-    if (this._skyEnvTarget) this._skyEnvTarget.dispose();
-    this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
-    this.scene.environment = this._skyEnvTarget.texture;
+    if (forceWireframe) {
+      if (this._skyEnvTarget) { this._skyEnvTarget.dispose(); this._skyEnvTarget = null; }
+      this.scene.environment = null;
+    } else {
+      if (this._skyEnvTarget) this._skyEnvTarget.dispose();
+      this._skyEnvTarget = this.pmremGenerator.fromScene(this.sky);
+      this.scene.environment = this._skyEnvTarget.texture;
+    }
 
     // ⬇️ keep fog in lockstep with sky & tile radius
     this._syncFogToSky();

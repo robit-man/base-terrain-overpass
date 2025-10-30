@@ -969,6 +969,24 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     }
   }
 
+  _syncTileToWireframe(tile) {
+    if (!tile || !this._wireframeMode) return;
+    const color = (this._wireframeLineColor instanceof THREE.Color)
+      ? this._wireframeLineColor
+      : new THREE.Color(0xffffff);
+    const mesh = tile?.grid?.mesh;
+    if (mesh?.material) {
+      this._applyMaterialWireframeState(mesh.material, true, color);
+    }
+    const adapterMat = tile?._adapter?.mesh?.material;
+    if (adapterMat) {
+      this._applyMaterialWireframeState(adapterMat, true, color);
+    }
+    if (tile?._treeGroup) {
+      tile._treeGroup.visible = false;
+    }
+  }
+
   _tileCornerPriority(tile) {
     if (!tile) return Infinity;
     if (tile.type === 'visual') return 0;
@@ -1908,6 +1926,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     tile._adapterDirty = false;
     const key = this._farfieldAdapterKey(tile);
     if (key) this._farfieldAdapterDirty.delete(key);
+    this._syncTileToWireframe(tile);
   }
   _updateFarfieldAdapter(tile) {
     const adapter = tile?._adapter;
@@ -3136,6 +3155,10 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       } catch (e) {
         console.warn('[TileManager] Normal map generation failed:', e);
       }
+    }
+
+    if (this._wireframeMode) {
+      this._applyMaterialWireframeState(mat, true, this._wireframeLineColor);
     }
 
     // Keep ordering stable (farfield < visual < interactive)
@@ -4795,6 +4818,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         this._queuePopulate(tile, true);
       }
     }
+    this._syncTileToWireframe(tile);
     return tile;
   }
 
@@ -4982,6 +5006,7 @@ _farfieldTierForDist(dist) {
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
     }
+    this._syncTileToWireframe(tile);
     return tile;
   }
   _addFarfieldTile(q, r, scale = 1, sampleMode = 'all') {
@@ -5066,6 +5091,7 @@ _farfieldTierForDist(dist) {
     }
     this._markFarfieldMergeDirty(tile);
     this._markHorizonDirty();
+    this._syncTileToWireframe(tile);
     return tile;
   }
 
@@ -5164,6 +5190,7 @@ _farfieldTierForDist(dist) {
 
     // Fetch phased full-res now
     this._queuePopulate(t, true);
+    this._syncTileToWireframe(t);
     return t;
   }
 
