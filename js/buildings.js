@@ -33,10 +33,10 @@ const TARGET_FPS = 60;
 // ── Grounding / resnap tuning ───────────────────────────────────────────
 // Hard cap on how long we let resnap run per animation frame.
 // (Prevents 150ms hitch spikes on phones when terrain + NKN spam hits.)
-const RESNAP_FRAME_BUDGET_MS = _bmIsMobile ? 6 : 12;
+const RESNAP_FRAME_BUDGET_MS = _bmIsMobile ? 4 : 6;
 
 // How often (in seconds) we sweep buildings against terrain
-const RESNAP_INTERVAL = _bmIsMobile ? 4 : 2;
+const RESNAP_INTERVAL = _bmIsMobile ? 5 : 3;
 
 // Vertical delta (meters) before we actually move a building toward terrain.
 // Looser tolerance on mobile means fewer tiny micro-adjustments.
@@ -51,6 +51,7 @@ const RESNAP_LOCK_FRAMES = _bmIsMobile ? 10 : 6;
 
 // How strict we are during routine verify sweeps
 const RESNAP_VERIFY_TOLERANCE = 0.5;
+const RESNAP_VERIFY_INTERVAL_DEFAULT = _bmIsMobile ? 6000 : 7000;
 
 // Older code still refers to this name, so keep the alias alive.
 const RESNAP_VERIFY_LOCK_TOLERANCE = RESNAP_LOCK_TOLERANCE;
@@ -326,7 +327,7 @@ export class BuildingManager {
     this._fetchTokens = 1;
     this._fetchTokenCapacity = 1;
     this._fetchLastTokenRefill = this._nowMs();
-    this._resnapVerifyIntervalMs = 2500;
+    this._resnapVerifyIntervalMs = RESNAP_VERIFY_INTERVAL_DEFAULT;
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
     this._resnapVerifyBatch = 12;
@@ -339,7 +340,8 @@ export class BuildingManager {
       this._maxFetchBatchPerDrain = Math.min(this._maxFetchBatchPerDrain, 3);
 
       // Slow down verify loops so we aren't hammering terrain locks every frame.
-      this._resnapVerifyIntervalMs = Math.max(this._resnapVerifyIntervalMs, 3000);
+      const minVerify = RESNAP_VERIFY_INTERVAL_DEFAULT * 0.5;
+      this._resnapVerifyIntervalMs = Math.max(this._resnapVerifyIntervalMs, minVerify);
       this._resnapVerifyBatch = Math.min(this._resnapVerifyBatch, 6);
     }
     this._wireframeMode = false;
@@ -2656,6 +2658,10 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
 
       const state = this._tileStates.get(tileKey);
       if (!state) continue;
+      if (!this._tileHasActiveContent(state)) {
+        state.resnapFrozen = true;
+        continue;
+      }
       this._resnapTile(tileKey, state);
     }
     if (this._resnapDirtyIndex >= this._resnapDirtyQueue.length) {
@@ -2666,11 +2672,26 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
 
   /* ---------------- resnap sweep ---------------- */
 
+  _tileHasActiveContent(state) {
+    if (!state) return false;
+    const activeBuilding = Array.isArray(state.buildings)
+      && state.buildings.some((b) => b?.info?.insideRadius !== false);
+    const activeExtra = Array.isArray(state.extras)
+      && state.extras.some((extra) => extra?.userData?.insideRadius !== false);
+    return !!(activeBuilding || activeExtra);
+  }
+
   _queueResnapSweep() {
     if (!this._tileStates.size) return;
     if (this._resnapQueue && this._resnapIndex < this._resnapQueue.length) return;
     this._resnapQueue = Array.from(this._tileStates.values())
       .filter((state) => state && (!state.resnapFrozen || (state.extras && state.extras.length)))
+      .filter((state) => {
+        if (!state) return false;
+        const active = this._tileHasActiveContent(state);
+        if (!active) state.resnapFrozen = true;
+        return active;
+      })
       .map((state) => state.tileKey);
     this._resnapIndex = 0;
   }
@@ -2705,7 +2726,12 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
       // even if we skip this tile
       processed++;
 
-      if (!state || (state.resnapFrozen && (!state.extras || !state.extras.length))) continue;
+      if (!state) continue;
+      if (!this._tileHasActiveContent(state)) {
+        state.resnapFrozen = true;
+        continue;
+      }
+      if (state.resnapFrozen && (!state.extras || !state.extras.length)) continue;
       this._resnapTile(tileKey, state);
     }
 
@@ -3147,6 +3173,7 @@ _refreshBuildingVisibility(building) {
     if (!tileKey) return;
     const state = this._tileStates.get(tileKey);
     if (!state?.mergedGroup) return;
+    const wireMode = !!this._wireframeMode;
     let visible = false;
     if (state.buildings?.length) {
       for (const building of state.buildings) {
@@ -3156,11 +3183,18 @@ _refreshBuildingVisibility(building) {
         const solidVis = !!(building?.solid && building.solid.visible);
         const renderVis = !!(building?.render && building.render.visible);
         const ghostNeeded = inside && !snapped;
+        if (wireMode && inside) {
+          visible = true;
+          break;
+        }
         if (solidVis || renderVis || ghostNeeded) {
           visible = true;
           break;
         }
       }
+    }
+    if (!visible && wireMode && state.extras?.length) {
+      visible = state.extras.some((extra) => extra?.userData?.insideRadius !== false);
     }
     state.mergedGroup.visible = visible;
   }
