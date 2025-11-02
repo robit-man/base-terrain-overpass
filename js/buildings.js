@@ -350,21 +350,18 @@ export class BuildingManager {
 
     // Opaque, matte buildings (vertex colors)
     this._buildingMaterial = new THREE.MeshPhysicalMaterial({
-      //color: new THREE.Color(0xaeb6c2),
-      transmission: 1,
-      thickness: 2,
-      roughness: 0.65,
-      //metalness: 0,
-      iridescence: 1,
-      iridescenceIOR: 1.2,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.05,
+      roughness: 0.68,
+      metalness: 0.02,
+      transmission: 0,
+      thickness: 0.2,
+      iridescence: 0.35,
+      iridescenceIOR: 1.15,
+      clearcoat: 0.12,
+      clearcoatRoughness: 0.08,
       envMap: envTexture,
       envMapIntensity: 0.6,
-      vertexColors: true,        // ← enable per-vertex colors
-      //transparent: true,
-      //opacity: 0.96,
-      side: THREE.BackSide
+      vertexColors: true,
+      side: THREE.FrontSide
     });
 
 

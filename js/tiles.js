@@ -303,6 +303,8 @@ export class TileManager {
     this._treeRingCooldown = 0;
     this._treeRegenQueue = [];
     this._treeRegenSet = new Set();
+    this._pendingFarfieldOverlays = new Set();
+    this._farfieldOverlayRetryTimer = null;
     this._primeWaybackVersions();
 
     // On mobile: don't even construct the manager (avoids buffers & per-frame update)
@@ -2614,27 +2616,6 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     for (const tile of tiles) this._ensureTileOverlay(tile);
   }
 
-  setOverlayEnabled(enabled) {
-    const next = !!enabled;
-    if (this._overlayEnabled === next) return;
-    this._overlayEnabled = next;
-    console.log('[tiles] overlay enabled =', next);
-    this._textureQueue = [];
-    this._textureQueueSet?.clear?.();
-    if (!next) {
-      this._overlayCache.clear();
-      this._clearAllOverlays();
-      return;
-    }
-    this._overlayCache.clear();
-    this._primeWaybackVersions();
-    for (const tile of this.tiles.values()) {
-      if (!tile) continue;
-      tile._texturesApplied = false;
-      this._ensureTileOverlay(tile);
-    }
-  }
-
   _clearAllOverlays() {
     for (const tile of this.tiles.values()) {
       this._teardownOverlayForTile(tile);
@@ -2642,6 +2623,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
   }
   _teardownOverlayForTile(tile) {
     if (!tile) return;
+    this._pendingFarfieldOverlays?.delete(tile);
     const mesh = tile.grid?.mesh;
     if (mesh?.material) {
       const mat = mesh.material;
@@ -2681,9 +2663,46 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (!version) return null;
     return `${WAYBACK_WMTS_ROOT}/tile/${version}/${zoom}/${y}/${x}`;
   }
-  _overlayMaxDimensionForType(type) {
-    if (!type) return OVERLAY_MAX_DIMENSIONS.interactive;
-    return OVERLAY_MAX_DIMENSIONS[type] || OVERLAY_MAX_DIMENSIONS.interactive;
+_overlayTargetDimension(target) {
+  const type = typeof target === 'string' ? target : (target?.type || 'interactive');
+  let base = OVERLAY_MAX_DIMENSIONS[type] || OVERLAY_MAX_DIMENSIONS.interactive;
+
+  if (typeof target === 'object' && target?.type === 'farfield') {
+    const dist = this._hexDist(target.q ?? 0, target.r ?? 0, 0, 0);
+    const visualRing = Math.max(this.VISUAL_RING ?? 0, (this.INTERACTIVE_RING ?? 0) + 1);
+    const delta = Math.max(0, dist - visualRing);
+    let scale = 1;
+    if (delta > 160) scale = 0.35;
+    else if (delta > 96) scale = 0.45;
+    else if (delta > 48) scale = 0.6;
+    else if (delta > 24) scale = 0.75;
+    else if (delta > 12) scale = 0.9;
+    base = Math.max(64, Math.round(base * scale));
+  }
+
+  return base;
+}
+
+  _scheduleFarfieldOverlayRetry(delay = 500) {
+    if (!this._pendingFarfieldOverlays?.size || !this._overlayEnabled) return;
+    if (this._farfieldOverlayRetryTimer) return;
+    this._farfieldOverlayRetryTimer = setTimeout(() => {
+      this._farfieldOverlayRetryTimer = null;
+      this._retryPendingFarfieldOverlays();
+    }, Math.max(100, delay));
+  }
+
+  _retryPendingFarfieldOverlays(limit = 4) {
+    if (!this._pendingFarfieldOverlays?.size || !this._overlayEnabled) return;
+    const tiles = Array.from(this._pendingFarfieldOverlays).slice(0, Math.max(1, limit));
+    for (const tile of tiles) {
+      this._pendingFarfieldOverlays.delete(tile);
+      if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
+      this._ensureTileOverlay(tile);
+    }
+    if (this._pendingFarfieldOverlays.size) {
+      this._scheduleFarfieldOverlayRetry(650);
+    }
   }
   _ensureTileOverlay(tile) {
     if (!this._overlayEnabled || !tile || !this.origin) return;
@@ -2694,6 +2713,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (tile._overlay && (tile._overlay.status === 'loading' || tile._overlay.status === 'ready')) return;
 
     if (tile.type === 'farfield') {
+      this._pendingFarfieldOverlays?.delete(tile);
       let pendingNear = 0;
       for (const candidate of this.tiles.values()) {
         if (!candidate) continue;
@@ -2702,7 +2722,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         const status = candidate._overlay?.status;
         if (status !== 'ready') {
           pendingNear++;
-          if (pendingNear >= 8) return;
+          if (pendingNear >= 8) {
+            this._pendingFarfieldOverlays?.add(tile);
+            this._scheduleFarfieldOverlayRetry(500);
+            return;
+          }
         }
       }
     }
@@ -2750,6 +2774,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         ? this._unionTileBounds(minX, maxX, minY, maxY, zoom)   // new helper below
         : this._slippyTileBounds(c.x, c.y, zoom);
 
+      const targetDim = this._overlayTargetDimension(tile);
       entry = {
         status: 'loading',
         waiters: new Set(),
@@ -2762,7 +2787,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         composite: multi,
         bounds: unionBounds,
         coverage,
-        maxDim: this._overlayMaxDimensionForType(tile.type)
+        maxDim: targetDim
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);          // (replaced) now supports composite
@@ -2772,7 +2797,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         : this._slippyTileBounds(entry.x, entry.y, zoom);
     }
 
-    const targetDim = this._overlayMaxDimensionForType(tile.type);
+    const targetDim = this._overlayTargetDimension(tile);
     if (Number.isFinite(targetDim)) {
       entry.maxDim = Math.max(entry.maxDim || targetDim, targetDim);
     }
@@ -2799,6 +2824,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     }
 
     if (!entry) {
+      const targetDim = this._overlayTargetDimension(tile);
       entry = {
         status: 'loading',
         waiters: new Set(),
@@ -2808,13 +2834,13 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         version,
         bounds,
         coverage,
-        maxDim: this._overlayMaxDimensionForType(tile.type)
+        maxDim: targetDim
       };
       this._overlayCache.set(key, entry);
       this._fetchOverlayTile(key, entry);
     }
 
-    const targetDim = this._overlayMaxDimensionForType(tile.type);
+    const targetDim = this._overlayTargetDimension(tile);
     if (Number.isFinite(targetDim)) {
       entry.maxDim = Math.max(entry.maxDim || targetDim, targetDim);
     }
@@ -2999,6 +3025,10 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (needsRefresh) {
       tile._texturesApplied = false;
       this._queueTextureApplication(tile, { force: true });
+    }
+
+    if (tile.type === 'interactive' || tile.type === 'visual') {
+      this._scheduleFarfieldOverlayRetry(250);
     }
   }
   // DROP-IN REPLACEMENT
@@ -6301,11 +6331,17 @@ _farfieldTierForDist(dist) {
   }
 
   _texturePriorityValue(tile) {
-    if (!tile) return 3;
+    if (!tile) return 4;
     if (tile.type === 'interactive') return 0;
     if (tile.type === 'visual') return 1;
-    if (tile.type === 'farfield') return 2;
-    return 3;
+    if (tile.type === 'farfield') {
+      const nearPad = Number.isFinite(this.FARFIELD_NEAR_PAD) ? this.FARFIELD_NEAR_PAD : 0;
+      const seamThreshold = this.VISUAL_RING + Math.max(1, nearPad);
+      const dist = this._hexDist(tile.q ?? 0, tile.r ?? 0, 0, 0);
+      if (dist <= seamThreshold) return 2; // near-seam padding
+      return 3; // distant farfield
+    }
+    return 4;
   }
 
   _drainGrassQueue() {
@@ -7683,6 +7719,7 @@ _sampleHeightFromNeighbors(x, z, excludeTile = null) {
     const ready = tile.ready;
     const base = tile.grid.group.position;
     let seeded = 0;
+    let touched = false;
     for (let i = 0; i < pos.count; i++) {
       if (ready && ready[i]) continue;
       const wx = base.x + pos.getX(i);
@@ -7690,12 +7727,14 @@ _sampleHeightFromNeighbors(x, z, excludeTile = null) {
       const sampled = this._sampleHeightFromNeighbors(wx, wz, tile);
       if (!Number.isFinite(sampled)) continue;
       const current = pos.getY(i);
-      if (Number.isFinite(current) && Math.abs(current - sampled) < 0.01) continue;
-      pos.setY(i, sampled);
+      if (!Number.isFinite(current) || Math.abs(current - sampled) >= 0.01) {
+        pos.setY(i, sampled);
+        touched = true;
+      }
       this._updateGlobalFromValue(sampled);
       seeded++;
     }
-    if (seeded) {
+    if (touched) {
       pos.needsUpdate = true;
       tile.grid.geometry?.computeVertexNormals?.();
     }
@@ -7816,13 +7855,28 @@ _sampleHeightFromNeighbors(x, z, excludeTile = null) {
 
   // tiles.js — inside TileManager
 setOverlayEnabled(on) {
-  const want = !!on;
-  if (this._overlayEnabled === want) return;
-  this._overlayEnabled = want;
-  // Tear down or ensure for current tiles
-  for (const t of this.tiles.values()) {
-    if (want) this._ensureTileOverlay(t);
-    else this._teardownOverlayForTile(t);
+  const next = !!on;
+  if (this._overlayEnabled === next) return;
+  this._overlayEnabled = next;
+  this._textureQueue = [];
+  this._textureQueueSet?.clear?.();
+  if (!next) {
+    this._pendingFarfieldOverlays?.clear?.();
+    if (this._farfieldOverlayRetryTimer) {
+      clearTimeout(this._farfieldOverlayRetryTimer);
+      this._farfieldOverlayRetryTimer = null;
+    }
+    this._overlayCache.clear();
+    this._clearAllOverlays();
+    return;
+  }
+
+  this._overlayCache.clear();
+  this._primeWaybackVersions();
+  for (const tile of this.tiles.values()) {
+    if (!tile) continue;
+    tile._texturesApplied = false;
+    this._ensureTileOverlay(tile);
   }
 }
 
@@ -7928,6 +7982,7 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     const t = this.tiles.get(id);
     const q = Number.isFinite(t?.q) ? t.q : null;
     const r = Number.isFinite(t?.r) ? t.r : null;
+    if (t) this._pendingFarfieldOverlays?.delete(t);
     if (t) this._stashOverlayForId(id, t);
     if (!t) return;
     if (t._treeGroup) this._clearTileTrees(t);
