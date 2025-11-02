@@ -464,17 +464,33 @@ class SmartObjectModal {
       const hydraPub = (peer.nknPub || '').toLowerCase();
       const nowStamp = Date.now();
 
+      // Prepare position and geo data
+      const position = this.currentObject.config.position || {};
+      const geo = {};
+      if (Number.isFinite(position.lat)) geo.lat = position.lat;
+      if (Number.isFinite(position.lon)) geo.lon = position.lon;
+      if (Number.isFinite(position.ground)) geo.ground = position.ground;
+      if (Number.isFinite(position.alt)) geo.alt = position.alt;
+      if (position.gh || position.geohash) geo.gh = position.gh || position.geohash;
+
       // Send sync request
       const syncRequest = {
         type: 'noclip-bridge-sync-request',
         from: noclipPub,
         noclipAddr,
+        hydraPub,
         discoveryRoom: this._resolvedDiscoveryRoom(),
         objectId: this.currentObject.uuid,
+        objectUuid: this.currentObject.uuid,
+        objectLabel: this.currentObject.config.mesh?.label?.text || 'Smart Object',
         objectConfig: {
-          position: { ...this.currentObject.config.position },
-          label: this.currentObject.config.mesh?.label?.text || 'Smart Object'
+          uuid: this.currentObject.uuid,
+          position: { ...position },
+          label: this.currentObject.config.mesh?.label?.text || 'Smart Object',
+          mesh: this.currentObject.config.mesh ? { ...this.currentObject.config.mesh } : undefined
         },
+        position: { ...position },
+        geo: Object.keys(geo).length > 0 ? geo : undefined,
         timestamp: nowStamp
       };
 
@@ -492,8 +508,14 @@ class SmartObjectModal {
       const entry = existing || {};
       entry.hydraPub = hydraPub;
       entry.objectId = this.currentObject.uuid;
+      entry.objectUuid = this.currentObject.uuid;
+      entry.objectLabel = this.currentObject.config.mesh?.label?.text || 'Smart Object';
       entry.status = 'pending';
       entry.requestedAt = nowStamp;
+      entry.discoveryRoom = this._resolvedDiscoveryRoom();
+      entry.position = position;
+      entry.geo = Object.keys(geo).length > 0 ? geo : undefined;
+      entry.direction = 'outgoing';
       delete entry.reason;
       delete entry.respondedAt;
       if (!existing) pendingList.push(entry);

@@ -321,6 +321,13 @@ export class TileManager {
     // Toggle for generation + per-frame updates (used elsewhere in the file)
     this._grassEnabled = !_tmOnMobile;
 
+    // Terrain zoom + falloff controls
+    this.tileZoomLevel = 12;
+    this.tileZoomFalloffEnabled = false;
+    this.tileZoomFalloffMode = 'linear';
+    this.tileZoomFalloffRate = 1;
+    this.tileZoomOuterLimit = 0.8;
+
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
       const sun = new THREE.DirectionalLight(0xffffff, .065);
@@ -342,6 +349,11 @@ export class TileManager {
       fogNearPct: this.FOG_NEAR_PCT,
       fogFarPct: this.FOG_FAR_PCT,
       horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
+      tileZoomLevel: this.tileZoomLevel,
+      tileZoomFalloffEnabled: this.tileZoomFalloffEnabled,
+      tileZoomFalloffMode: this.tileZoomFalloffMode,
+      tileZoomFalloffRate: this.tileZoomFalloffRate,
+      tileZoomOuterLimit: this.tileZoomOuterLimit,
     };
     this._defaultTerrainSettings = {
       interactiveRing: this.INTERACTIVE_RING,
@@ -355,6 +367,11 @@ export class TileManager {
       spacing: this.spacing,
       fogNearPct: this.FOG_NEAR_PCT,
       fogFarPct: this.FOG_FAR_PCT,
+      tileZoomLevel: this.tileZoomLevel,
+      tileZoomFalloffEnabled: this.tileZoomFalloffEnabled,
+      tileZoomFalloffMode: this.tileZoomFalloffMode,
+      tileZoomFalloffRate: this.tileZoomFalloffRate,
+      tileZoomOuterLimit: this.tileZoomOuterLimit,
       horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
     };
     this._lodQuality = 1;
@@ -2692,14 +2709,20 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
   _applyOverlayVersion(version) {
     if (!version || this._overlayVersion === version) return;
     this._overlayVersion = version;
-    const tiles = Array.from(this.tiles.values());
+    this._rebuildOverlayTextures();
+  }
+
+  _rebuildOverlayTextures() {
+    const tiles = Array.from(this.tiles?.values?.() || []);
     for (const tile of tiles) this._teardownOverlayForTile(tile);
-    for (const entry of this._overlayCache.values()) {
-      try {
-        entry.texture?.dispose?.();
-      } catch { /* noop */ }
+    if (this._overlayCache?.size) {
+      for (const entry of this._overlayCache.values()) {
+        try {
+          entry.texture?.dispose?.();
+        } catch { /* noop */ }
+      }
+      this._overlayCache.clear();
     }
-    this._overlayCache.clear();
     for (const tile of tiles) this._ensureTileOverlay(tile);
   }
 
@@ -4999,6 +5022,8 @@ _overlayTargetDimension(target) {
     this.scene.add(grid.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (grid.mesh) grid.mesh.renderOrder = 0;
+    // CRITICAL: Hide tile until elevation data is complete
+    grid.group.visible = false;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -5197,6 +5222,8 @@ _farfieldTierForDist(dist) {
     this.scene.add(low.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (low.mesh) low.mesh.renderOrder = -1;
+    // CRITICAL: Hide tile until elevation data is complete
+    low.group.visible = false;
 
     const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
@@ -5270,6 +5297,8 @@ _farfieldTierForDist(dist) {
     this.scene.add(low.group);
     low.group.layers.set(1);
     low.mesh.layers.set(1);
+    // CRITICAL: Hide tile until elevation data is complete
+    low.group.visible = false;
 
     // allow farfield meshes to answer height queries when no interactive terrain is nearby
     if (low.mesh) low.mesh.raycast = THREE.Mesh.prototype.raycast;
@@ -5343,6 +5372,9 @@ _farfieldTierForDist(dist) {
     this.scene.add(grid.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (grid.mesh) grid.mesh.renderOrder = 0;
+    // CRITICAL: Hide promoted tile until elevation data is fetched
+    // Keep old visual tile visible until new interactive tile is ready
+    grid.group.visible = false;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -5381,12 +5413,41 @@ _farfieldTierForDist(dist) {
     const neighborMeshes = this._gatherNeighborMeshes(q, r);
     const base = grid.group.position;
 
+    // OPTIMIZATION: Reuse exact elevation points from visual tile (center + 6 corners)
+    // Visual tiles have 7 vertices: center (index 0) + 6 corners (indices 1-6)
+    // This avoids re-fetching these points, reducing fetch queue size
+    const reuseMap = new Map();
+    if (lowPosAttr && lowPosAttr.count === 7) {
+      for (let vi = 0; vi < 7; vi++) {
+        const vx = lowPosAttr.getX(vi);
+        const vz = lowPosAttr.getZ(vi);
+        const vy = lowPosAttr.getY(vi);
+        const key = `${Math.round(vx * 1000)},${Math.round(vz * 1000)}`;
+        reuseMap.set(key, vy);
+      }
+    }
+
     for (let i = 0; i < pos.count; i++) {
       const wx = base.x + pos.getX(i);
       const wz = base.z + pos.getZ(i);
+      const lx = pos.getX(i);
+      const lz = pos.getZ(i);
+      const key = `${Math.round(lx * 1000)},${Math.round(lz * 1000)}`;
 
+      // Try to reuse exact match from visual tile first
+      let height = reuseMap.get(key);
+      if (height !== undefined && Number.isFinite(height)) {
+        pos.setY(i, height);
+        this._updateGlobalFromValue(height);
+        // Mark this point as fetched since we already have valid elevation
+        if (t.ready) t.ready[i] = 1;
+        if (t.fetched) t.fetched.add(i);
+        continue;
+      }
+
+      // Otherwise sample from mesh
       const sampled = this._robustSampleHeight(wx, wz, lowMesh, neighborMeshes, lowPosAttr, this._lastHeight);
-      let height = sampled;
+      height = sampled;
       if (!Number.isFinite(height)) {
         const fallback = this.getHeightAt(wx, wz);
         if (Number.isFinite(fallback)) height = fallback;
@@ -5408,16 +5469,14 @@ _farfieldTierForDist(dist) {
     this._applyAllColorsGlobal(t);
     this._ensureTileOverlay(t);
 
-    // Swap into map, dispose low-res
+    // Swap into map - but keep old tile visible until new one has elevation
     this.tiles.set(id, t);
     this._invalidateHeightCache();
     this._markRelaxListDirty();
-    try {
-      this.scene.remove(v.grid.group);
-      v.grid.geometry?.dispose?.();
-      v.grid.mat?.dispose?.();
-      v.wire?.material?.dispose?.();
-    } catch { }
+
+    // CRITICAL: Store reference to old tile for deferred disposal
+    // Old tile will be disposed when new tile becomes visible (after elevation fetch)
+    t._promotedFrom = v;
 
     // CRITICAL: Defer heavy edge sealing work to finalize queue
     // Running synchronously here causes lag spike when promoting many tiles
@@ -6524,6 +6583,25 @@ _farfieldTierForDist(dist) {
     // This ensures textures and grass are only applied AFTER terrain elevation is fetched
     tile._elevationFetched = true;
 
+    // CRITICAL: Make tile visible now that elevation data is complete
+    // This prevents rendering incomplete/invalid tiles
+    if (tile.grid?.group) {
+      tile.grid.group.visible = true;
+    }
+
+    // CRITICAL: If this tile was promoted from a lower-res tile, dispose the old tile now
+    // This ensures smooth visual transition: old tile stays visible until new tile is ready
+    if (tile._promotedFrom) {
+      const oldTile = tile._promotedFrom;
+      try {
+        this.scene.remove(oldTile.grid.group);
+        oldTile.grid.geometry?.dispose?.();
+        oldTile.grid.mat?.dispose?.();
+        oldTile.wire?.material?.dispose?.();
+      } catch { /* ignore disposal errors */ }
+      tile._promotedFrom = null;
+    }
+
     // CRITICAL: If overlay was loaded while waiting for elevation, apply it now
     if (tile._overlay && tile._overlay.status === 'ready' && tile._overlay.entry) {
       this._applyOverlayEntryToTile(tile, tile._overlay.entry);
@@ -7598,6 +7676,11 @@ _applyPendingSamples() {
       fogFarPct: this.FOG_FAR_PCT,
       horizonInnerRadius: horizonInner,
       horizonOuterRadius: horizonOuter,
+      tileZoomLevel: this.tileZoomLevel,
+      tileZoomFalloffEnabled: this.tileZoomFalloffEnabled,
+      tileZoomFalloffMode: this.tileZoomFalloffMode,
+      tileZoomFalloffRate: this.tileZoomFalloffRate,
+      tileZoomOuterLimit: this.tileZoomOuterLimit,
     };
   }
 
@@ -7617,7 +7700,14 @@ _applyPendingSamples() {
     fogNearPct,
     fogFarPct,
     horizonOuterRadius,
+    tileZoomLevel,
+    tileZoomFalloffEnabled,
+    tileZoomFalloffMode,
+    tileZoomFalloffRate,
+    tileZoomOuterLimit,
   } = {}) {
+    const prevTileZoom = this.tileZoomLevel;
+    const prevOverlayZoom = this._overlayZoom;
     let needReset = false;
     if (Number.isFinite(tileRadius) && tileRadius > 10 && tileRadius !== this.tileRadius) {
       this.tileRadius = tileRadius;
@@ -7665,6 +7755,32 @@ _applyPendingSamples() {
         this._markHorizonDirty();
       }
     }
+    if (Number.isFinite(tileZoomLevel)) {
+      const minZoom = 1;
+      const maxZoom = 24;
+      const nextZoom = THREE.MathUtils.clamp(Math.round(tileZoomLevel), minZoom, maxZoom);
+      if (nextZoom !== this.tileZoomLevel) {
+        this.tileZoomLevel = nextZoom;
+      }
+    }
+    if (typeof tileZoomFalloffEnabled === 'boolean') {
+      this.tileZoomFalloffEnabled = tileZoomFalloffEnabled;
+    }
+    if (tileZoomFalloffMode != null) {
+      this.tileZoomFalloffMode = tileZoomFalloffMode === 'logarithmic' ? 'logarithmic' : 'linear';
+    }
+    if (Number.isFinite(tileZoomFalloffRate)) {
+      const minRate = 0.1;
+      const maxRate = 10;
+      this.tileZoomFalloffRate = THREE.MathUtils.clamp(tileZoomFalloffRate, minRate, maxRate);
+    }
+    if (Number.isFinite(tileZoomOuterLimit)) {
+      this.tileZoomOuterLimit = THREE.MathUtils.clamp(tileZoomOuterLimit, 0.1, 1);
+    }
+    const overlayZoom = THREE.MathUtils.clamp(Math.round(this.tileZoomLevel), 0, 23);
+    if (overlayZoom !== this._overlayZoom) {
+      this._overlayZoom = overlayZoom;
+    }
 
     this._baseLod = {
       ...this._baseLod,
@@ -7675,6 +7791,11 @@ _applyPendingSamples() {
       farfieldCreateBudget: this.FARFIELD_CREATE_BUDGET,
       farfieldBatchSize: this.FARFIELD_BATCH_SIZE,
       horizonOuterRadius: this.HORIZON_TARGET_RADIUS,
+      tileZoomLevel: this.tileZoomLevel,
+      tileZoomFalloffEnabled: this.tileZoomFalloffEnabled,
+      tileZoomFalloffMode: this.tileZoomFalloffMode,
+      tileZoomFalloffRate: this.tileZoomFalloffRate,
+      tileZoomOuterLimit: this.tileZoomOuterLimit,
     };
 
     if (needReset) {
@@ -7693,6 +7814,9 @@ _applyPendingSamples() {
     }
     this._markHorizonDirty();
     this._scheduleBackfill(0);
+    if (this.tileZoomLevel !== prevTileZoom || this._overlayZoom !== prevOverlayZoom) {
+      this._rebuildOverlayTextures();
+    }
   }
 
   resetTerrainSettings() {

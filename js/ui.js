@@ -166,6 +166,19 @@ const envHorizonRadiusCurrent = document.getElementById('envHorizonRadiusCurrent
 const envTileRadius = document.getElementById('envTileRadius');
 const envTileRadiusValue = document.getElementById('envTileRadiusValue');
 const envTileRadiusCurrent = document.getElementById('envTileRadiusCurrent');
+const envTileZoomLevel = document.getElementById('envTileZoomLevel');
+const envTileZoomLevelValue = document.getElementById('envTileZoomLevelValue');
+const envTileZoomLevelInput = document.getElementById('envTileZoomLevelInput');
+const envFalloffEnable = document.getElementById('envFalloffEnable');
+const envFalloffModeRow = document.getElementById('envFalloffModeRow');
+const envFalloffLinear = document.getElementById('envFalloffLinear');
+const envFalloffLog = document.getElementById('envFalloffLog');
+const envFalloffRateRow = document.getElementById('envFalloffRateRow');
+const envFalloffRate = document.getElementById('envFalloffRate');
+const envFalloffRateValue = document.getElementById('envFalloffRateValue');
+const envOuterLimitRow = document.getElementById('envOuterLimitRow');
+const envOuterLimit = document.getElementById('envOuterLimit');
+const envOuterLimitValue = document.getElementById('envOuterLimitValue');
 const envFogNear = document.getElementById('envFogNear');
 const envFogNearValue = document.getElementById('envFogNearValue');
 const envFogNearCurrent = document.getElementById('envFogNearCurrent');
@@ -378,6 +391,10 @@ export const ui = {
   envFarfieldBatch, envFarfieldBatchValue, envFarfieldBatchCurrent,
   envHorizonRadius, envHorizonRadiusValue, envHorizonRadiusCurrent,
   envTileRadius, envTileRadiusValue, envTileRadiusCurrent,
+  envTileZoomLevel, envTileZoomLevelValue, envTileZoomLevelInput,
+  envFalloffEnable, envFalloffModeRow, envFalloffLinear, envFalloffLog,
+  envFalloffRateRow, envFalloffRate, envFalloffRateValue,
+  envOuterLimitRow, envOuterLimit, envOuterLimitValue,
   envFogNear, envFogNearValue, envFogNearCurrent,
   envFogFar, envFogFarValue, envFogFarCurrent,
   envTerrainApply, envTerrainAuto,

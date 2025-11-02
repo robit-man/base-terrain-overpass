@@ -27,6 +27,9 @@ import { SmartObjectModal } from './smartModal.js';
 import { ProgressiveLoader } from './progressiveLoader.js';
 import { FPSMonitor } from './fpsMonitor.js';
 
+const TERRAIN_SETTINGS_KEY = 'NKN_TERRAIN_SETTINGS_V1';
+const OVERLAY_SETTINGS_KEY = 'NKN_OVERLAY_SETTINGS_V1';
+
 const DAY_MS = 86400000;
 const J1970 = 2440588;
 const J2000 = 2451545;
@@ -317,6 +320,17 @@ class App {
       camera: this.sceneMgr.camera,
       progressiveLoader: this.progressiveLoader,
     });
+    this._restoreTerrainSettingsFromStorage();
+
+    // Restore overlay settings from localStorage
+    const overlaySettings = this._loadOverlaySettings();
+    if (overlaySettings && typeof overlaySettings.enabled === 'boolean') {
+      if (this.hexGridMgr.setOverlayEnabled) {
+        this.hexGridMgr.setOverlayEnabled(overlaySettings.enabled);
+      } else {
+        this.hexGridMgr._overlayEnabled = overlaySettings.enabled;
+      }
+    }
 
     // Register terrain handler with progressive loader
     this.progressiveLoader.setHandler('terrain', (tile, opts) => {
@@ -881,6 +895,15 @@ class App {
           this._locationState = { lat, lon };
           this.radio.updateFromLatLon(lat, lon);
 
+          // CRITICAL: Even with GPS lock OFF, update terrain origin to prevent world erasure
+          // This keeps terrain/buildings loaded around current GPS position
+          // without locking player movement to GPS
+          if (this.hexGridMgr && Number.isFinite(lat) && Number.isFinite(lon)) {
+            this.hexGridMgr.setOrigin(lat, lon, { immediate: false });
+          }
+          if (this.buildings && Number.isFinite(lat) && Number.isFinite(lon)) {
+            this.buildings.setOrigin(lat, lon, { forceRefresh: false });
+          }
         }
       }
       return;
@@ -1651,6 +1674,19 @@ class App {
       envHorizonRadius,
       envTileRadius,
       envTileRadiusValue,
+      envTileZoomLevel,
+      envTileZoomLevelValue,
+      envTileZoomLevelInput,
+      envFalloffEnable,
+      envFalloffModeRow,
+      envFalloffLinear,
+      envFalloffLog,
+      envFalloffRateRow,
+      envFalloffRate,
+      envFalloffRateValue,
+      envOuterLimitRow,
+      envOuterLimit,
+      envOuterLimitValue,
       envTerrainApply,
       envTerrainAuto,
       envTerrainTargetFps,
@@ -1703,6 +1739,61 @@ class App {
       el.textContent = `(engine: ${value}${suffix})`;
     };
 
+    const clampZoomLevel = (value) => {
+      const num = Number(value);
+      const min = Number(envTileZoomLevel?.min ?? 1);
+      const max = Number(envTileZoomLevel?.max ?? 18);
+      if (!Number.isFinite(num)) return Math.max(min, 1);
+      return THREE.MathUtils.clamp(Math.round(num), min, max);
+    };
+
+    const updateZoomUI = (value) => {
+      const zoom = clampZoomLevel(value);
+      if (envTileZoomLevel) envTileZoomLevel.value = String(zoom);
+      if (envTileZoomLevelInput) envTileZoomLevelInput.value = String(zoom);
+      if (envTileZoomLevelValue) envTileZoomLevelValue.textContent = `${zoom}`;
+      return zoom;
+    };
+
+    const applyFalloffState = (enabled, mode, rate, outerPercent) => {
+      const isEnabled = !!enabled;
+      const normalizedMode = mode === 'logarithmic' ? 'logarithmic' : 'linear';
+      const minRate = Number(envFalloffRate?.min ?? 0.1);
+      const maxRate = Number(envFalloffRate?.max ?? 5);
+      const clampedRate = THREE.MathUtils.clamp(Number(rate) || 1, minRate, maxRate);
+      const minOuter = Number(envOuterLimit?.min ?? 10);
+      const maxOuter = Number(envOuterLimit?.max ?? 100);
+      const clampedOuter = THREE.MathUtils.clamp(Math.round(Number(outerPercent) || 80), minOuter, maxOuter);
+
+      if (envFalloffEnable) envFalloffEnable.checked = isEnabled;
+      const display = isEnabled ? 'flex' : 'none';
+      if (envFalloffModeRow) envFalloffModeRow.style.display = display;
+      if (envFalloffRateRow) envFalloffRateRow.style.display = display;
+      if (envOuterLimitRow) envOuterLimitRow.style.display = display;
+
+      if (envFalloffLinear) envFalloffLinear.checked = normalizedMode !== 'logarithmic';
+      if (envFalloffLog) envFalloffLog.checked = normalizedMode === 'logarithmic';
+
+      if (envFalloffRate) envFalloffRate.value = String(clampedRate);
+      if (envFalloffRateValue) {
+        const formatted = normalizedMode === 'logarithmic'
+          ? `${clampedRate.toFixed(2)}×`
+          : clampedRate.toFixed(2);
+        envFalloffRateValue.textContent = formatted;
+      }
+
+      if (envOuterLimit) envOuterLimit.value = String(clampedOuter);
+      if (envOuterLimitValue) envOuterLimitValue.textContent = `${clampedOuter}%`;
+    };
+
+    const refreshFalloffUIFromControls = () => {
+      const enabled = !!envFalloffEnable?.checked;
+      const mode = envFalloffLog?.checked ? 'logarithmic' : 'linear';
+      const rate = Number(envFalloffRate?.value ?? 1);
+      const outer = Number(envOuterLimit?.value ?? 80);
+      applyFalloffState(enabled, mode, rate, outer);
+    };
+
     const updateTerrainCurrent = (settings) => {
       if (!settings) return;
       setCurrent(envInteractiveRingCurrent, settings.interactiveRing);
@@ -1732,6 +1823,15 @@ class App {
         const clamped = THREE.MathUtils.clamp(Math.round(kmValue), min, max);
         envHorizonRadius.value = String(clamped);
       }
+
+      const zoomLevel = settings.tileZoomLevel ?? this.hexGridMgr?.tileZoomLevel ?? 12;
+      updateZoomUI(zoomLevel);
+
+      const falloffEnabled = settings.tileZoomFalloffEnabled ?? this.hexGridMgr?.tileZoomFalloffEnabled ?? false;
+      const falloffMode = settings.tileZoomFalloffMode ?? this.hexGridMgr?.tileZoomFalloffMode ?? 'linear';
+      const falloffRate = settings.tileZoomFalloffRate ?? this.hexGridMgr?.tileZoomFalloffRate ?? 1;
+      const falloffOuter = (settings.tileZoomOuterLimit ?? this.hexGridMgr?.tileZoomOuterLimit ?? 0.8) * 100;
+      applyFalloffState(falloffEnabled, falloffMode, falloffRate, falloffOuter);
     };
     this._updateTerrainCurrentDisplay = updateTerrainCurrent;
 
@@ -1784,6 +1884,13 @@ class App {
         envFogFar.value = farPct;
         setText(envFogFarValue, `${farPct}%`);
       }
+      const zoomLevel = settings.tileZoomLevel ?? this.hexGridMgr?.tileZoomLevel ?? 12;
+      updateZoomUI(zoomLevel);
+      const falloffEnabled = settings.tileZoomFalloffEnabled ?? this.hexGridMgr?.tileZoomFalloffEnabled ?? false;
+      const falloffMode = settings.tileZoomFalloffMode ?? this.hexGridMgr?.tileZoomFalloffMode ?? 'linear';
+      const falloffRate = settings.tileZoomFalloffRate ?? this.hexGridMgr?.tileZoomFalloffRate ?? 1;
+      const falloffOuter = (settings.tileZoomOuterLimit ?? this.hexGridMgr?.tileZoomOuterLimit ?? 0.8) * 100;
+      applyFalloffState(falloffEnabled, falloffMode, falloffRate, falloffOuter);
       updateTerrainCurrent(settings);
     };
     this._syncTerrainControls = syncTerrainControls;
@@ -1884,6 +1991,41 @@ class App {
         envFogFar.value = farVal;
       }
       setText(envFogFarValue, `${farVal}%`);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envTileZoomLevel?.addEventListener('input', () => {
+      updateZoomUI(envTileZoomLevel.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envTileZoomLevelInput?.addEventListener('input', () => {
+      updateZoomUI(envTileZoomLevelInput.value);
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFalloffEnable?.addEventListener('change', () => {
+      refreshFalloffUIFromControls();
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFalloffLinear?.addEventListener('change', () => {
+      refreshFalloffUIFromControls();
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFalloffLog?.addEventListener('change', () => {
+      refreshFalloffUIFromControls();
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envFalloffRate?.addEventListener('input', () => {
+      refreshFalloffUIFromControls();
+      this._disableTerrainAuto();
+      this._scheduleTerrainUpdate();
+    });
+    envOuterLimit?.addEventListener('input', () => {
+      refreshFalloffUIFromControls();
       this._disableTerrainAuto();
       this._scheduleTerrainUpdate();
     });
@@ -2012,6 +2154,8 @@ class App {
           this.hexGridMgr._overlayEnabled = enabled;
           this.hexGridMgr._applyOverlayEnabledChange?.();
         }
+        // Save overlay enabled state to localStorage
+        this._saveOverlaySettings(enabled);
       });
     }
 
@@ -2098,6 +2242,11 @@ class App {
         : null,
       visualCreateBudget: tm.VISUAL_CREATE_BUDGET,
       horizonOuterRadius: settings.horizonOuterRadius ?? tm._lastHorizonOuterRadius ?? null,
+      tileZoomLevel: settings.tileZoomLevel ?? tm.tileZoomLevel,
+      tileZoomFalloffEnabled: settings.tileZoomFalloffEnabled ?? tm.tileZoomFalloffEnabled,
+      tileZoomFalloffMode: settings.tileZoomFalloffMode ?? tm.tileZoomFalloffMode,
+      tileZoomFalloffRate: settings.tileZoomFalloffRate ?? tm.tileZoomFalloffRate,
+      tileZoomOuterLimit: settings.tileZoomOuterLimit ?? tm.tileZoomOuterLimit,
       fogNearPct: settings.fogNearPct ?? tm.FOG_NEAR_PCT,
       fogFarPct: settings.fogFarPct ?? tm.FOG_FAR_PCT,
     };
@@ -2157,6 +2306,119 @@ class App {
       ui.envBuildingAuto.setAttribute('aria-pressed', this._buildingAuto ? 'true' : 'false');
       ui.envBuildingAuto.dataset.state = this._buildingAuto ? 'on' : 'off';
       ui.envBuildingAuto.textContent = this._buildingAuto ? 'Auto (On)' : 'Auto (Off)';
+    }
+  }
+
+  _loadTerrainSettingsFromStorage() {
+    try {
+      const raw = localStorage.getItem(TERRAIN_SETTINGS_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      const result = {};
+      const copyInt = (key, { min = -Infinity, max = Infinity } = {}) => {
+        const value = Number(parsed[key]);
+        if (Number.isFinite(value)) {
+          result[key] = Math.min(max, Math.max(min, Math.round(value)));
+        }
+      };
+      const copyFloat = (key, { clampMin = -Infinity, clampMax = Infinity } = {}) => {
+        const value = Number(parsed[key]);
+        if (Number.isFinite(value)) {
+          result[key] = Math.min(clampMax, Math.max(clampMin, value));
+        }
+      };
+      if ('interactiveRing' in parsed) copyInt('interactiveRing', { min: 1 });
+      if ('visualRing' in parsed) copyInt('visualRing', { min: 2 });
+      if ('farfieldExtra' in parsed) copyInt('farfieldExtra', { min: 1 });
+      if ('farfieldNearPad' in parsed) copyInt('farfieldNearPad', { min: 0 });
+      if ('farfieldCreateBudget' in parsed) copyInt('farfieldCreateBudget', { min: 1 });
+      if ('farfieldBatchSize' in parsed) copyInt('farfieldBatchSize', { min: 1 });
+      if ('tileRadius' in parsed) copyFloat('tileRadius', { clampMin: 10 });
+      if ('fogNearPct' in parsed) copyFloat('fogNearPct', { clampMin: 0, clampMax: 0.98 });
+      if ('fogFarPct' in parsed) copyFloat('fogFarPct', { clampMin: 0.02, clampMax: 1 });
+      if ('horizonOuterRadius' in parsed) copyFloat('horizonOuterRadius', { clampMin: 20000, clampMax: 200000 });
+      if ('tileZoomLevel' in parsed) copyInt('tileZoomLevel', { min: 1, max: 24 });
+      if ('tileZoomFalloffRate' in parsed) copyFloat('tileZoomFalloffRate', { clampMin: 0.1, clampMax: 10 });
+      if ('tileZoomOuterLimit' in parsed) copyFloat('tileZoomOuterLimit', { clampMin: 0.1, clampMax: 1 });
+      if (typeof parsed.tileZoomFalloffEnabled === 'boolean') {
+        result.tileZoomFalloffEnabled = parsed.tileZoomFalloffEnabled;
+      }
+      if (parsed.tileZoomFalloffMode === 'logarithmic' || parsed.tileZoomFalloffMode === 'linear') {
+        result.tileZoomFalloffMode = parsed.tileZoomFalloffMode;
+      }
+      return Object.keys(result).length ? result : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _saveTerrainSettingsToStorage(settings) {
+    if (!settings) return;
+    try {
+      const payload = {};
+      const assignInt = (key, value, { min = -Infinity, max = Infinity } = {}) => {
+        if (!Number.isFinite(value)) return;
+        const rounded = Math.round(value);
+        payload[key] = Math.min(max, Math.max(min, rounded));
+      };
+      const assignFloat = (key, value, { clampMin = -Infinity, clampMax = Infinity } = {}) => {
+        if (!Number.isFinite(value)) return;
+        const clamped = Math.min(clampMax, Math.max(clampMin, value));
+        payload[key] = clamped;
+      };
+      assignInt('interactiveRing', settings.interactiveRing, { min: 1 });
+      assignInt('visualRing', settings.visualRing, { min: 2 });
+      assignInt('farfieldExtra', settings.farfieldExtra, { min: 1 });
+      assignInt('farfieldNearPad', settings.farfieldNearPad, { min: 0 });
+      assignInt('farfieldCreateBudget', settings.farfieldCreateBudget, { min: 1 });
+      assignInt('farfieldBatchSize', settings.farfieldBatchSize, { min: 1 });
+      assignFloat('tileRadius', settings.tileRadius, { clampMin: 10 });
+      assignFloat('fogNearPct', settings.fogNearPct, { clampMin: 0, clampMax: 0.98 });
+      assignFloat('fogFarPct', settings.fogFarPct, { clampMin: 0.02, clampMax: 1 });
+      assignFloat('horizonOuterRadius', settings.horizonOuterRadius, { clampMin: 20000, clampMax: 200000 });
+      assignInt('tileZoomLevel', settings.tileZoomLevel, { min: 1, max: 24 });
+      assignFloat('tileZoomFalloffRate', settings.tileZoomFalloffRate, { clampMin: 0.1, clampMax: 10 });
+      assignFloat('tileZoomOuterLimit', settings.tileZoomOuterLimit, { clampMin: 0.1, clampMax: 1 });
+      if (typeof settings.tileZoomFalloffEnabled === 'boolean') {
+        payload.tileZoomFalloffEnabled = settings.tileZoomFalloffEnabled;
+      }
+      if (settings.tileZoomFalloffMode === 'logarithmic' || settings.tileZoomFalloffMode === 'linear') {
+        payload.tileZoomFalloffMode = settings.tileZoomFalloffMode;
+      }
+      localStorage.setItem(TERRAIN_SETTINGS_KEY, JSON.stringify(payload));
+    } catch {
+      /* ignore quota */
+    }
+  }
+
+  _restoreTerrainSettingsFromStorage() {
+    const stored = this._loadTerrainSettingsFromStorage();
+    if (stored && this.hexGridMgr?.updateTerrainSettings) {
+      this.hexGridMgr.updateTerrainSettings(stored);
+    }
+  }
+
+  _loadOverlaySettings() {
+    try {
+      const raw = localStorage.getItem(OVERLAY_SETTINGS_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return {
+        enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : false
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  _saveOverlaySettings(enabled) {
+    try {
+      const payload = { enabled: !!enabled };
+      localStorage.setItem(OVERLAY_SETTINGS_KEY, JSON.stringify(payload));
+    } catch {
+      /* ignore quota */
     }
   }
 
@@ -2221,6 +2483,26 @@ class App {
         horizonOuterRadius = km * 1000;
       }
     }
+    const zoomMin = Number(ui.envTileZoomLevel?.min ?? 1);
+    const zoomMax = Number(ui.envTileZoomLevel?.max ?? 18);
+    let tileZoomLevel = Number(ui.envTileZoomLevel?.value ?? ui.envTileZoomLevelInput?.value ?? this.hexGridMgr?.tileZoomLevel ?? 12);
+    if (!Number.isFinite(tileZoomLevel)) tileZoomLevel = this.hexGridMgr?.tileZoomLevel ?? 12;
+    tileZoomLevel = Math.min(zoomMax, Math.max(zoomMin, Math.round(tileZoomLevel)));
+
+    const falloffEnabled = !!ui.envFalloffEnable?.checked;
+    const falloffMode = falloffEnabled && ui.envFalloffLog?.checked ? 'logarithmic' : 'linear';
+    const rateMin = Number(ui.envFalloffRate?.min ?? 0.1);
+    const rateMax = Number(ui.envFalloffRate?.max ?? 5);
+    let falloffRate = Number(ui.envFalloffRate?.value ?? this.hexGridMgr?.tileZoomFalloffRate ?? 1);
+    if (!Number.isFinite(falloffRate)) falloffRate = this.hexGridMgr?.tileZoomFalloffRate ?? 1;
+    falloffRate = Math.min(rateMax, Math.max(rateMin, falloffRate));
+
+    const outerMin = Number(ui.envOuterLimit?.min ?? 10);
+    const outerMax = Number(ui.envOuterLimit?.max ?? 100);
+    let outerPercent = Number(ui.envOuterLimit?.value ?? Math.round((this.hexGridMgr?.tileZoomOuterLimit ?? 0.8) * 100));
+    if (!Number.isFinite(outerPercent)) outerPercent = Math.round((this.hexGridMgr?.tileZoomOuterLimit ?? 0.8) * 100);
+    outerPercent = Math.min(outerMax, Math.max(outerMin, Math.round(outerPercent)));
+
     const config = {
       interactiveRing: interactive,
       visualRing: visual,
@@ -2231,6 +2513,11 @@ class App {
       tileRadius,
       fogNearPct,
       fogFarPct,
+      tileZoomLevel,
+      tileZoomFalloffEnabled: falloffEnabled,
+      tileZoomFalloffMode: falloffMode,
+      tileZoomFalloffRate: falloffRate,
+      tileZoomOuterLimit: outerPercent / 100,
     };
     if (Number.isFinite(horizonOuterRadius)) config.horizonOuterRadius = horizonOuterRadius;
     return config;
@@ -2247,7 +2534,10 @@ class App {
     if (!auto) this._terrainAuto = false;
     this._syncEnvironmentAutoButtons();
     const settings = this.hexGridMgr.getTerrainSettings?.();
-    if (settings) this._updateTerrainCurrentDisplay?.(settings);
+    if (settings) {
+      this._saveTerrainSettingsToStorage(settings);
+      this._updateTerrainCurrentDisplay?.(settings);
+    }
     this._syncTerrainControls?.();
     this._syncBuildingControls?.();
     const profile = this._perf?.profile?.();

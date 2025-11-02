@@ -562,6 +562,37 @@
                 <input id="envImageryTimeline" type="range" min="0" max="0" step="1" value="0" />
               </div>
               <p class="tiny">Select historical ARCGIS Wayback imagery. Newer versions are higher quality.</p>
+              <p class="tiny"><strong>Terrain Tile Zoom</strong></p>
+              <div class="slider-row">
+                <label for="envTileZoomLevel">Zoom Level <span class="mono" id="envTileZoomLevelValue">12</span></label>
+                <input id="envTileZoomLevel" type="range" min="1" max="18" step="1" value="12" />
+                <input id="envTileZoomLevelInput" type="number" min="1" max="18" step="1" value="12" class="zoom-number-input" />
+              </div>
+              <div class="slider-row">
+                <label>
+                  <input id="envFalloffEnable" type="checkbox">
+                  Enable Falloff
+                </label>
+              </div>
+              <div class="slider-row" id="envFalloffModeRow" style="display: none;">
+                <label>
+                  <input id="envFalloffLinear" type="radio" name="falloffMode" value="linear" checked>
+                  Linear
+                </label>
+                <label style="margin-left: 16px;">
+                  <input id="envFalloffLog" type="radio" name="falloffMode" value="logarithmic">
+                  Logarithmic
+                </label>
+              </div>
+              <div class="slider-row" id="envFalloffRateRow" style="display: none;">
+                <label for="envFalloffRate">Falloff Rate <span class="mono" id="envFalloffRateValue">1.0</span></label>
+                <input id="envFalloffRate" type="range" min="0.1" max="5.0" step="0.1" value="1.0" />
+              </div>
+              <div class="slider-row" id="envOuterLimitRow" style="display: none;">
+                <label for="envOuterLimit">Outer Limit <span class="mono" id="envOuterLimitValue">80%</span> <span class="tiny">(farfield transition)</span></label>
+                <input id="envOuterLimit" type="range" min="10" max="100" step="5" value="80" />
+              </div>
+              <p class="tiny">Zoom level controls terrain tile resolution. Falloff creates smooth transitions to the farfield radius.</p>
             </section>
 
             <section class="modal-section">
