@@ -361,7 +361,7 @@ export class BuildingManager {
       envMap: envTexture,
       envMapIntensity: 0.6,
       vertexColors: true,
-      side: THREE.FrontSide
+      side: THREE.BackSide
     });
 
 

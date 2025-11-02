@@ -192,6 +192,10 @@ export class TileManager {
     this.HORIZON_UPDATE_INTERVAL_MS = HORIZON_UPDATE_INTERVAL_MS;
     this.HORIZON_INNER_GAP = Math.max(8, this.tileRadius * 0.08);
     this.HORIZON_TEXTURE_SCALE = HORIZON_TEXTURE_SCALE;
+    this.HORIZON_MAX_SEGMENTS = this._isMobile ? 96 : 160;
+    this.HORIZON_MAX_RADIAL_STEPS = this._isMobile ? 12 : 24;
+    this.HORIZON_GROWTH_FACTOR = 1.18;
+    this._horizonEnabled = false;
     this.FOG_NEAR_PCT = 0.12;
     this.FOG_FAR_PCT = 0.98;
     this._wireframeMode = false;
@@ -316,9 +320,6 @@ export class TileManager {
 
     // Toggle for generation + per-frame updates (used elsewhere in the file)
     this._grassEnabled = !_tmOnMobile;
-
-    this._initHorizonField();
-
 
     if (!scene.userData._tmLightsAdded) {
       scene.add(new THREE.AmbientLight(0xffffff, .055));
@@ -2103,6 +2104,64 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     return maxRadius;
   }
 
+  _collectFarfieldBoundaryPoints() {
+    const maxSeg = Math.max(32, this.HORIZON_MAX_SEGMENTS || 120);
+    const buckets = new Array(maxSeg).fill(null);
+    const posScratch = new THREE.Vector3();
+
+    const register = (x, y, z) => {
+      if (!Number.isFinite(x) || !Number.isFinite(z)) return;
+      const radius = Math.hypot(x, z);
+      if (!Number.isFinite(radius) || radius <= 0.1) return;
+      let angle = Math.atan2(z, x);
+      if (angle < 0) angle += TAU;
+      const idx = Math.min(maxSeg - 1, Math.max(0, Math.floor((angle / TAU) * maxSeg)));
+      const existing = buckets[idx];
+      if (!existing || radius > existing.radius) {
+        buckets[idx] = { x, y, z, radius, angle };
+      } else if (existing && Math.abs(radius - existing.radius) < 1e-3) {
+        existing.y = Math.max(existing.y, y);
+      }
+    };
+
+    for (const tile of this.tiles.values()) {
+      if (!tile || tile.type !== 'farfield') continue;
+      const posAttr = tile.pos;
+      const group = tile.grid?.group;
+      if (!posAttr || !group) continue;
+
+      for (let side = 0; side < 6; side++) {
+        const dir = HEX_DIRS[side];
+        const neighbor = this._getTile(tile.q + dir[0], tile.r + dir[1]);
+        if (neighbor && neighbor.type === 'farfield') continue;
+
+        const idxA = 1 + side;
+        const idxB = 1 + ((side + 1) % 6);
+
+        posScratch.set(
+          group.position.x + posAttr.getX(idxA),
+          group.position.y + posAttr.getY(idxA),
+          group.position.z + posAttr.getZ(idxA)
+        );
+        register(posScratch.x, posScratch.y, posScratch.z);
+
+        posScratch.set(
+          group.position.x + posAttr.getX(idxB),
+          group.position.y + posAttr.getY(idxB),
+          group.position.z + posAttr.getZ(idxB)
+        );
+        register(posScratch.x, posScratch.y, posScratch.z);
+      }
+    }
+
+    const boundary = [];
+    for (let i = 0; i < buckets.length; i++) {
+      const sample = buckets[i];
+      if (sample) boundary.push({ x: sample.x, y: sample.y, z: sample.z });
+    }
+    return boundary;
+  }
+
   _sampleHorizonHeight(x, z, fallback = this._lastHeight) {
     const mergeMesh = this._farfieldMerge?.mesh;
     if (mergeMesh) {
@@ -2119,12 +2178,23 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     return fallback;
   }
 
-  _initHorizonField() {
-    if (this._horizonField || !this.scene) return;
-    const segments = Math.max(12, Math.round(this.HORIZON_SEGMENTS || 48));
-    const radialSteps = Math.max(2, Math.round(this.HORIZON_RADIAL_STEPS || 3));
-    const vertCount = segments * radialSteps;
+  _ensureHorizonField(segments, radialSteps) {
+    if (!this.scene) return null;
+    const seg = Math.max(6, Math.round(segments || this.HORIZON_SEGMENTS || 48));
+    const steps = Math.max(2, Math.round(radialSteps || this.HORIZON_RADIAL_STEPS || 3));
 
+    const needsRebuild =
+      !this._horizonField ||
+      this._horizonField.segments !== seg ||
+      this._horizonField.radialSteps !== steps;
+
+    if (!needsRebuild) return this._horizonField;
+
+    if (this._horizonField) {
+      this._disposeHorizonField();
+    }
+
+    const vertCount = seg * steps;
     const geom = new THREE.BufferGeometry();
     const posAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 3), 3).setUsage(THREE.DynamicDrawUsage);
     const uvAttr = new THREE.BufferAttribute(new Float32Array(vertCount * 2), 2).setUsage(THREE.DynamicDrawUsage);
@@ -2134,11 +2204,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     geom.setAttribute('color', colAttr);
 
     const indices = [];
-    for (let r = 0; r < radialSteps - 1; r++) {
-      const ringStart = r * segments;
-      const nextRingStart = (r + 1) * segments;
-      for (let s = 0; s < segments; s++) {
-        const next = (s + 1) % segments;
+    for (let r = 0; r < steps - 1; r++) {
+      const ringStart = r * seg;
+      const nextRingStart = (r + 1) * seg;
+      for (let s = 0; s < seg; s++) {
+        const next = (s + 1) % seg;
         indices.push(ringStart + s, nextRingStart + s, nextRingStart + next);
         indices.push(ringStart + s, nextRingStart + next, ringStart + next);
       }
@@ -2164,9 +2234,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
     const colArr = colAttr.array;
     for (let i = 0; i < colArr.length; i += 3) {
-      colArr[i] = 0.22;
-      colArr[i + 1] = 0.24;
-      colArr[i + 2] = 0.27;
+      const t = Math.floor(i / 3) / (vertCount - 1 || 1);
+      const base = 0.22 + 0.03 * t;
+      colArr[i] = base;
+      colArr[i + 1] = base + 0.015;
+      colArr[i + 2] = base + 0.025;
     }
     colAttr.needsUpdate = true;
 
@@ -2176,17 +2248,18 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       posAttr,
       uvAttr,
       colAttr,
-      segments,
-      radialSteps,
-      angles: new Float32Array(segments),
-      weights: new Float32Array(segments),
-      focusGain: new Float32Array(segments),
-      innerHeights: new Float32Array(segments),
+      segments: seg,
+      radialSteps: steps,
+      angles: new Float32Array(seg),
+      focusGain: new Float32Array(seg),
+      innerHeights: new Float32Array(seg),
+      boundaryRadius: new Float32Array(seg),
       innerRadius: 0,
       outerRadius: 0,
     };
     this._horizonDirty = true;
     this._nextHorizonUpdate = 0;
+    return this._horizonField;
   }
 
   _disposeHorizonField() {
@@ -2200,102 +2273,114 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
   }
 
   _updateHorizonField(playerPos, deltaTime = 0) {
-    if (!this._horizonField) {
-      this._initHorizonField();
-      if (!this._horizonField) return;
-    }
-    const hf = this._horizonField;
+    if (!this._horizonEnabled) return;
     const now = performance?.now ? performance.now() : Date.now();
     const velocity = this._playerVelocity.length();
-    const needFocus = velocity > this.HORIZON_FOCUS_THRESHOLD;
-    if (!this._horizonDirty && now < this._nextHorizonUpdate && !needFocus) return;
+    const needFocusUpdate = velocity > this.HORIZON_FOCUS_THRESHOLD;
+    if (!this._horizonDirty && now < this._nextHorizonUpdate && !needFocusUpdate) return;
 
-    let farEdge = this._computeFarfieldOuterRadius();
-    const mergeMesh = this._farfieldMerge?.mesh;
-    if (mergeMesh?.geometry) {
-      mergeMesh.geometry.computeBoundingSphere?.();
-      const bs = mergeMesh.geometry.boundingSphere;
-      if (bs) {
-        const worldCenter = bs.center.clone();
-        mergeMesh.localToWorld(worldCenter);
-        const radial = Math.hypot(worldCenter.x, worldCenter.z) + bs.radius;
-        if (Number.isFinite(radial)) farEdge = Math.max(farEdge, radial);
+    const boundaryRaw = this._collectFarfieldBoundaryPoints();
+    let boundary = boundaryRaw;
+    let fallback = false;
+
+    if (!boundary || boundary.length < 6) {
+      fallback = true;
+      const fallbackSegments = Math.max(12, Math.round(this.HORIZON_SEGMENTS || 48));
+      const farEdge = this._computeFarfieldOuterRadius();
+      const baseRadius = Math.max(farEdge + this.HORIZON_INNER_GAP, this.tileRadius * (this.VISUAL_RING + 2));
+      boundary = [];
+      for (let i = 0; i < fallbackSegments; i++) {
+        const angle = (i / fallbackSegments) * TAU;
+        const x = Math.cos(angle) * baseRadius;
+        const z = Math.sin(angle) * baseRadius;
+        const y = this._sampleHorizonHeight(x, z, this._lastHeight);
+        boundary.push({ x, y, z });
       }
     }
-    if (Number.isFinite(farEdge) && farEdge > this._lastFarfieldOuterRadius) {
-      this._lastFarfieldOuterRadius = farEdge;
-    }
-    const minInner = this.tileRadius * (this.VISUAL_RING + Math.max(1, this.FARFIELD_EXTRA) * 0.5);
-    const innerRadius = Math.max(farEdge + this.HORIZON_INNER_GAP, minInner);
-    const outerRadius = Math.max(
-      innerRadius + this.HORIZON_EXTRA_METERS,
-      this.HORIZON_TARGET_RADIUS
-    );
 
-    const segments = hf.segments;
-    const radialSteps = hf.radialSteps;
-    const weights = hf.weights;
-    const focusGain = hf.focusGain;
-    const angles = hf.angles;
-    const innerHeights = hf.innerHeights;
+    const segments = boundary.length;
+    let hf = this._ensureHorizonField(segments, Math.max(2, this.HORIZON_RADIAL_STEPS || 3));
+    if (!hf) return;
 
-    const focusDir = needFocus ? Math.atan2(this._playerVelocity.z, this._playerVelocity.x) : null;
-    let totalWeight = 0;
+    const radii = new Array(segments);
+    let totalRadius = 0;
+    let minRadius = Infinity;
+    let perimeter = 0;
     for (let i = 0; i < segments; i++) {
-      const baseAngle = (i / segments) * TAU;
-      let weight = 1;
-      let gain = 0;
-      if (focusDir !== null) {
-        const diff = Math.atan2(Math.sin(baseAngle - focusDir), Math.cos(baseAngle - focusDir));
-        gain = Math.max(0, Math.cos(diff));
-        weight += this.HORIZON_FOCUS_STRENGTH * gain * gain;
-      }
-      weights[i] = weight;
-      focusGain[i] = gain;
-      totalWeight += weight;
+      const p = boundary[i];
+      const next = boundary[(i + 1) % segments];
+      const r = Math.hypot(p.x, p.z);
+      radii[i] = r;
+      totalRadius += r;
+      if (r < minRadius) minRadius = r;
+      perimeter += Math.hypot(next.x - p.x, next.z - p.z);
     }
-    if (!Number.isFinite(totalWeight) || totalWeight <= 0) totalWeight = segments;
 
-    let cumulative = 0;
-    for (let i = 0; i < segments; i++) {
-      const w = weights[i];
-      const start = cumulative / totalWeight;
-      cumulative += w;
-      const end = cumulative / totalWeight;
-      angles[i] = ((start + end) * 0.5) * TAU;
+    const avgRadius = totalRadius / segments;
+    const meanEdge = perimeter / segments;
+    const baseStep = Math.max(this.tileRadius * 0.5, meanEdge * Math.sqrt(3) * 0.5);
+
+    const ringRadii = [avgRadius];
+    let accumRadius = avgRadius;
+    const maxSteps = this.HORIZON_MAX_RADIAL_STEPS;
+    while (accumRadius < this.HORIZON_TARGET_RADIUS && ringRadii.length < maxSteps) {
+      const growthIdx = ringRadii.length - 1;
+      const step = baseStep * Math.pow(this.HORIZON_GROWTH_FACTOR, Math.max(0, growthIdx));
+      accumRadius += step;
+      ringRadii.push(Math.min(accumRadius, this.HORIZON_TARGET_RADIUS));
+      if (step <= 1) break;
     }
+    if (ringRadii.length < 2) ringRadii.push(this.HORIZON_TARGET_RADIUS);
+
+    const radialSteps = ringRadii.length;
+    if (hf.radialSteps !== radialSteps || hf.segments !== segments) {
+      hf = this._ensureHorizonField(segments, radialSteps);
+      if (!hf) return;
+    } else {
+      hf.radialSteps = radialSteps;
+    }
+
+    const focusDir = needFocusUpdate ? Math.atan2(this._playerVelocity.z, this._playerVelocity.x) : null;
 
     const posAttr = hf.posAttr;
     const uvAttr = hf.uvAttr;
+    const angles = hf.angles;
+    const focusGain = hf.focusGain;
+    const innerHeights = hf.innerHeights;
+    const boundaryRadius = hf.boundaryRadius;
 
-    const baseHeight = this._lastHeight;
+    // Populate base ring with collected boundary data
     for (let i = 0; i < segments; i++) {
-      const angle = angles[i];
-      const cosA = Math.cos(angle);
-      const sinA = Math.sin(angle);
-      const x = innerRadius * cosA;
-      const z = innerRadius * sinA;
-      const y = this._sampleHorizonHeight(x, z, baseHeight);
-      innerHeights[i] = y;
-      posAttr.setXYZ(i, x, y, z);
-      uvAttr.setXY(i, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
+      const p = boundary[i];
+      const angle = Math.atan2(p.z, p.x);
+      angles[i] = angle;
+      boundaryRadius[i] = radii[i];
+      innerHeights[i] = p.y;
+      focusGain[i] = focusDir != null ? Math.max(0, Math.cos(angle - focusDir)) : 0;
+      posAttr.setXYZ(i, p.x, p.y, p.z);
+      uvAttr.setXY(i, 0.5 + p.x * this.HORIZON_TEXTURE_SCALE, 0.5 + p.z * this.HORIZON_TEXTURE_SCALE);
+    }
+
+    const offsets = new Array(radialSteps);
+    for (let band = 0; band < radialSteps; band++) {
+      offsets[band] = ringRadii[band] - avgRadius;
     }
 
     for (let band = 1; band < radialSteps; band++) {
-      const bandT = band / (radialSteps - 1);
-      const radius = THREE.MathUtils.lerp(innerRadius, outerRadius, Math.pow(bandT, 1.15));
-      const heightBlend = Math.pow(bandT, 1.6);
+      const offset = offsets[band];
+      const blend = radialSteps > 1 ? band / (radialSteps - 1) : 1;
       for (let i = 0; i < segments; i++) {
+        const baseRadius = boundaryRadius[i];
+        const targetRadius = Math.max(baseRadius + offset, baseRadius);
         const angle = angles[i];
-        let radial = radius;
+        let radial = targetRadius;
         if (focusDir !== null && band === radialSteps - 1) {
-          radial += radius * 0.12 * focusGain[i];
+          radial += radial * 0.08 * focusGain[i];
         }
         const x = radial * Math.cos(angle);
         const z = radial * Math.sin(angle);
-        const innerY = innerHeights[i];
-        const farY = innerY * 0.25;
-        const y = THREE.MathUtils.lerp(innerY, farY, heightBlend);
+        const sample = this._sampleHorizonHeight(x, z, innerHeights[i]);
+        const y = THREE.MathUtils.lerp(innerHeights[i], sample, blend);
         const idx = band * segments + i;
         posAttr.setXYZ(idx, x, y, z);
         uvAttr.setXY(idx, 0.5 + x * this.HORIZON_TEXTURE_SCALE, 0.5 + z * this.HORIZON_TEXTURE_SCALE);
@@ -2305,15 +2390,17 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     posAttr.needsUpdate = true;
     uvAttr.needsUpdate = true;
     try {
-      hf.geometry.computeVertexNormals();
-      hf.geometry.computeBoundingSphere();
+      this._horizonField.geometry.computeVertexNormals();
+      this._horizonField.geometry.computeBoundingSphere();
     } catch { }
 
-    hf.innerRadius = innerRadius;
-    hf.outerRadius = outerRadius;
+    hf.innerRadius = Math.min(minRadius, avgRadius);
+    hf.outerRadius = ringRadii[ringRadii.length - 1];
     hf.mesh.visible = true;
-    this._lastHorizonOuterRadius = outerRadius;
-    this._horizonDirty = false;
+    hf.segments = segments;
+    hf.radialSteps = radialSteps;
+    this._lastHorizonOuterRadius = hf.outerRadius;
+    this._horizonDirty = fallback; // force refresh more frequently while sparse data
     this._nextHorizonUpdate = now + this.HORIZON_UPDATE_INTERVAL_MS;
   }
 
@@ -6926,7 +7013,11 @@ _kickFarfieldIfIdle() {
       }
 
       this._updateFarfieldMergedMesh();
-      this._updateHorizonField(playerPos, deltaTime);
+      if (this._horizonEnabled) {
+        this._updateHorizonField(playerPos, deltaTime);
+      } else if (this._horizonField) {
+        this._disposeHorizonField();
+      }
       const treeRefreshPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 3, this._treeComplexity ?? 0.35)));
       this._serviceTreeRefresh(treeRefreshPerFrame);
 
