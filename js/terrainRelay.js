@@ -14,8 +14,29 @@ function ensureJson(obj) {
   return obj;
 }
 
+function detectMobileDevice() {
+  try {
+    const nav = globalThis.navigator;
+    const ua = nav?.userAgent || '';
+    if (/Android|iPhone|iPad|iPod/i.test(ua)) return true;
+    const coarse = globalThis.matchMedia?.('(pointer: coarse)');
+    if (coarse?.matches) return true;
+  } catch {
+    // ignore detection failures
+  }
+  return false;
+}
+
 export class TerrainRelay {
-  constructor({ defaultRelay = '', dataset = 'mapzen', mode = 'geohash', onStatus = null, clientProvider = null, wsEndpoint = 'https://noclip-elevation.loca.lt' } = {}) {
+  constructor({
+    defaultRelay = '',
+    dataset = 'mapzen',
+    mode = 'geohash',
+    onStatus = null,
+    clientProvider = null,
+    wsEndpoint = 'https://noclip-elevation.loca.lt',
+    useWsFallback = null,
+  } = {}) {
     this.relayAddress = defaultRelay.trim();
     this.dataset = dataset.trim() || 'mapzen';
     this.mode = mode === 'latlng' ? 'latlng' : 'geohash';
@@ -28,7 +49,9 @@ export class TerrainRelay {
     this._wsPending = new Map();
     this._wsRetryTimer = null;
     this._wsRetryDelay = 1000;
-    this._useWsFallback = false; // Enable WebSocket fallback by default
+    this._isMobile = detectMobileDevice();
+    const fallbackDefault = useWsFallback == null ? this._isMobile : !!useWsFallback;
+    this._useWsFallback = fallbackDefault;
 
     this._clientProvider = typeof clientProvider === 'function' ? clientProvider : null;
     this._internalClient = null;
@@ -290,25 +313,52 @@ export class TerrainRelay {
   _handleWsResponse(data) {
     if (!data || typeof data !== 'object') return;
 
-    // Try to find matching request by matching geohashes or request ID
-    for (const [id, pending] of this._wsPending.entries()) {
-      // Check if this response matches the request
-      const matches = pending.checkMatch?.(data) ?? true;
-      if (matches) {
-        this._wsPending.delete(id);
-        clearTimeout(pending.timeout);
-        pending.resolve(data);
-        return;
+    const getError = () => {
+      if (!data.error) return null;
+      if (typeof data.error === 'string') return data.error;
+      if (data.error && typeof data.error.message === 'string') return data.error.message;
+      try { return JSON.stringify(data.error); } catch { return 'WebSocket elevation error'; }
+    };
+
+    const responseId = data.id || data.requestId || data.reqId || null;
+    let pendingEntry = null;
+
+    if (responseId && this._wsPending.has(responseId)) {
+      pendingEntry = this._wsPending.get(responseId);
+      this._wsPending.delete(responseId);
+    } else {
+      for (const [id, pending] of this._wsPending.entries()) {
+        const matches = pending.checkMatch?.(data) ?? true;
+        if (matches) {
+          pendingEntry = pending;
+          this._wsPending.delete(id);
+          break;
+        }
       }
+    }
+
+    if (!pendingEntry) return;
+
+    clearTimeout(pendingEntry.timeout);
+
+    const errMsg = getError();
+    if (errMsg) {
+      pendingEntry.reject(new Error(errMsg));
+    } else {
+      pendingEntry.resolve(data);
     }
   }
 
-  async _queryViaWebSocket(geohashes, timeoutMs = 15000) {
+  async _queryViaWebSocket(requestPayload, timeoutMs = 15000) {
     if (!this._wsConnected || !this._wsSocket) {
       throw new Error('WebSocket not connected');
     }
 
     const id = globalThis.crypto?.randomUUID?.() || Math.random().toString(16).slice(2);
+    const basePayload = (requestPayload && typeof requestPayload === 'object')
+      ? { ...requestPayload }
+      : {};
+    const geohashes = Array.isArray(basePayload.geohashes) ? basePayload.geohashes.slice() : null;
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -320,11 +370,11 @@ export class TerrainRelay {
 
       // Store with a matcher function to identify the response
       const checkMatch = (data) => {
-        // If error, don't match
-        if (data.error) return false;
+        const respId = data?.id || data?.requestId || data?.reqId;
+        if (respId && respId !== id) return false;
 
         // For geohash mode, check if response contains our geohashes
-        if (data.mode === 'geohash' && data.results && Array.isArray(data.results)) {
+        if (geohashes && data.mode === 'geohash' && data.results && Array.isArray(data.results)) {
           const responseHashes = new Set(data.results.map(r => r.geohash));
           const requestHashes = new Set(geohashes);
           // Check if there's significant overlap
@@ -338,15 +388,17 @@ export class TerrainRelay {
         return true; // Default to accepting if we can't determine
       };
 
-      this._wsPending.set(id, { resolve, reject, timeout, checkMatch });
+      this._wsPending.set(id, { id, resolve, reject, timeout, checkMatch });
 
       // Send request
       const payload = {
+        ...basePayload,
+        id,
         dataset: this.dataset,
-        geohashes: geohashes,
-        dest: this.relayAddress || undefined, // <-- add this
-
+        mode: this.mode,
       };
+      if (geohashes) payload.geohashes = geohashes;
+      if (this.relayAddress) payload.dest = this.relayAddress;
 
       this._wsSocket.emit('elevation-request', payload);
     });
@@ -387,14 +439,12 @@ export class TerrainRelay {
       try { localStorage.setItem(LS_SEED_KEY, seed); } catch { /* ignore */ }
     }
 
-    const IS_MOBILE =
-      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
-      (globalThis.matchMedia?.('(pointer: coarse)').matches ?? false);
+    const isMobile = this._isMobile ?? detectMobileDevice();
 
     const mc = new window.nkn.MultiClient({
       seed,
       identifier: 'terrain',
-      numSubClients: IS_MOBILE ? 1 : 4,   // was 4
+      numSubClients: isMobile ? 3 : 4,
       originalClient: false,
     });
 
@@ -504,7 +554,7 @@ export class TerrainRelay {
     if (this._useWsFallback && this._wsConnected && this.mode === 'geohash' && payload.geohashes) {
       try {
         const wsStart = this._nowMs();
-        const wsResult = await this._queryViaWebSocket(payload.geohashes, 10000);
+        const wsResult = await this._queryViaWebSocket(payload, 10000);
         const wsDuration = this._nowMs() - wsStart;
 
         if (wsResult && !wsResult.error && wsResult.results) {

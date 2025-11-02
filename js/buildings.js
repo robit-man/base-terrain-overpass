@@ -1360,12 +1360,22 @@ _updateTiles(force = false) {
         const distSq = dxMeters * dxMeters + dzMeters * dzMeters;
         if (distSq > maxDistSq) continue;
         const tileKey = `${tx + dx},${tz + dz}`;
-        const state = this._tileStates.get(tileKey);
-        if (!state && !this._terrainTileReady(tileKey)) {
-          this._pendingTerrainTiles?.add(tileKey);
-          continue;
+        let state = this._tileStates.get(tileKey);
+        if (!state) {
+          state = this._createTileState(tileKey);
+          this._tileStates.set(tileKey, state);
         }
-        if (this._pendingTerrainTiles) this._pendingTerrainTiles.delete(tileKey);
+        const terrainReady = this._terrainTileReady(tileKey);
+        if (!terrainReady) {
+          if (state) state.waitingForTerrain = true;
+          this._pendingTerrainTiles?.add(tileKey);
+        } else {
+          if (state?.waitingForTerrain) {
+            state.waitingForTerrain = false;
+            this._enqueueDirtyResnap(tileKey);
+          }
+          if (this._pendingTerrainTiles) this._pendingTerrainTiles.delete(tileKey);
+        }
         tiles.push({ key: tileKey, distSq });
       }
     }
@@ -1406,6 +1416,11 @@ _updateTiles(force = false) {
         }
         if (this._terrainTileReady(pendingKey)) {
           this._pendingTerrainTiles.delete(pendingKey);
+          const pendingState = this._tileStates.get(pendingKey);
+          if (pendingState?.waitingForTerrain) {
+            pendingState.waitingForTerrain = false;
+            this._enqueueDirtyResnap(pendingKey);
+          }
         }
       }
     }
@@ -1477,6 +1492,7 @@ _updateTiles(force = false) {
       raw: null,
       tileKey,
       resnapFrozen: false,
+      waitingForTerrain: false,
     };
   }
 

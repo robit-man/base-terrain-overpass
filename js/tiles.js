@@ -295,9 +295,13 @@ export class TileManager {
 
     this._treePerfSamples = [];
     this._treePerfSampleTime = 0;
-
     this._treePerfEvalTimer = 0;
-    this._treeRegenQueue = null;
+
+    this._treeMinRing = 0.5;
+    this._treeMaxRing = Math.max(this._treeMinRing, this.INTERACTIVE_RING || this._treeMinRing);
+    this._treeActiveRing = this._treeEnabled ? Math.min(0.75, this._treeMaxRing) : 0;
+    this._treeRingCooldown = 0;
+    this._treeRegenQueue = [];
     this._treeRegenSet = new Set();
     this._primeWaybackVersions();
 
@@ -1912,12 +1916,6 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       mesh.castShadow = false;
       tile.grid.group.add(mesh);
 
-      const cArr = colAttr.array;
-      for (let i = 0; i < cArr.length; i += 3) {
-        cArr[i] = cArr[i + 1] = cArr[i + 2] = 0.22;
-      }
-      colAttr.needsUpdate = true;
-
       tile._adapter = { mesh, geometry: geom, posAttr, colAttr, segments, outerCount };
     }
 
@@ -1958,15 +1956,27 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       return fallback;
     };
 
-    const setColor = (idx, lum) => {
+    const applyColor = (idx, color) => {
       const o = idx * 3;
-      colAttr.array[o] = colAttr.array[o + 1] = colAttr.array[o + 2] = lum;
+      colAttr.array[o] = color.r;
+      colAttr.array[o + 1] = color.g;
+      colAttr.array[o + 2] = color.b;
+    };
+
+    const computeColor = (height) => {
+      const norm = this._normalizedHeight(height);
+      const base = this._colorFromHeight(height, norm);
+      const light = THREE.MathUtils.lerp(0.92, 1.06, norm);
+      return {
+        r: THREE.MathUtils.clamp(base.r * light, 0, 1),
+        g: THREE.MathUtils.clamp(base.g * light, 0, 1),
+        b: THREE.MathUtils.clamp(base.b * light, 0, 1),
+      };
     };
 
     const outerVertices = [];
     const corners = this._hexCorners(this.tileRadius);
     let idx = 0;
-    const outerLum = this.LUM_MAX;
 
     for (let s = 0; s < 6; s++) {
       const a = corners[s];
@@ -1982,8 +1992,9 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         let height = sampleNeighborHeight(wx, wz, this._approxTileHeight(tile, lx, lz));
         if (!Number.isFinite(height)) height = this._approxTileHeight(tile, lx, lz);
         posAttr.setXYZ(idx, lx, height, lz);
-        setColor(idx, outerLum);
-        outerVertices[idx] = { x: lx, z: lz, y: height };
+        const color = computeColor(height);
+        applyColor(idx, color);
+        outerVertices[idx] = { x: lx, z: lz, y: height, color };
         idx++;
       }
     }
@@ -1999,7 +2010,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       const baseLen = Math.hypot(edgeX, edgeZ);
       if (baseLen < 1e-6) {
         posAttr.setXYZ(outerCount + i, curr.x, curr.y, curr.z);
-        setColor(outerCount + i, this.LUM_MIN);
+        applyColor(outerCount + i, curr?.color || computeColor(curr?.y ?? 0));
         continue;
       }
 
@@ -2035,8 +2046,12 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       const innerY = THREE.MathUtils.lerp(neighborHeight, farfieldHeight, smoothBlend);
 
       posAttr.setXYZ(outerCount + i, innerX, innerY, innerZ);
-      const innerLum = THREE.MathUtils.lerp(outerLum, this.LUM_MIN, smoothBlend);
-      setColor(outerCount + i, innerLum);
+      const innerColorBase = computeColor(innerY);
+      const sideColor = curr?.color && nxt?.color
+        ? this._lerpColor(curr.color, nxt.color, 0.5)
+        : curr?.color || innerColorBase;
+      const finalColor = this._lerpColor(sideColor, innerColorBase, THREE.MathUtils.clamp(smoothBlend, 0, 1));
+      applyColor(outerCount + i, finalColor);
     }
 
     posAttr.needsUpdate = true;
@@ -3298,6 +3313,16 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       this._clearTileTrees(tile);
       return;
     }
+    const ring = this._treeActiveRing ?? 0;
+    if (!this._treeEnabled || ring <= 0) {
+      this._clearTileTrees(tile);
+      return;
+    }
+    const distFromCenter = this._hexDist(tile.q, tile.r, 0, 0);
+    if (distFromCenter > ring + 1e-3) {
+      this._clearTileTrees(tile);
+      return;
+    }
     const bounds = entry.bounds;
     if (!bounds || !this.origin) return;
     const samples = entry.samples;
@@ -3331,7 +3356,14 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       const key = `${Math.round(wx * 2)},${Math.round(wz * 2)}`;
       if (used.has(key)) continue;
       used.add(key);
-      worldPositions.push({ x: wx, y: height, z: wz });
+      const sampleColor = s.color
+        ? {
+            r: THREE.MathUtils.clamp((s.color.r ?? 0) / 255, 0, 1),
+            g: THREE.MathUtils.clamp((s.color.g ?? 0) / 255, 0, 1),
+            b: THREE.MathUtils.clamp((s.color.b ?? 0) / 255, 0, 1),
+          }
+        : null;
+      worldPositions.push({ x: wx, y: height, z: wz, color: sampleColor });
     }
     this._spawnTreesForTile(tile, worldPositions);
   }
@@ -3409,6 +3441,21 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
   updateTreePerformanceSample(fps, dt = 0) {
     if (!this._treeEnabled) return;
     if (!Number.isFinite(fps) || !Number.isFinite(dt) || dt <= 0) return;
+    const maxRing = Math.max(this._treeMinRing, (this.INTERACTIVE_RING ?? 0) || this._treeMinRing);
+    if (!Number.isFinite(this._treeMaxRing) || Math.abs(this._treeMaxRing - maxRing) > 1e-3) {
+      this._treeMaxRing = maxRing;
+      const prior = Number.isFinite(this._treeActiveRing) ? this._treeActiveRing : Math.min(0.75, this._treeMaxRing);
+      const clamped = this._treeEnabled
+        ? THREE.MathUtils.clamp(prior, this._treeMinRing, this._treeMaxRing)
+        : 0;
+      const ringChanged = Math.abs(clamped - (this._treeActiveRing ?? 0)) > 1e-3;
+      this._treeActiveRing = clamped;
+      if (ringChanged) {
+        this._scheduleTreeRefresh({ force: true });
+      }
+    }
+    this._treeRingCooldown = Math.max(0, (this._treeRingCooldown ?? 0) - dt);
+
     if (!Array.isArray(this._treePerfSamples)) {
       this._treePerfSamples = [];
       this._treePerfSampleTime = 0;
@@ -3430,6 +3477,7 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         totalDt += sample.dt;
       }
       const avgFps = totalDt > 1e-6 ? totalFps / totalDt : fps;
+      const prevRing = this._treeActiveRing ?? this._treeMinRing;
       const prevTarget = this._treeTargetComplexity;
       if (avgFps >= 54) {
         this._treeTargetComplexity = Math.min(1, this._treeTargetComplexity + 0.12);
@@ -3441,6 +3489,21 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
       }
       if (Math.abs(this._treeTargetComplexity - prevTarget) > 0.1) {
         this._scheduleTreeRefresh();
+      }
+
+      if ((this._treeRingCooldown ?? 0) <= 0) {
+        let ringChanged = false;
+        if (avgFps >= 56 && prevRing < this._treeMaxRing - 0.05) {
+          this._treeActiveRing = Math.min(this._treeMaxRing, prevRing + 0.6);
+          ringChanged = true;
+        } else if (avgFps <= 48 && prevRing > this._treeMinRing + 0.05) {
+          this._treeActiveRing = Math.max(this._treeMinRing, prevRing - 0.6);
+          ringChanged = true;
+        }
+        if (ringChanged) {
+          this._treeRingCooldown = 6;
+          this._scheduleTreeRefresh({ force: true });
+        }
       }
       this._treePerfEvalTimer = 0;
     }
@@ -3709,49 +3772,61 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
         : (Billboard.Double ?? opts.leaves.billboard);
     }
   }
-  _scheduleTreeRefresh() {
-    if (!this.tiles?.size) return;
-    if (Array.isArray(this._treeRegenQueue) && this._treeRegenQueue.length) return;
-    const tiles = Array.from(this.tiles.values()).filter((tile) => tile && tile.type === 'interactive');
-    if (!tiles.length) return;
-    this._treeRegenQueue = tiles;
+  _scheduleTreeRefresh({ force = false } = {}) {
+    if (!this.tiles?.size || !this._treeEnabled) return;
+    if (!Array.isArray(this._treeRegenQueue)) this._treeRegenQueue = [];
+    if (force) {
+      this._treeRegenQueue.length = 0;
+      this._treeRegenSet?.clear?.();
+    }
+    if (!this._treeRegenSet) this._treeRegenSet = new Set();
+
+    for (const tile of this.tiles.values()) {
+      if (!tile || tile.type !== 'interactive') continue;
+      if (tile._overlay?.status !== 'ready') continue;
+      const key = `${tile.q},${tile.r}`;
+      if (this._treeRegenSet.has(key)) continue;
+      this._treeRegenSet.add(key);
+      this._treeRegenQueue.push(tile);
+    }
   }
 
-  _serviceTreeRefresh() {
-    // DISABLED: Don't regenerate trees on complexity changes
-    // Trees should stay stable with only LOD adjustments (leaf density)
-    // This prevents "flapping" when moving around
-    return;
-
-    // OLD CODE DISABLED - was causing tree regeneration
-    /*
+  _serviceTreeRefresh(maxTilesPerFrame = 1) {
+    if (!this._treeEnabled) return;
     if (!Array.isArray(this._treeRegenQueue) || !this._treeRegenQueue.length) return;
+    if (!this._treeRegenSet) this._treeRegenSet = new Set();
+
+    const budgetMs = 1.8;
     const start = performance?.now ? performance.now() : Date.now();
-    const budgetMs = 1.2;
     let processed = 0;
+
     while (this._treeRegenQueue.length && processed < maxTilesPerFrame) {
       if (performance?.now && performance.now() - start > budgetMs) break;
       const tile = this._treeRegenQueue.shift();
-      if (!tile || !this.tiles.has(`${tile.q},${tile.r}`)) continue;
-      if (tile._overlay?.status !== 'ready') {
-        this._treeRegenQueue.push(tile);
-        processed += 1;
+      if (!tile) continue;
+      const key = `${tile.q},${tile.r}`;
+      this._treeRegenSet.delete(key);
+      if (!this.tiles.has(key)) continue;
+
+      const ring = this._treeActiveRing ?? 0;
+      const dist = this._hexDist(tile.q, tile.r, 0, 0);
+      const allow = ring > 0 && dist <= ring + 1e-3;
+      if (!allow) {
+        this._clearTileTrees(tile);
         continue;
       }
-      const entryKey = tile._overlay?.cacheKey;
-      const entry = entryKey ? this._overlayCache.get(entryKey) : null;
-      if (!entry || !Array.isArray(entry.samples) || !entry.samples.length) {
-        this._treeRegenQueue.push(tile);
-        processed += 1;
-        continue;
-      }
-      this._applyTreeSeeds(tile, entry);
+
+      const overlayEntry = tile._overlay?.entry;
+      if (!overlayEntry || !Array.isArray(overlayEntry.samples) || !overlayEntry.samples.length) continue;
+
+      this._applyTreeSeeds(tile, overlayEntry);
       processed += 1;
     }
+
     if (!this._treeRegenQueue.length) {
-      this._treeRegenQueue = null;
+      this._treeRegenQueue.length = 0;
+      this._treeRegenSet?.clear?.();
     }
-    */
   }
 
 
@@ -3760,6 +3835,11 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     try {
       this._clearTileTrees(tile);
       if (!this._treeEnabled || !worldPositions.length) return;
+
+      const ring = this._treeActiveRing ?? 0;
+      if (ring <= 0) return;
+      const distFromCenter = this._hexDist(tile.q, tile.r, 0, 0);
+      if (distFromCenter > ring + 1e-3) return;
 
       const treeLib = await this._ensureTreeLibrary();
       if (!treeLib || !treeLib.Tree) return;
@@ -3808,6 +3888,44 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
           if (child.isMesh || child.isPoints) {
             child.castShadow = true;
             child.receiveShadow = !child.isPoints;
+            const materials = Array.isArray(child.material) ? child.material : [child.material];
+            const recolored = [];
+            for (let m = 0; m < materials.length; m++) {
+              const mat = materials[m];
+              if (!mat || typeof mat.clone !== 'function') {
+                recolored.push(mat);
+                continue;
+              }
+              const cloned = mat.clone();
+              if (cloned.color) {
+                const sample = pos.color
+                  ? new THREE.Color(pos.color.r, pos.color.g, pos.color.b)
+                  : new THREE.Color(0.32, 0.38, 0.28);
+                const luminance = sample.r * 0.299 + sample.g * 0.587 + sample.b * 0.114;
+                const noise = this._seededRandom(seed, 41 + m);
+                const shade = THREE.MathUtils.clamp(luminance * 0.55 + noise * 0.35, 0.28, 0.82);
+                const shadowTint = sample.clone().lerp(new THREE.Color(0.12, 0.18, 0.1), 0.45);
+                const finalColor = shadowTint.multiplyScalar(shade);
+                cloned.color.copy(finalColor);
+                cloned.needsUpdate = true;
+                if (cloned.emissive) cloned.emissive.multiplyScalar(0.1);
+                if (cloned.roughness !== undefined) {
+                  cloned.roughness = THREE.MathUtils.clamp((cloned.roughness ?? 0.7) + 0.15, 0, 1);
+                }
+                if (cloned.metalness !== undefined) {
+                  cloned.metalness = THREE.MathUtils.clamp((cloned.metalness ?? 0.05) * 0.4, 0, 1);
+                }
+              }
+              recolored.push(cloned);
+              if (cloned !== mat && typeof mat?.dispose === 'function') {
+                mat.dispose();
+              }
+            }
+            if (Array.isArray(child.material)) {
+              child.material = recolored;
+            } else if (recolored.length) {
+              child.material = recolored[0];
+            }
           }
         });
 
