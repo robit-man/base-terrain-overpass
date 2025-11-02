@@ -2633,16 +2633,16 @@ const building = { render: edges, solid: solidMesh, pick: pickMesh, info };
     this._resnapDirtyQueue.push(tileKey);
     const state = this._tileStates.get(tileKey);
     if (state && Array.isArray(state.buildings)) {
-      let unlockedFound = false;
+      let anyFound = false;
       for (const building of state.buildings) {
         if (!building?.info) continue;
         const info = building.info;
-        if (info.resnapLock) continue;
+        info.resnapLock = false;
         info.resnapFrozen = false;
         info.resnapStableFrames = 0;
-        unlockedFound = true;
+        anyFound = true;
       }
-      if (!unlockedFound && (!state.extras || !state.extras.length)) {
+      if (!anyFound && (!state.extras || !state.extras.length)) {
         // fully locked tile; skip queuing work
         this._resnapDirtyTiles.delete(tileKey);
         const idx = this._resnapDirtyQueue.lastIndexOf(tileKey);
@@ -4203,17 +4203,62 @@ _refreshBuildingVisibility(building) {
   }
 
   _saveTileToCache(tileKey, data) {
-    try {
-      if (typeof localStorage === 'undefined') return;
-      const key = this._cacheKey(tileKey);
-      if (!key) return;
-      const payload = { ts: Date.now(), data };
-      localStorage.setItem(key, JSON.stringify(payload));
-      this._pruneCache();
-      console.log(`[Buildings] cached ${tileKey}`);
-    } catch (err) {
-      console.warn('[Buildings] cache write failed', err);
+    if (typeof localStorage === 'undefined') return;
+    const key = this._cacheKey(tileKey);
+    if (!key) return;
+    const payload = { ts: Date.now(), data };
+    const serialized = JSON.stringify(payload);
+
+    let stored = false;
+    let attempts = 0;
+
+    while (!stored && attempts < 6) {
+      try {
+        localStorage.setItem(key, serialized);
+        stored = true;
+      } catch (err) {
+        const quotaExceeded =
+          err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
+        if (!quotaExceeded) {
+          console.warn('[Buildings] cache write failed', err);
+          return;
+        }
+        const evicted = this._evictOldestCacheEntries(Math.max(1, Math.floor(CACHE_LIMIT * 0.05)));
+        if (!evicted) {
+          console.warn('[Buildings] cache write failed (no room to evict)', err);
+          return;
+        }
+      }
+      attempts += 1;
     }
+
+    if (!stored) return;
+
+    this._pruneCache();
+    console.log(`[Buildings] cached ${tileKey}`);
+  }
+
+  _evictOldestCacheEntries(count = 1) {
+    if (typeof localStorage === 'undefined' || count <= 0) return false;
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(this._cachePrefix)) continue;
+      let ts = 0;
+      try {
+        const payload = JSON.parse(localStorage.getItem(key));
+        ts = payload?.ts ?? 0;
+      } catch { ts = 0; }
+      entries.push({ key, ts });
+    }
+    if (!entries.length) return false;
+    entries.sort((a, b) => a.ts - b.ts);
+    let removed = 0;
+    for (let i = 0; i < entries.length && removed < count; i++) {
+      localStorage.removeItem(entries[i].key);
+      removed += 1;
+    }
+    return removed > 0;
   }
 
   _pruneCache() {
