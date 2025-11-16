@@ -58,6 +58,21 @@ export class MiniMap {
     this._autoFollowThreshold = 0.0001; // ≈10–12 m on Earth
     this._followRecenterThreshold = 0.00005;
     this._followRecenterThresholdSq = this._followRecenterThreshold * this._followRecenterThreshold;
+    this._presentationModes = ['heading', 'north', 'free'];
+    this._presentationIndex = this._presentationModes.indexOf('north');
+    this._presentationMode = this._presentationModes[Math.max(0, this._presentationIndex)];
+    this._presentationBtn = null;
+    this._rotatablePaneNames = [
+      'mapPane',
+      'tilePane',
+      'shadowPane',
+      'overlayPane',
+      'markerPane',
+      'tooltipPane',
+      'popupPane',
+    ];
+    this._mapRotationDeg = 0;
+    this._lastHeadingDeg = 0;
     this._pendingHeadingDeg = null;
     this._headingCssCurrent = null;
     this._pendingTeleport = null;
@@ -212,7 +227,12 @@ export class MiniMap {
     };
 
     this.map.on('movestart', () => {
-      if (this.followEnabled) this._setFollow(false);
+      if (this._presentationMode !== 'free') {
+        this._setPresentationMode('free', { enforceFollow: false });
+        if (this.followEnabled) this._setFollow(false);
+      } else if (this.followEnabled) {
+        this._setFollow(false);
+      }
       this.userHasPanned = true;
       cancelLongPress();
     });
@@ -244,6 +264,10 @@ export class MiniMap {
       cancelLongPress();
       armFromEvent(ev);
     });
+
+    this._setupPaneRotationHooks();
+    this._installPresentationButton();
+    this._syncPresentationState();
   }
 
   update() {
@@ -317,9 +341,18 @@ export class MiniMap {
     return { lat: clampLat(ll.lat), lon: clampLon(ll.lon) };
   }
 
-  _setFollow(enabled, { triggerAuto = true, resetManual = false } = {}) {
+  _setFollow(enabled, { triggerAuto = true, resetManual = false, skipModeUpdate = false } = {}) {
     if (this.followEnabled === enabled) return;
     this.followEnabled = !!enabled;
+    if (!skipModeUpdate) {
+      if (!this.followEnabled && this._presentationMode !== 'free') {
+        this._presentationMode = 'free';
+        this._presentationIndex = this._presentationModes.indexOf('free');
+      } else if (this.followEnabled && this._presentationMode === 'free') {
+        this._presentationIndex = this._presentationModes.indexOf('north');
+        this._presentationMode = this._presentationModes[Math.max(0, this._presentationIndex)];
+      }
+    }
     if (this.followEnabled) {
       this.userHasPanned = false;
       if (this.currentLatLon) this.viewCenter = { ...this.currentLatLon };
@@ -337,6 +370,7 @@ export class MiniMap {
     this._lastFollowLatLon = this.currentLatLon ? { ...this.currentLatLon } : null;
     this._updateFollowButton();
     this._updateMoveButton();
+    if (!skipModeUpdate) this._syncPresentationState({ enforceFollow: false });
   }
 
   _centerOnPlayer(force = false) {
@@ -522,6 +556,133 @@ export class MiniMap {
     }
   }
 
+  _cyclePresentationMode() {
+    const next = (this._presentationIndex + 1) % this._presentationModes.length;
+    this._setPresentationMode(this._presentationModes[next]);
+  }
+
+  _setPresentationMode(mode, { enforceFollow = true } = {}) {
+    if (!this._presentationModes.includes(mode)) mode = 'north';
+    if (this._presentationMode === mode) {
+      if (enforceFollow) this._syncPresentationState();
+      return;
+    }
+    this._presentationMode = mode;
+    this._presentationIndex = this._presentationModes.indexOf(mode);
+    this._syncPresentationState({ enforceFollow });
+  }
+
+  _installPresentationButton() {
+    if (!this.map) return;
+    const container = this.map.getContainer();
+    if (!container) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'minimap-mode-btn';
+    btn.textContent = '';
+    btn.style.position = 'absolute';
+    btn.style.top = '8px';
+    btn.style.right = '8px';
+    btn.style.zIndex = '410';
+    btn.style.padding = '6px 10px';
+    btn.style.border = '1px solid rgba(255,255,255,0.45)';
+    btn.style.background = 'rgba(20,20,20,0.65)';
+    btn.style.color = '#f5f5f5';
+    btn.style.font = '600 12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
+    btn.style.borderRadius = '6px';
+    btn.style.cursor = 'pointer';
+    btn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      this._cyclePresentationMode();
+    });
+    container.appendChild(btn);
+    this._presentationBtn = btn;
+    this._updatePresentationUi();
+  }
+
+  _updatePresentationUi() {
+    if (!this._presentationBtn) return;
+    const label = (() => {
+      switch (this._presentationMode) {
+        case 'heading': return 'Follow · Heading';
+        case 'free': return 'Explore · Free';
+        default: return 'Follow · North';
+      }
+    })();
+    this._presentationBtn.textContent = label;
+  }
+
+  _setupPaneRotationHooks() {
+    if (!this.map) return;
+    const record = () => {
+      this._recordPaneBaseTransforms();
+      this._applyMapRotation(this._mapRotationDeg);
+    };
+    this.map.whenReady(record);
+    this.map.on('move', record);
+    this.map.on('zoom', record);
+    this.map.on('zoomend', record);
+  }
+
+  _recordPaneBaseTransforms() {
+    if (!this.map) return;
+    const stripRotate = (value) => (value || '').replace(/rotate\([^)]*\)/g, '').trim();
+    for (const name of this._rotatablePaneNames) {
+      const pane = this.map.getPane(name);
+      if (!pane) continue;
+      const base = stripRotate(pane.style.transform || '');
+      pane.dataset.minimapBaseTransform = base;
+      if (pane.style.transform !== base) pane.style.transform = base;
+      pane.style.transformOrigin = '50% 50%';
+    }
+  }
+
+  _setMapRotation(deg) {
+    const value = Number.isFinite(deg) ? deg : 0;
+    if (Math.abs(value - this._mapRotationDeg) < 0.01) {
+      this._mapRotationDeg = value;
+      this._applyMapRotation(this._mapRotationDeg);
+      return;
+    }
+    this._mapRotationDeg = value;
+    this._applyMapRotation(this._mapRotationDeg);
+  }
+
+  _applyMapRotation(deg) {
+    if (!this.map) return;
+    const rotation = Number.isFinite(deg) ? deg : 0;
+    for (const name of this._rotatablePaneNames) {
+      const pane = this.map.getPane(name);
+      if (!pane) continue;
+      const base = pane.dataset.minimapBaseTransform || '';
+      const transform = Math.abs(rotation) < 0.01 ? base : `${base} rotate(${rotation}deg)`.trim();
+      if (pane.style.transform !== transform) pane.style.transform = transform;
+      pane.style.transformOrigin = '50% 50%';
+    }
+  }
+
+  _syncPresentationState({ enforceFollow = true } = {}) {
+    const mode = this._presentationMode;
+    if (mode === 'heading') {
+      if (enforceFollow && !this.followEnabled) {
+        this._setFollow(true, { triggerAuto: false, resetManual: true, skipModeUpdate: true });
+      }
+      this._setMapRotation(this._lastHeadingDeg);
+    } else if (mode === 'north') {
+      if (enforceFollow && !this.followEnabled) {
+        this._setFollow(true, { triggerAuto: false, resetManual: true, skipModeUpdate: true });
+      }
+      this._setMapRotation(0);
+    } else {
+      if (enforceFollow && this.followEnabled) {
+        this._setFollow(false, { triggerAuto: false, resetManual: false, skipModeUpdate: true });
+      }
+      this._setMapRotation(0);
+    }
+    this._updatePresentationUi();
+  }
+
   _needsFollowRecentre(latLon, { force = false } = {}) {
     if (force) return true;
     if (!latLon) return false;
@@ -560,9 +721,22 @@ export class MiniMap {
     if (!marker) return;
 
     const normalized = ((deg % 360) + 360) % 360;
-    let target = normalized;
-    if (target > 180) target -= 360;
-    target = -target;
+    let signed = normalized;
+    if (signed > 180) signed -= 360;
+    const target = -signed;
+
+    this._lastHeadingDeg = target;
+
+    if (this._presentationMode === 'heading') {
+      this._setMapRotation(this._lastHeadingDeg);
+      marker.style.transform = `rotate(${(-this._lastHeadingDeg)}deg)`;
+      this._headingCssCurrent = -this._lastHeadingDeg;
+      return;
+    }
+
+    if (Math.abs(this._mapRotationDeg) > 0.01) {
+      this._setMapRotation(0);
+    }
 
     if (!Number.isFinite(this._headingCssCurrent)) {
       this._headingCssCurrent = target;

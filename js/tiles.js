@@ -150,10 +150,7 @@ export class TileManager {
     // Backfill scheduler (faster cadence)
     this._backfillTimer = null;
     this._backfillIntervalMs = 1200; // was 2500
-    this._periodicBackfill = setInterval(
-      () => this._backfillMissing({ onlyIfRelayReady: true }),
-      this._backfillIntervalMs
-    );
+    this._periodicBackfill = null;
 
     this._heightCache = new Map();
     this._heightCacheTTL = 250;
@@ -161,6 +158,7 @@ export class TileManager {
     this._heightMeshesFallback = [];
     this._heightListeners = new Set();
     this._farfieldAdapterDirty = new Set();
+    this._nextLightPopulateAt = 0;
   }
 
   /* ---------------- small helpers ---------------- */
@@ -2758,7 +2756,10 @@ _stitchInteractiveToVisualEdges(tile, {
   }
 
   _prewarmFarfieldRing(q0 = 0, r0 = 0) {
-    for (let d = this.VISUAL_RING + 1; d <= this.FARFIELD_RING; d++) {
+    if (this._fetchPhase !== 'farfield' && !this._interactiveSecondPass) return;
+    const limit = Math.min(this.FARFIELD_RING, this.VISUAL_RING + Math.max(1, this.FARFIELD_NEAR_PAD));
+    if (limit <= this.VISUAL_RING) return;
+    for (let d = this.VISUAL_RING + 1; d <= limit; d++) {
       const tier = this._farfieldTierForDist(d);
       const { stride, scale, samples, minPrec } = tier;
       this._forEachAxialRing(q0, r0, d, stride, (q, r) => {
@@ -2821,6 +2822,8 @@ update(playerPos) {
   maintenance();
 
   if (!doHeavy) {
+    if (startMs < this._nextLightPopulateAt) return;
+    this._nextLightPopulateAt = startMs + 180;
     // Light populate ping near the edge to keep things lively without cost
     let created = 0;
     const MAX_PINGS = Math.max(1, Math.floor((this.VISUAL_CREATE_BUDGET || 4) * 0.25));

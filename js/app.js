@@ -1272,9 +1272,10 @@ class App {
       idleBudget: build._idleBudgetMs,
       mergeBudget: build._mergeBudgetMs,
       resnapBudget: build._resnapFrameBudgetMs,
-      resnapInterval: build._resnapInterval,
+      resnapHotBudget: build._resnapHotBudgetMs,
       radius: build.radius,
       quality: build._currentPerfQuality,
+      moveThreshold: Math.round(Math.sqrt(build._updateMoveThresholdSq ?? 0)),
     };
   }
 

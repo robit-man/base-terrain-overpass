@@ -278,7 +278,6 @@ export class BuildingManager {
     this._fetchTokens = 1;
     this._fetchTokenCapacity = 1;
     this._fetchLastTokenRefill = this._nowMs();
-    this._resnapVerifyIntervalMs = 1500;
     this._resnapVerifyNextMs = 0;
     this._resnapVerifyCursor = 0;
     this._resnapVerifyBatch = 12;
@@ -288,46 +287,35 @@ export class BuildingManager {
     this._wireframeMode = false;
 
     const envTexture = scene?.environment || null;
-    this._buildingMaterial = new THREE.MeshPhysicalMaterial({
-      //color: new THREE.Color(0xaeb6c2),
-      transmission: 1,
-      thickness: 2,
-      roughness: 0.65,
-      //metalness: 0,
-      iridescence: 1,
-      iridescenceIOR: 1.2,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.05,
+    this._buildingMaterial = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(0xaeb6c2),
+      roughness: 0.85,
+      metalness: 0.05,
       envMap: envTexture,
-      envMapIntensity: 0.6,
-      //vertexColors: true,
-      //transparent: true,
-      //opacity: 0.96,
-      side: THREE.BackSide
+      envMapIntensity: 0.35,
+      flatShading: true
     });
-    this._roadMaterial = new THREE.MeshPhysicalMaterial({
-      transmission: 1,
-      thickness: 2,
-      roughness: 0.65,
-      //metalness: 0,
-      iridescence: 1,
-      iridescenceIOR: 1.2,
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.05,
+    this._roadMaterial = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(this.roadColor || 0x424a57),
+      roughness: 0.95,
+      metalness: 0.02,
       envMap: envTexture,
-      envMapIntensity: 0.6,
-      side: THREE.FrontSide
+      envMapIntensity: 0.25
     });
-    this._waterMaterialShared = new THREE.MeshBasicMaterial({
+    this._waterMaterialShared = new THREE.MeshStandardMaterial({
       color: new THREE.Color(0x1f3f55),
+      roughness: 0.4,
+      metalness: 0.0,
       envMap: envTexture,
-      envMapIntensity: 0.4,
+      envMapIntensity: 0.3,
       transparent: true,
       opacity: 0.65,
-      vertexColors: true,
+      vertexColors: true
     });
-    this._areaMaterial = new THREE.MeshPhysicalMaterial({
+    this._areaMaterial = new THREE.MeshStandardMaterial({
       color: new THREE.Color(0x7c8b95),
+      roughness: 0.9,
+      metalness: 0.0,
       transparent: true,
       opacity: 0.35,
       vertexColors: true,
@@ -376,10 +364,15 @@ export class BuildingManager {
     this._idleBudgetMs = BUILD_IDLE_BUDGET_MS;
     this._mergeBudgetMs = MERGE_BUDGET_MS;
     this._resnapFrameBudgetMs = RESNAP_FRAME_BUDGET_MS;
-    this._resnapInterval = RESNAP_INTERVAL;
-    this._tileUpdateInterval = 0.25; // seconds — 0 = every frame
-    this._tileUpdateTimer = 0;
-    this._resnapTimer = 0;
+    this._resnapHotBudgetMs = 0.6;
+    this._resnapDirtyMaxPerFrame = 2;
+    this._resnapVerifyCooldownMs = 2500;
+    this._resnapSweepRequested = false;
+    this._verifyPending = false;
+    this._resnapVerifyNextMs = 0;
+    this._lastUpdateWorld = new THREE.Vector3(NaN, NaN, NaN);
+    this._updateMoveThresholdSq = Math.pow(Math.max(4, this.tileSize ? this.tileSize * 0.35 : 60), 2);
+    this._tileGraphDirty = true;
     this._qosTargetFps = TARGET_FPS;
 
     // Init CSS3D (non-invasive overlay)
@@ -456,12 +449,10 @@ export class BuildingManager {
     this._idleBudgetMs = THREE.MathUtils.lerp(1.8, BUILD_IDLE_BUDGET_MS, qNorm);
     this._mergeBudgetMs = THREE.MathUtils.lerp(1.1, MERGE_BUDGET_MS, qNorm);
     this._resnapFrameBudgetMs = THREE.MathUtils.lerp(0.25, RESNAP_FRAME_BUDGET_MS, qNorm);
-    this._resnapInterval = THREE.MathUtils.lerp(RESNAP_INTERVAL * 4.5, RESNAP_INTERVAL, qNorm);
     this._resnapHotBudgetMs = THREE.MathUtils.lerp(0.18, 0.8, qNorm);
     this._resnapDirtyMaxPerFrame = Math.max(1, Math.round(THREE.MathUtils.lerp(1, 5, qNorm)));
-    this._tileUpdateInterval = THREE.MathUtils.lerp(0.65, 0.08, qNorm);
-    this._tileUpdateTimer = Math.min(this._tileUpdateTimer, this._tileUpdateInterval);
-    if (this._tileUpdateInterval <= 0) this._tileUpdateTimer = 0;
+    const moveThreshold = Math.max(4, this.tileSize ? this.tileSize * THREE.MathUtils.lerp(0.25, 0.5, qNorm) : 60);
+    this._updateMoveThresholdSq = moveThreshold * moveThreshold;
 
     // ── QoS level (for UI/telemetry) ────────────────────────────────────────────
     const level = qualityClamp >= 0.82 ? 'high' : (qualityClamp >= 0.6 ? 'medium' : 'low');
@@ -525,10 +516,10 @@ export class BuildingManager {
 
         // Visibility recompute is cheap; defer heavy tile graph updates unless radius really changed.
         this._refreshRadiusVisibility?.();
-
-        // If your pipeline expects a tiles rebuild on radius change, call it here,
-        // but only when the change was meaningful (we already checked).
-        this._updateTiles?.(true);
+        this._tileGraphDirty = true;
+        this._queueResnapSweep();
+        this._verifyPending = true;
+        this._resnapVerifyNextMs = nowMs + this._resnapVerifyCooldownMs;
       }
 
       // Start cooldown to avoid thrash.
@@ -546,10 +537,8 @@ export class BuildingManager {
       idleBudget: this._idleBudgetMs,
       mergeBudget: this._mergeBudgetMs,
       resnapBudget: this._resnapFrameBudgetMs,
-      resnapInterval: this._resnapInterval,
       radius: this.radius,
       desiredRadius,
-      tileUpdateInterval: this._tileUpdateInterval,
       throttled: !!inCooldown,
       cooldownMsRemaining: inCooldown ? Math.max(0, Math.round(this._applyCooldownUntil - nowMs)) : 0,
       appliedHeavy,
@@ -640,59 +629,70 @@ export class BuildingManager {
 
   update(dt = 0) {
     if (!this._hasOrigin || !this.camera) {
-      // still render CSS3D as hidden once to keep layout
       if (this._cssRenderer && this._cssScene && this.camera) {
         this._cssRenderer.render(this._cssScene, this.camera);
       }
       return;
     }
 
-    if (this._tileUpdateInterval <= 0) {
-      this._updateTiles();
-    } else {
-      this._tileUpdateTimer += dt;
-      if (this._tileUpdateTimer >= this._tileUpdateInterval) {
-        this._tileUpdateTimer = 0;
-        this._updateTiles();
+    const tracking = this._resolveTrackingNode();
+    let moved = false;
+    if (tracking?.getWorldPosition) {
+      tracking.getWorldPosition(this._tmpVec);
+      if (!Number.isFinite(this._lastUpdateWorld.x)) {
+        this._lastUpdateWorld.copy(this._tmpVec);
+        moved = true;
+      } else if (this._lastUpdateWorld.distanceToSquared(this._tmpVec) > this._updateMoveThresholdSq) {
+        this._lastUpdateWorld.copy(this._tmpVec);
+        moved = true;
       }
     }
 
-    this._drainBuildQueue(this._frameBudgetMs);
-    this._processMergeQueue();
-    const dirtyBefore = this._resnapDirtyQueue.length;
-    this._drainDirtyResnapQueue(this._resnapHotBudgetMs);
-    if (dirtyBefore) this._resnapTimer = 0;
+    const pendingWork =
+      (this._pendingTerrainTiles?.size ?? 0) > 0 ||
+      (this._pendingFetchTiles?.size ?? 0) > 0 ||
+      this._pendingFetchDrainPending;
 
-    this._resnapTimer += dt;
-    if (this._resnapTimer > this._resnapInterval) {
-      this._resnapTimer = 0;
-      this._queueResnapSweep();
+    if (moved || this._tileGraphDirty || pendingWork) {
+      this._updateTiles(!this._hasOrigin || moved);
     }
-    this._drainResnapQueue(this._resnapFrameBudgetMs);
+
+    if (this._buildQueue.length || this._activeBuildJob) {
+      this._drainBuildQueue(this._frameBudgetMs);
+    }
+    this._processMergeQueue();
+
+    if (this._resnapDirtyQueue.length) {
+      this._drainDirtyResnapQueue(this._resnapHotBudgetMs);
+    }
+    if (this._resnapSweepRequested || (this._resnapQueue && this._resnapIndex < this._resnapQueue.length)) {
+      this._ensureResnapQueue();
+      this._drainResnapQueue(this._resnapFrameBudgetMs);
+    }
 
     const nowMs = this._nowMs();
-    if (nowMs >= this._resnapVerifyNextMs) {
+    const resnapIdle = !this._resnapDirtyQueue.length
+      && !this._resnapSweepRequested
+      && (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length);
+    if (this._verifyPending && resnapIdle && nowMs >= this._resnapVerifyNextMs) {
       this._verifyFloatingBuildings();
-      this._resnapVerifyNextMs = nowMs + this._resnapVerifyIntervalMs;
+      this._verifyPending = false;
+      this._resnapVerifyNextMs = nowMs + this._resnapVerifyCooldownMs;
     }
+
     if (this._pendingFetchDrainPending || (this._pendingFetchTiles?.size && !this._patchInflight)) {
       this._drainPendingFetchQueue(nowMs);
     }
 
-    // Keep the old label oriented (if you ever turn it back on)
     if (this._hoverGroup.visible) this._orientLabel(this.camera);
 
-    // CSS3D panel: render only when visible, and throttle (big perf win)
     if (this._cssEnabled && this._cssRenderer && this._cssScene) {
       const anyVisible = (this._cssPanelVisible === true) || this._hoverGroup?.visible === true;
-      const nowMs = this._nowMs();
-      if (anyVisible) {
-        this._nextCssRenderMs = this._nextCssRenderMs || 0;
-        if (nowMs >= this._nextCssRenderMs) {
-          this._updateCSS3DPanelFacing?.();
-          this._cssRenderer.render(this._cssScene, this.camera);
-          this._nextCssRenderMs = nowMs + 90; // ~11 Hz
-        }
+      const nextRenderDue = this._nextCssRenderMs || 0;
+      if (anyVisible && nowMs >= nextRenderDue) {
+        this._updateCSS3DPanelFacing?.();
+        this._cssRenderer.render(this._cssScene, this.camera);
+        this._nextCssRenderMs = nowMs + 90;
       }
     }
   }
@@ -1193,6 +1193,20 @@ export class BuildingManager {
 
   /* ---------------- radius & visibility ---------------- */
 
+  _evaluateInsideRadius(prevInside, centre) {
+    if (!centre) return !!prevInside;
+    const radius = Math.max(0, this.radius || 0);
+    const margin = Math.max(20, this.tileSize ? this.tileSize * 0.6 : 0);
+    const enterR = radius + margin;
+    const exitCandidate = radius - margin * 0.5;
+    const exitR = Math.max(0, radius * 0.5, exitCandidate);
+    const distSq = centre.x * centre.x + centre.z * centre.z;
+    const enterSq = enterR * enterR;
+    const exitSq = exitR * exitR;
+    if (prevInside) return distSq <= exitSq;
+    return distSq <= enterSq;
+  }
+
   _refreshRadiusVisibility() {
     for (const state of this._tileStates.values()) {
       if (!state) continue;
@@ -1203,7 +1217,8 @@ export class BuildingManager {
           const info = building?.info;
           if (!info) continue;
           const centre = info.centroid;
-          const inside = centre ? this._isInsideRadius(centre) : true;
+          const prevInside = info.insideRadius !== false;
+          const inside = centre ? this._evaluateInsideRadius(prevInside, centre) : true;
           info.insideRadius = inside;
           this._refreshBuildingVisibility(building);
           if ((building.solid && building.solid.visible) || (building.render && building.render.visible)) {
@@ -1217,7 +1232,8 @@ export class BuildingManager {
       if (state.extras?.length) {
         for (const extra of state.extras) {
           const centre = extra?.userData?.center;
-          const inside = centre ? this._isInsideRadius(centre) : true;
+          const prevInside = extra?.userData?.insideRadius !== false;
+          const inside = centre ? this._evaluateInsideRadius(prevInside, centre) : true;
           if (extra?.userData) extra.userData.insideRadius = inside;
           if (extra?.userData?.type === 'road') {
             this._refreshRoadVisibility(extra);
@@ -1243,6 +1259,7 @@ export class BuildingManager {
     const hasPendingWait = (this._pendingTerrainTiles?.size ?? 0) > 0;
     if (!force && key === this._currentCenter && !hasPendingWait) return;
     this._currentCenter = key;
+    let graphStillDirty = false;
 
     const [tx, tz] = key.split(',').map(Number);
     const span = this._tileSpanForRadius();
@@ -1261,6 +1278,7 @@ export class BuildingManager {
         const state = this._tileStates.get(tileKey);
         if (!state && !this._terrainTileReady(tileKey)) {
           this._pendingTerrainTiles?.add(tileKey);
+          graphStillDirty = true;
           continue;
         }
         if (this._pendingTerrainTiles) this._pendingTerrainTiles.delete(tileKey);
@@ -1300,6 +1318,7 @@ export class BuildingManager {
       for (const pendingKey of Array.from(this._pendingTerrainTiles)) {
         if (!needed.has(pendingKey)) {
           this._pendingTerrainTiles.delete(pendingKey);
+          graphStillDirty = true;
           continue;
         }
         if (this._terrainTileReady(pendingKey)) {
@@ -1307,6 +1326,7 @@ export class BuildingManager {
         }
       }
     }
+    if ((this._pendingTerrainTiles?.size ?? 0) > 0) graphStillDirty = true;
 
     const cached = [];
     const uncached = [];
@@ -1333,7 +1353,10 @@ export class BuildingManager {
       const fetchNow = uncached.slice(0, Math.max(1, this._fetchBatchSize | 0));
       const deferred = uncached.slice(fetchNow.length);
       for (const key of deferred) this._pendingFetchTiles.add(key);
-      if (deferred.length) this._schedulePendingFetchDrain();
+      if (deferred.length) {
+        this._schedulePendingFetchDrain();
+        graphStillDirty = true;
+      }
 
       const nowMs = this._nowMs();
       this._refillFetchTokens(nowMs);
@@ -1343,11 +1366,19 @@ export class BuildingManager {
         this._fetchTokens = Math.max(0, this._fetchTokens - 1);
         this._fetchPatch(orderedFetch.length ? orderedFetch : fetchNow, fetchNow);
         this._lastFetchMs = nowMs;
+        if (fetchNow.length) graphStillDirty = true;
       } else {
         for (const key of fetchNow) this._pendingFetchTiles.add(key);
-        if (fetchNow.length) this._schedulePendingFetchDrain();
+        if (fetchNow.length) {
+          this._schedulePendingFetchDrain();
+          graphStillDirty = true;
+        }
       }
     }
+
+    const hasPending = (this._pendingTerrainTiles?.size ?? 0) > 0
+      || (this._pendingFetchTiles?.size ?? 0) > 0;
+    this._tileGraphDirty = hasPending || graphStillDirty;
   }
 
   _resolveTrackingNode() {
@@ -1721,7 +1752,7 @@ export class BuildingManager {
         if (!building) return;
         const { render, solid, pick, info } = building;
         info.tile = tileKey;
-        info.insideRadius = this._isInsideRadius(info.centroid);
+        info.insideRadius = this._evaluateInsideRadius(false, info.centroid);
         this.group.add(render);
         if (solid) this.group.add(solid);
         this._pickerRoot.add(pick);
@@ -1787,6 +1818,8 @@ export class BuildingManager {
       (job.fromCache ? ' (cache)' : '') +
       mismatch
     );
+    this._verifyPending = true;
+    this._queueResnapSweep();
   }
 
   _processMergeQueue() {
@@ -1966,7 +1999,7 @@ export class BuildingManager {
       tile: null,
       resnapStableFrames: 0,
       resnapFrozen: false,
-      insideRadius: true,
+      insideRadius: this._evaluateInsideRadius(false, centroid),
       isVisualEdge: this._isNearVisualEdge(centroid.x, centroid.z)
     };
 
@@ -2197,6 +2230,8 @@ export class BuildingManager {
     if (this._resnapDirtyTiles.has(tileKey)) return;
     this._resnapDirtyTiles.add(tileKey);
     this._resnapDirtyQueue.push(tileKey);
+    this._verifyPending = true;
+    this._resnapVerifyNextMs = Math.max(this._resnapVerifyNextMs, this._nowMs() + 250);
     const state = this._tileStates.get(tileKey);
     if (state && Array.isArray(state.buildings)) {
       for (const building of state.buildings) {
@@ -2232,14 +2267,22 @@ export class BuildingManager {
 
   _queueResnapSweep() {
     if (!this._tileStates.size) return;
-    if (this._resnapQueue && this._resnapIndex < this._resnapQueue.length) return;
+    this._resnapSweepRequested = true;
+    this._verifyPending = true;
+    this._resnapVerifyNextMs = Math.max(this._resnapVerifyNextMs, this._nowMs() + 250);
+  }
+
+  _ensureResnapQueue() {
+    if (!this._resnapSweepRequested) return;
     this._resnapQueue = Array.from(this._tileStates.values())
       .filter((state) => state && (!state.resnapFrozen || (state.extras && state.extras.length)))
       .map((state) => state.tileKey);
     this._resnapIndex = 0;
+    this._resnapSweepRequested = false;
   }
 
   _drainResnapQueue(budgetMs) {
+    if (this._resnapSweepRequested) this._ensureResnapQueue();
     if (!this._resnapQueue || this._resnapIndex >= this._resnapQueue.length) return;
 
     const effectiveBudget = Number.isFinite(budgetMs) && budgetMs > 0
@@ -2449,6 +2492,7 @@ export class BuildingManager {
 
   _schedulePendingFetchDrain() {
     this._pendingFetchDrainPending = true;
+    this._tileGraphDirty = true;
   }
 
   _refillFetchTokens(nowMs = this._nowMs()) {
@@ -2689,7 +2733,7 @@ export class BuildingManager {
     mesh.userData.center = center;
     mesh.userData.resnapStableFrames = 0;
     mesh.userData.resnapFrozen = false;
-    mesh.userData.insideRadius = this._isInsideRadius(center);
+    mesh.userData.insideRadius = this._evaluateInsideRadius(false, center);
     mesh.visible = false;
 
     if (this._debugEnabled && this._nowMs() >= this._nextRoadLogMs) {
@@ -2724,7 +2768,8 @@ export class BuildingManager {
 
     const centre = averagePoint(flat);
     mesh.userData.center = centre;
-    mesh.visible = this._isInsideRadius(centre);
+    mesh.userData.insideRadius = this._evaluateInsideRadius(false, centre);
+    mesh.visible = mesh.userData.insideRadius !== false;
     const color = this._elevationColor(base + 0.5);
     this._applyGeometryColor(mesh.geometry, color);
     return mesh;
@@ -2751,7 +2796,8 @@ export class BuildingManager {
 
     const centre = averagePoint(flat);
     mesh.userData.center = centre;
-    mesh.visible = this._isInsideRadius(centre);
+    mesh.userData.insideRadius = this._evaluateInsideRadius(false, centre);
+    mesh.visible = mesh.userData.insideRadius !== false;
     const color = this._elevationColor(base + 0.2);
     this._applyGeometryColor(mesh.geometry, color);
     mesh.material.wireframe = this._wireframeMode;
@@ -3234,6 +3280,10 @@ export class BuildingManager {
     this._pendingTerrainTiles?.clear?.();
     for (const tileKey of Array.from(this._tileStates.keys())) this._removeTileObjects(tileKey);
     this._tileStates.clear();
+    this._tileGraphDirty = true;
+    this._lastUpdateWorld.set(NaN, NaN, NaN);
+    this._verifyPending = false;
+    this._resnapSweepRequested = false;
   }
 
   _disposeObject(obj) {
