@@ -22,6 +22,7 @@ export class MiniMap {
     snapBtn,
     tileManager,
     getWorldPosition,
+    getLatLon,
     getHeadingDeg,
     getCompassHeadingRad,
     isSnapActive,
@@ -39,6 +40,7 @@ export class MiniMap {
     this.snapBtn = snapBtn || null;
     this.tileManager = tileManager || null;
     this.getWorldPosition = typeof getWorldPosition === 'function' ? getWorldPosition : null;
+    this.getLatLon = typeof getLatLon === 'function' ? getLatLon : null;
     this.getHeadingDeg = typeof getHeadingDeg === 'function' ? getHeadingDeg : () => 0;
     this.getCompassHeadingRad = typeof getCompassHeadingRad === 'function' ? getCompassHeadingRad : null;
     this.isSnapActive = typeof isSnapActive === 'function' ? isSnapActive : null;
@@ -250,9 +252,17 @@ export class MiniMap {
     if (!this.tileManager?.origin) return;
 
     let latLon = null;
-    const worldPos = this.getWorldPosition?.();
-    if (worldPos) {
-      latLon = this._worldToLatLon(worldPos.x, worldPos.z);
+    if (this.getLatLon) {
+      const resolved = this.getLatLon();
+      if (resolved && Number.isFinite(resolved.lat) && Number.isFinite(resolved.lon)) {
+        latLon = { lat: clampLat(resolved.lat), lon: clampLon(resolved.lon) };
+      }
+    }
+    if (!latLon) {
+      const worldPos = this.getWorldPosition?.();
+      if (worldPos) {
+        latLon = this._worldToLatLon(worldPos.x, worldPos.z);
+      }
     }
 
     if (latLon) {
@@ -311,6 +321,12 @@ export class MiniMap {
 
   _worldToLatLon(x, z) {
     const origin = this.tileManager?.origin;
+    if (typeof this.tileManager?.localToLatLon === 'function') {
+      const precise = this.tileManager.localToLatLon(x, z);
+      if (precise && Number.isFinite(precise.lat) && Number.isFinite(precise.lon)) {
+        return { lat: clampLat(precise.lat), lon: clampLon(precise.lon) };
+      }
+    }
     if (!origin) return null;
     const ll = worldToLatLon(x, z, origin.lat, origin.lon);
     if (!ll) return null;

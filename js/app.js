@@ -4,7 +4,8 @@ import { SceneManager } from './scene.js';
 import { Sensors, GeoButton } from './sensors.js';
 import { Input } from './input.js';
 import { AudioEngine } from './audio.js';
-import { TileManager } from './tiles.js';
+import { GlobeTerrain } from './globeTerrain.js';
+import { GlobeCamera } from './globeCamera.js';
 import { ipLocate, latLonToWorld, worldToLatLon, metresPerDegree } from './geolocate.js';
 import { geohashEncode, pickGeohashPrecision } from './geohash.js';
 import { Locomotion } from './locomotion.js';
@@ -251,6 +252,8 @@ class App {
     this._orbitDragLastX = 0;
     this._orbitDragLastY = 0;
     this._orbitDragSensitivity = 0.0022;
+    this._pointerLockSensitivity = 0.0022;
+    this._pointerLockMoveHandler = (event) => this._onPointerLockMouseMove(event);
 
     this._perfCadenceMs = 220;        // ~4–5 Hz regular cadence
     this._perfNextMs = 0;
@@ -315,11 +318,23 @@ class App {
     this.audio = new AudioEngine(this.sceneMgr);
     this._meshClientPromise = null;
     const terrainClientProvider = () => this._getMeshClient();
-    this.hexGridMgr = new TileManager(this.sceneMgr.scene, 10, 100, this.audio, {
-      terrainRelayClient: terrainClientProvider,
-      camera: this.sceneMgr.camera,
-      progressiveLoader: this.progressiveLoader,
+
+    // Initialize globe-based terrain system
+    this.hexGridMgr = new GlobeTerrain(this.sceneMgr.scene, {
+      spacing: 10,
+      tileRadius: 100,
+      subdivisionLevels: 6,
+      relayAddress: 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f',
+      dataset: 'mapzen',
+      onStatus: (msg, level) => {
+        console.log(`[GlobeTerrain] ${msg} (${level})`);
+      }
     });
+
+    // Initialize globe camera controller
+    this.globeCamera = new GlobeCamera(this.sceneMgr.camera, this.hexGridMgr, { autoApply: false });
+    this.globeCamera.setCameraOffset(0, 0);
+
     this._restoreTerrainSettingsFromStorage();
 
     // Restore overlay settings from localStorage
@@ -628,6 +643,16 @@ class App {
     this._tmpVec4 = new THREE.Vector3();
     this._tmpVec5 = new THREE.Vector3();
     this._tmpVec6 = new THREE.Vector3();
+    this._tmpVecGlobeForward = new THREE.Vector3();
+    this._tmpVecGlobeHeading = new THREE.Vector3();
+    this._tmpVecGlobeAux = new THREE.Vector3();
+    this._tmpVecGlobeUp = new THREE.Vector3();
+    this._tmpVecGlobeTangent = new THREE.Vector3();
+    this._tmpVecGlobeRight = new THREE.Vector3();
+    this._tmpMatGlobeAlign = new THREE.Matrix4();
+    this._tmpQuatGlobe = new THREE.Quaternion();
+    this._globeHeading = null;
+    this._playerLatLon = null;
     this._tmpVecTeleport = new THREE.Vector3();
     this._tmpScaleForward = new THREE.Vector3();
     this._tmpScaleRight = new THREE.Vector3();
@@ -725,6 +750,15 @@ class App {
       snapBtn: ui.miniMapSnap,
       tileManager: this.hexGridMgr,
       getWorldPosition: () => this.sceneMgr?.dolly?.position,
+      getLatLon: () => {
+        const pose = this.sceneMgr?.dolly?.userData?.globePose;
+        if (pose && Number.isFinite(pose.lat) && Number.isFinite(pose.lon)) {
+          return { lat: pose.lat, lon: pose.lon };
+        }
+        const dolly = this.sceneMgr?.dolly;
+        if (!dolly) return null;
+        return this._localToLatLon(dolly.position.x, dolly.position.z);
+      },
       getHeadingDeg: () => {
         const dolly = this.sceneMgr?.dolly;
         if (!dolly) return 0;
@@ -895,15 +929,6 @@ class App {
           this._locationState = { lat, lon };
           this.radio.updateFromLatLon(lat, lon);
 
-          // CRITICAL: Even with GPS lock OFF, update terrain origin to prevent world erasure
-          // This keeps terrain/buildings loaded around current GPS position
-          // without locking player movement to GPS
-          if (this.hexGridMgr && Number.isFinite(lat) && Number.isFinite(lon)) {
-            this.hexGridMgr.setOrigin(lat, lon, { immediate: false });
-          }
-          if (this.buildings && Number.isFinite(lat) && Number.isFinite(lon)) {
-            this.buildings.setOrigin(lat, lon, { forceRefresh: false });
-          }
         }
       }
       return;
@@ -938,6 +963,8 @@ class App {
     }
 
     const shouldLock = this._gpsLockEnabled || source === 'manual';
+
+    this._playerLatLon = { lat, lon };
     const detailForApply = { ...detail };
     if (!shouldLock && source !== 'manual' && detailForApply.recenter == null) {
       detailForApply.recenter = false;
@@ -1002,6 +1029,11 @@ class App {
 
     const allowRecenter = !skipOrigin && detail.recenter !== false && (this._gpsLockEnabled || source === 'manual');
     const skipRecenterForStoredPose = this._poseRestored && detail.force !== true && !isManualRequest;
+
+    if (source !== 'unknown') {
+      this._pendingPoseRestore = null;
+      this._poseRestored = false;
+    }
     if (allowRecenter && !skipRecenterForStoredPose) {
       this._resetPlayerPosition();
       if (isManualRequest) {
@@ -1035,6 +1067,7 @@ class App {
 
     this.miniMap?.notifyLocationChange?.({ lat, lon, source, detail });
     this.miniMap?.forceRedraw?.();
+    this._updateGlobePose();
   }
 
   _ingestGpsSample(lat, lon) {
@@ -1077,6 +1110,8 @@ class App {
     const dolly = this.sceneMgr?.dolly;
     if (!dolly || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
+    this._playerLatLon = { lat, lon };
+
     const origin = this.hexGridMgr?.origin || null;
     const detailBase = { ...rawDetail, source };
 
@@ -1093,7 +1128,7 @@ class App {
       return;
     }
 
-    const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+    const world = this._latLonToLocal(lat, lon);
     if (!world) return;
 
     const target = this._tmpGpsWorld.set(world.x, 0, world.z);
@@ -1311,8 +1346,7 @@ class App {
       return;
     }
     const hit = hits[0];
-    const origin = this.hexGridMgr?.origin;
-    const latLon = origin ? worldToLatLon(hit.point.x, hit.point.z, origin.lat, origin.lon) : null;
+    const latLon = this._localToLatLon(hit.point.x, hit.point.z);
     this._beginTeleportTween(hit.point, latLon);
   }
 
@@ -1335,10 +1369,30 @@ class App {
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
     const start = dolly.position.clone();
     const target = hitPoint.clone();
-    let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
-    if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
-    if (!Number.isFinite(ground)) ground = start.y - eyeHeight;
-    target.y = ground + eyeHeight;
+
+    // Check if in globe mode
+    const origin = this.hexGridMgr?.origin;
+    const globe = this.hexGridMgr?.globe;
+
+    if (origin && globe && latLon) {
+      // GLOBE MODE: Position on sphere surface at target lat/lon
+      const surfacePos = globe.latLonToSphere(latLon.lat, latLon.lon);
+
+      // Position on base sphere (elevation applied by surface patch system)
+      const EARTH_RADIUS = 6371000;
+      const direction = surfacePos.clone().normalize();
+      const approxTarget = direction.multiplyScalar(EARTH_RADIUS + eyeHeight);
+      const attached = this.hexGridMgr?.getSurfacePositionForPlayer?.(approxTarget, eyeHeight);
+      target.copy(attached || approxTarget);
+
+    } else {
+      // FLAT TERRAIN MODE: Original behavior
+      let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
+      if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
+      if (!Number.isFinite(ground)) ground = start.y - eyeHeight;
+      target.y = ground + eyeHeight;
+    }
+
     const distance = start.distanceTo(target);
     if (!Number.isFinite(distance) || distance < 0.25) {
       pushToast(distance < 0.25 ? 'Already at that spot' : 'Teleport failed');
@@ -1366,10 +1420,38 @@ class App {
     const progress = THREE.MathUtils.clamp(elapsed / duration, 0, 1);
     const eased = this._easeInOut(progress);
     const target = this._tmpVecTeleport.lerpVectors(tween.start, tween.end, eased);
-    let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
-    if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
-    target.y = ground + eyeHeight;
+
+    // Check if in globe mode
+    const origin = this.hexGridMgr?.origin;
+    const globe = this.hexGridMgr?.globe;
+
+    if (origin && globe) {
+      // GLOBE MODE: Interpolate along sphere surface
+      // Project interpolated position back to sphere
+      const direction = target.clone().normalize();
+      const EARTH_RADIUS = 6371000;
+
+      // Position on base sphere (elevation applied by surface patch system)
+      const approxTarget = direction.multiplyScalar(EARTH_RADIUS + eyeHeight);
+      const attached = this.hexGridMgr?.getSurfacePositionForPlayer?.(approxTarget, eyeHeight);
+      target.copy(attached || approxTarget);
+
+      // Update camera up vector during teleport
+      const up = this.hexGridMgr?.getSurfaceNormal?.(target) || direction.clone();
+      this.sceneMgr.camera.up.copy(up);
+      dolly.up.copy(up);
+
+    } else {
+      // FLAT TERRAIN MODE: Original behavior
+      let ground = this.hexGridMgr?.getHeightAt?.(target.x, target.z);
+      if (!Number.isFinite(ground)) ground = target.y - eyeHeight;
+      target.y = ground + eyeHeight;
+    }
+
     dolly.position.copy(target);
+    if (origin && globe) {
+      this._applyGlobeRigOrientation();
+    }
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
     if (progress >= 0.999) {
       this._finishTeleportTween();
@@ -1431,8 +1513,32 @@ class App {
     const dolly = this.sceneMgr?.dolly;
     if (!dolly) return;
     const eyeHeight = this.move?.eyeHeight?.() ?? 1.6;
-    const groundY = this.hexGridMgr?.getHeightAt?.(0, 0) ?? 0;
-    dolly.position.set(0, groundY + eyeHeight, 0);
+
+    // Position player on globe surface at their GPS coordinates
+    const origin = this.hexGridMgr?.origin;
+    const targetLatLon = this._playerLatLon || origin;
+    if (targetLatLon && this.hexGridMgr?.globe) {
+      // Get position on globe surface at player's GPS coordinates
+      const surfacePos = this.hexGridMgr.globe.latLonToSphere(targetLatLon.lat, targetLatLon.lon);
+      // Add eye height radially from Earth center
+      const direction = surfacePos.clone().normalize();
+      const approxPos = direction.multiplyScalar(surfacePos.length() + eyeHeight);
+      const attached = this.hexGridMgr.getSurfacePositionForPlayer?.(approxPos, eyeHeight);
+      const finalPos = attached || approxPos;
+      dolly.position.copy(finalPos);
+
+      const up = finalPos.clone().normalize();
+      this.sceneMgr?.camera?.up.copy(up);
+      dolly.up.copy(up);
+
+      this._primeGlobeHeading(up);
+      this._applyGlobeRigOrientation();
+    } else {
+      // Fallback to flat terrain
+      const groundY = this.hexGridMgr?.getHeightAt?.(0, 0) ?? 0;
+      dolly.position.set(0, groundY + eyeHeight, 0);
+    }
+
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
   }
 
@@ -1458,7 +1564,7 @@ class App {
     const landingGround = this.hexGridMgr?.getHeightAt(landing.x, landing.z);
     const groundVal = Number.isFinite(landingGround) ? landingGround : baseGround;
 
-    const latLon = worldToLatLon(landing.x, landing.z, origin.lat, origin.lon);
+    const latLon = this._localToLatLon(landing.x, landing.z);
     if (!latLon) return null;
 
     const yaw = new THREE.Euler().setFromQuaternion(dolly.quaternion, 'YXZ').y;
@@ -1493,7 +1599,7 @@ class App {
       const origin = this.hexGridMgr?.origin;
       const dolly = this.sceneMgr?.dolly;
       if (!origin || !dolly) return false;
-      const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+      const world = this._latLonToLocal(lat, lon);
       if (!world) return false;
 
       const groundHeight = Number.isFinite(ground)
@@ -1687,6 +1793,12 @@ class App {
       envOuterLimitRow,
       envOuterLimit,
       envOuterLimitValue,
+      envFallbackEnable,
+      envFallbackEndpoint,
+      envFallbackForce,
+      envDataSourceTest,
+      envDataSourceReset,
+      envDataSourceStatus,
       envTerrainApply,
       envTerrainAuto,
       envTerrainTargetFps,
@@ -2047,6 +2159,37 @@ class App {
       const val = Number(e.target.value);
       this._handleTargetFpsChange(val);
     });
+
+    // Terrain data source fallback controls (disabled — NKN relay only)
+    console.log('[app] HTTP terrain fallback disabled; using NKN relay only.');
+    if (envFallbackEnable) {
+      envFallbackEnable.checked = false;
+      envFallbackEnable.disabled = true;
+      envFallbackEnable.title = 'HTTP fallback disabled (NKN relay only)';
+    }
+    if (envFallbackForce) {
+      envFallbackForce.checked = false;
+      envFallbackForce.disabled = true;
+      envFallbackForce.title = 'HTTP fallback disabled (NKN relay only)';
+    }
+    if (envFallbackEndpoint) {
+      envFallbackEndpoint.value = '';
+      envFallbackEndpoint.disabled = true;
+      envFallbackEndpoint.placeholder = 'NKN relay only';
+    }
+    if (envDataSourceTest) {
+      envDataSourceTest.disabled = true;
+      envDataSourceTest.title = 'HTTP fallback disabled';
+    }
+    if (envDataSourceReset) {
+      envDataSourceReset.disabled = true;
+      envDataSourceReset.title = 'HTTP fallback disabled';
+    }
+    if (envDataSourceStatus) {
+      envDataSourceStatus.style.display = 'block';
+      envDataSourceStatus.textContent = 'NKN relay active · HTTP fallback disabled';
+      envDataSourceStatus.style.color = 'var(--text-muted, #999)';
+    }
 
     envBuildingApply?.addEventListener('click', () => {
       this._disableBuildingAuto();
@@ -3477,8 +3620,7 @@ class App {
     const { lat, lon } = detail;
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
-    const origin = this.hexGridMgr.origin;
-    const world = latLonToWorld(lat, lon, origin.lat, origin.lon);
+    const world = this._latLonToLocal(lat, lon);
     if (!world) return;
 
     const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -3586,8 +3728,64 @@ class App {
     nav.predictedWorld.z = THREE.MathUtils.damp(nav.predictedWorld.z, nav.positionWorld.z, 0.5, elapsed);
 
     const dolly = this.sceneMgr.dolly;
-    dolly.position.x = THREE.MathUtils.damp(dolly.position.x, nav.predictedWorld.x, 6, elapsed);
-    dolly.position.z = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
+
+    // Check if we're in globe mode
+    const origin = this.hexGridMgr?.origin;
+    const globe = this.hexGridMgr?.globe;
+
+    if (origin && globe) {
+      // GLOBE MODE: Apply movement along sphere surface
+
+      // Calculate delta movement in world space
+      const targetX = THREE.MathUtils.damp(dolly.position.x, nav.predictedWorld.x, 6, elapsed);
+      const targetZ = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
+      const deltaX = targetX - dolly.position.x;
+      const deltaZ = targetZ - dolly.position.z;
+
+      // Get current position and local tangent frame
+      const currentPos = dolly.position.clone();
+      const up = currentPos.clone().normalize();
+      const east = new THREE.Vector3(0, 1, 0).cross(up).normalize();
+      const north = up.cross(east).normalize();
+
+      // Create movement vector in world space
+      const moveVec = new THREE.Vector3(deltaX, 0, deltaZ);
+
+      // Transform to local tangent plane
+      const moveEast = moveVec.dot(east);
+      const moveNorth = moveVec.dot(north);
+
+      // Apply movement in tangent plane
+      const movement = new THREE.Vector3()
+        .addScaledVector(east, moveEast)
+        .addScaledVector(north, moveNorth);
+
+      // Add to current position and project back to sphere
+      const newPos = currentPos.clone().add(movement);
+      const direction = newPos.normalize();
+      const EARTH_RADIUS = 6371000;
+      const eyeHeight = 1.6; // Default eye height for mobile
+      const approxPos = direction.multiplyScalar(EARTH_RADIUS + eyeHeight);
+      dolly.position.copy(approxPos);
+
+      // Attach to surface patch elevation if available
+      const attached = this.hexGridMgr?.getSurfacePositionForPlayer?.(approxPos, eyeHeight);
+      if (attached) {
+        dolly.position.copy(attached);
+      }
+
+      // Update camera up vector
+      const newUp = this.hexGridMgr?.getSurfaceNormal?.(dolly.position) || dolly.position.clone().normalize();
+      this.sceneMgr.camera.up.copy(newUp);
+      dolly.up.copy(newUp);
+
+      this._applyGlobeRigOrientation();
+
+    } else {
+      // FLAT TERRAIN MODE: Original behavior
+      dolly.position.x = THREE.MathUtils.damp(dolly.position.x, nav.predictedWorld.x, 6, elapsed);
+      dolly.position.z = THREE.MathUtils.damp(dolly.position.z, nav.predictedWorld.z, 6, elapsed);
+    }
 
     if (Number.isFinite(nav.velocity.x) && Number.isFinite(nav.velocity.z)) {
       const speedSq = nav.velocity.x * nav.velocity.x + nav.velocity.z * nav.velocity.z;
@@ -3604,21 +3802,213 @@ class App {
     this._gpsLastWorldValid = true;
 
     if (this.hexGridMgr?.origin) {
-      const fused = worldToLatLon(dolly.position.x, dolly.position.z, this.hexGridMgr.origin.lat, this.hexGridMgr.origin.lon);
+      let fused = null;
+      if (this.hexGridMgr?.globe) {
+        fused = this.hexGridMgr.globe.sphereToLatLon(dolly.position);
+      }
+      if (!fused) {
+        fused = this._localToLatLon(dolly.position.x, dolly.position.z);
+      }
       if (fused) nav.fusedLatLon = fused;
     }
   }
 
+  _updateGlobePose({ groundY, eyeHeight } = {}) {
+    if (!this.globeCamera || !this.hexGridMgr?.origin) return;
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return;
+
+    let latLon = null;
+    if (this.hexGridMgr?.globe) {
+      latLon = this.hexGridMgr.globe.sphereToLatLon(dolly.position);
+    }
+    if (!latLon) {
+      latLon = this._localToLatLon(dolly.position.x, dolly.position.z);
+    }
+    if (!latLon) return;
+
+    const forwardVec = this._tmpVecGlobeForward.set(0, 0, -1).applyQuaternion(dolly.quaternion).normalize();
+    const bearingRad = Math.atan2(forwardVec.x, -forwardVec.z);
+    this.globeCamera.bearing = THREE.MathUtils.radToDeg(bearingRad);
+    this.globeCamera.pitch = THREE.MathUtils.radToDeg(this._pitch || 0);
+    const effectiveEye = Number.isFinite(eyeHeight) ? eyeHeight : (this.move?.eyeHeight?.() ?? 1.6);
+    this.globeCamera.setPosition(latLon.lat, latLon.lon, effectiveEye);
+    const pose = this.globeCamera.getPose();
+    if (pose) {
+      pose.groundElevation = Number.isFinite(groundY) ? groundY : 0;
+      pose.eyeHeight = effectiveEye;
+      pose.lat = latLon.lat;
+      pose.lon = latLon.lon;
+      pose.elevation = Number.isFinite(groundY)
+        ? groundY
+        : this.hexGridMgr?.globe?.getElevationAt?.(latLon.lat, latLon.lon) ?? 0;
+      pose.local = {
+        x: dolly.position.x,
+        y: dolly.position.y,
+        z: dolly.position.z
+      };
+      if (!dolly.userData) dolly.userData = {};
+      dolly.userData.globePose = pose;
+    }
+  }
+
+  _applyGlobeYawPitch(yawDelta = 0, pitchDelta = 0) {
+    if (!this.hexGridMgr?.origin || !this.hexGridMgr?.globe) return false;
+    const dolly = this.sceneMgr?.dolly;
+    if (!dolly) return true;
+    if (!this._tmpVecGlobeHeading) this._tmpVecGlobeHeading = new THREE.Vector3();
+    if (!this._tmpVecGlobeRight) this._tmpVecGlobeRight = new THREE.Vector3();
+    if (!this._tmpVecGlobeForward) this._tmpVecGlobeForward = new THREE.Vector3();
+    if (!this._tmpVecGlobeAux) this._tmpVecGlobeAux = new THREE.Vector3();
+    const up = this._tmpVecGlobeUp.copy(dolly.position).normalize();
+    if (!Number.isFinite(up.lengthSq()) || up.lengthSq() < 1e-6) return true;
+
+    if (yawDelta) {
+      if (!this._globeHeading) {
+        this._globeHeading = new THREE.Vector3(0, 0, -1);
+      }
+      const heading = this._globeHeading;
+      const cross = this._tmpVecGlobeRight.crossVectors(up, heading);
+      const cos = Math.cos(yawDelta);
+      const sin = Math.sin(yawDelta);
+      const axisTerm = this._tmpVecGlobeAux.copy(up).multiplyScalar(heading.dot(up) * (1 - cos));
+      const rotated = this._tmpVecGlobeForward.copy(heading).multiplyScalar(cos)
+        .add(cross.multiplyScalar(sin))
+        .add(axisTerm);
+
+      const tangent = rotated.sub(this._tmpVecGlobeAux.copy(up).multiplyScalar(rotated.dot(up)));
+      if (tangent.lengthSq() > 1e-8) {
+        this._globeHeading.copy(tangent.normalize());
+      }
+    }
+
+    if (pitchDelta) {
+      const currentPitch = this._pitch ?? 0;
+      const maxUp = this._pitchMax - currentPitch;
+      const maxDown = this._pitchMin - currentPitch;
+      const clampedDelta = THREE.MathUtils.clamp(pitchDelta, maxDown, maxUp);
+      this._pitch = THREE.MathUtils.clamp(currentPitch + clampedDelta, this._pitchMin, this._pitchMax);
+    }
+
+    return true;
+  }
+
+  _primeGlobeHeading(up) {
+    if (!up || up.lengthSq() < 1e-6) return;
+    if (!this._tmpVecGlobeHeading) this._tmpVecGlobeHeading = new THREE.Vector3();
+    if (!this._tmpVecGlobeAux) this._tmpVecGlobeAux = new THREE.Vector3();
+    if (!this._globeHeading) this._globeHeading = new THREE.Vector3(0, 0, -1);
+    const candidate = this._tmpVecGlobeHeading.copy(this._globeHeading.lengthSq() > 0
+      ? this._globeHeading
+      : this._headingBasis);
+    candidate.sub(up.clone().multiplyScalar(candidate.dot(up)));
+    if (candidate.lengthSq() < 1e-6) {
+      candidate.copy(this._headingBasis)
+        .sub(up.clone().multiplyScalar(this._headingBasis.dot(up)));
+    }
+    if (candidate.lengthSq() < 1e-6) {
+      candidate.copy(this._tmpVecGlobeAux.set(0, 1, 0).cross(up));
+    }
+    if (candidate.lengthSq() < 1e-6) candidate.set(1, 0, 0);
+    candidate.normalize();
+    this._globeHeading.copy(candidate);
+  }
+
+  _applyGlobeRigOrientation() {
+    if (!this.hexGridMgr?.origin || !this.hexGridMgr?.globe) return;
+    const dolly = this.sceneMgr?.dolly;
+    const camera = this.sceneMgr?.camera;
+    if (!dolly || !camera) return;
+
+    if (!this._tmpVecGlobeHeading) this._tmpVecGlobeHeading = new THREE.Vector3();
+    if (!this._tmpVecGlobeAux) this._tmpVecGlobeAux = new THREE.Vector3();
+
+    const position = dolly.position;
+    if (!Number.isFinite(position.lengthSq()) || position.lengthSq() < 1e-6) return;
+
+    const up = this._tmpVecGlobeUp.copy(position).normalize();
+
+    if (!this._globeHeading) {
+      this._primeGlobeHeading(up);
+    }
+
+    // Determine tangent forward direction from stored heading
+    const radialComponent = this._tmpVecGlobeHeading.copy(up).multiplyScalar((this._globeHeading || this._headingBasis).dot(up));
+    const projectedHeading = this._tmpVecGlobeTangent.copy(this._globeHeading || this._headingBasis).sub(radialComponent);
+
+    if (projectedHeading.lengthSq() < 1e-6) {
+      projectedHeading.copy(this._tmpVecGlobeAux.set(0, 1, 0).cross(up));
+      if (projectedHeading.lengthSq() < 1e-6) {
+        projectedHeading.set(1, 0, 0);
+        projectedHeading.sub(up.clone().multiplyScalar(projectedHeading.dot(up)));
+      }
+    }
+
+    const forward = projectedHeading.normalize();
+    this._globeHeading.copy(forward);
+
+    // Build orthonormal basis (right = up × forward)
+    const right = this._tmpVecGlobeRight.crossVectors(up, forward);
+    if (right.lengthSq() < 1e-6) {
+      right.set(1, 0, 0);
+      right.sub(up.clone().multiplyScalar(right.dot(up)));
+    }
+    right.normalize();
+
+    const zAxis = this._tmpVecGlobeForward.copy(forward).negate();
+    this._tmpMatGlobeAlign.makeBasis(right, up, zAxis);
+
+    dolly.quaternion.setFromRotationMatrix(this._tmpMatGlobeAlign);
+    dolly.up.copy(up);
+
+    // Apply pitch around local right axis for camera
+    const pitchAngle = THREE.MathUtils.clamp(this._pitch ?? 0, this._pitchMin, this._pitchMax);
+    const pitchQuat = this._tmpQuatGlobe.setFromAxisAngle(right, pitchAngle);
+    camera.quaternion.copy(dolly.quaternion).multiply(pitchQuat);
+    camera.up.copy(up);
+  }
+
   /* ---------- Helpers ---------- */
 
-  _collectPeerLocations() {
+  _latLonToLocal(lat, lon, altitude = 0) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (typeof this.hexGridMgr?.latLonToLocal === 'function') {
+      const converted = this.hexGridMgr.latLonToLocal(lat, lon, altitude);
+      if (converted && typeof converted === 'object') {
+        return {
+          x: Number(converted.x) || 0,
+          z: Number(converted.z) || 0,
+          y: Number(converted.y) || 0
+        };
+      }
+    }
     const origin = this.hexGridMgr?.origin;
-    if (!origin || !this.remotes?.map?.size) return [];
+    if (!origin) return null;
+    const fallback = latLonToWorld(lat, lon, origin.lat, origin.lon);
+    if (!fallback) return null;
+    return { x: Number(fallback.x) || 0, z: Number(fallback.z) || 0, y: 0 };
+  }
+
+  _localToLatLon(x, z, { altitude = 0 } = {}) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+    if (typeof this.hexGridMgr?.localToLatLon === 'function') {
+      const res = this.hexGridMgr.localToLatLon(x, z, altitude);
+      if (res && typeof res === 'object') {
+        return { lat: Number(res.lat) || 0, lon: Number(res.lon) || 0 };
+      }
+    }
+    const origin = this.hexGridMgr?.origin;
+    if (!origin) return null;
+    return worldToLatLon(x, z, origin.lat, origin.lon);
+  }
+
+  _collectPeerLocations() {
+    if (!this.remotes?.map?.size) return [];
     const peers = [];
     for (const ent of this.remotes.map.values()) {
       const pos = ent?.avatar?.group?.position || ent?.targetPos;
       if (!pos) continue;
-      const latLon = worldToLatLon(pos.x, pos.z, origin.lat, origin.lon);
+      const latLon = this._localToLatLon(pos.x, pos.z);
       if (!latLon) continue;
       const label = typeof ent.pub === 'string'
         ? ent.pub.slice(0, 4).toUpperCase()
@@ -4915,12 +5305,36 @@ class App {
       this._pitch = clamped;
       camera.quaternion.setFromEuler(new THREE.Euler(clamped, 0, 0, 'YXZ'));
     }
-    camera.up.set(0, 1, 0);
-
     const eyeHeight = Number.isFinite(pose.eyeHeight) ? pose.eyeHeight : (this.move?.eyeHeight?.() ?? 1.6);
-    const groundY = this.hexGridMgr?.getHeightAt?.(dolly.position.x, dolly.position.z);
-    if (Number.isFinite(groundY) && Number.isFinite(eyeHeight)) {
-      dolly.position.y = groundY + eyeHeight;
+
+    // Check if we're in globe mode
+    const origin = this.hexGridMgr?.origin;
+    const globe = this.hexGridMgr?.globe;
+
+    if (origin && globe) {
+      // GLOBE MODE: Position player on sphere surface at GPS coordinates
+      const surfacePos = globe.latLonToSphere(origin.lat, origin.lon);
+      const upDirection = surfacePos.clone().normalize();
+      const finalRadius = surfacePos.length() + eyeHeight;
+      const approxPos = upDirection.clone().multiplyScalar(finalRadius);
+      const attached = this.hexGridMgr?.getSurfacePositionForPlayer?.(approxPos, eyeHeight);
+      dolly.position.copy(attached || approxPos);
+
+      const surfaceNormal = this.hexGridMgr?.getSurfaceNormal?.(dolly.position) || dolly.position.clone().normalize();
+      camera.up.copy(surfaceNormal);
+      dolly.up.copy(surfaceNormal);
+
+      this._applyGlobeRigOrientation();
+
+    } else {
+      // FLAT TERRAIN MODE: Standard Y-up positioning
+      camera.up.set(0, 1, 0);
+      dolly.up.set(0, 1, 0);
+
+      const groundY = this.hexGridMgr?.getHeightAt?.(dolly.position.x, dolly.position.z);
+      if (Number.isFinite(groundY) && Number.isFinite(eyeHeight)) {
+        dolly.position.y = groundY + eyeHeight;
+      }
     }
 
     this.hexGridMgr?.update?.(dolly.position);
@@ -5096,7 +5510,16 @@ class App {
           // Remove yaw from cameraQuat
           this._tmpQuat.setFromAxisAngle(this._yAxis, -yawFromCamera);
           camera.quaternion.copy(cameraQuat).premultiply(this._tmpQuat);
-          camera.up.set(0, 1, 0);
+
+          // Set camera up vector (globe-aware if in globe mode)
+          const origin = this.hexGridMgr?.origin;
+          const globe = this.hexGridMgr?.globe;
+          if (origin && globe) {
+            const up = dolly.position.clone().normalize();
+            camera.up.copy(up);
+          } else {
+            camera.up.set(0, 1, 0);
+          }
 
           // Legacy pitch tracking
           this._pitch = this._tmpEuler.setFromQuaternion(cameraQuat, 'YXZ').x;
@@ -5111,7 +5534,16 @@ class App {
           dolly.rotation.set(0, yawAbs, 0);
           const camEuler = this._tmpEuler.set(this._pitch, 0, 0, 'YXZ');
           camera.quaternion.setFromEuler(camEuler);
-          camera.up.set(0, 1, 0);
+
+          // Set camera up vector (globe-aware if in globe mode)
+          const origin = this.hexGridMgr?.origin;
+          const globe = this.hexGridMgr?.globe;
+          if (origin && globe) {
+            const up = dolly.position.clone().normalize();
+            camera.up.copy(up);
+          } else {
+            camera.up.set(0, 1, 0);
+          }
         }
       });
     }
@@ -5125,7 +5557,12 @@ class App {
     const eyeHeight = this.move.eyeHeight();
     const desiredMove = this._tmpVec2.copy(dolly.position).sub(prevPos);
     let allowedMove = desiredMove;
-    if (this.physics?.isCharacterReady?.()) {
+
+    // Check if in globe mode
+    const globeMode = this.hexGridMgr?.origin && this.hexGridMgr?.globe;
+
+    // Only use physics in flat terrain mode (physics assumes flat space)
+    if (this.physics?.isCharacterReady?.() && !globeMode) {
       allowedMove = measure('physics.resolveMove', () => {
         if (performance?.mark) performance.mark('phys-resolve-start');
         const resolved = this.physics.resolveCharacterMovement(prevPos, eyeHeight, desiredMove);
@@ -5150,10 +5587,65 @@ class App {
       this.physics.notifyCharacterImpact(impactPos, intensity);
     }
 
-    const finalPos = this._tmpVec3.copy(prevPos).add(allowedMove);
-    let groundY = measure('height.locomotion', () => this.hexGridMgr.getHeightAt(finalPos.x, finalPos.z));
-    finalPos.y = groundY + eyeHeight;
-    dolly.position.copy(finalPos);
+    // Calculate final position with globe-aware movement
+    const origin = this.hexGridMgr?.origin;
+    const globe = this.hexGridMgr?.globe;
+    let groundY;
+
+    if (origin && globe) {
+      // GLOBE MODE: Movement follows sphere surface
+
+      // Get current position and calculate local tangent frame
+      const currentPos = prevPos.clone();
+      const up = currentPos.clone().normalize();
+      const east = new THREE.Vector3(0, 1, 0).cross(up).normalize();
+      const north = up.cross(east).normalize();
+
+      // Transform world-space movement into local tangent plane coordinates
+      // allowedMove is in world X/Z space, we need to map it to surface-local east/north
+      const moveEast = allowedMove.dot(east);
+      const moveNorth = allowedMove.dot(north);
+
+      // Apply movement in tangent plane
+      const movement = new THREE.Vector3()
+        .addScaledVector(east, moveEast)
+        .addScaledVector(north, moveNorth);
+
+      // Add to current position
+      const newPos = currentPos.clone().add(movement);
+
+      // Project back onto sphere surface to maintain distance from Earth center
+      const direction = newPos.normalize();
+      const EARTH_RADIUS = 6371000; // meters
+
+      // Position on sphere surface (base sphere, elevation applied by surface patch system)
+      const approxPos = direction.multiplyScalar(EARTH_RADIUS + eyeHeight);
+      dolly.position.copy(approxPos);
+
+      const attached = this.hexGridMgr?.getSurfacePositionForPlayer?.(approxPos, eyeHeight);
+      if (attached) {
+        dolly.position.copy(attached);
+      }
+
+      // Update camera up vector to match new position on sphere
+      const newUp = this.hexGridMgr?.getSurfaceNormal?.(dolly.position) || dolly.position.clone().normalize();
+      this.sceneMgr.camera.up.copy(newUp);
+      dolly.up.copy(newUp);
+
+      this._applyGlobeRigOrientation();
+
+      // Store groundY based on current radius
+      const radius = dolly.position.length();
+      groundY = Number.isFinite(radius) ? Math.max(0, radius - eyeHeight) : 0;
+
+    } else {
+      // FLAT TERRAIN MODE: Original behavior
+      const finalPos = this._tmpVec3.copy(prevPos).add(allowedMove);
+      groundY = measure('height.locomotion', () => this.hexGridMgr.getHeightAt(finalPos.x, finalPos.z));
+      finalPos.y = groundY + eyeHeight;
+      dolly.position.copy(finalPos);
+    }
+    this._updateGlobePose({ groundY, eyeHeight });
 
     if (this._teleportTween) {
       this._updateTeleportTween(now, eyeHeight);
@@ -5212,8 +5704,13 @@ class App {
     measure('hover.update', () => this._updateBuildingHover(xrOn));
 
     const pos = dolly.position;
-    groundY = measure('height.final', () => this.hexGridMgr.getHeightAt(pos.x, pos.z));
-    dolly.position.y = groundY + eyeHeight;
+    if (origin && globe) {
+      const radius = pos.length();
+      groundY = Number.isFinite(radius) ? Math.max(0, radius - eyeHeight) : 0;
+    } else {
+      groundY = measure('height.final', () => this.hexGridMgr.getHeightAt(pos.x, pos.z));
+      dolly.position.y = groundY + eyeHeight;
+    }
     this.physics?.setCharacterPosition?.(dolly.position, eyeHeight);
     measure('hud.scale', () => this._updateHudScale({ groundY }));
 
@@ -5354,12 +5851,11 @@ class App {
 
     measure('pose.saveMaybe', () => this._poseMaybeSave(dt));
 
-    const origin = this.hexGridMgr?.origin;
     const hudNow = nowMs;
     const movedHudSq = this._hudGeoLastPos.distanceToSquared(dolly.position);
     if ((origin && (hudNow >= this._hudGeoNextMs || movedHudSq > 0.5 * 0.5))) {
       measure('hud.geo', () => {
-        const hudLatLon = worldToLatLon(dolly.position.x, dolly.position.z, origin.lat, origin.lon);
+        const hudLatLon = this._localToLatLon(dolly.position.x, dolly.position.z);
         if (hudLatLon) {
           this._updateHudGeo(hudLatLon);
           this._maybeUpdateWeatherFromScene(hudLatLon);
@@ -5372,6 +5868,10 @@ class App {
     if (nowMs >= this._miniMapNextMs) {
       measure('minimap.update', () => this.miniMap?.update());
       this._miniMapNextMs = nowMs + 100;
+    }
+
+    if (this.globeCamera) {
+      measure('globe.update', () => this.globeCamera.update(dt));
     }
 
     measure('renderer.render', () => {
@@ -5886,23 +6386,41 @@ class App {
   }
 
   _applyDesktopOrbitDelta(dx, dy) {
+    this._handlePointerLookDelta(dx, dy, this._orbitDragSensitivity || 0.0022);
+  }
+  _handlePointerLookDelta(dx, dy, sensitivity = this._pointerLockSensitivity || 0.0022) {
     const dolly = this.sceneMgr?.dolly;
     if (!dolly) return;
-    const sensitivity = this._orbitDragSensitivity || 0.0022;
     const yawDelta = -dx * sensitivity;
     let pitchDelta = -dy * sensitivity;
     const currentPitch = this._pitch ?? 0;
     const maxUp = this._pitchMax - currentPitch;
     const maxDown = this._pitchMin - currentPitch;
     pitchDelta = THREE.MathUtils.clamp(pitchDelta, maxDown, maxUp);
+
+    if (this._applyGlobeYawPitch(yawDelta, pitchDelta)) {
+      this._applyGlobeRigOrientation();
+      return;
+    }
+
+    const newPitch = THREE.MathUtils.clamp(currentPitch + pitchDelta, this._pitchMin, this._pitchMax);
+    this._pitch = newPitch;
+
     const euler = this._tmpEuler.setFromQuaternion(dolly.quaternion, 'YXZ');
     euler.y += yawDelta;
-    euler.x = pitchDelta;
+    euler.x = newPitch;
     dolly.quaternion.setFromEuler(euler);
   }
 
   _handlePointerLockChange(isLocked) {
     this._pointerLockActive = !!isLocked;
+    if (this._pointerLockMoveHandler) {
+      if (this._pointerLockActive) {
+        document.addEventListener('mousemove', this._pointerLockMoveHandler, false);
+      } else {
+        document.removeEventListener('mousemove', this._pointerLockMoveHandler, false);
+      }
+    }
     if (!isLocked) {
       this._pointerLockArmed = false;
     }
@@ -5913,6 +6431,15 @@ class App {
     if (isLocked) {
       this._setPointerRingVisible(false);
     }
+  }
+
+  _onPointerLockMouseMove(event) {
+    if (!this._pointerLockActive) return;
+    const dx = event.movementX || event.mozMovementX || event.webkitMovementX || 0;
+    const dy = event.movementY || event.mozMovementY || event.webkitMovementY || 0;
+    if (!dx && !dy) return;
+    this._handlePointerLookDelta(dx, dy, this._pointerLockSensitivity || this._orbitDragSensitivity || 0.0022);
+    event.preventDefault?.();
   }
 
   _syncPointerLockButton(force = false) {

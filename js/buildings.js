@@ -1943,6 +1943,13 @@ _updateTiles(force = false) {
         const { render, solid, pick, info } = building;
         info.tile = tileKey;
         info.insideRadius = this._isInsideRadius(info.centroid);
+
+        // Position building on globe surface at GPS coordinates
+        const { lat, lon } = this._worldToLatLon(info.centroid.x, info.centroid.z);
+        if (render) this._positionBuildingOnGlobe(render, lat, lon);
+        if (solid) this._positionBuildingOnGlobe(solid, lat, lon);
+        if (pick) this._positionBuildingOnGlobe(pick, lat, lon);
+
         this.group.add(render);
         if (solid) this.group.add(solid);
         this._pickerRoot.add(pick);
@@ -4166,11 +4173,43 @@ _refreshBuildingVisibility(building) {
   }
 
   _latLonToWorld(lat, lon) {
+    // Always return flat plane coordinates for building geometry construction
+    // Globe positioning is applied later via _positionBuildingOnGlobe()
     const { dLat, dLon } = metresPerDegree(this.lat0);
     return {
       x: (lon - this.lon0) * dLon,
       z: (this.lat0 - lat) * dLat,
     };
+  }
+
+  /**
+   * Position a building mesh on the globe surface at its GPS location
+   * This is called after the building geometry is created in flat space
+   * @param {THREE.Object3D} buildingMesh - The building mesh to position
+   * @param {number} lat - Building centroid latitude
+   * @param {number} lon - Building centroid longitude
+   */
+  _positionBuildingOnGlobe(buildingMesh, lat, lon) {
+    if (!this.tileManager?.globe) return; // Not in globe mode
+
+    // Get base sphere position (NO elevation lookup to avoid performance issues)
+    const surfacePos = this.tileManager.globe.latLonToSphere(lat, lon);
+
+    // Position the building
+    buildingMesh.position.copy(surfacePos);
+
+    // Orient building perpendicular to globe surface
+    // Surface normal points from Earth center outward
+    const surfaceNormal = surfacePos.clone().normalize();
+
+    // Set up vector to match surface normal
+    buildingMesh.up.copy(surfaceNormal);
+
+    // Make building "stand" on surface (Y-axis aligned with normal)
+    buildingMesh.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 1, 0), // Building's local up
+      surfaceNormal // Globe's surface normal
+    );
   }
 
   _isInsideRadius({ x, z }) {

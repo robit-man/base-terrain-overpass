@@ -29,7 +29,7 @@ function detectMobileDevice() {
 
 export class TerrainRelay {
   constructor({
-    defaultRelay = '',
+    defaultRelay = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f',
     dataset = 'mapzen',
     mode = 'geohash',
     onStatus = null,
@@ -563,20 +563,21 @@ export class TerrainRelay {
           return wsResult;
         }
       } catch (wsErr) {
-        console.warn('[TerrainRelay] WebSocket query failed, falling back to NKN:', wsErr.message);
+        console.warn('[TerrainRelay] WebSocket query failed, trying NKN...', wsErr.message);
         // Continue to NKN fallback
       }
     }
 
-    // NKN relay path (original implementation)
-    const mc = await this.ensureClient();
+    // NKN relay path (primary)
     const m = this._metrics;
     m.inflight += 1;
     if (m.inflight > m.maxInflight) m.maxInflight = m.inflight;
 
-    const maxAttempts = 3;
-    let attempt = 0;
     try {
+      const mc = await this.ensureClient();
+      const maxAttempts = 3;
+      let attempt = 0;
+
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const attemptStart = this._nowMs();
@@ -592,7 +593,6 @@ export class TerrainRelay {
             attempt += 1;
             continue;
           }
-          this._recordFailure(err);
           throw err;
         }
 
@@ -617,6 +617,9 @@ export class TerrainRelay {
         }
         return reply;
       }
+    } catch (err) {
+      this._recordFailure(err);
+      throw err;
     } finally {
       m.inflight = Math.max(0, m.inflight - 1);
     }

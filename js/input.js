@@ -1,13 +1,26 @@
-import { PointerLockControls } from 'PointerLockControls';
 import { now, isMobile } from './utils.js';
 import { ui } from './ui.js';
 
 export class Input {
   constructor(sceneMgr) {
     this.sceneMgr = sceneMgr;
-    const canvas = sceneMgr.renderer?.domElement || document.querySelector('canvas');
+    const canvas = sceneMgr.renderer?.domElement || document.querySelector('canvas') || document.body;
 
-    this.controls = new PointerLockControls(sceneMgr.dolly, document.body);
+    this.controls = {
+      isLocked: false,
+      lock: () => {
+        const target = canvas || document.body;
+        if (target?.requestPointerLock) target.requestPointerLock();
+      },
+      unlock: () => {
+        if (document.exitPointerLock) document.exitPointerLock();
+      }
+    };
+
+    document.addEventListener('pointerlockchange', () => {
+      const lockedEl = document.pointerLockElement || document.mozPointerLockElement || document.webkitPointerLockElement;
+      this.controls.isLocked = !!lockedEl && lockedEl === canvas;
+    });
     this.m = { f:false,b:false,l:false,r:false, run:false, crouch:false, jump:false };
 
     addEventListener('keydown', e => this._k(e, true));

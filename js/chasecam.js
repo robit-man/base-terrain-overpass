@@ -1,6 +1,10 @@
 // chasecam.js
 import * as THREE from 'three';
 
+const EARTH_RADIUS_METERS = 6371000;
+const EARTH_DIAMETER_METERS = EARTH_RADIUS_METERS * 2;
+const DEFAULT_MAX_BOOM = EARTH_DIAMETER_METERS * 0.6;
+
 /**
  * Third-person chase cam that scroll-zooms into first-person.
  * - Camera is a CHILD of the dolly (player rig).
@@ -22,7 +26,7 @@ export class ChaseCam {
     this.targetBoom = 3.5;    // meters behind the head (local +Z)
     this.boom = 3.5;
     this.minBoom = 0.0;
-    this.maxBoom = 2500.0;
+    this.maxBoom = DEFAULT_MAX_BOOM;
     this.pivotLift = 0.35;     // mild shoulder-height bias around the head pivot
     this.surfaceClearance = 0.3; // keep camera above ground when clamped
     this.FIRST_THRESHOLD = 0.12; // <= this → first person
@@ -56,8 +60,9 @@ export class ChaseCam {
     // Wheel to zoom (scroll in ⇒ closer to FPV)
     window.addEventListener('wheel', (e) => {
       if (!this._shouldHandleWheel(e)) return;
+      const zoomRate = Math.max(0.1, Math.abs(this.targetBoom) * 0.0002);
       this.targetBoom = THREE.MathUtils.clamp(
-        this.targetBoom + e.deltaY * 0.1,
+        this.targetBoom + e.deltaY * zoomRate,
         this.minBoom,
         this.maxBoom
       );
@@ -86,7 +91,8 @@ export class ChaseCam {
       const dist = Math.hypot(dx, dy);
       if (!isFinite(dist) || dist <= 0) return;
       const delta = dist - this._pinch.startDist;
-      const target = this._pinch.startBoom + delta * this._pinch.scale;
+      const scale = Math.max(0.02, Math.abs(this._pinch.startBoom) * 0.00002);
+      const target = this._pinch.startBoom + delta * scale;
       this.targetBoom = THREE.MathUtils.clamp(target, this.minBoom, this.maxBoom);
     };
 

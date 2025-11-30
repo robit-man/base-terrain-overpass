@@ -6,11 +6,14 @@ const TWILIGHT_ALTITUDE = THREE.MathUtils.degToRad(-0.5);
 const NIGHT_ALTITUDE = THREE.MathUtils.degToRad(-12);
 const DAY_EXPOSURE = 0.8;
 const NIGHT_EXPOSURE = 0.018;
-const NIGHT_FOG_COLOR = new THREE.Color(0x05070d);
-const NIGHT_AMBIENT_COLOR = new THREE.Color(0x000000);
+const NIGHT_FOG_COLOR = new THREE.Color(0x0a1320);
+const NIGHT_AMBIENT_COLOR = new THREE.Color(0x0b111c);
 const DAY_AMBIENT_COLOR = new THREE.Color(0x1e212b);
 const DUSK_SUN_COLOR = new THREE.Color(0xffa864);
 const DAY_SUN_COLOR = new THREE.Color(0xffffff);
+const EARTH_RADIUS_METERS = 6371000;
+const EARTH_DIAMETER_METERS = EARTH_RADIUS_METERS * 2;
+const EARTH_VIEW_DISTANCE = EARTH_DIAMETER_METERS * 1.1;
 
 export class SceneManager {
   constructor() {
@@ -64,10 +67,12 @@ export class SceneManager {
 
 
     // Camera stays at (0,0,0) in dolly local space; dolly handles eye height
-    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 22000);
+    this.camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, EARTH_VIEW_DISTANCE);
     this.camera.position.set(0, 0, 0);
     this.camera.up.set(0, 1, 0);
     this.camera.rotation.order = 'YXZ';
+    this.camera.updateProjectionMatrix();
+    this._maxViewDistance = EARTH_VIEW_DISTANCE;
 
     // Dolly = player rig; add camera as a child (critical for chasecam & FPV)
     this.dolly = new THREE.Group();
@@ -77,7 +82,7 @@ export class SceneManager {
 
     // Sky & sun lighting
     this.sky = new Sky();
-    this.sky.scale.setScalar(60000);
+    this.sky.scale.setScalar(EARTH_DIAMETER_METERS * 1.5);
     this.scene.add(this.sky);
     const skyUniforms = this.sky.material.uniforms;
     skyUniforms['turbidity'].value = 2.5;
@@ -89,8 +94,8 @@ export class SceneManager {
     this._farFogInsetFrac = 0.05;  // fog.far ~5% inside the farfield edge
     this._wireframeMode = false;
     this._wireframeThemeBg = null;
-    this._defaultFogNear = 0.12;
-    this._defaultFogFar = 0.98;
+    this._defaultFogNear = 0.02;
+    this._defaultFogFar = 1.0;
 
     // OPTIMIZED: Enhanced directional sun light with realistic intensity
     this.sunLight = new THREE.DirectionalLight(0xffffff, 3.5);  // Slightly reduced for more realistic contrast
@@ -113,7 +118,7 @@ export class SceneManager {
     this.scene.add(this.sunLight.target);
 
     // OPTIMIZED: Enhanced ambient lighting for better shadow visibility
-    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.18);  // Increased from 0.18 to fill shadows
+    this.ambient = new THREE.AmbientLight(DAY_AMBIENT_COLOR.clone(), 0.22);  // Brighter base ambient for globe visibility
     this.scene.add(this.ambient);
     this._ambientDayColor = DAY_AMBIENT_COLOR.clone();
     this._ambientNightColor = NIGHT_AMBIENT_COLOR.clone();
@@ -384,19 +389,26 @@ _sampleTileRadius() {
     const clampedNearPct = THREE.MathUtils.clamp(nearPct, 0, 0.95);
     const clampedFarPct = THREE.MathUtils.clamp(farPct, clampedNearPct + 0.02, 1);
 
-    let far = THREE.MathUtils.clamp(radius * clampedFarPct, this.camera.near + 30, this.camera.far - 25);
+    const maxFogDistance = Math.min(this._maxViewDistance ?? this.camera.far, this.camera.far - 5);
+    let far = THREE.MathUtils.clamp(radius * clampedFarPct, this.camera.near + 30, maxFogDistance);
+    far = Math.min(maxFogDistance, far);
+    if (!Number.isFinite(far) || far <= this.camera.near + 30) {
+      far = Math.max(this.camera.near + 30, maxFogDistance);
+    }
     if (nightMix > 0) {
       const duskClamp = THREE.MathUtils.lerp(far * 0.5, far, Math.pow(dayFactor, 0.65));
       far = Math.min(far, duskClamp);
     }
     far = Math.max(this.camera.near + 40, far);
 
-    let near = THREE.MathUtils.clamp(radius * clampedNearPct, this.camera.near + 10, far - 10);
+    // Push the horizon fog wall much farther out so distant curvature stays visible.
+    const targetNear = Math.max(this.camera.near + 50, far * Math.min(0.05, clampedNearPct));
+    let near = THREE.MathUtils.clamp(targetNear, this.camera.near + 10, far - 20);
     if (nightMix > 0) {
       const nightNear = Math.min(far - 12, radius * Math.min(0.3, clampedNearPct + 0.12) + 20 * nightMix);
       near = THREE.MathUtils.lerp(nightNear, near, Math.pow(dayFactor, 0.7));
     }
-    near = Math.min(near, far - 10);
+    near = Math.min(near, far - 20);
 
     return { near, far };
   }
@@ -555,8 +567,9 @@ _sampleTileRadius() {
     this.sunLight.intensity = sunIntensity;
     this.sunLight.visible = sunIntensity > 0.02;
 
-    const ambientDay = THREE.MathUtils.lerp(0.06, 0.22, daylight);
-    const ambientIntensity = THREE.MathUtils.lerp(0.008, ambientDay, Math.pow(dayFactor, 1.1));
+    const ambientDay = THREE.MathUtils.lerp(0.12, 0.28, daylight);
+    const ambientNightFloor = 0.06;
+    const ambientIntensity = THREE.MathUtils.lerp(ambientNightFloor, ambientDay, Math.pow(dayFactor, 1.05));
     this.ambient.intensity = ambientIntensity;
     this.ambient.color.copy(this._ambientNightColor).lerp(this._ambientDayColor, Math.pow(dayFactor, 1.3));
 

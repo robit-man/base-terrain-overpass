@@ -37,10 +37,18 @@ const WAYBACK_WMTS_ROOT = 'https://wayback.maptiles.arcgis.com/arcgis/rest/servi
 const WAYBACK_WMTS_CAPABILITIES = 'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml';
 const DEFAULT_WAYBACK_VERSION = '49849';
 
-// phased acquisition for interactive tiles
-const PHASE_SEED = 0; // center + 6 tips
-const PHASE_EDGE = 1; // midpoints on 6 sides
-const PHASE_FULL = 2; // remaining unknowns / full pass
+// TWO-PASS LIGHTWEIGHT LOD SYSTEM
+// Pass 1: Low-res (7 points: center + 6 corners) - ALL tiles
+// Pass 2: High-res (remaining interior points) - ALL tiles (smooth progressive rendering)
+const PHASE_LOWRES = 0;  // Pass 1: 7 points (center + 6 corners) - ALL tile types
+const PHASE_HIGHRES = 1; // Pass 2: Full detail - ALL tile types (smooth progressive rendering)
+
+// Legacy aliases for compatibility (map old 4-phase system to new 2-phase)
+const PHASE_CENTER = PHASE_LOWRES;
+const PHASE_CORNERS = PHASE_LOWRES;
+const PHASE_EDGES = PHASE_HIGHRES;
+const PHASE_FULL = PHASE_HIGHRES;
+const PHASE_SEED = PHASE_LOWRES;
 
 // axial neighbors for hex tiles (pointy-top)
 const HEX_DIRS = [
@@ -232,7 +240,7 @@ export class TileManager {
     // ---- caching config ----
     this.CACHE_VER = 'v1';
     this._originCacheKey = 'na';
-    this._fetchPhase = 'interactive';
+    this._fetchPhase = 'lowres'; // Start with low-res pass (7 points: center + corners)
 
     // Clean up old cache versions on initialization
     this._cleanupOldCacheVersions();
@@ -836,8 +844,119 @@ _robustSampleHeight(wx, wz, primaryMesh, neighborMeshes, nearestGeomAttr, approx
 } 
 
 
+// Helper: Sample height from a specific tile's mesh at world coordinates
+_sampleHeightFromTile(tile, wx, wz) {
+  if (!tile || !tile.grid?.mesh) return null;
+
+  const mesh = tile.grid.mesh;
+  if (!mesh.geometry || !mesh.geometry.attributes.position) return null;
+
+  // Simple raycast from above
+  this.ray.set(new THREE.Vector3(wx, 1e6, wz), this.DOWN);
+  const hits = this.ray.intersectObject(mesh, false);
+  if (hits.length > 0) {
+    return hits[0].point.y;
+  }
+
+  // Fallback: find nearest vertex
+  const pos = tile.pos;
+  const base = tile.grid.group.position;
+  let bestDist2 = Infinity;
+  let bestY = null;
+
+  for (let i = 0; i < pos.count; i++) {
+    const vx = base.x + pos.getX(i);
+    const vz = base.z + pos.getZ(i);
+    const dx = vx - wx;
+    const dz = vz - wz;
+    const dist2 = dx * dx + dz * dz;
+
+    if (dist2 < bestDist2) {
+      bestDist2 = dist2;
+      bestY = pos.getY(i);
+    }
+  }
+
+  return bestY;
+}
+
+// CRITICAL: Attach unfetched neighbor edges to fetched neighbor edges
+// This prevents holes when tiles are visible before elevation data arrives
+_attachUnfetchedNeighborEdges(unfetchedTile) {
+  if (!unfetchedTile || !unfetchedTile.pos) return;
+
+  // Only process unfetched tiles
+  if (unfetchedTile._elevationFetched || unfetchedTile.unreadyCount === 0) return;
+
+  const pos = unfetchedTile.pos;
+  const aR = this.tileRadius;
+  const base = unfetchedTile.grid.group.position;
+  const tips = this._selectCornerTipIndices?.(unfetchedTile);
+  if (!tips || tips.length < 6) return;
+
+  const sideAng = Array.from({ length: 6 }, (_, i) => (i + 0.5) * (Math.PI / 3));
+  const RIM_STRICT = aR * 0.985;
+  const BAND_INNER = aR * 0.75; // Wider blend for unfetched tiles
+
+  for (let s = 0; s < 6; s++) {
+    const nq = unfetchedTile.q + (HEX_DIRS[s]?.[0] ?? 0);
+    const nr = unfetchedTile.r + (HEX_DIRS[s]?.[1] ?? 0);
+    const nTile = this._getTile(nq, nr);
+
+    // Only attach to FETCHED neighbors
+    if (!nTile || !nTile._elevationFetched || nTile.unreadyCount > 0) continue;
+
+    const iA = tips[s];
+    const iB = tips[(s + 1) % 6];
+    if (iA == null || iB == null) continue;
+
+    // Sample neighbor's edge heights at the two shared corners
+    const Ax = base.x + pos.getX(iA), Az = base.z + pos.getZ(iA);
+    const Bx = base.x + pos.getX(iB), Bz = base.z + pos.getZ(iB);
+
+    // Raycast into neighbor to get actual heights at corners
+    const Ay = this._sampleHeightFromTile(nTile, Ax, Az) || 0;
+    const By = this._sampleHeightFromTile(nTile, Bx, Bz) || 0;
+
+    // Lift our edge to match neighbor's edge heights
+    const ABx = (Bx - Ax), ABz = (Bz - Az);
+    const denom = ABx * ABx + ABz * ABz;
+    if (denom < 1e-8) continue;
+
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z);
+      if (r < BAND_INNER) continue;
+
+      // Check if this vertex belongs to side s
+      const a = this._angleOf(x, z);
+      const d = this._angDiff(a, sideAng[s]);
+      if (d > Math.PI / 8) continue;
+
+      const wx = base.x + x, wz = base.z + z;
+      let t = ((wx - Ax) * ABx + (wz - Az) * ABz) / denom;
+      t = Math.max(0, Math.min(1, t));
+
+      const yLine = Ay + t * (By - Ay);
+
+      // Blend from center (0) to edge height
+      const blendFactor = (r - BAND_INNER) / (aR - BAND_INNER);
+      const w = Math.max(0, Math.min(1, blendFactor));
+      const smoothW = w * w * (3 - 2 * w); // smoothstep
+
+      const currentY = pos.getY(i);
+      pos.setY(i, currentY + (yLine - currentY) * smoothW);
+    }
+  }
+
+  pos.needsUpdate = true;
+  if (unfetchedTile.grid?.geometry && !this._isMobile) {
+    try { unfetchedTile.grid.geometry.computeVertexNormals(); } catch {}
+  }
+}
+
 // When a neighbor is missing (not yet fetched), keep our shared side planar
-// so there’s never a crack when the neighbor arrives later.
+// so there's never a crack when the neighbor arrives later.
 _planarizeEdgeWhenNeighborMissing(tile, {
   bandRatio = 0.06,        // ~6% of radius inward
   sideArc = Math.PI / 10   // angular width considered "this side"
@@ -863,8 +982,8 @@ _planarizeEdgeWhenNeighborMissing(tile, {
     const nr = tile.r + (HEX_DIRS[s]?.[1] ?? 0);
     const nTile = this._getTile(nq, nr);
 
-    // Only run this when neighbor doesn't exist yet
-    if (nTile) continue;
+    // Only run this when neighbor doesn't exist OR is unfetched
+    if (nTile && (nTile._elevationFetched || nTile.unreadyCount === 0)) continue;
 
     const iA = tips[s];
     const iB = tips[(s + 1) % 6];
@@ -1698,8 +1817,9 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
     if (this._overlayEnabled) {
       if (state.mesh) this._disposeFarfieldMergedMesh();
       // Make sure individual farfield tiles are visible (and any overlay rings can be hidden elsewhere)
+      // CRITICAL: Only show tiles that have completed elevation fetch
       for (const tile of this.tiles.values()) {
-        if (tile && tile.type === 'farfield' && tile.grid?.group) {
+        if (tile && tile.type === 'farfield' && tile.grid?.group && tile._elevationFetched) {
           tile.grid.group.visible = true;
         }
       }
@@ -1761,7 +1881,8 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
     if (!geometries.length) {
       // Nothing to merge: restore pre-hidden tiles and dispose merged
-      for (const t of preHiddenFarTiles) if (t.grid?.group) t.grid.group.visible = true;
+      // CRITICAL: Only show tiles that have completed elevation fetch
+      for (const t of preHiddenFarTiles) if (t.grid?.group && t._elevationFetched) t.grid.group.visible = true;
       this._disposeFarfieldMergedMesh();
       state.dirty = false;
       state.lastBuildTime = tNow;
@@ -1813,7 +1934,8 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
     if (!merged) {
       // Merge failed: restore pre-hidden tiles and dispose merged
-      for (const t of preHiddenFarTiles) if (t.grid?.group) t.grid.group.visible = true;
+      // CRITICAL: Only show tiles that have completed elevation fetch
+      for (const t of preHiddenFarTiles) if (t.grid?.group && t._elevationFetched) t.grid.group.visible = true;
       this._disposeFarfieldMergedMesh();
       state.dirty = false;
       state.lastBuildTime = tNow;
@@ -1855,8 +1977,9 @@ _robustSampleHeightFromMesh(mesh, wx, wz) {
 
   _restoreFarfieldTileVisibility() {
     // Restore visibility of individual farfield tiles when merged mesh is removed
+    // CRITICAL: Only show tiles that have completed elevation fetch
     for (const tile of this.tiles.values()) {
-      if (tile && tile.type === 'farfield' && tile.grid?.group) {
+      if (tile && tile.type === 'farfield' && tile.grid?.group && tile._elevationFetched) {
         tile.grid.group.visible = true;
       }
     }
@@ -4657,6 +4780,34 @@ _overlayTargetDimension(target) {
     tile.col.needsUpdate = true;
     if (tile.grid?.mesh?.material) tile.grid.mesh.material.needsUpdate = true;
 
+    // CRITICAL: Update normals incrementally so tiles render correctly as data arrives
+    // Skip on mobile to reduce overhead, defer to batch processor
+    if (!this._isMobile && tile.grid?.geometry) {
+      try {
+        tile.grid.geometry.computeVertexNormals();
+      } catch (err) {
+        console.warn('[tiles] Failed to compute normals:', err);
+      }
+    } else if (tile.grid?.geometry) {
+      // Defer normal computation on mobile
+      if (!tile._deferredNormalsUpdate) {
+        tile._deferredNormalsUpdate = true;
+        if (!this._deferredNormalsTiles) this._deferredNormalsTiles = new Set();
+        this._deferredNormalsTiles.add(tile);
+      }
+    }
+
+    // CRITICAL: Update unfetched neighbors after each batch so they stay attached
+    // This prevents holes as elevation data incrementally arrives
+    if (updates.length > 0) {
+      for (const [dq, dr] of HEX_DIRS) {
+        const neighbor = this._getTile(tile.q + dq, tile.r + dr);
+        if (neighbor && !neighbor._elevationFetched && neighbor.unreadyCount > 0) {
+          this._attachUnfetchedNeighborEdges(neighbor);
+        }
+      }
+    }
+
     // Mark farfield adapter dirty if this is a farfield tile
     if (tile.type === 'farfield') {
       this._markFarfieldAdapterDirty(tile);
@@ -4778,8 +4929,9 @@ _overlayTargetDimension(target) {
       tile.populating = false;
       tile.unreadyCount = 0;
       if (tile._retryCounts) {
-        if ('seed' in tile._retryCounts) tile._retryCounts.seed = 0;
-        if ('edge' in tile._retryCounts) tile._retryCounts.edge = 0;
+        if ('center' in tile._retryCounts) tile._retryCounts.center = 0;
+        if ('corners' in tile._retryCounts) tile._retryCounts.corners = 0;
+        if ('edges' in tile._retryCounts) tile._retryCounts.edges = 0;
         if ('full' in tile._retryCounts) tile._retryCounts.full = 0;
       }
 
@@ -4792,12 +4944,22 @@ _overlayTargetDimension(target) {
       // consider interactive cache as full-done
       if (!tile._phase) tile._phase = {};
       if (tile.type === 'interactive') {
-        tile._phase.seedDone = true;
-        tile._phase.edgeDone = true;
+        tile._phase.centerDone = true;
+        tile._phase.cornersDone = true;
+        tile._phase.edgesDone = true;
         tile._phase.fullDone = true;
         tile.relaxEnabled = false;
       } else {
         tile._phase.fullDone = true;
+      }
+
+      // CRITICAL: Mark cached tiles as having elevation data
+      // This allows them to be shown immediately since they have valid geometry
+      tile._elevationFetched = true;
+
+      // CRITICAL: Make cached tiles visible since they have complete data
+      if (tile.grid?.group) {
+        tile.grid.group.visible = true;
       }
 
       if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
@@ -4840,7 +5002,7 @@ _overlayTargetDimension(target) {
 
   _saveInteractiveSeed(tile) {
     if (!tile || tile.type !== 'interactive') return;
-    if (!tile._phase?.seedDone || tile._phase?.edgeDone) return;
+    if (!tile._phase?.centerDone || tile._phase?.cornersDone) return;
     if (!tile.fetched || tile.fetched.size === 0) return;
     try {
       const pos = tile.pos;
@@ -4853,7 +5015,7 @@ _overlayTargetDimension(target) {
       if (!samples.length) return;
       const payload = {
         v: this.CACHE_VER,
-        phase: 'seed',
+        phase: 'center',  // GLOBAL PROGRESSIVE LOD: was 'seed'
         type: 'interactive',
         spacing: this.spacing,
         tileRadius: this.tileRadius,
@@ -4873,7 +5035,8 @@ _overlayTargetDimension(target) {
       if (!raw) return false;
 
       const data = JSON.parse(raw);
-      if (!data || data.phase !== 'seed') return false;
+      // Accept both old 'seed' and new 'center' phase for backward compatibility
+      if (!data || (data.phase !== 'center' && data.phase !== 'seed')) return false;
       if (data.spacing !== this.spacing || data.tileRadius !== this.tileRadius) return false;
       if (!Array.isArray(data.y) || data.y.length !== tile.pos.count) return false;
 
@@ -4906,13 +5069,14 @@ _overlayTargetDimension(target) {
       tile.unreadyCount = Math.max(0, pos.count - readyCount);
       tile.populating = false;
       if (!tile._phase) tile._phase = {};
-      tile._phase.seedDone = true;
-      tile._phase.edgeDone = false;
+      tile._phase.centerDone = true;
+      tile._phase.edgesDone = false;
       tile._phase.fullDone = false;
       tile.relaxEnabled = false;
       if (tile._retryCounts) {
-        tile._retryCounts.seed = 0;
-        if ('edge' in tile._retryCounts) tile._retryCounts.edge = 0;
+        tile._retryCounts.center = 0;
+        tile._retryCounts.corners = 0;
+        if ('edges' in tile._retryCounts) tile._retryCounts.edges = 0;
         if ('full' in tile._retryCounts) tile._retryCounts.full = 0;
       }
 
@@ -5022,8 +5186,8 @@ _overlayTargetDimension(target) {
     this.scene.add(grid.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (grid.mesh) grid.mesh.renderOrder = 0;
-    // CRITICAL: Hide tile until elevation data is complete
-    grid.group.visible = false;
+    // Show tile immediately as flat plane - updates incrementally as elevation arrives
+    grid.group.visible = true;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -5049,12 +5213,12 @@ _overlayTargetDimension(target) {
       normTick: 0,
       col: null,
       unreadyCount: pos.count,
-      _phase: { seedDone: false, edgeDone: false, fullDone: false },
+      _phase: { lowresDone: false, highresDone: false },
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
       _visualEdgeLocks: new Set(),
       relaxEnabled: false,
-      _retryCounts: { seed: 0, edge: 0, full: 0 },
+      _retryCounts: { center: 0, corners: 0, edges: 0, full: 0 },
       wire
     };
     this._ensureTileBuffers(tile);
@@ -5067,6 +5231,12 @@ _overlayTargetDimension(target) {
     this._ensureTileOverlay(tile);
     this._markRelaxListDirty();
     this._invalidateHeightCache();
+
+    // CRITICAL: Attach new unfetched tile's edges to any already-fetched neighbors
+    // This prevents holes on initial tile creation
+    if (!tile._elevationFetched && tile.unreadyCount > 0) {
+      this._attachUnfetchedNeighborEdges(tile);
+    }
 
     if (!this._tryLoadTileFromCache(tile)) {
       if (this._tryLoadInteractiveSeed(tile)) {
@@ -5222,8 +5392,8 @@ _farfieldTierForDist(dist) {
     this.scene.add(low.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (low.mesh) low.mesh.renderOrder = -1;
-    // CRITICAL: Hide tile until elevation data is complete
-    low.group.visible = false;
+    // Show tile immediately as flat plane - updates incrementally as elevation arrives
+    low.group.visible = true;
 
     const pos = low.geometry.attributes.position;
     const ready = new Uint8Array(pos.count);
@@ -5248,7 +5418,7 @@ _farfieldTierForDist(dist) {
       populating: false,
       unreadyCount: pos.count,
       col: low.geometry.attributes.color,
-      _phase: { fullDone: false },
+      _phase: { lowresDone: false, highresDone: false },
       _queuedPhases: new Set(),
       _retryCounts: { full: 0 },
       wire
@@ -5263,6 +5433,11 @@ _farfieldTierForDist(dist) {
     for (const [dq, dr] of HEX_DIRS) {
       const n = this._getTile(q + dq, r + dr);
       if (n && n.type === 'farfield') this._markFarfieldAdapterDirty(n);
+    }
+
+    // CRITICAL: Attach new unfetched tile's edges to any already-fetched neighbors
+    if (!tile._elevationFetched && tile.unreadyCount > 0) {
+      this._attachUnfetchedNeighborEdges(tile);
     }
 
     if (!this._tryLoadTileFromCache(tile)) {
@@ -5297,8 +5472,8 @@ _farfieldTierForDist(dist) {
     this.scene.add(low.group);
     low.group.layers.set(1);
     low.mesh.layers.set(1);
-    // CRITICAL: Hide tile until elevation data is complete
-    low.group.visible = false;
+    // Show tile immediately as flat plane - updates incrementally as elevation arrives
+    low.group.visible = true;
 
     // allow farfield meshes to answer height queries when no interactive terrain is nearby
     if (low.mesh) low.mesh.raycast = THREE.Mesh.prototype.raycast;
@@ -5320,7 +5495,7 @@ _farfieldTierForDist(dist) {
       populating: false,
       unreadyCount: pos.count,
       col: low.geometry.attributes.color,
-      _phase: { fullDone: false },
+      _phase: { lowresDone: false, highresDone: false },
       _queuedPhases: new Set(),
       _retryCounts: { full: 0 },
       scale,
@@ -5350,6 +5525,11 @@ _farfieldTierForDist(dist) {
       this._nextFarfieldLog = this._nowMs() + 2000;
     }
 
+    // CRITICAL: Attach new unfetched tile's edges to any already-fetched neighbors
+    if (!tile._elevationFetched && tile.unreadyCount > 0) {
+      this._attachUnfetchedNeighborEdges(tile);
+    }
+
     if (!this._tryLoadTileFromCache(tile)) {
       this._queuePopulate(tile, false);
     }
@@ -5372,9 +5552,8 @@ _farfieldTierForDist(dist) {
     this.scene.add(grid.group);
     // Set renderOrder to ensure proper layering: farfield < visual < interactive
     if (grid.mesh) grid.mesh.renderOrder = 0;
-    // CRITICAL: Hide promoted tile until elevation data is fetched
-    // Keep old visual tile visible until new interactive tile is ready
-    grid.group.visible = false;
+    // Show promoted tile immediately - old visual tile stays visible underneath
+    grid.group.visible = true;
 
     const dist = this._hexDist(q, r, 0, 0);
     const interactiveFade = this._interactiveWireFade(dist);
@@ -5400,7 +5579,7 @@ _farfieldTierForDist(dist) {
       normTick: 0,
       col: null,
       unreadyCount: pos.count,
-      _phase: { seedDone: false, edgeDone: false, fullDone: false },
+      _phase: { lowresDone: false, highresDone: false },
       _queuedPhases: new Set(),
       locked: new Uint8Array(pos.count),
       relaxEnabled: false,
@@ -5855,14 +6034,14 @@ _farfieldTierForDist(dist) {
       return !(tile._phase?.fullDone) || tile.unreadyCount > 0;
     }
     // interactive: any phase not done OR there are still unknowns
-    return !(tile._phase?.seedDone && tile._phase?.edgeDone && tile._phase?.fullDone) || tile.unreadyCount > 0;
+    return !(tile._phase?.centerDone && tile._phase?.edgesDone && tile._phase?.fullDone) || tile.unreadyCount > 0;
   }
 
   _interactiveTilesPending(exclude = null) {
     for (const tile of this.tiles.values()) {
       if (tile === exclude) continue;
       if (tile.type !== 'interactive') continue;
-      if (!tile._phase?.seedDone) return true;
+      if (!tile._phase?.centerDone) return true;
       if (this._interactiveSecondPass && this._tileNeedsFetch(tile)) return true;
     }
     return false;
@@ -5889,21 +6068,21 @@ _farfieldTierForDist(dist) {
   _activateInteractiveSecondPass() {
     if (this._interactiveSecondPass) return;
     this._interactiveSecondPass = true;
-    this._fetchPhase = 'interactive-final';
-    console.log('[tiles] interactive second pass activated');
-    this._primePhaseWork('interactive-final');
+    // DON'T override _fetchPhase here - it's already set to 'interactive-edges'
+    console.log('[tiles] interactive second pass activated (EDGE + FULL phases)');
+    this._releaseDeferredInteractivePhases();
   }
 
   _releaseDeferredInteractivePhases() {
     if (!this._deferredInteractive.size) return;
     for (const tile of this._deferredInteractive) {
       if (!tile || tile.type !== 'interactive') continue;
-      if (!tile._phase?.seedDone) continue;
-      if (!tile._phase.edgeDone && !this._isPhaseQueued(tile, PHASE_EDGE)) {
-        this._queuePopulatePhase(tile, PHASE_EDGE);
+      if (!tile._phase?.centerDone) continue;
+      if (!tile._phase.edgesDone && !this._isPhaseQueued(tile, PHASE_EDGES)) {
+        this._queuePopulatePhase(tile, PHASE_EDGES);
         continue;
       }
-      if (tile._phase.edgeDone && !tile._phase.fullDone && !this._isPhaseQueued(tile, PHASE_FULL)) {
+      if (tile._phase.edgesDone && !tile._phase.fullDone && !this._isPhaseQueued(tile, PHASE_FULL)) {
         this._queuePopulatePhase(tile, PHASE_FULL);
       }
     }
@@ -5911,68 +6090,60 @@ _farfieldTierForDist(dist) {
   }
 
   _tryAdvanceFetchPhase(exclude = null) {
-    if (this._fetchPhase === 'interactive') {
-      if (this._interactiveTilesPending(exclude)) return;
-      this._fetchPhase = 'visual';
-      this._primePhaseWork('visual');
-      this._markRelaxListDirty();
+    // TWO-PASS LIGHTWEIGHT LOD: Simple and efficient
+    // Pass 1: Low-res (7 points) for ALL tiles → Pass 2: High-res for interactive only
+
+    if (this._fetchPhase === 'lowres') {
+      // Check if ALL tiles have low-res data (center + 6 corners = 7 points)
+      let pending = 0;
+      for (const t of this.tiles.values()) {
+        if (!t || t === exclude) continue;
+        if (!t._phase?.lowresDone) pending++;
+      }
+      if (pending > 0) return;
+
+      console.log('[tiles] ✓ PASS 1 COMPLETE: All tiles have basic shape (7 points) → PASS 2: Interactive high-res');
+      this._fetchPhase = 'highres';
+      this._primePhaseWork('highres');
       this._scheduleBackfill(0);
       return;
     }
-    if (this._fetchPhase === 'visual') {
-      if (this._visualTilesPending(exclude)) {
-        // Count tiny holes and allow a soft advance
-        let holes = 0;
-        for (const t of this.tiles.values()) if (t.type === 'visual') holes += (t.unreadyCount || 0);
-        if (holes > 0 && holes <= (this.VISUAL_HOLE_TOLERANCE || 24)) {
-          // proceed to farfield despite tiny holes
-        } else {
-          return; // keep waiting
-        }
+
+    if (this._fetchPhase === 'highres') {
+      // Check if ALL tiles have full detail (interactive, visual, farfield)
+      let pending = 0;
+      for (const t of this.tiles.values()) {
+        if (!t || t === exclude) continue;
+        if (!t._phase?.highresDone) pending++;
       }
-      this._fetchPhase = 'farfield';
-      this._primePhaseWork('farfield');
-      this._kickFarfieldIfIdle();
-      this._scheduleBackfill(0);
-    }
-    if (this._fetchPhase === 'farfield') {
-      if (this._farfieldTilesPending(exclude)) return;
-      this._activateInteractiveSecondPass();
+      if (pending > 0) return;
+
+      console.log('[tiles] ✓ PASS 2 COMPLETE: All tiles fully detailed');
       return;
     }
   }
 
   _primePhaseWork(phase) {
-    const wantVisual = phase === 'visual' || phase === 'farfield' || phase === 'interactive-final';
-    const wantFarfield = phase === 'farfield' || phase === 'interactive-final';
-
-    if (phase === 'interactive') {
+    if (phase === 'lowres') {
+      // PASS 1: Fetch 7 points (center + 6 corners) for ALL tiles
+      console.log('[tiles] Starting PASS 1: Fetching low-res (7 points) for all tiles');
       for (const tile of this.tiles.values()) {
-        if (tile.type !== 'interactive') continue;
-        if (tile._phase?.seedDone) continue;
-        this._queuePopulatePhase(tile, PHASE_SEED, true);
+        if (!tile) continue;
+        if (tile._phase?.lowresDone) continue;
+        this._queuePopulatePhase(tile, PHASE_LOWRES, true);
       }
       return;
     }
 
-    if (wantVisual) {
+    if (phase === 'highres') {
+      // PASS 2: Fetch remaining interior points for ALL tiles (smooth progressive rendering)
+      console.log('[tiles] Starting PASS 2: Fetching high-res for all tiles');
       for (const tile of this.tiles.values()) {
-        if (tile.type !== 'visual') continue;
-        if (!this._tileNeedsFetch(tile)) continue;
-        this._queuePopulatePhase(tile, PHASE_FULL, true);
+        if (!tile) continue;
+        if (tile._phase?.highresDone) continue;
+        this._queuePopulatePhase(tile, PHASE_HIGHRES, true);
       }
-    }
-
-    if (wantFarfield) {
-      for (const tile of this.tiles.values()) {
-        if (tile.type !== 'farfield') continue;
-        if (!this._tileNeedsFetch(tile)) continue;
-        this._queuePopulatePhase(tile, PHASE_FULL, true);
-      }
-    }
-
-    if (phase === 'interactive-final') {
-      this._releaseDeferredInteractivePhases();
+      return;
     }
   }
 
@@ -6003,18 +6174,22 @@ _farfieldTierForDist(dist) {
   }
 
   _phaseKey(phase) {
-    return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
+    if (phase === PHASE_LOWRES) return 'lowres';
+    if (phase === PHASE_HIGHRES) return 'highres';
+    return 'unknown';
   }
 
   _phaseName(phase) {
-    return phase === PHASE_SEED ? 'seed' : (phase === PHASE_EDGE ? 'edge' : 'full');
+    if (phase === PHASE_LOWRES) return 'lowres';
+    if (phase === PHASE_HIGHRES) return 'highres';
+    return 'unknown';
   }
 
   _registerPhaseRetry(tile, phase) {
     if (!tile) return false;
-    if (!tile._retryCounts) tile._retryCounts = { seed: 0, edge: 0, full: 0 };
+    if (!tile._retryCounts) tile._retryCounts = { lowres: 0, highres: 0 };
     const key = this._phaseName(phase);
-    const cap = key === 'seed' ? 4 : 3;
+    const cap = key === 'center' ? 4 : 3;
     tile._retryCounts[key] = (tile._retryCounts[key] || 0) + 1;
     return tile._retryCounts[key] <= cap;
   }
@@ -6038,21 +6213,24 @@ _farfieldTierForDist(dist) {
     if (!tile) return;
     if (!this._tileNeedsFetch(tile)) return;
     if (tile.populating) return;
-    if (tile.type === 'visual' && this._fetchPhase === 'interactive') return;
-    if (tile.type === 'farfield' && this._fetchPhase !== 'farfield') return;
 
-    if (tile.type === 'visual' || tile.type === 'farfield') {
-      if (!tile._phase.fullDone) this._queuePopulatePhase(tile, PHASE_FULL, priority);
+    // TWO-PASS LIGHTWEIGHT LOD: Simple and efficient
+    // Pass 1: All tiles get low-res (7 points)
+    // Pass 2: All tiles get high-res (remaining points) - smooth progressive rendering
+
+    if (this._fetchPhase === 'lowres') {
+      if (!tile._phase.lowresDone) {
+        this._queuePopulatePhase(tile, PHASE_LOWRES, priority);
+      }
       return;
     }
-    if (!tile._phase.seedDone) {
-      this._queuePopulatePhase(tile, PHASE_SEED, priority);
-    } else if (!this._interactiveSecondPass) {
-      this._deferredInteractive.add(tile);
-    } else if (!tile._phase.edgeDone) {
-      this._queuePopulatePhase(tile, PHASE_EDGE, priority);
-    } else if (!tile._phase.fullDone) {
-      this._queuePopulatePhase(tile, PHASE_FULL, priority);
+
+    if (this._fetchPhase === 'highres') {
+      // ALL tiles participate in high-res phase for smooth progressive rendering
+      if (!tile._phase.highresDone) {
+        this._queuePopulatePhase(tile, PHASE_HIGHRES, priority);
+      }
+      return;
     }
   }
 
@@ -6081,22 +6259,16 @@ _farfieldTierForDist(dist) {
 
   _handleInteractivePhaseCompletion(tile, phase) {
     if (!tile || tile.type !== 'interactive') return;
-    if (phase === PHASE_SEED) {
-      tile._phase.seedDone = true;
-      if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_EDGE);
-      else this._deferredInteractive.add(tile);
-      this._saveInteractiveSeed(tile);
-      if (this._fetchPhase === 'interactive') this._tryAdvanceFetchPhase(tile);
-    } else if (phase === PHASE_EDGE) {
-      tile._phase.edgeDone = true;
-      if (this._interactiveSecondPass) this._queuePopulatePhase(tile, PHASE_FULL);
-      else this._deferredInteractive.add(tile);
-    } else {
-      tile._phase.fullDone = true;
-      this._deferredInteractive.delete(tile);
+
+    if (phase === PHASE_LOWRES) {
+      tile._phase.lowresDone = true;
+      if (this._fetchPhase === 'lowres') this._tryAdvanceFetchPhase(tile);
+    } else if (phase === PHASE_HIGHRES) {
+      tile._phase.highresDone = true;
       if (tile.locked) tile.locked.fill(0);
       this._saveTileToCache(tile);
       this._noteMobileInteractiveCompletion(tile);
+      if (this._fetchPhase === 'highres') this._tryAdvanceFetchPhase(tile);
     }
   }
 
@@ -6156,11 +6328,27 @@ _farfieldTierForDist(dist) {
       const { tile, phase } = next;
       if (!tile) continue;
 
-      if (tile.type === 'visual' && this._fetchPhase === 'interactive') {
+      // STRICT PHASE BLOCKING: skip tiles that shouldn't fetch in current phase
+      if (tile.type === 'visual' && (this._fetchPhase === 'interactive' || this._fetchPhase === 'interactive-edges')) {
         const k = this._phaseKey(phase);
         tile._queuedPhases?.delete(k);
         tile.populating = false;
         continue;
+      }
+      if (tile.type === 'farfield' && this._fetchPhase !== 'farfield') {
+        const k = this._phaseKey(phase);
+        tile._queuedPhases?.delete(k);
+        tile.populating = false;
+        continue;
+      }
+      // Block interactive edge/full during wrong phases
+      if (tile.type === 'interactive' && this._fetchPhase !== 'interactive' && this._fetchPhase !== 'interactive-edges') {
+        if (phase !== PHASE_SEED) {
+          const k = this._phaseKey(phase);
+          tile._queuedPhases?.delete(k);
+          tile.populating = false;
+          continue;
+        }
       }
 
       if (tile.populating) {
@@ -6201,34 +6389,29 @@ _farfieldTierForDist(dist) {
     const count = pos.count;
     if (!Number.isFinite(count) || count === 0) { tile.populating = false; return; }
 
-    // ---- choose indices for this phase ----
+    // ---- choose indices for this phase (TWO-PASS LIGHTWEIGHT LOD) ----
     let indices = null;
-    if (tile.type === 'visual') {
-      // visuals fetch the full 7 verts
-      indices = Array.from({ length: count }, (_, i) => i);
-    } else {
-      if (phase === PHASE_SEED) {
-        const center = this._selectCenterIndex(tile);
-        const tips = this._selectCornerTipIndices(tile);
-        indices = Array.from(new Set([center, ...tips]));
-      } else if (phase === PHASE_EDGE) {
-        indices = this._selectEdgeMidpointIndices(tile);
-      } else {
-        // PHASE_FULL: fetch remaining unknowns only
-        indices = [];
-        for (let i = 0; i < count; i++) if (!tile.ready[i]) indices.push(i);
-        if (indices.length === 0) {
-          // nothing left; mark done & finish phase chain
-          if (tile.type === 'interactive') {
-            tile._phase.fullDone = true;
-            if (tile.locked) tile.locked.fill(0);
-            this._saveTileToCache(tile);
-          } else {
-            tile._phase.fullDone = true;
-            this._saveTileToCache(tile);
-          }
-          return;
-        }
+
+    if (phase === PHASE_LOWRES) {
+      // PASS 1: 7 points (center + 6 corners) for ALL tile types
+      const center = this._selectCenterIndex(tile);
+      const tips = this._selectCornerTipIndices(tile);
+      indices = [];
+      if (center != null) indices.push(center);
+      if (tips) indices.push(...tips);
+    } else if (phase === PHASE_HIGHRES) {
+      // PASS 2: Remaining interior points for ALL tile types
+      // Visual and farfield tiles also get full detail now for smooth progressive rendering
+      indices = [];
+      for (let i = 0; i < count; i++) if (!tile.ready[i]) indices.push(i);
+
+      if (indices.length === 0) {
+        // Nothing left; mark done
+        tile._phase.highresDone = true;
+        if (tile.locked) tile.locked.fill(0);
+        this._saveTileToCache(tile);
+        tile.populating = false;
+        return;
       }
     }
 
@@ -6318,10 +6501,14 @@ _farfieldTierForDist(dist) {
 
     let skipBlend = false;
     if (tile.type === 'interactive') {
-      if (phase === PHASE_SEED) {
-        this._pinEdgesFromCorners(tile);
+      if (phase === PHASE_CENTER) {
+        // After center fetch, project to create initial flat surface
         skipBlend = this._projectInteractiveSeed(tile);
-      } else if (phase === PHASE_EDGE) {
+      } else if (phase === PHASE_CORNERS) {
+        // After corners, pin edges from corners
+        this._pinEdgesFromCorners(tile);
+      } else if (phase === PHASE_EDGES) {
+        // After edges, pin from corners again
         this._pinEdgesFromCorners(tile);
       }
     }
@@ -6589,6 +6776,15 @@ _farfieldTierForDist(dist) {
       tile.grid.group.visible = true;
     }
 
+    // CRITICAL: Update unfetched neighbors to smoothly attach to this tile's edges
+    // This prevents holes between fetched and unfetched tiles
+    for (const [dq, dr] of HEX_DIRS) {
+      const neighbor = this._getTile(tile.q + dq, tile.r + dr);
+      if (neighbor && !neighbor._elevationFetched && neighbor.unreadyCount > 0) {
+        this._attachUnfetchedNeighborEdges(neighbor);
+      }
+    }
+
     // CRITICAL: If this tile was promoted from a lower-res tile, dispose the old tile now
     // This ensures smooth visual transition: old tile stays visible until new tile is ready
     if (tile._promotedFrom) {
@@ -6619,12 +6815,19 @@ _farfieldTierForDist(dist) {
 
     // ---- mark phase complete & chain next ----
     // Skip phase completion for promotions (they don't have a phase)
-    if (!isPromotion) {
-      if (tile.type === 'interactive' && phase != null) {
+    if (!isPromotion && phase != null) {
+      if (tile.type === 'interactive') {
         this._handleInteractivePhaseCompletion(tile, phase);
       } else {
-        tile._phase.fullDone = true;
-        this._saveTileToCache(tile);
+        // Visual and farfield tiles mark phases complete
+        if (phase === PHASE_LOWRES) {
+          tile._phase.lowresDone = true;
+          if (this._fetchPhase === 'lowres') this._tryAdvanceFetchPhase(tile);
+        } else if (phase === PHASE_HIGHRES) {
+          tile._phase.highresDone = true;
+          this._saveTileToCache(tile);
+          if (this._fetchPhase === 'highres') this._tryAdvanceFetchPhase(tile);
+        }
       }
       if (!this._tileNeedsFetch(tile)) this._tryAdvanceFetchPhase(tile);
     }
@@ -6904,10 +7107,11 @@ _kickFarfieldIfIdle() {
 
   if (!idle) return;
 
-  // Make sure we’re actually in farfield fetch phase
-  if (this._fetchPhase !== 'farfield') {
-    this._fetchPhase = 'farfield';
-  }
+  // GLOBAL PROGRESSIVE LOD: Don't override fetchPhase - farfield tiles
+  // participate in the same center/corners sweeps as all other tiles
+  // if (this._fetchPhase !== 'farfield') {
+  //   this._fetchPhase = 'farfield';
+  // }
 
   // Ensure farfield tiles are prewarmed for the current center
   const q = this._lastQR?.q ?? 0;
@@ -6941,7 +7145,7 @@ _kickFarfieldIfIdle() {
         this._tileNeedsFetch(t) &&
         !t.populating &&
         !this._isPhaseQueued(t, PHASE_SEED) &&
-        !this._isPhaseQueued(t, PHASE_EDGE) &&
+        !this._isPhaseQueued(t, PHASE_EDGES) &&
         !this._isPhaseQueued(t, PHASE_FULL)
       );
 
@@ -7349,6 +7553,11 @@ _kickFarfieldIfIdle() {
       // FIX: Force heavy sweep to continue populating tiles
       this._pendingHeavySweep = true;
       this._lastQR = { q: 0, r: 0 };
+
+      // GLOBAL PROGRESSIVE LOD: Start the initial center sweep
+      // This works whether tiles were restored from cache or created fresh
+      console.log('[tiles] Origin changed, starting SWEEP 1: Center points');
+      this._primePhaseWork('lowres');
     } else if (immediate && !this.tiles.size) {
       // Try to restore tiles from cache first
       const restoredCount = this._restoreTilesFromCache();
@@ -7368,6 +7577,10 @@ _kickFarfieldIfIdle() {
       }
       this._pendingHeavySweep = true;
       this._lastQR = { q: 0, r: 0 };
+
+      // GLOBAL PROGRESSIVE LOD: Start the initial center sweep
+      console.log('[tiles] Origin changed, starting SWEEP 1: Center points');
+      this._primePhaseWork('lowres');
     }
 
     if (immediate && this.origin) {
@@ -8037,7 +8250,7 @@ _sampleHeightFromNeighbors(x, z, excludeTile = null) {
     const axial = this._axialRound(axialFloat.q, axialFloat.r);
     const tile = this.tiles.get(`${axial.q},${axial.r}`);
     if (!tile || tile.type !== 'interactive') return false;
-    const seedDone = tile._phase?.seedDone;
+    const seedDone = tile._phase?.centerDone;
     if (!seedDone) return false;
     if (!Number.isFinite(tile.unreadyCount)) return true;
     const total = Number.isFinite(tile.pos?.count) ? tile.pos.count : Infinity;
@@ -8086,12 +8299,26 @@ setOverlayEnabled(on) {
     return;
   }
 
-  this._overlayCache.clear();
+  // CRITICAL: Don't clear overlay cache when enabling - reuse existing overlays
+  // Only clear cache when settings change (zoom level, version, etc.)
+  // this._overlayCache.clear();  // REMOVED - keeps existing satellite tiles
+
   this._primeWaybackVersions();
   for (const tile of this.tiles.values()) {
     if (!tile) continue;
+
+    // CRITICAL: Only mark for texture reapplication, don't refetch overlays
+    // This applies overlays to existing geometry without re-downloading satellite tiles
     tile._texturesApplied = false;
-    this._ensureTileOverlay(tile);
+
+    // Only ensure overlay if tile doesn't already have one
+    // This prevents redundant satellite tile downloads
+    if (!tile._overlay || tile._overlay.status !== 'ready') {
+      this._ensureTileOverlay(tile);
+    } else {
+      // Tile already has overlay - just queue for texture application
+      this._queueTextureApplication(tile, { force: true });
+    }
   }
 }
 
@@ -8165,8 +8392,12 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
       tile._queuedPhases?.clear?.();
 
       if (!tile._phase) tile._phase = {};
-      if (tile.type === 'interactive') tile._phase = { seedDone: false, edgeDone: false, fullDone: false };
-      else tile._phase = { fullDone: false };
+      // GLOBAL PROGRESSIVE LOD: All tiles use same phase structure
+      if (tile.type === 'interactive') {
+        tile._phase = { centerDone: false, cornersDone: false, edgesDone: false, fullDone: false };
+      } else {
+        tile._phase = { centerDone: false, cornersDone: false, fullDone: false };
+      }
 
       if (!tile.locked || tile.locked.length !== tile.pos.count) tile.locked = new Uint8Array(tile.pos.count);
       else tile.locked.fill(0);
@@ -8182,7 +8413,8 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
 
       this._queuePopulate(tile, tile.type === 'interactive');
     }
-    this._fetchPhase = 'interactive';
+    // GLOBAL PROGRESSIVE LOD: Reset to initial phase
+    this._fetchPhase = 'lowres';
     this._markRelaxListDirty();
     this._scheduleBackfill(0);
   }
@@ -8255,7 +8487,8 @@ getRasterColorAt(x, z, { averageRadius = 0, samples = 1 } = {}) {
     this._relaxCursor = 0;
     this._relaxKeysDirty = true;
     this._lastHeight = 0;
-    this._fetchPhase = 'interactive';
+    // GLOBAL PROGRESSIVE LOD: Reset to initial phase
+    this._fetchPhase = 'lowres';
     this._deferredInteractive.clear();
     this._interactiveSecondPass = false;
     this._farfieldAdapterDirty.clear();
