@@ -1,38 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NKN Elevation Forwarder — single-file, venv-bootstrapped, with NKN MultiClient sidecar.
+NKN Elevation Forwarder — geohash-aware (drop-in), venv-bootstrapped.
 
-Flow
-----
-- Python (Flask) <-> Node sidecar (nkn-sdk-js MultiClient) via NDJSON over stdio.
-- Incoming DM payloads:
-    { "id": "...", "type": "elev.query", "locations":[{"lat":..,"lng":..},...], "dataset":"mapzen" }
-  or the generic form:
-    { "id": "...", "type": "http.request", "method":"GET", "url":"/v1/mapzen?locations=56,123" }
-- The forwarder calls local OpenTopo: http://localhost:5000/v1/<dataset>?locations=...
-- Sends DM back:
-    { "id": "...", "type":"http.response", "status":200, "headers":{...}, "body_b64":"...", "duration_ms":N }
+New in this version:
+- 🔐 Persistent NKN identity: generates a seed once and saves it to NKN_SEED_FILE
+  (default sidecar/nkn.seed), then reuses it across restarts. You can still force
+  a specific key by setting NKN_SEED in .env.
 
-HTTP endpoints
---------------
-GET  /healthz
-POST /forward   -> {dest, locations:[{lat,lng},...], dataset?}  (builds elev.query to DM peer; waits for DM reply)
+Other notes:
+- Accepts geohashes or lat/lng over DM and HTTP (OpenTopoData-compatible).
 """
 
 from __future__ import annotations
-import os, sys, subprocess, json, time, uuid, threading, base64, shutil, socket, ssl, re, math
+import os, sys, subprocess, json, time, uuid, threading, base64, shutil, socket, ssl, re, math, hashlib
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
-from collections import deque
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0) Minimal re-exec into a local venv (create once, then fast-start)
+# 0) Minimal re-exec into a local venv
 # ─────────────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 VENV_DIR   = SCRIPT_DIR / ".venv"
 SETUP_MKR  = SCRIPT_DIR / ".forwarder_setup_complete"
+SIDE_DIR   = SCRIPT_DIR / "sidecar"
+SIDECAR_JS = SIDE_DIR / "sidecar.js"
+SIDECAR_PKG = SIDE_DIR / "package.json"
+SIDECAR_NKN = SIDE_DIR / "node_modules" / "nkn-sdk"
+DEFAULT_SEED_RPC = [
+    "https://mainnet-seed-0001.nkn.org/mainnet/api/wallet",
+    "https://mainnet-seed-0002.nkn.org/mainnet/api/wallet",
+    "https://mainnet-seed-0003.nkn.org/mainnet/api/wallet"
+]
+DEFAULT_SEED_WS = [
+    "wss://mainnet-seed-0001.nkn.org/mainnet/ws",
+    "wss://mainnet-seed-0002.nkn.org/mainnet/ws",
+    "wss://mainnet-seed-0003.nkn.org/mainnet/ws"
+]
 
 def _in_venv() -> bool:
     base = getattr(sys, "base_prefix", None)
@@ -58,14 +63,26 @@ def _ensure_venv_and_reexec():
 _ensure_venv_and_reexec()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) First-run pip deps + .env + Node sidecar (nkn-sdk)
+# 1) First-run deps and sidecar
 # ─────────────────────────────────────────────────────────────────────────────
+if SETUP_MKR.exists():
+    missing = []
+    if not SIDE_DIR.is_dir(): missing.append("sidecar/")
+    if not SIDECAR_JS.exists(): missing.append("sidecar.js")
+    if not SIDECAR_PKG.exists(): missing.append("package.json")
+    if not SIDECAR_NKN.exists(): missing.append("nkn-sdk")
+    if missing:
+        print(f"[WARN] Missing sidecar assets ({', '.join(missing)}); re-running setup.", flush=True)
+        try: SETUP_MKR.unlink()
+        except FileNotFoundError: pass
+
 def _pip(*pkgs): subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
 
 if not SETUP_MKR.exists():
     print("[PROCESS] Installing Python dependencies…", flush=True)
     _pip("--upgrade", "pip")
     _pip("flask", "flask-cors", "python-dotenv", "requests", "waitress", "cryptography")
+
     # Write default .env
     env_path = SCRIPT_DIR / ".env"
     if not env_path.exists():
@@ -73,102 +90,99 @@ if not SETUP_MKR.exists():
             "FORWARD_BIND=0.0.0.0\n"
             "FORWARD_PORT=9011\n"
             "FORWARD_FORCE_LOCAL=0\n"
-            "FORWARD_CONCURRENCY=16\n"
-            "FORWARD_RATE_RPS=20\n"
-            "FORWARD_RATE_BURST=40\n"
+            "FORWARD_CONCURRENCY=4\n"
+            "FORWARD_RATE_RPS=6\n"
+            "FORWARD_RATE_BURST=12\n"
             "\n"
-            "# TLS: 0|1|adhoc|generate|mkcert\n"
             "FORWARD_SSL=0\n"
             "FORWARD_SSL_CERT=tls/cert.pem\n"
             "FORWARD_SSL_KEY=tls/key.pem\n"
             "FORWARD_SSL_REFRESH=0\n"
             "FORWARD_SSL_EXTRA_DNS_SANS=\n"
             "\n"
-            "# OpenTopo local service\n"
             "ELEV_BASE=http://localhost:5000\n"
             "ELEV_DATASET=mapzen\n"
             "ELEV_TIMEOUT_MS=10000\n"
             "\n"
-            "# NKN MultiClient sidecar settings\n"
             "NKN_IDENTIFIER=forwarder\n"
-            "NKN_SEED=\n"
-            "NKN_SUBCLIENTS=4\n"
+            "NKN_SEED=\n"                      # you can still hard-pin a seed here
+            "NKN_SEED_FILE=sidecar/nkn.seed\n" # ⬅ seed will be persisted here
+            "NKN_SUBCLIENTS=8\n"
+            "NKN_RESPONSE_TIMEOUT_MS=20000\n"
+            "NKN_MSG_HOLDING_S=90\n"
+            "NKN_WS_HEARTBEAT_MS=120000\n"
+            "NKN_SEND_DELAY_MS=250\n"
+            "NKN_SEND_QUEUE_MAX=256\n"
             "NKN_RPC_ADDRS=\n"
+            "DM_CHUNK_LIMIT_BYTES=1024\n"
         )
         print("[SUCCESS] Wrote .env with defaults.", flush=True)
+
     # Sidecar files
-    SIDE_DIR = SCRIPT_DIR / "sidecar"
     SIDE_DIR.mkdir(parents=True, exist_ok=True)
     (SIDE_DIR / ".gitignore").write_text("node_modules/\npackage-lock.json\n")
-    pkg = SIDE_DIR / "package.json"
-    if not pkg.exists():
+
+    if not SIDECAR_PKG.exists():
         subprocess.check_call(["npm", "init", "-y"], cwd=str(SIDE_DIR))
-    # Write sidecar.js
-    (SIDE_DIR / "sidecar.js").write_text(r"""
-/* NKN sidecar: NDJSON over stdio.
-   Env:
-   - NKN_IDENTIFIER
-   - NKN_SEED (optional; empty = random)
-   - NKN_SUBCLIENTS (int)
-   - NKN_RPC_ADDRS (comma-separated)
-*/
+
+    # keep sidecar minimal; seed persistence is handled in Python before launch
+    SIDECAR_JS.write_text(r"""
 const readline = require('readline');
 const { MultiClient } = require('nkn-sdk');
-
 function ndj(obj){ try{ process.stdout.write(JSON.stringify(obj)+"\n"); }catch{} }
-
 (async () => {
   const identifier = (process.env.NKN_IDENTIFIER || 'forwarder').trim();
   const seed = (process.env.NKN_SEED || '').trim() || undefined;
   const numSubClients = Math.max(1, parseInt(process.env.NKN_SUBCLIENTS || '4', 10));
   const rpcStr = (process.env.NKN_RPC_ADDRS || '').trim();
   const rpcServerAddr = rpcStr ? rpcStr.split(',').map(s=>s.trim()).filter(Boolean) : undefined;
-
+  const seedRpcServerAddr = (process.env.NKN_SEED_RPC_ADDRS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  const seedWsAddr = (process.env.NKN_SEED_WS_ADDRS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  const responseTimeout = Math.max(5000, parseInt(process.env.NKN_RESPONSE_TIMEOUT_MS || '20000', 10) || 20000);
+  const msgHoldingSeconds = Math.max(30, parseInt(process.env.NKN_MSG_HOLDING_S || '90', 10) || 90);
+  const wsConnHeartbeatTimeout = Math.max(30000, parseInt(process.env.NKN_WS_HEARTBEAT_MS || '120000', 10) || 120000);
   let mc;
-  try {
-    mc = new MultiClient({ identifier, seed, numSubClients, originalClient: false, rpcServerAddr });
-  } catch (e) {
-    ndj({ ev:"error", message: String(e && e.message || e) });
-    process.exit(1);
-  }
-
+  try { mc = new MultiClient({
+      identifier,
+      seed,
+      numSubClients,
+      originalClient: false,
+      rpcServerAddr,
+      seedRpcServerAddr: seedRpcServerAddr.length ? seedRpcServerAddr : undefined,
+      seedWsAddr: seedWsAddr.length ? seedWsAddr : undefined,
+      tls: true,
+      responseTimeout,
+      msgHoldingSeconds,
+      msgCacheExpiration: 300000,
+      reconnectIntervalMin: 1000,
+      reconnectIntervalMax: 8000,
+      wsConnHeartbeatTimeout
+    }); }
+  catch (e) { ndj({ ev:"error", message: String(e && e.message || e) }); process.exit(1); }
   mc.onConnect(() => ndj({ ev:"ready", addr: mc.addr }));
   mc.onMessage(({ src, payload }) => {
-    try {
-      const buf = (typeof payload === 'string') ? Buffer.from(payload) : Buffer.from(payload);
-      ndj({ ev:"message", src, payload_b64: buf.toString('base64') });
-    } catch (e) {
-      ndj({ ev:"error", message: "onMessage decode: "+(e && e.message || e) });
-    }
+    try { const buf = (typeof payload === 'string') ? Buffer.from(payload) : Buffer.from(payload);
+      ndj({ ev:"message", src, payload_b64: buf.toString('base64') }); }
+    catch (e) { ndj({ ev:"error", message: "onMessage decode: "+(e && e.message || e) }); }
   });
-
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on('line', async (line) => {
-    let msg;
-    try { msg = JSON.parse(line); } catch { return; }
-    if (!msg || typeof msg !== 'object') return;
+    let msg; try { msg = JSON.parse(line); } catch { return; }
     if (msg.op === 'send') {
-      try {
-        const dest = String(msg.dest || '').trim();
-        if (!dest) return ndj({ ev:"error", message:"missing dest", id: msg.id });
+      try { const dest = String(msg.dest || '').trim(); if (!dest) return ndj({ ev:"error", message:"missing dest", id: msg.id });
         const data = msg.payload_b64 ? Buffer.from(msg.payload_b64, 'base64') : Buffer.alloc(0);
-        await mc.send(dest, data);
-        ndj({ ev:"sent", id: msg.id, dest });
-      } catch (e) {
-        ndj({ ev:"error", id: msg.id, message: String(e && e.message || e) });
-      }
-    } else if (msg.op === 'close') {
-      try { await mc.close(); } catch {}
-      process.exit(0);
-    }
+        await mc.send(dest, data); ndj({ ev:"sent", id: msg.id, dest }); }
+      catch (e) { ndj({ ev:"error", id: msg.id, message: String(e && e.message || e) }); }
+    } else if (msg.op === 'close') { try { await mc.close(); } catch {} process.exit(0); }
   });
-
   process.on('SIGINT', async ()=>{ try{ await mc.close(); }catch{} process.exit(0); });
   process.on('SIGTERM', async ()=>{ try{ await mc.close(); }catch{} process.exit(0); });
 })();
 """)
+
     print("[PROCESS] Installing Node sidecar dependency (nkn-sdk)…", flush=True)
     subprocess.check_call(["npm", "install", "nkn-sdk@latest", "--no-fund", "--silent"], cwd=str(SIDE_DIR))
+
     SETUP_MKR.write_text("ok")
     print("[SUCCESS] Setup complete. Restarting…", flush=True)
     os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -176,7 +190,7 @@ function ndj(obj){ try{ process.stdout.write(JSON.stringify(obj)+"\n"); }catch{}
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) Runtime deps & env
 # ─────────────────────────────────────────────────────────────────────────────
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import requests
@@ -186,9 +200,9 @@ load_dotenv(SCRIPT_DIR / ".env")
 FORWARD_BIND        = os.getenv("FORWARD_BIND", "0.0.0.0")
 FORWARD_PORT        = int(os.getenv("FORWARD_PORT", "9011"))
 FORWARD_FORCE_LOCAL = os.getenv("FORWARD_FORCE_LOCAL", "0") == "1"
-FORWARD_CONCURRENCY = max(1, int(os.getenv("FORWARD_CONCURRENCY", "16")))
-FORWARD_RATE_RPS    = max(1, int(os.getenv("FORWARD_RATE_RPS", "20")))
-FORWARD_RATE_BURST  = max(1, int(os.getenv("FORWARD_RATE_BURST", "40")))
+FORWARD_CONCURRENCY = max(1, min(4, int(os.getenv("FORWARD_CONCURRENCY", "4"))))
+FORWARD_RATE_RPS    = max(1, min(6, int(os.getenv("FORWARD_RATE_RPS", "6"))))
+FORWARD_RATE_BURST  = max(1, min(12, int(os.getenv("FORWARD_RATE_BURST", "12"))))
 
 FORWARD_SSL_MODE    = (os.getenv("FORWARD_SSL", "0") or "0").lower()
 FORWARD_SSL_CERT    = os.getenv("FORWARD_SSL_CERT", "tls/cert.pem")
@@ -202,143 +216,76 @@ ELEV_TIMEOUT_MS     = int(os.getenv("ELEV_TIMEOUT_MS", "10000"))
 
 NKN_IDENTIFIER      = os.getenv("NKN_IDENTIFIER", "forwarder")
 NKN_SEED            = os.getenv("NKN_SEED", "").strip()
-NKN_SUBCLIENTS      = max(1, int(os.getenv("NKN_SUBCLIENTS", "4")))
+NKN_SEED_FILE       = os.getenv("NKN_SEED_FILE", "sidecar/nkn.seed").strip()  # ⬅ added
+NKN_SUBCLIENTS      = max(1, min(8, int(os.getenv("NKN_SUBCLIENTS", "8"))))
 NKN_RPC_ADDRS       = [s.strip() for s in os.getenv("NKN_RPC_ADDRS","").split(",") if s.strip()]
+DM_CHUNK_LIMIT_BYTES = max(0, int(os.getenv("DM_CHUNK_LIMIT_BYTES", "800000")))  # hard cap ~800 KB per chunk
+NKN_RESPONSE_TIMEOUT_MS = max(5000, int(os.getenv("NKN_RESPONSE_TIMEOUT_MS", "20000")))
+NKN_MSG_HOLDING_S      = max(30, int(os.getenv("NKN_MSG_HOLDING_S", "90")))
+NKN_WS_HEARTBEAT_MS    = max(30000, int(os.getenv("NKN_WS_HEARTBEAT_MS", "120000")))
+NKN_SEND_DELAY_MS      = max(0, int(os.getenv("NKN_SEND_DELAY_MS", "250")))
+NKN_SEND_QUEUE_MAX     = max(32, int(os.getenv("NKN_SEND_QUEUE_MAX", "256")))
+NKN_SEED_RPC_ADDRS     = [s.strip() for s in os.getenv("NKN_SEED_RPC_ADDRS", "").split(",") if s.strip()]
+NKN_SEED_WS_ADDRS      = [s.strip() for s in os.getenv("NKN_SEED_WS_ADDRS", "").split(",") if s.strip()]
 
 TLS_DIR             = SCRIPT_DIR / "tls"
 TLS_DIR.mkdir(exist_ok=True, parents=True)
 
-class ForwarderMetrics:
-    def __init__(self):
-        self.lock = threading.Lock()
-        now = time.time()
-        self.started_at = now
-        self.forward_total = 0
-        self.forward_success = 0
-        self.forward_failure = 0
-        self.forward_timeouts = 0
-        self.forward_inflight = 0
-        self.forward_max_inflight = 0
-        self.forward_last_status = None
-        self.forward_last_duration_ms = None
-        self.forward_duration_samples = deque(maxlen=200)
-        self.forward_duration_sum = 0.0
-        self.last_forward_at = None
-        self.last_forward_success_at = None
-        self.last_forward_error_at = None
-        self.last_forward_error = None
-        self.dm_total = 0
-        self.dm_health = 0
-        self.dm_query = 0
-        self.dm_invalid = 0
-        self.last_health_at = None
-        self.last_health_payload = None
-        self.sidecar_errors = 0
-        self.last_sidecar_error = None
-        self.last_sidecar_error_at = None
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.1) Ensure a persistent NKN seed (so the address is stable across restarts)
+# ─────────────────────────────────────────────────────────────────────────────
+def _ensure_persisted_seed():
+    """
+    Ensures env var NKN_SEED is set, loading it from NKN_SEED_FILE or generating
+    a new one (via Node 'nkn-sdk' Wallet) and saving it to disk (0600).
+    """
+    global NKN_SEED
+    if NKN_SEED:
+        # explicit seed provided; do not overwrite file
+        print(f"[PROCESS] Using NKN_SEED from environment (length={len(NKN_SEED)}).", flush=True)
+        return
 
-    def start_forward(self):
-        with self.lock:
-            self.forward_total += 1
-            self.forward_inflight += 1
-            if self.forward_inflight > self.forward_max_inflight:
-                self.forward_max_inflight = self.forward_inflight
-            self.last_forward_at = time.time()
+    seed_path = (SCRIPT_DIR / NKN_SEED_FILE).resolve()
+    try:
+        if seed_path.exists():
+            seed = seed_path.read_text(encoding="utf-8").strip()
+            if seed:
+                os.environ["NKN_SEED"] = seed
+                NKN_SEED = seed
+                print(f"[PROCESS] Loaded persisted NKN seed from {seed_path}", flush=True)
+                return
+    except Exception as e:
+        print(f"[WARN] Could not read NKN_SEED_FILE: {e}", flush=True)
 
-    def finish_forward(self, duration_ms: float, ok: bool, status: Optional[int] = None, error: Optional[Exception] = None):
-        now = time.time()
-        with self.lock:
-            self.forward_inflight = max(0, self.forward_inflight - 1)
-            if duration_ms is not None:
-                clamped = max(0.0, float(duration_ms))
-                self.forward_last_duration_ms = clamped
-                self.forward_duration_samples.append(clamped)
-                self.forward_duration_sum += clamped
-            if status is not None:
-                self.forward_last_status = int(status)
-            if ok:
-                self.forward_success += 1
-                self.last_forward_success_at = now
-            else:
-                self.forward_failure += 1
-                if error:
-                    msg = str(error)
-                    self.last_forward_error = msg
-                    if 'timeout' in msg.lower():
-                        self.forward_timeouts += 1
-                else:
-                    self.last_forward_error = None
-                self.last_forward_error_at = now
-
-    def record_dm(self, kind: str, ok: bool = True):
-        with self.lock:
-            self.dm_total += 1
-            if kind == 'health':
-                self.dm_health += 1
-                self.last_health_at = time.time()
-            elif kind == 'query':
-                if ok:
-                    self.dm_query += 1
-                else:
-                    self.dm_invalid += 1
-            elif not ok:
-                self.dm_invalid += 1
-
-    def record_health_payload(self, payload: Dict[str, Any]):
-        with self.lock:
-            self.last_health_payload = payload
-            self.last_health_at = time.time()
-
-    def note_sidecar_error(self, message: str):
-        with self.lock:
-            self.sidecar_errors += 1
-            self.last_sidecar_error = message
-            self.last_sidecar_error_at = time.time()
-
-    def snapshot(self) -> Dict[str, Any]:
-        now = time.time()
-        with self.lock:
-            durations = list(self.forward_duration_samples)
-            avg_ms = (sum(durations) / len(durations)) if durations else 0.0
-            p95_ms = 0.0
-            if durations:
-                ordered = sorted(durations)
-                idx = min(len(ordered) - 1, max(0, int(math.ceil(len(ordered) * 0.95)) - 1))
-                p95_ms = ordered[idx]
-            return {
-                "uptime_s": round(now - self.started_at, 3),
-                "forward": {
-                    "total": self.forward_total,
-                    "success": self.forward_success,
-                    "failure": self.forward_failure,
-                    "timeouts": self.forward_timeouts,
-                    "inflight": self.forward_inflight,
-                    "max_inflight": self.forward_max_inflight,
-                    "avg_ms": round(avg_ms, 3),
-                    "p95_ms": round(p95_ms, 3),
-                    "last_duration_ms": self.forward_last_duration_ms,
-                    "last_status": self.forward_last_status,
-                    "last_request_ts": int(self.last_forward_at * 1000) if self.last_forward_at else None,
-                    "last_success_ts": int(self.last_forward_success_at * 1000) if self.last_forward_success_at else None,
-                    "last_error": self.last_forward_error,
-                    "last_error_ts": int(self.last_forward_error_at * 1000) if self.last_forward_error_at else None,
-                },
-                "dm": {
-                    "total": self.dm_total,
-                    "health": self.dm_health,
-                    "query": self.dm_query,
-                    "invalid": self.dm_invalid,
-                    "last_health_ts": int(self.last_health_at * 1000) if self.last_health_at else None,
-                },
-                "sidecar": {
-                    "errors": self.sidecar_errors,
-                    "last_error": self.last_sidecar_error,
-                    "last_error_ts": int(self.last_sidecar_error_at * 1000) if self.last_sidecar_error_at else None,
-                },
-                "last_health_payload": self.last_health_payload,
-            }
-
-METRICS = ForwarderMetrics()
+    # Generate a seed using Node's nkn-sdk (so format is guaranteed)
+    try:
+        SIDE_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "node", "-e",
+            r"""
+const { Wallet } = require('nkn-sdk');
+const w = new Wallet();
+const s = (typeof w.getSeed==='function') ? w.getSeed() : (w.seed || '');
+if (!s) { process.stderr.write('no-seed'); process.exit(1); }
+process.stdout.write(s);
+"""
+        ]
+        seed = subprocess.check_output(cmd, cwd=str(SIDE_DIR)).decode("utf-8", "ignore").strip()
+        if not seed:
+            raise RuntimeError("empty seed from wallet")
+        seed_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(seed_path, "w", encoding="utf-8") as f:
+            f.write(seed)
+        try:
+            os.chmod(seed_path, 0o600)
+        except Exception:
+            pass
+        os.environ["NKN_SEED"] = seed
+        NKN_SEED = seed
+        print(f"[SUCCESS] Generated and persisted new NKN seed at {seed_path}", flush=True)
+    except Exception as e:
+        print(f"[ERR] Failed to generate NKN seed using Node sidecar deps: {e}", flush=True)
+        # Sidecar will fall back to ephemeral if we proceed without a seed.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) Small logging, rate limit, semaphore
@@ -348,6 +295,35 @@ def log(msg, cat="INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c = CLR.get(cat, ""); e = CLR["RESET"] if c else ""
     print(f"{c}[{ts}] {cat}: {msg}{e}", flush=True)
+
+METRICS = {
+    "dm_received": 0,
+    "dm_errors": 0,
+    "dm_forwarded": 0,
+    "dm_chunked_out": 0,
+    "dm_bytes_in": 0,
+    "dm_bytes_out": 0,
+    "http_calls": 0,
+    "http_fail": 0,
+}
+
+def _bump(key: str, delta: int = 1):
+    try:
+        METRICS[key] = METRICS.get(key, 0) + delta
+    except Exception:
+        pass
+
+def _fmt_kb(num: int) -> str:
+    try:
+        return f"{num/1024:.1f} KB"
+    except Exception:
+        return f"{num} B"
+
+def _metrics_summary() -> str:
+    ok = METRICS.get("dm_forwarded", 0)
+    err = METRICS.get("dm_errors", 0)
+    chunked = METRICS.get("dm_chunked_out", 0)
+    return f"ok={ok} err={err} chunked={chunked} in={_fmt_kb(METRICS.get('dm_bytes_in',0))} out={_fmt_kb(METRICS.get('dm_bytes_out',0))}"
 
 from threading import Semaphore, Lock
 _CONC = Semaphore(FORWARD_CONCURRENCY)
@@ -369,12 +345,9 @@ def _rate_ok(ip: str) -> bool:
         return True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) NKN sidecar supervisor (Node process) — NDJSON bridge
+# 4) NKN sidecar supervisor — NDJSON bridge
 # ─────────────────────────────────────────────────────────────────────────────
 import threading, queue
-
-SIDE_DIR = SCRIPT_DIR / "sidecar"
-SIDECAR_JS = SIDE_DIR / "sidecar.js"
 
 class Sidecar:
     def __init__(self):
@@ -383,15 +356,34 @@ class Sidecar:
         self.addr = None
         self.events = queue.Queue()   # (ev, data_dict)
         self.lock = threading.Lock()
+        self.send_q: "queue.Queue[Tuple[str,str,str]]" = queue.Queue(maxsize=NKN_SEND_QUEUE_MAX)
+        self.stop_evt = threading.Event()
+        self.sender = None
     def start(self):
         if not shutil.which("node"):
             log("Node.js is required (not found on PATH).", "ERR"); sys.exit(1)
+
+        # Ensure we have a persistent seed before launching the sidecar:
+        _ensure_persisted_seed()
+
         env = os.environ.copy()
         env["NKN_IDENTIFIER"] = NKN_IDENTIFIER
-        env["NKN_SEED"] = NKN_SEED
+        env["NKN_SEED"] = os.getenv("NKN_SEED", "").strip()  # may be set by _ensure_persisted_seed()
         env["NKN_SUBCLIENTS"] = str(NKN_SUBCLIENTS)
         if NKN_RPC_ADDRS:
             env["NKN_RPC_ADDRS"] = ",".join(NKN_RPC_ADDRS)
+        env["NKN_RESPONSE_TIMEOUT_MS"] = str(NKN_RESPONSE_TIMEOUT_MS)
+        env["NKN_MSG_HOLDING_S"] = str(NKN_MSG_HOLDING_S)
+        env["NKN_WS_HEARTBEAT_MS"] = str(NKN_WS_HEARTBEAT_MS)
+        if NKN_SEED_RPC_ADDRS:
+            env["NKN_SEED_RPC_ADDRS"] = ",".join(NKN_SEED_RPC_ADDRS)
+        else:
+            env["NKN_SEED_RPC_ADDRS"] = ",".join(DEFAULT_SEED_RPC)
+        if NKN_SEED_WS_ADDRS:
+            env["NKN_SEED_WS_ADDRS"] = ",".join(NKN_SEED_WS_ADDRS)
+        else:
+            env["NKN_SEED_WS_ADDRS"] = ",".join(DEFAULT_SEED_WS)
+
         self.proc = subprocess.Popen(
             ["node", str(SIDECAR_JS)],
             cwd=str(SIDE_DIR),
@@ -412,12 +404,36 @@ class Sidecar:
                     log(f"NKN sidecar ready: {self.addr}", "SUCCESS")
                 self.events.put((ev, obj))
         self.reader = threading.Thread(target=_read, daemon=True, name="nkn-reader"); self.reader.start()
-    def send(self, dest: str, payload_b64: str, msg_id: str):
+        self.sender = threading.Thread(target=self._drain_send_queue, daemon=True, name="nkn-send"); self.sender.start()
+
+    def _drain_send_queue(self):
+        delay = NKN_SEND_DELAY_MS / 1000.0
+        while not self.stop_evt.is_set():
+            try:
+                dest, payload_b64, msg_id = self.send_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._send_now(dest, payload_b64, msg_id)
+            except Exception as e:
+                log(f"send queue error ({msg_id}): {e}", "WARN")
+            if delay > 0:
+                time.sleep(delay)
+
+    def _send_now(self, dest: str, payload_b64: str, msg_id: str):
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("sidecar not running")
         cmd = {"op":"send", "id": msg_id, "dest": dest, "payload_b64": payload_b64}
         self.proc.stdin.write(json.dumps(cmd)+"\n"); self.proc.stdin.flush()
+
+    def send(self, dest: str, payload_b64: str, msg_id: str):
+        try:
+            self.send_q.put((dest, payload_b64, msg_id), timeout=1.0)
+        except queue.Full:
+            raise RuntimeError("sidecar send queue is full; backpressure active")
+
     def close(self):
+        self.stop_evt.set()
         try:
             if self.proc and self.proc.stdin:
                 self.proc.stdin.write(json.dumps({"op":"close"})+"\n"); self.proc.stdin.flush()
@@ -431,119 +447,368 @@ import asyncio
 _pending: Dict[str, asyncio.Future] = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) DM dispatcher thread: consume sidecar events
+# 5) Geohash utilities (pure Python; no deps)
+# ─────────────────────────────────────────────────────────────────────────────
+_GH32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+_GHMAP = {c:i for i,c in enumerate(_GH32)}
+
+def geohash_decode(gh: str) -> Tuple[float, float]:
+    even = True
+    lat_min, lat_max = -90.0, 90.0
+    lon_min, lon_max = -180.0, 180.0
+    for c in gh.strip():
+        val = _GHMAP.get(c)
+        if val is None: raise ValueError(f"invalid geohash char: {c}")
+        for mask in (16,8,4,2,1):
+            if even:
+                mid = (lon_min + lon_max) / 2
+                if val & mask: lon_min = mid
+                else:          lon_max = mid
+            else:
+                mid = (lat_min + lat_max) / 2
+                if val & mask: lat_min = mid
+                else:          lat_max = mid
+            even = not even
+    return ( (lat_min + lat_max) / 2, (lon_min + lon_max) / 2 )
+
+def _looks_like_geohash_token(tok: str) -> bool:
+    tok = tok.strip().lower()
+    if not tok or ("," in tok) or (" " in tok): return False
+    return all(ch in _GHMAP for ch in tok)
+
+def _parse_locations_or_geohashes(payload: Dict[str, Any]) -> Tuple[str, List[Tuple[float,float]], Optional[List[str]]]:
+    """
+    Returns (mode, latlng_list, geohashes_or_None)
+      mode: "geohash" or "latlng"
+    Accepts:
+      - payload["geohashes"]: list[str] or "gh|gh|gh"
+      - payload["locations"]: list[{lat,lng}] or list["gh","gh"] or "lat,lng|..." or "gh|gh|..."
+    """
+    # 1) explicit geohashes
+    if "geohashes" in payload and payload["geohashes"]:
+        if isinstance(payload["geohashes"], str):
+            ghs = [t for t in payload["geohashes"].split("|") if t.strip()]
+        else:
+            ghs = [str(t).strip() for t in payload["geohashes"] if str(t).strip()]
+        latlng = [geohash_decode(g) for g in ghs]
+        return "geohash", latlng, ghs
+
+    # 2) locations as list/str — could be lat/lng or geohash strings
+    locs = payload.get("locations")
+    if isinstance(locs, list) and locs:
+        if isinstance(locs[0], dict) and ("lat" in locs[0]) and ("lng" in locs[0]):
+            return "latlng", [(float(p["lat"]), float(p["lng"])) for p in locs], None
+        if isinstance(locs[0], str):
+            toks = [t.strip() for t in locs if t.strip()]
+            if toks and all(_looks_like_geohash_token(t) for t in toks):
+                latlng = [geohash_decode(g) for g in toks]
+                return "geohash", latlng, toks
+            pairs: List[Tuple[float,float]] = []
+            for t in toks:
+                if "," not in t: raise ValueError("locations[] token missing comma")
+                a,b = t.split(",",1)
+                pairs.append((float(a),float(b)))
+            return "latlng", pairs, None
+
+    if isinstance(locs, str) and locs.strip():
+        toks = [t for t in locs.split("|") if t.strip()]
+        if toks and all(_looks_like_geohash_token(t) for t in toks):
+            latlng = [geohash_decode(g) for g in toks]
+            return "geohash", latlng, toks
+        pairs: List[Tuple[float,float]] = []
+        for t in toks:
+            a,b = t.split(",",1)
+            pairs.append((float(a),float(b)))
+        return "latlng", pairs, None
+
+    raise ValueError("No locations/geohashes provided")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) Upstream call helper
 # ─────────────────────────────────────────────────────────────────────────────
 def _now_ms() -> int: return int(time.time()*1000)
 
-def _http_elev_query(locations: Any, dataset: Optional[str]) -> Dict[str, Any]:
-    """Call http://localhost:5000/v1/<dataset>?locations=... and return dict with status, headers, body_b64, duration_ms"""
-    if isinstance(locations, str):
-        loc_q = locations.strip()
-    elif isinstance(locations, list):
-        # expect list of {lat,lng}
-        pairs = []
-        for p in locations:
-            lat = p.get("lat"); lng = p.get("lng")
-            pairs.append(f"{lat},{lng}")
-        loc_q = "|".join(pairs)
-    else:
-        raise ValueError("locations must be string or list[{lat,lng}]")
+def _http_elev_query_from_latlng(latlng: List[Tuple[float,float]], dataset: Optional[str]) -> Dict[str, Any]:
+    pairs = [f"{lat:.6f},{lng:.6f}" for (lat,lng) in latlng]
+    loc_q = "|".join(pairs)
     ds = (dataset or ELEV_DATASET).strip() or ELEV_DATASET
     url = f"{ELEV_BASE}/v1/{ds}?locations={requests.utils.quote(loc_q, safe='|,')}"
     t0 = _now_ms()
-    METRICS.start_forward()
-    status_code = None
     try:
         resp = requests.get(url, timeout=ELEV_TIMEOUT_MS/1000.0)
         dur = _now_ms() - t0
-        status_code = resp.status_code
         body = resp.content or b""
         headers = {str(k): str(v) for k, v in resp.headers.items()}
-        METRICS.finish_forward(dur, True, status=status_code)
         return {"status": resp.status_code, "headers": headers, "body_b64": base64.b64encode(body).decode(), "duration_ms": dur}
     except Exception as e:
-        dur = _now_ms() - t0
-        METRICS.finish_forward(dur, False, status=status_code, error=e)
-        return {"status": 502, "headers": {"content-type":"application/json"}, "body_b64": base64.b64encode(json.dumps({"error": f"upstream failure: {e}"}).encode()).decode(), "duration_ms": dur}
+        return {"status": 502, "headers": {"content-type":"application/json"},
+                "body_b64": base64.b64encode(json.dumps({"error": f"upstream failure: {e}"}).encode()).decode(),
+                "duration_ms": 0}
 
+def _compute_chunk_limit(msg: Dict[str, Any]) -> int:
+    """Determine chunk size for DM responses (raw bytes per chunk)."""
+    base = DM_CHUNK_LIMIT_BYTES
+    raw = msg.get("max_chunk_bytes") or msg.get("chunk_bytes")
+    limit = base
+    if raw is not None:
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            limit = base
+    if limit is None:
+        limit = base
+    if limit <= 0:
+        return 0
+    if base > 0:
+        return min(limit, base)
+    return limit
+
+def _decode_body(resp: Dict[str, Any]) -> bytes:
+    b64 = resp.get("body_b64")
+    if not b64:
+        return b""
+    try:
+        data = b64 if isinstance(b64, (bytes, bytearray)) else str(b64).encode()
+        return base64.b64decode(data)
+    except Exception:
+        return b""
+
+def _emit_chunked_response(src: str, resp: Dict[str, Any], rid: str, body: bytes, chunk_limit: int):
+    if not body:
+        wire = base64.b64encode(json.dumps(resp, separators=(",",":")).encode()).decode()
+        sidecar.send(src, wire, msg_id=rid)
+        return
+    chunk_size = max(1, chunk_limit)
+    total = len(body)
+    chunk_count = max(1, math.ceil(total / chunk_size))
+    digest = hashlib.sha256(body).hexdigest()
+    for idx in range(chunk_count):
+        start = idx * chunk_size
+        chunk = body[start:start+chunk_size]
+        chunk_msg = {
+            "type": "http.chunk",
+            "id": rid,
+            "chunk_index": idx,
+            "chunk_count": chunk_count,
+            "bytes_total": total,
+            "body_b64": base64.b64encode(chunk).decode()
+        }
+        wire = base64.b64encode(json.dumps(chunk_msg, separators=(",",":")).encode()).decode()
+        sidecar.send(src, wire, msg_id=f"{rid}-chunk-{idx}")
+    resp = dict(resp)
+    resp["chunked"] = True
+    resp["chunk_count"] = chunk_count
+    resp["bytes_total"] = total
+    resp["body_digest"] = digest
+    resp["body_b64"] = ""
+    wire_resp = base64.b64encode(json.dumps(resp, separators=(",",":")).encode()).decode()
+    sidecar.send(src, wire_resp, msg_id=rid)
+
+def _send_http_response(src: str, mid: str, resp: Dict[str, Any], chunk_limit: int):
+    rid = mid or resp.get("id") or uuid.uuid4().hex
+    meta = {"bytes_total": 0, "chunk_count": 0, "chunk_limit": chunk_limit or 0}
+    payload = dict(resp)
+    payload["id"] = rid
+    body_len = len(_decode_body(payload))
+    meta["bytes_total"] = body_len
+    if chunk_limit > 0:
+        body = _decode_body(payload)
+        if len(body) > chunk_limit:
+            chunk_count = math.ceil(len(body) / max(1, chunk_limit))
+            meta["chunk_count"] = chunk_count
+            _emit_chunked_response(src, payload, rid, body, chunk_limit)
+            return meta
+    wire = base64.b64encode(json.dumps(payload, separators=(",",":")).encode()).decode()
+    sidecar.send(src, wire, msg_id=rid)
+    return meta
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) Dispatcher consuming sidecar events
+# ─────────────────────────────────────────────────────────────────────────────
 def _handle_incoming_dm(src: str, payload_b64: str):
+    _bump("dm_received")
     try:
         raw = base64.b64decode(payload_b64) if payload_b64 else b""
         msg = json.loads(raw.decode("utf-8", "ignore") or "{}")
     except Exception:
+        _bump("dm_errors")
         return
+    _bump("dm_bytes_in", len(raw))
     t = str(msg.get("type","")).lower()
     mid = str(msg.get("id") or "")
+    chunk_limit = _compute_chunk_limit(msg)
+
+    if t == "ping":
+        reply = {
+            "id": mid or uuid.uuid4().hex,
+            "type": "pong",
+            "ts": int(time.time()*1000),
+            "addr": sidecar.addr
+        }
+        wire = base64.b64encode(json.dumps(reply, separators=(",",":")).encode()).decode()
+        sidecar.send(src, wire, msg_id=mid or uuid.uuid4().hex)
+        log(f"[DM] pong → {src} id={mid or 'auto'}", "INFO")
+        return
+
+    # Fulfill /forward futures
     if t == "http.response" and mid:
-        # fulfill pending /forward
         fut = _pending.pop(mid, None)
         if fut and not fut.done():
             fut.set_result(msg)
         return
 
-    if t == "health":
-        reply = {
-            "id": mid or uuid.uuid4().hex,
-            "type": "health.response",
-            "status": "ok",
-            "forwarder": sidecar.addr,
-            "time": datetime.utcnow().isoformat() + "Z",
-            "metrics": METRICS.snapshot(),
-            "dm_pending": len(_pending),
-        }
-        METRICS.record_dm("health")
-        METRICS.record_health_payload(reply)
-        sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
-        return
-
     if t in ("elev.query", "http.request"):
-        # Forward to OpenTopo and reply to src with same id
+        started = time.time()
         if t == "elev.query":
             dataset  = msg.get("dataset") or ELEV_DATASET
-            locations = msg.get("locations")
             try:
-                with _CONC:
-                    resp = _http_elev_query(locations, dataset)
+                mode, latlng, gh_list = _parse_locations_or_geohashes(msg)
             except Exception as e:
-                resp = {"status": 500, "headers":{"content-type":"application/json"},
-                        "body_b64": base64.b64encode(json.dumps({"error": str(e)}).encode()).decode(),
-                        "duration_ms": 0}
+                reply = {"id": mid or uuid.uuid4().hex, "type":"http.response",
+                         "status": 400, "headers": {"content-type":"application/json"},
+                         "body_b64": base64.b64encode(json.dumps({"error": f"bad request: {e}"}).encode()).decode(),
+                         "duration_ms": 0}
+                _bump("dm_errors")
+                _send_http_response(src, mid, reply, chunk_limit)
+                log(f"[DM] elev.query ❌ bad request from {src} id={mid or 'n/a'} err={e} chunkLimit={_fmt_kb(chunk_limit)}", "WARN")
+                return
+
+            with _CONC:
+                resp = _http_elev_query_from_latlng(latlng, dataset)
+            _bump("http_calls")
+            if mode == "geohash" and gh_list is not None:
+                try:
+                    body_bytes = base64.b64decode(resp.get("body_b64") or b"")
+                    upstream = json.loads(body_bytes.decode("utf-8","ignore") or "{}")
+                    results = upstream.get("results") or []
+                    out = []
+                    if len(results) == len(gh_list):
+                        for gh, r in zip(gh_list, results):
+                            elev = r.get("elevation", None)
+                            out.append({"geohash": gh, "elevation": elev})
+                    else:
+                        m = {}
+                        for r in results:
+                            loc = r.get("location") or {}
+                            k = f'{float(loc.get("lat",0.0)):.6f},{float(loc.get("lng",0.0)):.6f}'
+                            m[k] = r.get("elevation", None)
+                        for gh, (lat,lng) in zip(gh_list, latlng):
+                            k = f"{lat:.6f},{lng:.6f}"
+                            out.append({"geohash": gh, "elevation": m.get(k)})
+                    body = json.dumps({"results": out}, separators=(",",":")).encode()
+                    resp["body_b64"] = base64.b64encode(body).decode()
+                    resp["headers"] = dict(resp.get("headers") or {})
+                    resp["headers"]["content-type"] = "application/json"
+                except Exception as e:
+                    log(f"repack failed (geohash mode): {e}", "WARN")
+
             reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
-            METRICS.record_dm("query", ok=isinstance(resp.get("status"), int) and resp["status"] < 500)
-            sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
+            meta = _send_http_response(src, mid, reply, chunk_limit) or {}
+            dur_ms = resp.get("duration_ms", 0)
+            status = resp.get("status")
+            ok = isinstance(status, int) and status < 500
+            _bump("dm_forwarded")
+            if not ok:
+                _bump("dm_errors"); _bump("http_fail")
+            if meta.get("bytes_total"):
+                _bump("dm_bytes_out", meta["bytes_total"])
+            if meta.get("chunk_count"):
+                _bump("dm_chunked_out", meta["chunk_count"])
+            log(f"[DM] elev.query → {src} id={mid or reply['id']} mode={mode} geos={len(gh_list or latlng)} chunkLimit={_fmt_kb(meta.get('chunk_limit',0))} "
+                f"resp={status} bytes={_fmt_kb(meta.get('bytes_total',0))} chunks={meta.get('chunk_count',0)} upstream={dur_ms}ms in={len(raw)}B stats={_metrics_summary()}",
+                "SUCCESS" if ok else "WARN")
             return
 
         if t == "http.request":
-            # VERY limited support: only GET to /v1/<dataset>?locations=...
             method = str(msg.get("method","GET")).upper()
             url    = str(msg.get("url","")).strip()
             if method != "GET" or not url.startswith("/v1/"):
-                METRICS.record_dm("query", ok=False)
                 body = base64.b64encode(json.dumps({"error":"only GET /v1/<dataset>?locations=... supported"}).encode()).decode()
-                sidecar.send(src, base64.b64encode(json.dumps({"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
+                reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}
+                _send_http_response(src, mid, reply, chunk_limit)
+                _bump("dm_errors")
+                log(f"[DM] http.request ❌ invalid method/url from {src} id={mid or reply['id']} url={url}", "WARN")
                 return
-            # Extract dataset and locations; pass to OpenTopo
             m = re.match(r"^/v1/([^?]+)\?locations=(.+)$", url)
             if not m:
-                METRICS.record_dm("query", ok=False)
                 body = base64.b64encode(json.dumps({"error":"missing locations"}).encode()).decode()
-                sidecar.send(src, base64.b64encode(json.dumps({"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
+                reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}
+                _send_http_response(src, mid, reply, chunk_limit)
+                _bump("dm_errors")
+                log(f"[DM] http.request ❌ missing locations from {src} id={mid or reply['id']}", "WARN")
                 return
             dataset = m.group(1)
-            # locations may be URL-encoded already; send as-is to our _http_elev_query
+            locs_q = requests.utils.unquote(m.group(2))
             try:
+                if "|" in locs_q and ("," not in locs_q):
+                    gh_list = [t for t in locs_q.split("|") if t.strip()]
+                    latlng = [geohash_decode(g) for g in gh_list]
+                    with _CONC:
+                        resp = _http_elev_query_from_latlng(latlng, dataset)
+                    _bump("http_calls")
+                    try:
+                        body_bytes = base64.b64decode(resp.get("body_b64") or b"")
+                        upstream = json.loads(body_bytes.decode("utf-8","ignore") or "{}")
+                        results = upstream.get("results") or []
+                        out = []
+                        if len(results) == len(gh_list):
+                            for gh, r in zip(gh_list, results):
+                                out.append({"geohash": gh, "elevation": r.get("elevation")})
+                        else:
+                            mlat = {}
+                            for r in results:
+                                loc = r.get("location") or {}
+                                k = f'{float(loc.get("lat",0.0)):.6f},{float(loc.get("lng",0.0)):.6f}'
+                                mlat[k] = r.get("elevation", None)
+                            for gh, (lat,lng) in zip(gh_list, latlng):
+                                out.append({"geohash": gh, "elevation": mlat.get(f"{lat:.6f},{lng:.6f}")})
+                        body = json.dumps({"results": out}, separators=(",",":")).encode()
+                        resp["body_b64"] = base64.b64encode(body).decode()
+                        resp["headers"] = dict(resp.get("headers") or {})
+                        resp["headers"]["content-type"] = "application/json"
+                    except Exception as e:
+                        log(f"repack failed (http.request geohash): {e}", "WARN")
+                    reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
+                    meta = _send_http_response(src, mid, reply, chunk_limit) or {}
+                    status = resp.get("status")
+                    ok = isinstance(status, int) and status < 500
+                    if not ok:
+                        _bump("dm_errors"); _bump("http_fail")
+                    _bump("dm_forwarded")
+                    if meta.get("bytes_total"):
+                        _bump("dm_bytes_out", meta["bytes_total"])
+                    if meta.get("chunk_count"):
+                        _bump("dm_chunked_out", meta["chunk_count"])
+                    log(f"[DM] http.request → {src} id={mid or reply['id']} gh={len(gh_list)} chunkLimit={_fmt_kb(meta.get('chunk_limit',0))} "
+                        f"resp={status} bytes={_fmt_kb(meta.get('bytes_total',0))} chunks={meta.get('chunk_count',0)} stats={_metrics_summary()}", "SUCCESS" if ok else "WARN")
+                    return
+                pairs = [t for t in locs_q.split("|") if t.strip()]
+                _ = [tuple(map(float, p.split(",",1))) for p in pairs]
                 with _CONC:
-                    resp = _http_elev_query(m.group(2), dataset)
+                    resp = _http_elev_query_from_latlng(_, dataset)
+                _bump("http_calls")
+                reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
+                meta = _send_http_response(src, mid, reply, chunk_limit) or {}
+                status = resp.get("status")
+                ok = isinstance(status, int) and status < 500
+                if not ok:
+                    _bump("dm_errors"); _bump("http_fail")
+                _bump("dm_forwarded")
+                if meta.get("bytes_total"):
+                    _bump("dm_bytes_out", meta["bytes_total"])
+                if meta.get("chunk_count"):
+                    _bump("dm_chunked_out", meta.get("chunk_count"))
+                log(f"[DM] http.request → {src} id={mid or reply['id']} locs={len(_)} chunkLimit={_fmt_kb(meta.get('chunk_limit',0))} "
+                    f"resp={status} bytes={_fmt_kb(meta.get('bytes_total',0))} chunks={meta.get('chunk_count',0)} stats={_metrics_summary()}", "SUCCESS" if ok else "WARN")
+                return
             except Exception as e:
-                resp = {"status": 500, "headers":{"content-type":"application/json"},
-                        "body_b64": base64.b64encode(json.dumps({"error": str(e)}).encode()).decode(),
-                        "duration_ms": 0}
-            reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", **resp}
-            METRICS.record_dm("query", ok=isinstance(resp.get("status"), int) and resp["status"] < 500)
-            sidecar.send(src, base64.b64encode(json.dumps(reply).encode()).decode(), msg_id=mid or uuid.uuid4().hex)
-            return
+                body = base64.b64encode(json.dumps({"error": f"bad locations: {e}"}).encode()).decode()
+                reply = {"id": mid or uuid.uuid4().hex, "type":"http.response", "status":400, "headers":{"content-type":"application/json"}, "body_b64": body, "duration_ms":0}
+                _send_http_response(src, mid, reply, chunk_limit)
+                _bump("dm_errors")
+                log(f"[DM] http.request ❌ bad locations from {src} id={mid or reply['id']} err={e}", "WARN")
+                return
 
-# Reader loop thread
 def _event_loop():
     while True:
         ev, obj = sidecar.events.get()
@@ -551,14 +816,13 @@ def _event_loop():
             _handle_incoming_dm(obj.get("src"), obj.get("payload_b64") or "")
         elif ev == "error":
             log(f"Sidecar error: {obj.get('message')}", "ERR")
-            METRICS.note_sidecar_error(str(obj.get("message")))
         elif ev == "ready":
             log(f"My NKN address: {obj.get('addr')}", "INFO")
 
 threading.Thread(target=_event_loop, daemon=True, name="nkn-dispatch").start()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) Flask HTTP API
+# 8) Flask HTTP API
 # ─────────────────────────────────────────────────────────────────────────────
 from werkzeug.serving import make_server, generate_adhoc_ssl_context
 from werkzeug.serving import BaseWSGIServer
@@ -582,22 +846,30 @@ def _rate_guard():
 def healthz():
     return jsonify({
         "ok": True, "addr": sidecar.addr, "elev_base": ELEV_BASE, "dataset": ELEV_DATASET,
-        "ts": int(time.time()*1000),
-        "dm_pending": len(_pending),
-        "metrics": METRICS.snapshot(),
+        "ts": int(time.time()*1000)
     })
 
 @app.post("/forward")
 def forward():
     data = request.get_json(force=True, silent=True) or {}
     dest = (data.get("dest") or "").strip()
-    locations = data.get("locations")  # string "lat,lng|..." or list of {lat,lng}
     dataset = data.get("dataset") or ELEV_DATASET
-    if not dest or not locations:
-        return jsonify({"error":"dest and locations required"}), 400
+    if not dest:
+        return jsonify({"error":"dest required"}), 400
+
+    try:
+        mode, latlng, gh_list = _parse_locations_or_geohashes(data)
+    except Exception as e:
+        return jsonify({"error": f"bad payload: {e}"}), 400
+
     dm_id = uuid.uuid4().hex
-    payload = {"id": dm_id, "type":"elev.query", "dataset": dataset, "locations": locations}
-    wire = base64.b64encode(json.dumps(payload).encode()).decode()
+    payload = {"id": dm_id, "type":"elev.query", "dataset": dataset}
+    if mode == "geohash":
+        payload["geohashes"] = gh_list
+    else:
+        payload["locations"] = [{"lat":lat,"lng":lng} for (lat,lng) in latlng]
+
+    wire = base64.b64encode(json.dumps(payload, separators=(",",":")).encode()).decode()
 
     loop = asyncio.get_event_loop()
     fut: asyncio.Future = loop.create_future()
@@ -615,7 +887,6 @@ def forward():
         _pending.pop(dm_id, None)
         return jsonify({"error":"dm response timeout"}), 504
 
-    # return body_b64 and utf8 convenience
     body = base64.b64decode(dmresp.get("body_b64") or b"") if dmresp.get("body_b64") else b""
     return jsonify({
         "ok": True, "id": dm_id, "status": dmresp.get("status"), "headers": dmresp.get("headers"),
@@ -624,7 +895,7 @@ def forward():
     })
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7) TLS helpers + Serve (Werkzeug/Waitress)
+# 9 TLS helpers + Serve
 # ─────────────────────────────────────────────────────────────────────────────
 def _list_local_ips():
     ips=set()
@@ -645,6 +916,7 @@ def _get_all_sans():
     return sorted(dns), sorted(ip)
 
 def _generate_self_signed(cert_file: Path, key_file: Path):
+    from cryptography.hazmat.primitives.asymmetric import rsa
     keyobj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     dns_sans, ip_sans = _get_all_sans()
     san_list = [DNSName(d) for d in dns_sans]
@@ -753,7 +1025,7 @@ if hasattr(signal, "SIGTSTP"):
     signal.signal(signal.SIGTSTP, _graceful_exit)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8) Main
+# 10) Main
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     _start_server()
