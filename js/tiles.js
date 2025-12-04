@@ -3,7 +3,7 @@ import { now } from './utils.js';
 import { TerrainRelay } from './terrainRelay.js';
 import { UnifiedTerrainMesh } from './unifiedTerrain.js';
 
-const DEFAULT_TERRAIN_RELAY = 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f';
+const DEFAULT_TERRAIN_RELAY = 'forwarder.5d7bdb47e1c757508d28f5726469afa1f7c93bd037a1940aa0dab97ab421c833';
 const DEFAULT_TERRAIN_DATASET = 'mapzen';
 
 const CONFIG_DEFAULTS = {
